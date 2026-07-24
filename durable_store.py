@@ -1576,6 +1576,121 @@ class DurableStore:
             raise StoreError("Stored agent usage metadata is invalid.")
         return usage
 
+    def pause_agent(self, agent_id: str, now: Optional[float] = None) -> ManagedAgent:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            active = self.connection.execute(
+                """
+                SELECT 1 FROM agent_mailbox
+                WHERE agent_id = ? AND state = 'leased'
+                """,
+                (agent_id,),
+            ).fetchone()
+            console = self.connection.execute(
+                """
+                SELECT 1 FROM agent_consoles
+                WHERE agent_id = ? AND state IN ('starting', 'running')
+                """,
+                (agent_id,),
+            ).fetchone()
+            if active is not None or console is not None:
+                raise StoreError("Agent must be idle before it can be paused.")
+            cursor = self.connection.execute(
+                """
+                UPDATE agents
+                SET lifecycle_state = 'stopped', updated_at = ?
+                WHERE agent_id = ? AND role IN ('project', 'worker')
+                    AND lifecycle_state != 'stopped'
+                """,
+                (timestamp, agent_id),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("Managed agent is already paused or unavailable.")
+            row = self.connection.execute(
+                "SELECT * FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self._managed_agent_from_row(row)
+
+    def resume_agent(self, agent_id: str, now: Optional[float] = None) -> ManagedAgent:
+        timestamp = time.time() if now is None else float(now)
+        cursor = self.connection.execute(
+            """
+            UPDATE agents
+            SET lifecycle_state = 'registered', updated_at = ?
+            WHERE agent_id = ? AND role IN ('project', 'worker')
+                AND lifecycle_state = 'stopped'
+            """,
+            (timestamp, agent_id),
+        )
+        if cursor.rowcount != 1:
+            raise StoreError("Managed agent is not paused.")
+        return self.resolve_agent(agent_id)
+
+    def reset_agent_session(
+        self,
+        agent_id: str,
+        now: Optional[float] = None,
+    ) -> ManagedAgent:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            busy = self.connection.execute(
+                """
+                SELECT 1 FROM agent_mailbox
+                WHERE agent_id = ? AND state IN ('queued', 'leased')
+                """,
+                (agent_id,),
+            ).fetchone()
+            console = self.connection.execute(
+                """
+                SELECT 1 FROM agent_consoles
+                WHERE agent_id = ? AND state IN ('starting', 'running')
+                """,
+                (agent_id,),
+            ).fetchone()
+            if busy is not None or console is not None:
+                raise StoreError(
+                    "Agent must have an idle mailbox and stopped console "
+                    "before starting a new session."
+                )
+            cursor = self.connection.execute(
+                """
+                UPDATE agents
+                SET provider_session_id = NULL, lifecycle_state = 'registered',
+                    updated_at = ?
+                WHERE agent_id = ? AND role IN ('project', 'worker')
+                    AND provider_session_id IS NOT NULL
+                    AND lifecycle_state != 'running'
+                """,
+                (timestamp, agent_id),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("Managed agent has no persisted session to replace.")
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('agent_session_reset', 'agent', ?, '{}', ?)
+                """,
+                (agent_id, timestamp),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self._managed_agent_from_row(row)
+
     def reserve_agent_console(
         self,
         agent_id: str,
@@ -2135,7 +2250,9 @@ class DurableStore:
                 """
                 SELECT m.*
                 FROM agent_mailbox AS m
+                JOIN agents AS a ON a.agent_id = m.agent_id
                 WHERE m.state = 'queued' AND m.available_at <= ?
+                    AND a.lifecycle_state != 'stopped'
                     AND NOT EXISTS (
                         SELECT 1
                         FROM agent_consoles AS console

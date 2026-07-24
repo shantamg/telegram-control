@@ -245,6 +245,16 @@ dynamic content: stage labels are bold and voice transcripts are block quotes.
 Provider output remains plain text until a tested renderer can safely support a
 documented Markdown subset without interpreting arbitrary model text as markup.
 
+`/agent` includes one-time, topic-bound lifecycle buttons. **Pause** prevents
+new mailbox claims while allowing Telegram inputs to queue durably; **Resume**
+drains them again. **New session…** requires a second confirmation, an idle
+mailbox, and a stopped console before clearing the controller's session pointer.
+The prior Codex conversation is retained by Codex and is not deleted.
+
+The live lifecycle test passed on July 23, 2026. A paused turn remained durably
+queued with zero attempts and completed after Resume. Opening New Session
+displayed its second confirmation without changing the current session.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

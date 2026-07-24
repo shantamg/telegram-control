@@ -224,7 +224,11 @@ def inspect_keyboard() -> Optional[dict]:
     }
 
 
-def send_message(text: str, include_inspect_button: bool = False) -> None:
+def send_message(
+    text: str,
+    include_inspect_button: bool = False,
+    reply_markup: Optional[dict] = None,
+) -> None:
     global OUTPUT_SEQUENCE
     chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
     if chat_id_text:
@@ -236,7 +240,8 @@ def send_message(text: str, include_inspect_button: bool = False) -> None:
     remaining = text.strip()
     if not remaining:
         remaining = "[empty transcript]"
-    reply_markup = inspect_keyboard() if include_inspect_button else None
+    if include_inspect_button:
+        reply_markup = inspect_keyboard()
     while remaining:
         if len(remaining) <= TELEGRAM_TEXT_CHUNK:
             chunk, remaining = remaining, ""
@@ -298,6 +303,54 @@ def send_agent_status() -> None:
             if agent is not None
             else None
         )
+        job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+        user_id = os.environ.get("TELEGRAM_FROM_ID")
+        keyboard = None
+        if agent is not None and job_id and user_id:
+            action_type = (
+                "agent_resume"
+                if agent.lifecycle_state == "stopped"
+                else "agent_pause"
+            )
+            action_label = (
+                "▶️ Resume"
+                if agent.lifecycle_state == "stopped"
+                else "⏸ Pause"
+            )
+            lifecycle_action = store.create_callback_action(
+                operation_id=f"inbox:{job_id}:{action_type}",
+                action_type=action_type,
+                payload={"agent_id": agent.agent_id},
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=int(user_id),
+                one_time=True,
+                ttl_seconds=15 * 60,
+            )
+            new_session_action = store.create_callback_action(
+                operation_id=f"inbox:{job_id}:agent-new-session-prompt",
+                action_type="agent_new_session_prompt",
+                payload={"agent_id": agent.agent_id},
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=int(user_id),
+                one_time=True,
+                ttl_seconds=15 * 60,
+            )
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": action_label,
+                            "callback_data": f"a:{lifecycle_action.token}",
+                        },
+                        {
+                            "text": "New session…",
+                            "callback_data": f"a:{new_session_action.token}",
+                        },
+                    ]
+                ]
+            }
     if agent is None:
         send_message("This Telegram surface has no managed agent.")
         return
@@ -323,7 +376,8 @@ def send_agent_status() -> None:
         f"State: {agent.lifecycle_state}\n"
         f"Session: {session}\n"
         f"Console: {console_state}"
-        f"{usage_line}"
+        f"{usage_line}",
+        reply_markup=keyboard,
     )
 
 
@@ -405,6 +459,114 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "The opaque action was authorized, resolved from SQLite, and "
             "consumed exactly once."
         )
+        return
+    if action.action_type in {"agent_pause", "agent_resume"}:
+        agent_id = str(action.payload.get("agent_id", ""))
+        try:
+            with DurableStore(Path(database_path)) as store:
+                bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+                if bound_agent is None or bound_agent.agent_id != agent_id:
+                    raise StoreError("Managed agent surface changed.")
+                if action.action_type == "agent_pause":
+                    store.pause_agent(agent_id)
+                    result_text = "⏸ Agent paused."
+                else:
+                    store.resume_agent(agent_id)
+                    result_text = "▶️ Agent resumed."
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": result_text,
+                },
+                "callback-answer",
+            )
+        send_message(result_text + " Send /agent to inspect or change it.")
+        return
+    if action.action_type == "agent_new_session_prompt":
+        agent_id = str(action.payload.get("agent_id", ""))
+        with DurableStore(Path(database_path)) as store:
+            bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+            if bound_agent is None or bound_agent.agent_id != agent_id:
+                raise StoreError("Managed agent surface changed.")
+            confirm = store.create_callback_action(
+                operation_id=f"callback:{update['update_id']}:agent-new-session-confirm",
+                action_type="agent_new_session_confirm",
+                payload={"agent_id": agent_id},
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=user_id,
+                one_time=True,
+                ttl_seconds=5 * 60,
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Confirmation required.",
+                },
+                "callback-answer",
+            )
+        send_message(
+            "Start a fresh Codex conversation?\n\n"
+            "The current conversation is retained by Codex, but new messages "
+            "will no longer continue it.",
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Confirm new session",
+                            "callback_data": f"a:{confirm.token}",
+                        }
+                    ]
+                ]
+            },
+        )
+        return
+    if action.action_type == "agent_new_session_confirm":
+        agent_id = str(action.payload.get("agent_id", ""))
+        try:
+            with DurableStore(Path(database_path)) as store:
+                bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+                if bound_agent is None or bound_agent.agent_id != agent_id:
+                    raise StoreError("Managed agent surface changed.")
+                store.reset_agent_session(agent_id)
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "New session ready.",
+                },
+                "callback-answer",
+            )
+        send_message("✅ The next message will start a fresh Codex conversation.")
         return
     if action.action_type == "refresh_status":
         chat_id, thread_id = surface_coordinates()

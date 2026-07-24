@@ -922,6 +922,61 @@ class DurableStoreTests(unittest.TestCase):
             "queued",
         )
 
+    def test_agent_pause_resume_and_session_reset_are_safe(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Stage 2 Test",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        self.store.connection.execute(
+            "UPDATE agents SET provider_session_id = ? WHERE agent_id = ?",
+            ("019f924b-bbbf-7080-b778-a52e3e1bf4cc", agent.agent_id),
+        )
+        paused = self.store.pause_agent(agent.agent_id, now=101)
+        self.assertEqual(paused.lifecycle_state, "stopped")
+
+        self.store.ingest_update(topic_message_update(10, "queued"), now=102)
+        job = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+        ).fetchone()
+        self.store.enqueue_agent_message(
+            agent.agent_id,
+            int(job["job_id"]),
+            "queued",
+            now=102,
+        )
+        self.assertIsNone(self.store.claim_agent_mailbox("worker", now=103))
+        resumed = self.store.resume_agent(agent.agent_id, now=104)
+        self.assertEqual(resumed.lifecycle_state, "registered")
+        mailbox = self.store.claim_agent_mailbox("worker", now=105)
+        self.assertEqual(mailbox.input_text, "queued")
+        with self.assertRaisesRegex(StoreError, "idle mailbox"):
+            self.store.reset_agent_session(agent.agent_id, now=106)
+        self.store.complete_agent_mailbox(
+            mailbox.mailbox_id,
+            "worker",
+            "019f924b-bbbf-7080-b778-a52e3e1bf4cc",
+            "done",
+            ["done"],
+            {},
+            now=107,
+        )
+        reset = self.store.reset_agent_session(agent.agent_id, now=108)
+        self.assertIsNone(reset.provider_session_id)
+        self.assertEqual(reset.lifecycle_state, "registered")
+
 
 class SchemaCompatibilityTests(unittest.TestCase):
     def test_schema_one_database_migrates_to_current_schema(self):
@@ -1723,6 +1778,12 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 self.assertIn("State: registered", response.params["text"])
                 self.assertNotIn("Last turn:", response.params["text"])
+                labels = [
+                    button["text"]
+                    for row in response.params["reply_markup"]["inline_keyboard"]
+                    for button in row
+                ]
+                self.assertEqual(labels, ["⏸ Pause", "New session…"])
                 route_json = store.connection.execute(
                     "SELECT route_json FROM outbox_messages WHERE message_id = ?",
                     (response.message_id,),

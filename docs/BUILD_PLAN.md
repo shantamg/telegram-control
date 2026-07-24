@@ -828,6 +828,22 @@ July 23, 2026:
 - a live voice note visibly progressed through transcription, transcript
   sending, Codex work, and the exact final response in one Telegram message.
 
+The first managed lifecycle-control slice passed 59 offline tests and its live
+test on July 23, 2026:
+
+- `/agent` exposes opaque, authorized, one-time Pause/Resume and New Session
+  actions scoped to the agent's topic;
+- paused agents keep accepting durable Telegram inputs but are excluded from
+  mailbox claims until resumed;
+- pausing fails while a provider turn or interactive console owns the agent;
+- starting a fresh provider conversation requires a second confirmation, an
+  idle mailbox, and a stopped console;
+- resetting changes only the controller's provider-session pointer; it does not
+  delete the previous Codex conversation.
+- a live paused turn remained queued with zero attempts, completed after
+  Resume, and New Session stopped at its separate confirmation without changing
+  the persisted session.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)
