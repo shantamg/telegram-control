@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import codex_sessions
 import discovery
 import router_contract
 import telegram_bridge as bridge
@@ -427,6 +428,18 @@ def send_agent_status() -> None:
                 one_time=True,
                 ttl_seconds=15 * 60,
             )
+            resume_session_action = None
+            if agent.provider == "codex":
+                resume_session_action = store.create_callback_action(
+                    operation_id=f"inbox:{job_id}:agent-resume-session-picker",
+                    action_type="agent_resume_session_picker",
+                    payload={"agent_id": agent.agent_id},
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    authorized_user_id=int(user_id),
+                    one_time=True,
+                    ttl_seconds=15 * 60,
+                )
             keyboard = {
                 "inline_keyboard": [
                     [
@@ -438,7 +451,21 @@ def send_agent_status() -> None:
                             "text": "New session…",
                             "callback_data": f"a:{new_session_action.token}",
                         },
-                    ]
+                    ],
+                    *(
+                        [
+                            [
+                                {
+                                    "text": "Resume another session…",
+                                    "callback_data": (
+                                        f"a:{resume_session_action.token}"
+                                    ),
+                                }
+                            ]
+                        ]
+                        if resume_session_action is not None
+                        else []
+                    ),
                 ]
             }
     if agent is None:
@@ -1666,6 +1693,304 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             )
         send_message(
             f"✅ The next message will start a fresh {provider_name} conversation."
+        )
+        return
+    if action.action_type == "agent_resume_session_picker":
+        agent_id = str(action.payload.get("agent_id", ""))
+        with DurableStore(Path(database_path)) as store:
+            bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+            if bound_agent is None or bound_agent.agent_id != agent_id:
+                raise StoreError("Managed agent surface changed.")
+            if bound_agent.provider != "codex":
+                raise StoreError("Only Codex sessions can be resumed here.")
+            working_directory = (
+                bound_agent.working_directory or bound_agent.project_path
+            )
+            if not working_directory:
+                raise StoreError("Managed agent has no working directory.")
+            used_session_ids = store.registered_provider_session_ids(
+                excluding_agent_id=agent_id
+            )
+            if bound_agent.provider_session_id:
+                used_session_ids.add(bound_agent.provider_session_id)
+            snapshot_operation_id = (
+                f"callback:{update['update_id']}:"
+                "agent-resume-session-snapshot"
+            )
+            snapshot = store.resolve_callback_action_operation(
+                snapshot_operation_id
+            )
+            if snapshot is None:
+                discovered = codex_sessions.discover_sessions(
+                    working_directory,
+                    excluded_session_ids=used_session_ids,
+                )
+                snapshot = store.create_callback_action(
+                    operation_id=snapshot_operation_id,
+                    action_type="agent_resume_session_snapshot",
+                    payload={
+                        "agent_id": agent_id,
+                        "candidates": [
+                            {
+                                "provider_session_id": candidate.session_id,
+                                "label": candidate.button_label(),
+                            }
+                            for candidate in discovered
+                        ],
+                    },
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    authorized_user_id=user_id,
+                    one_time=False,
+                    ttl_seconds=5 * 60,
+                )
+            store.retire_callback_action_operation(
+                snapshot_operation_id,
+                "agent_resume_session_snapshot",
+            )
+            if snapshot.payload.get("agent_id") != agent_id:
+                raise StoreError("Persisted session picker snapshot is invalid.")
+            candidates = snapshot.payload.get("candidates")
+            if not isinstance(candidates, list) or len(candidates) > 5:
+                raise StoreError("Persisted session picker snapshot is invalid.")
+            buttons = []
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    raise StoreError(
+                        "Persisted session picker snapshot is invalid."
+                    )
+                candidate_session_id = str(
+                    candidate.get("provider_session_id", "")
+                )
+                candidate_label = str(candidate.get("label", ""))
+                if (
+                    codex_sessions.SESSION_ID_PATTERN.fullmatch(
+                        candidate_session_id
+                    )
+                    is None
+                    or not candidate_label
+                    or len(candidate_label) > 64
+                ):
+                    raise StoreError(
+                        "Persisted session picker snapshot is invalid."
+                    )
+                select = store.create_callback_action(
+                    operation_id=(
+                        f"callback:{update['update_id']}:"
+                        "agent-resume-session-prompt:"
+                        f"{candidate_session_id}"
+                    ),
+                    action_type="agent_resume_session_prompt",
+                    payload={
+                        "agent_id": agent_id,
+                        "provider_session_id": candidate_session_id,
+                        "candidate_label": candidate_label,
+                    },
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    authorized_user_id=user_id,
+                    one_time=True,
+                    ttl_seconds=5 * 60,
+                )
+                buttons.append(
+                    [
+                        {
+                            "text": candidate_label,
+                            "callback_data": f"a:{select.token}",
+                        }
+                    ]
+                )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": (
+                        "Choose a persisted session."
+                        if candidates
+                        else "No compatible sessions found."
+                    ),
+                },
+                "callback-answer",
+            )
+        if not candidates:
+            send_message(
+                "No other persisted Codex sessions were found for this "
+                "topic’s working directory."
+            )
+            return
+        send_message(
+            "Resume a persisted Codex session\n\n"
+            "Choose a recent session from this exact working directory. "
+            "This can resume a closed or dormant session; it cannot safely "
+            "take control of a turn that is still running in another Codex window.",
+            reply_markup={"inline_keyboard": buttons},
+        )
+        return
+    if action.action_type == "agent_resume_session_prompt":
+        agent_id = str(action.payload.get("agent_id", ""))
+        provider_session_id = str(
+            action.payload.get("provider_session_id", "")
+        )
+        candidate_label = str(action.payload.get("candidate_label", ""))
+        if not candidate_label or len(candidate_label) > 64:
+            raise StoreError("Persisted session selection is invalid.")
+        try:
+            with DurableStore(Path(database_path)) as store:
+                bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+                if bound_agent is None or bound_agent.agent_id != agent_id:
+                    raise StoreError("Managed agent surface changed.")
+                confirm_operation_id = (
+                    f"callback:{update['update_id']}:"
+                    "agent-resume-session-confirm"
+                )
+                confirm = store.resolve_callback_action_operation(
+                    confirm_operation_id
+                )
+                if confirm is None:
+                    working_directory = (
+                        bound_agent.working_directory
+                        or bound_agent.project_path
+                    )
+                    candidate = (
+                        codex_sessions.resolve_session(
+                            provider_session_id,
+                            working_directory,
+                        )
+                        if working_directory
+                        else None
+                    )
+                    if candidate is None:
+                        raise StoreError(
+                            "That persisted session is no longer available for "
+                            "this working directory."
+                        )
+                    confirm = store.create_callback_action(
+                        operation_id=confirm_operation_id,
+                        action_type="agent_resume_session_confirm",
+                        payload={
+                            "agent_id": agent_id,
+                            "provider_session_id": candidate.session_id,
+                            "candidate_label": candidate_label,
+                            "expected_provider_session_id": (
+                                bound_agent.provider_session_id
+                            ),
+                        },
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        authorized_user_id=user_id,
+                        one_time=True,
+                        ttl_seconds=5 * 60,
+                    )
+                if (
+                    confirm.payload.get("agent_id") != agent_id
+                    or confirm.payload.get("provider_session_id")
+                    != provider_session_id
+                    or confirm.payload.get("candidate_label")
+                    != candidate_label
+                ):
+                    raise StoreError(
+                        "Persisted session confirmation is invalid."
+                    )
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Confirmation required.",
+                },
+                "callback-answer",
+            )
+        send_message(
+            "Resume this Codex session?\n\n"
+            f"{candidate_label}\n\n"
+            "The topic’s current conversation remains stored, but future "
+            "messages will continue the selected session. Close any active "
+            "turn using it elsewhere first.",
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "Confirm resume",
+                            "callback_data": f"a:{confirm.token}",
+                        }
+                    ]
+                ]
+            },
+        )
+        return
+    if action.action_type == "agent_resume_session_confirm":
+        agent_id = str(action.payload.get("agent_id", ""))
+        provider_session_id = str(
+            action.payload.get("provider_session_id", "")
+        )
+        expected_provider_session_id = action.payload.get(
+            "expected_provider_session_id"
+        )
+        if expected_provider_session_id is not None:
+            expected_provider_session_id = str(expected_provider_session_id)
+        try:
+            with DurableStore(Path(database_path)) as store:
+                bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+                if bound_agent is None or bound_agent.agent_id != agent_id:
+                    raise StoreError("Managed agent surface changed.")
+                working_directory = (
+                    bound_agent.working_directory or bound_agent.project_path
+                )
+                candidate = (
+                    codex_sessions.resolve_session(
+                        provider_session_id,
+                        working_directory,
+                    )
+                    if working_directory
+                    else None
+                )
+                if candidate is None:
+                    raise StoreError(
+                        "That persisted session is no longer available for this "
+                        "working directory."
+                    )
+                store.adopt_agent_session(
+                    agent_id,
+                    candidate.session_id,
+                    expected_provider_session_id,
+                )
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Codex session resumed.",
+                },
+                "callback-answer",
+            )
+        send_message(
+            "✅ This topic will continue the selected Codex session on its "
+            "next message."
         )
         return
     if action.action_type == "refresh_status":

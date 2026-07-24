@@ -1210,10 +1210,23 @@ Remaining release work:
    workspaces; Git metadata remains optional.~~ Completed in schema v18.
 2. Give each forum topic lightweight durable subject state and conversational
    worker/session controls. Schema v19 implements subject provisioning and
-   reuses the existing worker controls; proactive crash and hang reporting
-   remains.
+   reuses the existing worker controls. Provider silence is bounded by the
+   adapter deadline, worker crashes recover through leases, transient failures
+   replace the live card with a retry state, and terminal failures replace it
+   with an actionable error; no separate watchdog actor is needed.
 3. Add adoption of discoverable existing Codex sessions, voice replies, and
-   status presentation polish.
+   status presentation polish. Session adoption is explicit and
+   confirmation-gated: `/agent` can list a bounded set of recent persisted
+   Codex sessions whose recorded working directory exactly matches the topic
+   agent. The controller revalidates the selection and requires an idle
+   mailbox, a stopped managed console, and exclusive ownership before changing
+   only that agent's provider-session pointer. Controller-created sessions and
+   sessions already attached elsewhere are omitted. This resumes persisted
+   context; it deliberately does not claim that a concurrently active Codex
+   window can be seized or steered through a second app-server process.
+   Discovery and confirmation revalidation use capped date traversal, file
+   counts, metadata bytes, index bytes/lines, and wall time so accumulated
+   Codex history cannot monopolize the Telegram inbox worker.
 4. Run the full acceptance matrix and an independent Codex review before each
    live schema migration and deployment.
 

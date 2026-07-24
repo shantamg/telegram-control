@@ -1727,6 +1727,35 @@ class DurableStore:
                 self.connection.execute("ROLLBACK")
             raise
 
+    def resolve_callback_action_operation(
+        self,
+        operation_id: str,
+    ) -> Optional[CallbackAction]:
+        row = self.connection.execute(
+            "SELECT * FROM callback_actions WHERE operation_id = ?",
+            (str(operation_id),),
+        ).fetchone()
+        return self._callback_from_row(row) if row is not None else None
+
+    def retire_callback_action_operation(
+        self,
+        operation_id: str,
+        action_type: str,
+        now: Optional[float] = None,
+    ) -> None:
+        timestamp = time.time() if now is None else float(now)
+        cursor = self.connection.execute(
+            """
+            UPDATE callback_actions
+            SET state = 'expired', updated_at = ?
+            WHERE operation_id = ? AND action_type = ?
+                AND state = 'active'
+            """,
+            (timestamp, str(operation_id), str(action_type)),
+        )
+        if cursor.rowcount not in {0, 1}:
+            raise StoreError("Callback snapshot retirement was ambiguous.")
+
     @staticmethod
     def _telegram_mutation_from_row(row: sqlite3.Row) -> TelegramMutation:
         result = (
@@ -5922,6 +5951,125 @@ class DurableStore:
             self.connection.execute("ROLLBACK")
             raise
         return self._managed_agent_from_row(row)
+
+    def registered_provider_session_ids(
+        self,
+        excluding_agent_id: Optional[str] = None,
+    ) -> set[str]:
+        rows = self.connection.execute(
+            """
+            SELECT provider_session_id
+            FROM agents
+            WHERE provider_session_id IS NOT NULL
+                AND (? IS NULL OR agent_id != ?)
+            """,
+            (excluding_agent_id, excluding_agent_id),
+        ).fetchall()
+        return {str(row["provider_session_id"]) for row in rows}
+
+    def adopt_agent_session(
+        self,
+        agent_id: str,
+        provider_session_id: str,
+        expected_provider_session_id: Optional[str],
+        now: Optional[float] = None,
+    ) -> ManagedAgent:
+        """Point an idle Codex agent at an explicitly confirmed session."""
+        if not provider_session_id or len(provider_session_id) > 256:
+            raise StoreError("Persisted provider session ID is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT *
+                FROM agents
+                WHERE agent_id = ? AND role IN ('project', 'worker')
+                    AND provider = 'codex'
+                """,
+                (agent_id,),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Managed Codex agent was not found.")
+            current_session_id = (
+                str(row["provider_session_id"])
+                if row["provider_session_id"] is not None
+                else None
+            )
+            if current_session_id == provider_session_id:
+                self.connection.execute("COMMIT")
+                return self._managed_agent_from_row(row)
+            if current_session_id != expected_provider_session_id:
+                raise StoreError(
+                    "The topic's Codex session changed after this "
+                    "confirmation was created. Open /agent and choose again."
+                )
+            busy = self.connection.execute(
+                """
+                SELECT 1 FROM agent_mailbox
+                WHERE agent_id = ? AND state IN ('queued', 'leased')
+                """,
+                (agent_id,),
+            ).fetchone()
+            console = self.connection.execute(
+                """
+                SELECT 1 FROM agent_consoles
+                WHERE agent_id = ? AND state IN ('starting', 'running')
+                """,
+                (agent_id,),
+            ).fetchone()
+            owner = self.connection.execute(
+                """
+                SELECT 1 FROM agents
+                WHERE agent_id != ? AND provider_session_id = ?
+                """,
+                (agent_id, provider_session_id),
+            ).fetchone()
+            if busy is not None or console is not None:
+                raise StoreError(
+                    "Agent must have an idle mailbox and stopped console "
+                    "before resuming another session."
+                )
+            if owner is not None:
+                raise StoreError(
+                    "That persisted session is already attached to another "
+                    "managed agent."
+                )
+            self.connection.execute(
+                """
+                UPDATE agents
+                SET provider_session_id = ?, lifecycle_state = 'registered',
+                    updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (provider_session_id, timestamp, agent_id),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('agent_session_adopted', 'agent', ?, ?, ?)
+                """,
+                (
+                    agent_id,
+                    json.dumps(
+                        {"provider_session_id": provider_session_id},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                ),
+            )
+            updated = self.connection.execute(
+                "SELECT * FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self._managed_agent_from_row(updated)
 
     def reserve_agent_console(
         self,
