@@ -86,6 +86,7 @@ def open_store(path: Path) -> DurableStore:
 def collect_once(
     store: DurableStore,
     token: str,
+    config: dict[str, Any],
     timeout: int = 50,
 ) -> int:
     updates = bridge.api_call(
@@ -96,7 +97,19 @@ def collect_once(
         allowed_updates=["message", "callback_query"],
     )
     for update in updates:
-        inserted = store.ingest_update(update)
+        authorization_failure = bridge.update_authorization_failure(
+            config,
+            update,
+        )
+        stored_update = (
+            update
+            if authorization_failure is None
+            else {
+                "update_id": int(update["update_id"]),
+                "ignored_unauthorized": authorization_failure,
+            }
+        )
+        inserted = store.ingest_update(stored_update)
         committed_offset = store.poll_offset()
         if committed_offset is not None:
             # Keep Stage 0's fallback cursor current, but only after the durable
@@ -104,24 +117,36 @@ def collect_once(
             # duplicate fetch; it cannot lose the durable job.
             bridge.save_offset(committed_offset)
         log_event(
-            "update_ingested" if inserted else "update_duplicate",
+            (
+                "update_ignored"
+                if inserted and authorization_failure is not None
+                else "update_ingested"
+                if inserted
+                else "update_duplicate"
+            ),
             update_id=int(update["update_id"]),
             offset=committed_offset,
+            **(
+                {"authorization_failure": authorization_failure}
+                if authorization_failure is not None
+                else {}
+            ),
         )
     return len(updates)
 
 
 def collect_command(args: argparse.Namespace) -> None:
     token = bridge.read_token()
+    config = bridge.load_config()
     with open_store(args.db) as store:
         if args.once:
-            collect_once(store, token, timeout=0)
+            collect_once(store, token, config, timeout=0)
             return
 
         delay = 1.0
         while True:
             try:
-                collect_once(store, token)
+                collect_once(store, token, config)
                 delay = 1.0
             except bridge.BridgeError as exc:
                 log_event("collector_error", error=str(exc), retry_seconds=delay)

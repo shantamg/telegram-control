@@ -5483,6 +5483,126 @@ class DurableIntegrationTests(unittest.TestCase):
                     {"queued": 1},
                 )
 
+    def test_new_private_forum_requires_confirmation_before_control(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            update = topic_message_update(
+                10,
+                "Bind this forum to my Life workspace",
+            )
+            update["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            update["message"]["reply_to_message"]["forum_topic_created"][
+                "name"
+            ] = "General"
+            with DurableStore(database_path) as store:
+                store.ingest_update(update, now=100)
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(store, config, job, "worker")
+
+                prompt = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(prompt.method, "sendMessage")
+                self.assertEqual(prompt.params["chat_id"], -100777)
+                self.assertEqual(prompt.params["message_thread_id"], 62)
+                self.assertIn(
+                    "Authorize this private forum",
+                    prompt.params["text"],
+                )
+                callback_data = prompt.params["reply_markup"][
+                    "inline_keyboard"
+                ][0][0]["callback_data"]
+                self.assertIsNone(store.resolve_surface_binding(-100777, None))
+                self.assertIsNone(store.resolve_surface_binding(-100777, 62))
+                self.assertEqual(
+                    store.status_counts().get("router_mailbox", {}),
+                    {},
+                )
+                store.complete_outbox(
+                    prompt.message_id,
+                    "sender",
+                    {"message_id": 700, "chat": {"id": -100777}},
+                    now=101,
+                )
+
+                confirmation = callback_update(
+                    11,
+                    data=callback_data,
+                    message_id=700,
+                    message_thread_id=62,
+                )
+                confirmation["callback_query"]["message"]["chat"] = {
+                    "id": -100777,
+                    "type": "supergroup",
+                    "title": "Life",
+                    "is_forum": True,
+                }
+                store.ingest_update(confirmation, now=102)
+                callback_job = store.claim_job("worker", now=102)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    callback_job,
+                    "worker",
+                )
+
+                forum_binding = store.resolve_surface_binding(-100777, None)
+                self.assertIsNotNone(forum_binding)
+                self.assertEqual(forum_binding.surface_type, "control")
+                self.assertEqual(forum_binding.display_name, "Life")
+                self.assertEqual(forum_binding.target_type, "controller")
+                self.assertEqual(forum_binding.target_id, "control")
+
+                second = topic_message_update(
+                    12,
+                    "Bind this forum to my Life workspace",
+                )
+                second["message"]["chat"] = update["message"]["chat"]
+                second["message"]["reply_to_message"]["forum_topic_created"][
+                    "name"
+                ] = "General"
+                store.ingest_update(second, now=103)
+                second_job = store.claim_job("worker", now=103)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    second_job,
+                    "worker",
+                )
+
+                topic_binding = store.resolve_surface_binding(-100777, 62)
+                self.assertIsNotNone(topic_binding)
+                self.assertEqual(topic_binding.surface_type, "control")
+                self.assertEqual(topic_binding.display_name, "General")
+                self.assertEqual(
+                    store.status_counts()["router_mailbox"],
+                    {"queued": 1},
+                )
+                receipt = store.connection.execute(
+                    """
+                    SELECT params_json
+                    FROM outbox_messages
+                    WHERE operation_id = ?
+                    """,
+                    (f"router-input:{second_job.job_id}:receipt",),
+                ).fetchone()
+                self.assertIsNotNone(receipt)
+                receipt_params = json.loads(receipt["params_json"])
+                self.assertEqual(receipt_params["chat_id"], -100777)
+                self.assertEqual(receipt_params["message_thread_id"], 62)
+                self.assertEqual(
+                    receipt_params["text"],
+                    "🧭 <b>Control is routing…</b>",
+                )
+
     def test_status_command_reuses_existing_project_topic_binding(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"
@@ -5924,6 +6044,46 @@ class DurableIntegrationTests(unittest.TestCase):
                     "telegram-control\n\nvoice route complete",
                 )
 
+    def test_new_private_forum_voice_prompts_before_transcription(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            update = topic_voice_update()
+            update["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            with DurableStore(database_path) as store:
+                store.ingest_update(update, now=100)
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    {
+                        "chat_id": 123,
+                        "owner_user_id": 123,
+                        "handler_path": str(Path(on_message.__file__).resolve()),
+                    },
+                    job,
+                    "worker",
+                )
+
+                receipt = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(
+                    receipt.method,
+                    "sendMessage",
+                )
+                self.assertIn(
+                    "Authorize this private forum",
+                    receipt.params["text"],
+                )
+                self.assertIsNone(store.resolve_surface_binding(-100777, None))
+                self.assertIsNone(store.resolve_surface_binding(-100777, 62))
+                self.assertEqual(
+                    store.status_counts().get("router_mailbox", {}),
+                    {},
+                )
+
     def test_handler_queues_reply_instead_of_calling_telegram(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"
@@ -5974,7 +6134,15 @@ class DurableIntegrationTests(unittest.TestCase):
                         telegram_control.bridge,
                         "save_offset",
                     ) as save_offset:
-                        count = telegram_control.collect_once(store, "secret", timeout=0)
+                        count = telegram_control.collect_once(
+                            store,
+                            "secret",
+                            {
+                                "chat_id": 123,
+                                "owner_user_id": 123,
+                            },
+                            timeout=0,
+                        )
 
                 self.assertEqual(count, 2)
                 self.assertEqual(store.poll_offset(), 22)
@@ -5989,6 +6157,56 @@ class DurableIntegrationTests(unittest.TestCase):
                     offset=None,
                     timeout=0,
                     allowed_updates=["message", "callback_query"],
+                )
+
+    def test_collector_does_not_persist_unauthorized_group_content(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "controller.sqlite3"
+            unauthorized = topic_message_update(
+                20,
+                "SECRET message from another group member",
+            )
+            unauthorized["message"]["from"]["id"] = 456
+            unauthorized["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            with DurableStore(path) as store:
+                with mock.patch.object(
+                    telegram_control.bridge,
+                    "api_call",
+                    return_value=[unauthorized],
+                ):
+                    with mock.patch.object(
+                        telegram_control.bridge,
+                        "save_offset",
+                    ):
+                        count = telegram_control.collect_once(
+                            store,
+                            "secret",
+                            {
+                                "chat_id": 123,
+                                "owner_user_id": 123,
+                            },
+                            timeout=0,
+                        )
+
+                self.assertEqual(count, 1)
+                self.assertEqual(store.poll_offset(), 21)
+                self.assertEqual(store.status_counts()["updates"], {"ignored": 1})
+                self.assertEqual(store.status_counts()["inbox"], {})
+                raw_json = store.connection.execute(
+                    "SELECT raw_json FROM telegram_updates WHERE update_id = 20"
+                ).fetchone()["raw_json"]
+                self.assertNotIn("SECRET", raw_json)
+                self.assertEqual(
+                    json.loads(raw_json),
+                    {
+                        "ignored_unauthorized": "user",
+                        "update_id": 20,
+                    },
                 )
 
 

@@ -513,6 +513,7 @@ def setup_command(_: argparse.Namespace) -> None:
 
     config = {
         "chat_id": int(selected["chat"]["id"]),
+        "owner_user_id": int(selected["from"]["id"]),
         "bot_username": bot_username,
         "handler_path": str(DEFAULT_HANDLER_PATH),
     }
@@ -567,6 +568,51 @@ def explicit_reply_message_id(message: dict[str, Any]) -> str:
     return str(message_id) if message_id is not None else ""
 
 
+def update_authorization_failure(
+    config: dict[str, Any],
+    update: dict[str, Any],
+) -> Optional[str]:
+    """Return the failed authorization dimension, or None when allowed.
+
+    Besides the paired private chat, only owner-authored messages in a private
+    forum topic are admitted. Durable forum enrollment is enforced by the
+    handler before such a topic may reach Control.
+    """
+    callback_query = update.get("callback_query")
+    message = update.get("message")
+    if not message and isinstance(callback_query, dict):
+        message = callback_query.get("message")
+    if not isinstance(message, dict):
+        return "chat"
+
+    chat = message.get("chat") or {}
+    owner_user_id = int(config.get("owner_user_id") or config["chat_id"])
+    chat_type = str(chat.get("type", ""))
+    chat_id = int(chat.get("id", 0))
+    authorized_private_chat = (
+        chat_type == "private" and chat_id == int(config["chat_id"])
+    )
+    authorized_private_forum = (
+        chat_type == "supergroup"
+        and chat.get("is_forum") is True
+        and not chat.get("username")
+        and message.get("message_thread_id") is not None
+    )
+    if not (authorized_private_chat or authorized_private_forum):
+        return "chat"
+
+    sender = (
+        callback_query.get("from", {})
+        if isinstance(callback_query, dict)
+        else message.get("from", {})
+    )
+    try:
+        sender_id = int(sender.get("id", 0))
+    except (TypeError, ValueError):
+        return "user"
+    return None if sender_id == owner_user_id else "user"
+
+
 def process_update(
     config: dict[str, Any],
     update: dict[str, Any],
@@ -579,10 +625,17 @@ def process_update(
     if not message:
         return
 
-    chat = message.get("chat", {})
-    if chat.get("type") != "private" or int(chat.get("id", 0)) != int(config["chat_id"]):
-        print(f"Ignored an unauthorized chat (update {update['update_id']}).", flush=True)
+    authorization_failure = update_authorization_failure(config, update)
+    if authorization_failure is not None:
+        print(
+            f"Ignored an unauthorized {authorization_failure} "
+            f"(update {update['update_id']}).",
+            flush=True,
+        )
         return
+
+    chat = message.get("chat", {})
+    chat_type = str(chat.get("type", ""))
 
     handler_path = Path(config["handler_path"]).expanduser().resolve()
     if not handler_path.is_file():
@@ -593,14 +646,24 @@ def process_update(
         if isinstance(callback_query, dict)
         else message.get("from", {})
     )
-    sender_id = int(sender.get("id", 0))
-    if sender_id and sender_id != int(config["chat_id"]):
-        print(f"Ignored an unauthorized user (update {update['update_id']}).", flush=True)
-        return
     environment = os.environ.copy()
+    topic_service_message = message.get("reply_to_message") or {}
+    topic_created = (
+        topic_service_message.get("forum_topic_created")
+        if isinstance(topic_service_message, dict)
+        else None
+    )
+    topic_name = (
+        str(topic_created.get("name", ""))
+        if isinstance(topic_created, dict)
+        else ""
+    )
     environment.update(
         {
             "TELEGRAM_CHAT_ID": str(chat["id"]),
+            "TELEGRAM_CHAT_TYPE": chat_type,
+            "TELEGRAM_CHAT_TITLE": str(chat.get("title", "")),
+            "TELEGRAM_TOPIC_NAME": topic_name,
             "TELEGRAM_MESSAGE_ID": str(message.get("message_id", "")),
             "TELEGRAM_MESSAGE_THREAD_ID": str(message.get("message_thread_id", "")),
             "TELEGRAM_REPLY_TO_MESSAGE_ID": explicit_reply_message_id(message),

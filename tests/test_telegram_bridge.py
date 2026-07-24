@@ -615,6 +615,199 @@ class ApiCallSubprocessTests(unittest.TestCase):
                 pass
 
 
+class ProcessUpdateAuthorizationTests(unittest.TestCase):
+    def setUp(self):
+        self.config = {
+            "chat_id": 123,
+            "owner_user_id": 123,
+            "handler_path": str(telegram_bridge.SCRIPT_PATH),
+        }
+
+    @staticmethod
+    def update(chat, sender_id=123):
+        return {
+            "update_id": 10,
+            "message": {
+                "message_id": 20,
+                "from": {"id": sender_id, "username": "owner"},
+                "chat": chat,
+                "message_thread_id": 62,
+                "text": "hello",
+            },
+        }
+
+    @staticmethod
+    def callback_update(chat, sender_id=123):
+        return {
+            "update_id": 11,
+            "callback_query": {
+                "id": "callback-11",
+                "from": {"id": sender_id, "username": "owner"},
+                "data": "a:opaque",
+                "message": {
+                    "message_id": 21,
+                    "chat": chat,
+                    "message_thread_id": 62,
+                },
+            },
+        }
+
+    def test_paired_private_chat_is_still_accepted(self):
+        update = self.update({"id": 123, "type": "private"})
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(
+            telegram_bridge.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            telegram_bridge.process_update(self.config, update)
+
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["TELEGRAM_CHAT_ID"], "123")
+        self.assertEqual(environment["TELEGRAM_CHAT_TYPE"], "private")
+
+    def test_owner_is_accepted_in_a_private_forum_group(self):
+        update = self.update(
+            {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+        )
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(
+            telegram_bridge.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            telegram_bridge.process_update(self.config, update)
+
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["TELEGRAM_CHAT_ID"], "-100777")
+        self.assertEqual(environment["TELEGRAM_CHAT_TYPE"], "supergroup")
+        self.assertEqual(environment["TELEGRAM_CHAT_TITLE"], "Life")
+        self.assertEqual(environment["TELEGRAM_FROM_ID"], "123")
+
+    def test_other_users_are_ignored_in_an_authorized_private_group(self):
+        update = self.update(
+            {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            },
+            sender_id=456,
+        )
+        with mock.patch.object(telegram_bridge.subprocess, "run") as run:
+            telegram_bridge.process_update(self.config, update)
+        run.assert_not_called()
+
+    def test_public_groups_are_not_accepted_as_control_surfaces(self):
+        update = self.update(
+            {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Public Life",
+                "username": "public_life",
+                "is_forum": True,
+            }
+        )
+        with mock.patch.object(telegram_bridge.subprocess, "run") as run:
+            telegram_bridge.process_update(self.config, update)
+        run.assert_not_called()
+
+    def test_non_forum_groups_are_not_accepted_as_control_surfaces(self):
+        for chat in (
+            {
+                "id": -777,
+                "type": "group",
+                "title": "Private Group",
+            },
+            {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Private Supergroup",
+            },
+        ):
+            with self.subTest(chat_type=chat["type"]):
+                update = self.update(chat)
+                with mock.patch.object(
+                    telegram_bridge.subprocess,
+                    "run",
+                ) as run:
+                    telegram_bridge.process_update(self.config, update)
+                run.assert_not_called()
+
+    def test_owner_callback_is_accepted_in_exact_private_forum_topic(self):
+        update = self.callback_update(
+            {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+        )
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(
+            telegram_bridge.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            telegram_bridge.process_update(self.config, update)
+
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["TELEGRAM_CHAT_ID"], "-100777")
+        self.assertEqual(environment["TELEGRAM_MESSAGE_THREAD_ID"], "62")
+        self.assertEqual(environment["TELEGRAM_FROM_ID"], "123")
+        self.assertEqual(environment["TELEGRAM_CALLBACK_QUERY_ID"], "callback-11")
+
+    def test_foreign_callback_is_rejected_in_private_forum(self):
+        update = self.callback_update(
+            {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            },
+            sender_id=456,
+        )
+        with mock.patch.object(telegram_bridge.subprocess, "run") as run:
+            telegram_bridge.process_update(self.config, update)
+        run.assert_not_called()
+
+    def test_callback_is_rejected_in_public_or_non_forum_group(self):
+        chats = (
+            {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Public Life",
+                "username": "public_life",
+                "is_forum": True,
+            },
+            {
+                "id": -100778,
+                "type": "supergroup",
+                "title": "Private Non-forum",
+            },
+        )
+        for chat in chats:
+            with self.subTest(title=chat["title"]):
+                update = self.callback_update(chat)
+                with mock.patch.object(
+                    telegram_bridge.subprocess,
+                    "run",
+                ) as run:
+                    telegram_bridge.process_update(self.config, update)
+                run.assert_not_called()
+
+    def test_an_unpaired_private_chat_is_ignored(self):
+        update = self.update({"id": 999, "type": "private"})
+        with mock.patch.object(telegram_bridge.subprocess, "run") as run:
+            telegram_bridge.process_update(self.config, update)
+        run.assert_not_called()
+
+
 class TokenValidationTests(unittest.TestCase):
     def test_accepts_valid_token(self):
         self.assertEqual(

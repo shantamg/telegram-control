@@ -20,8 +20,9 @@ plan for building the durable controller. See [docs/BUILD_PLAN.md](docs/BUILD_PL
 - A macOS LaunchAgent that starts the listener at login and restarts it if it
   exits.
 - Bot token storage in macOS Keychain.
-- Authorization restricted to the Telegram private chat confirmed during
-  pairing.
+- Authorization restricted to the Telegram user confirmed during pairing.
+  That owner may use the paired bot chat or private groups that contain the
+  bot; other users and public groups are ignored.
 
 Stage 0 intentionally does not yet route messages into Codex, create agents,
 send synthesized voice responses, provide buttons, or guarantee durable job
@@ -492,6 +493,38 @@ ID and adds a durable control queue for active worker turns:
   keys. Terminal completion supersedes queued status edits and removes the
   inline keyboard, preventing an old `Working` or `Stop` state from
   overwriting a final response.
+
+## One bot across private forum groups
+
+Slam Paws is the single Telegram identity. The paired owner may add it as an
+administrator to private forum groups without creating another BotFather token
+or controller process. Administrator status matters: Telegram's default Group
+Privacy hides ordinary topic text and voice from non-admin bots. The
+transport accepts an update only when:
+
+- it comes from the original paired user;
+- it is in the paired private bot chat or a private forum supergroup topic
+  without a public username; and
+- every later callback still matches its stored chat, topic, and authorized
+  user.
+
+Messages from other group members, non-forum groups, public groups, channels,
+and unrelated private chats are discarded before their content enters SQLite.
+A first text or voice message in a new private forum produces one
+owner/topic-bound **Authorize forum** button and does not reach Control. After
+that explicit confirmation, resend the request: its topic becomes a
+Control-bound surface under the authorized forum using the existing
+`(chat_id, message_thread_id)` key. Consequential workspace or agent creation
+remains separately confirmation-gated. Multiple bot tokens are not required.
+
+Live setup:
+
+1. Create a private Telegram group and enable Topics.
+2. Add Slam Paws and promote it to administrator so Group Privacy does not
+   suppress ordinary text and voice.
+3. Send any harmless text or voice request in a topic.
+4. Tap **Authorize forum**, then resend the request.
+5. Confirm the topic shows the normal routing status card.
 
 Replies that legitimately remain with the main router (receipts, direct
 responses, relayed continuation chunks, fallback deliveries) now carry bounded

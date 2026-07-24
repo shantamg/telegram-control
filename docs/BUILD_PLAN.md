@@ -1206,16 +1206,39 @@ than prerequisites for basic messaging and voice use.
 
 Remaining release work:
 
-1. Deploy durable live progress, reply-to-steer, and Stop for Codex worker
-   turns, including race and restart recovery.
-2. Detect and conversationally bind private forum groups to arbitrary
+1. Detect and conversationally bind private forum groups to arbitrary
    workspaces; Git metadata remains optional.
-3. Give each forum topic lightweight durable subject state and conversational
+2. Give each forum topic lightweight durable subject state and conversational
    worker/session controls, with proactive crash and hang reporting.
-4. Add adoption of discoverable existing Codex sessions, voice replies, and
+3. Add adoption of discoverable existing Codex sessions, voice replies, and
    status presentation polish.
-5. Run the full acceptance matrix and an independent Codex review before each
+4. Run the full acceptance matrix and an independent Codex review before each
    live schema migration and deployment.
+
+### Live-control checkpoint
+
+Schema v17 live progress, reply-to-steer, and Stop passed the production
+Telegram acceptance test on July 24, 2026. Replying to the exact active card
+delivered guidance to the stored Codex provider turn and changed its final
+answer. A separate long-running turn moved from Working to Stopping to
+Cancelled after the one-time Stop action; Codex acknowledged the interrupt,
+the mailbox remained terminally cancelled, and no late result or retry
+appeared.
+
+### Private-forum transport checkpoint
+
+The next slice keeps one Slam Paws identity and admits only the paired owner in
+a private forum supergroup topic. Public groups, non-forum groups, channels,
+unrelated private chats, and other users fail before their content is written
+to SQLite. A new forum does not reach the global router immediately: its first
+text or voice request produces an exact user/chat/topic-bound **Authorize
+forum** action. Only the confirmed forum receives a root Control binding; the
+user then resends the request and its topic becomes a Control surface.
+
+Telegram enables Group Privacy by default, so Slam Paws must be promoted to
+administrator in each private forum before ordinary topic text and voice can
+reach the controller. This is an explicit live-setup requirement, not
+something the local tests can simulate.
 
 ## References
 

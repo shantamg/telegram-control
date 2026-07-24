@@ -120,6 +120,14 @@ def surface_coordinates():
     return chat_id, thread_id
 
 
+def surface_display_name() -> str:
+    return (
+        os.environ.get("TELEGRAM_TOPIC_NAME")
+        or os.environ.get("TELEGRAM_CHAT_TITLE")
+        or "Control"
+    )
+
+
 def refresh_keyboard(token: str) -> dict:
     return {
         "inline_keyboard": [
@@ -175,13 +183,11 @@ def send_status_card(update: dict) -> None:
             message_thread_id=thread_id,
         )
         if binding is None:
-            if thread_id is not None:
-                raise StoreError("This topic has no durable controller binding.")
             binding = store.ensure_surface_binding(
                 chat_id=chat_id,
                 message_thread_id=thread_id,
                 surface_type="control",
-                display_name="Control",
+                display_name=surface_display_name(),
                 target_type="controller",
                 target_id="control",
             )
@@ -581,7 +587,7 @@ def enqueue_router_input(text: str) -> None:
                 chat_id=chat_id,
                 message_thread_id=thread_id,
                 surface_type="control",
-                display_name="Control",
+                display_name=surface_display_name(),
                 target_type="controller",
                 target_id="control",
             )
@@ -599,6 +605,71 @@ def enqueue_router_input(text: str) -> None:
             receipt_text="🧭 <b>Control is routing…</b>",
             receipt_parse_mode="HTML",
         )
+
+
+def forum_is_authorized_or_prompt() -> bool:
+    """Require one explicit owner confirmation before a forum reaches Control."""
+    if os.environ.get("TELEGRAM_CHAT_TYPE") != "supergroup":
+        return True
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    if not thread_id_text:
+        raise StoreError("Private forum input requires a Telegram topic.")
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    user_id_text = os.environ.get("TELEGRAM_FROM_ID")
+    if not all((database_path, job_id, chat_id_text, user_id_text)):
+        raise StoreError(
+            "Private forum authorization requires the durable controller."
+        )
+    chat_id = int(chat_id_text)
+    thread_id = int(thread_id_text)
+    display_name = (
+        os.environ.get("TELEGRAM_CHAT_TITLE") or f"Forum {chat_id}"
+    ).strip()
+    if not display_name or len(display_name) > 128:
+        raise StoreError("Private forum display name is invalid.")
+    with DurableStore(Path(database_path)) as store:
+        forum_binding = store.resolve_surface_binding(chat_id, None)
+        if forum_binding is not None:
+            if (
+                forum_binding.target_type != "controller"
+                or forum_binding.target_id != "control"
+                or forum_binding.state != "active"
+            ):
+                raise StoreError("Private forum authorization is invalid.")
+            return True
+        action = store.create_callback_action(
+            operation_id=f"inbox:{job_id}:authorize-forum",
+            action_type="authorize_forum",
+            payload={
+                "chat_id": chat_id,
+                "display_name": display_name,
+            },
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            authorized_user_id=int(user_id_text),
+            one_time=True,
+            ttl_seconds=60 * 60,
+        )
+    send_message(
+        "Authorize this private forum for Slam Paws?\n\n"
+        f"Forum: {display_name}\n\n"
+        "Only your paired Telegram account will be accepted. Add Slam Paws "
+        "as a forum administrator so ordinary text and voice messages reach "
+        "the controller. After authorizing, send your request again.",
+        reply_markup={
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Authorize forum",
+                        "callback_data": f"a:{action.token}",
+                    }
+                ]
+            ]
+        },
+    )
+    return False
 
 
 def handle_callback(update: dict, callback_query: dict) -> None:
@@ -640,6 +711,52 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 },
                 "callback-answer",
             )
+        return
+
+    if action.action_type == "authorize_forum":
+        target_chat_id = int(action.payload.get("chat_id", 0))
+        display_name = str(action.payload.get("display_name", "")).strip()
+        if (
+            target_chat_id != chat_id
+            or not display_name
+            or len(display_name) > 128
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in display_name
+            )
+        ):
+            raise StoreError("Stored private-forum authorization is invalid.")
+        with DurableStore(Path(database_path)) as store:
+            store.ensure_surface_binding(
+                chat_id=chat_id,
+                message_thread_id=None,
+                surface_type="control",
+                display_name=display_name,
+                target_type="controller",
+                target_id="control",
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": f"{display_name} authorized.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "forum-authorization-clear",
+        )
+        send_message(
+            f"✅ {display_name} is authorized.\n\n"
+            "Send your text or voice request in this topic again."
+        )
         return
 
     if action.action_type == "inspect_status":
@@ -1613,13 +1730,13 @@ def handle_voice(update: dict, voice: dict) -> None:
             )
     elif database_path and job_id:
         chat_id, thread_id = surface_coordinates()
-        if binding is None and thread_id is None:
+        if binding is None:
             with DurableStore(Path(database_path)) as store:
                 binding = store.ensure_surface_binding(
                     chat_id=chat_id,
                     message_thread_id=thread_id,
                     surface_type="control",
-                    display_name="Control",
+                    display_name=surface_display_name(),
                     target_type="controller",
                     target_id="control",
                 )
@@ -1719,10 +1836,13 @@ def main() -> int:
             handle_callback(update, callback_query)
         elif message and "voice" in message:
             print(f"Received voice message from @{username}.", flush=True)
-            handle_voice(update, message["voice"])
+            if forum_is_authorized_or_prompt():
+                handle_voice(update, message["voice"])
         elif message and "text" in message:
             text = str(message["text"])
             print(f"Received text message from @{username}: {text}", flush=True)
+            if not forum_is_authorized_or_prompt():
+                return 0
             replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
             agent_create = re.fullmatch(
                 r"/agent\s+create\s+([a-z0-9]+(?:-[a-z0-9]+)*)",
@@ -1765,7 +1885,10 @@ def main() -> int:
                 binding = current_surface_binding()
                 thread_id = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID")
                 if thread_id and binding is None:
-                    send_message("This topic has no durable controller binding.")
+                    # A newly created private-forum topic begins as a Control
+                    # surface. The router can then enroll or attach its
+                    # workspace conversationally; no command is required.
+                    enqueue_router_input(text)
                 elif thread_id and binding is not None:
                     if binding.target_type == "agent":
                         enqueue_agent_input(binding.target_id, text)
