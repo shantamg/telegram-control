@@ -98,6 +98,16 @@ consumed the stored action and returned its routed response. A second tap
 created a separate durable callback update but returned only “This button was
 already used” without executing the action again.
 
+Schema version 3 adds durable outbound-message return routes. After Telegram
+confirms a `sendMessage` call, the outbox sender atomically binds the returned
+Telegram message ID to its local target, chat, topic, policy, and expiry. Reply
+messages resolve that binding from SQLite; none of those internal target
+details appear in Telegram.
+
+The live reply-routing test passed on July 23, 2026. The route was created,
+survived a forced LaunchAgent restart, and then routed a Telegram reply back to
+the controller. The routed response received its own return route.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

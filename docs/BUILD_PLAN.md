@@ -674,8 +674,19 @@ The first Stage 2 slice passed offline and live tests on July 23, 2026:
 - the live **Inspect transport** button routed once and the second tap produced
   only the replay notice.
 
-The next Stage 2 slice is outbound-message route recording and reply-to-message
-routing, followed by topic bindings.
+The outbound-message route and reply-to-message slice passed offline and live
+tests on July 23, 2026:
+
+- schema version 3 records a route only after Telegram returns the sent
+  message ID;
+- outbox completion and route creation occur in one local transaction;
+- route lookup validates chat, topic, message ID, lifecycle state, and expiry;
+- a route survived a forced LaunchAgent restart;
+- replying to the exact bot response returned through its stored controller
+  route;
+- the routed response received its own durable return route.
+
+Topic bindings and editable status/menu cards are the next Stage 2 slice.
 
 ## References
 

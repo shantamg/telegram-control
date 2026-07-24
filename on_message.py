@@ -23,7 +23,12 @@ TELEGRAM_TEXT_CHUNK = 3_800
 OUTPUT_SEQUENCE = 0
 
 
-def deliver_api_call(method: str, params: dict, operation_name: str) -> None:
+def deliver_api_call(
+    method: str,
+    params: dict,
+    operation_name: str,
+    route: Optional[dict] = None,
+) -> None:
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
     if database_path and job_id:
@@ -32,11 +37,21 @@ def deliver_api_call(method: str, params: dict, operation_name: str) -> None:
                 f"inbox:{job_id}:{operation_name}",
                 method,
                 params,
+                route=route,
             )
         return
 
     token = bridge.read_token()
     bridge.api_call(token, method, **params)
+
+
+def controller_reply_route() -> dict:
+    return {
+        "target_type": "controller",
+        "target_id": "control",
+        "policy": "reply",
+        "ttl_seconds": 30 * 24 * 60 * 60,
+    }
 
 
 def inspect_keyboard() -> Optional[dict]:
@@ -106,6 +121,23 @@ def send_message(text: str, include_inspect_button: bool = False) -> None:
             "sendMessage",
             params,
             f"message:{OUTPUT_SEQUENCE}",
+            route=controller_reply_route(),
+        )
+
+
+def resolve_replied_message_route():
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not all((database_path, replied_message_id, chat_id)):
+        return None
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    thread_id = int(thread_id_text) if thread_id_text else None
+    with DurableStore(Path(database_path)) as store:
+        return store.resolve_message_route(
+            chat_id=int(chat_id),
+            message_thread_id=thread_id,
+            telegram_message_id=int(replied_message_id),
         )
 
 
@@ -265,10 +297,27 @@ def main() -> int:
         elif message and "text" in message:
             text = str(message["text"])
             print(f"Received text message from @{username}: {text}", flush=True)
-            send_message(
-                f"✅ Mac script ran and received: {text}",
-                include_inspect_button=True,
-            )
+            replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
+            if replied_message_id:
+                route = resolve_replied_message_route()
+                if (
+                    route is not None
+                    and route.target_type == "controller"
+                    and route.target_id == "control"
+                ):
+                    send_message(
+                        "✅ Durable reply route verified.\n\n"
+                        f"Received through the stored controller route: {text}"
+                    )
+                else:
+                    send_message(
+                        "That replied-to message has no active durable route."
+                    )
+            else:
+                send_message(
+                    f"✅ Mac script ran and received: {text}",
+                    include_inspect_button=True,
+                )
         else:
             send_message("Send me a text or Telegram voice message.")
         return 0

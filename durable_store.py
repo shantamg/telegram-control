@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class StoreError(RuntimeError):
@@ -66,6 +66,18 @@ class CallbackAction:
     message_thread_id: Optional[int]
     authorized_user_id: int
     one_time: bool
+    expires_at: float
+
+
+@dataclass(frozen=True)
+class MessageRoute:
+    route_id: int
+    chat_id: int
+    message_thread_id: Optional[int]
+    telegram_message_id: int
+    target_type: str
+    target_id: str
+    policy: str
     expires_at: float
 
 
@@ -170,6 +182,38 @@ MIGRATION_2 = (
     """,
 )
 
+MIGRATION_3 = (
+    """
+    ALTER TABLE outbox_messages
+    ADD COLUMN route_json TEXT
+    """,
+    """
+    CREATE TABLE telegram_message_routes (
+        route_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_outbox_message_id INTEGER NOT NULL UNIQUE
+            REFERENCES outbox_messages(message_id) ON DELETE RESTRICT,
+        chat_id INTEGER NOT NULL,
+        message_thread_id INTEGER NOT NULL,
+        telegram_message_id INTEGER NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        policy TEXT NOT NULL CHECK (policy IN ('reply')),
+        state TEXT NOT NULL
+            CHECK (state IN ('active', 'expired', 'revoked')),
+        expires_at REAL NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE(chat_id, message_thread_id, telegram_message_id)
+    )
+    """,
+    """
+    CREATE INDEX telegram_message_routes_lookup
+    ON telegram_message_routes(
+        chat_id, message_thread_id, telegram_message_id, state, expires_at
+    )
+    """,
+)
+
 
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
@@ -225,6 +269,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 2
                 self.connection.execute("PRAGMA user_version = 2")
+            if current < 3:
+                for statement in MIGRATION_3:
+                    self.connection.execute(statement)
+                current = 3
+                self.connection.execute("PRAGMA user_version = 3")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -462,32 +511,50 @@ class DurableStore:
         operation_id: str,
         method: str,
         params: dict[str, Any],
+        route: Optional[dict[str, Any]] = None,
         now: Optional[float] = None,
     ) -> int:
         if not operation_id or not method:
             raise StoreError("Outbox operation_id and method are required.")
         timestamp = time.time() if now is None else float(now)
         params_json = json.dumps(params, separators=(",", ":"), sort_keys=True)
+        route_json = (
+            json.dumps(route, separators=(",", ":"), sort_keys=True)
+            if route is not None
+            else None
+        )
         self.connection.execute(
             """
             INSERT INTO outbox_messages(
                 operation_id, method, params_json, state, attempts,
-                available_at, created_at, updated_at
+                available_at, created_at, updated_at, route_json
             )
-            VALUES (?, ?, ?, 'queued', 0, ?, ?, ?)
+            VALUES (?, ?, ?, 'queued', 0, ?, ?, ?, ?)
             ON CONFLICT(operation_id) DO NOTHING
             """,
-            (operation_id, method, params_json, timestamp, timestamp, timestamp),
+            (
+                operation_id,
+                method,
+                params_json,
+                timestamp,
+                timestamp,
+                timestamp,
+                route_json,
+            ),
         )
         row = self.connection.execute(
             """
-            SELECT message_id, method, params_json
+            SELECT message_id, method, params_json, route_json
             FROM outbox_messages
             WHERE operation_id = ?
             """,
             (operation_id,),
         ).fetchone()
-        if row["method"] != method or row["params_json"] != params_json:
+        if (
+            row["method"] != method
+            or row["params_json"] != params_json
+            or row["route_json"] != route_json
+        ):
             raise StoreError(
                 f"Outbox operation {operation_id!r} was reused with a different payload."
             )
@@ -784,19 +851,149 @@ class DurableStore:
     ) -> None:
         timestamp = time.time() if now is None else float(now)
         result_json = json.dumps(result, separators=(",", ":"), sort_keys=True)
-        cursor = self.connection.execute(
-            """
-            UPDATE outbox_messages
-            SET state = 'sent', lease_owner = NULL, lease_expires_at = NULL,
-                last_error = NULL, telegram_result_json = ?, updated_at = ?
-            WHERE message_id = ? AND state = 'leased' AND lease_owner = ?
-            """,
-            (result_json, timestamp, int(message_id), worker_id),
-        )
-        if cursor.rowcount != 1:
-            raise LeaseLostError(
-                f"Outbox lease for message {message_id} is no longer owned."
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT method, params_json, route_json
+                FROM outbox_messages
+                WHERE message_id = ? AND state = 'leased' AND lease_owner = ?
+                """,
+                (int(message_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Outbox lease for message {message_id} is no longer owned."
+                )
+            cursor = self.connection.execute(
+                """
+                UPDATE outbox_messages
+                SET state = 'sent', lease_owner = NULL, lease_expires_at = NULL,
+                    last_error = NULL, telegram_result_json = ?, updated_at = ?
+                WHERE message_id = ? AND state = 'leased' AND lease_owner = ?
+                """,
+                (result_json, timestamp, int(message_id), worker_id),
             )
+            if cursor.rowcount != 1:
+                raise LeaseLostError(
+                    f"Outbox lease for message {message_id} is no longer owned."
+                )
+
+            if row["route_json"] is not None:
+                if row["method"] != "sendMessage" or not isinstance(result, dict):
+                    raise StoreError(
+                        "Only a successful sendMessage result can create a reply route."
+                    )
+                params = json.loads(row["params_json"])
+                route = json.loads(row["route_json"])
+                target_type = str(route.get("target_type", ""))
+                target_id = str(route.get("target_id", ""))
+                policy = str(route.get("policy", ""))
+                ttl_seconds = float(route.get("ttl_seconds", 0))
+                if (
+                    not re.fullmatch(r"[a-z][a-z0-9_]{1,63}", target_type)
+                    or not target_id
+                    or len(target_id) > 128
+                    or policy != "reply"
+                    or ttl_seconds <= 0
+                    or ttl_seconds > 365 * 24 * 60 * 60
+                ):
+                    raise StoreError("Outbox reply route is invalid.")
+                try:
+                    telegram_message_id = int(result["message_id"])
+                    chat_id = int(params["chat_id"])
+                except (KeyError, TypeError, ValueError):
+                    raise StoreError(
+                        "Telegram sendMessage result cannot be routed."
+                    ) from None
+                result_chat = result.get("chat")
+                if isinstance(result_chat, dict) and "id" in result_chat:
+                    if int(result_chat["id"]) != chat_id:
+                        raise StoreError(
+                            "Telegram sendMessage result has an unexpected chat."
+                        )
+                thread_id = int(params.get("message_thread_id") or 0)
+                self.connection.execute(
+                    """
+                    INSERT INTO telegram_message_routes(
+                        source_outbox_message_id, chat_id, message_thread_id,
+                        telegram_message_id, target_type, target_id, policy,
+                        state, expires_at, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                    """,
+                    (
+                        int(message_id),
+                        chat_id,
+                        thread_id,
+                        telegram_message_id,
+                        target_type,
+                        target_id,
+                        policy,
+                        timestamp + ttl_seconds,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _message_route_from_row(row: sqlite3.Row) -> MessageRoute:
+        thread_id = int(row["message_thread_id"])
+        return MessageRoute(
+            route_id=int(row["route_id"]),
+            chat_id=int(row["chat_id"]),
+            message_thread_id=thread_id if thread_id != 0 else None,
+            telegram_message_id=int(row["telegram_message_id"]),
+            target_type=str(row["target_type"]),
+            target_id=str(row["target_id"]),
+            policy=str(row["policy"]),
+            expires_at=float(row["expires_at"]),
+        )
+
+    def resolve_message_route(
+        self,
+        chat_id: int,
+        telegram_message_id: int,
+        message_thread_id: Optional[int] = None,
+        now: Optional[float] = None,
+    ) -> Optional[MessageRoute]:
+        timestamp = time.time() if now is None else float(now)
+        thread_id = int(message_thread_id) if message_thread_id is not None else 0
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT *
+                FROM telegram_message_routes
+                WHERE chat_id = ? AND message_thread_id = ?
+                    AND telegram_message_id = ?
+                """,
+                (int(chat_id), thread_id, int(telegram_message_id)),
+            ).fetchone()
+            if row is None or row["state"] != "active":
+                self.connection.execute("COMMIT")
+                return None
+            if float(row["expires_at"]) <= timestamp:
+                self.connection.execute(
+                    """
+                    UPDATE telegram_message_routes
+                    SET state = 'expired', updated_at = ?
+                    WHERE route_id = ? AND state = 'active'
+                    """,
+                    (timestamp, int(row["route_id"])),
+                )
+                self.connection.execute("COMMIT")
+                return None
+            route = self._message_route_from_row(row)
+            self.connection.execute("COMMIT")
+            return route
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
 
     def fail_outbox(
         self,
@@ -885,6 +1082,7 @@ class DurableStore:
             ("inbox", "inbox_jobs"),
             ("outbox", "outbox_messages"),
             ("callbacks", "callback_actions"),
+            ("routes", "telegram_message_routes"),
         ):
             state_column = "ingest_state" if label == "updates" else "state"
             rows = self.connection.execute(

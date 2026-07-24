@@ -13,6 +13,7 @@ import on_message
 import telegram_control
 from durable_store import (
     MIGRATION_1,
+    MIGRATION_2,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -21,8 +22,8 @@ from durable_store import (
 )
 
 
-def message_update(update_id=10, text="hello"):
-    return {
+def message_update(update_id=10, text="hello", reply_to_message_id=None):
+    update = {
         "update_id": update_id,
         "message": {
             "message_id": 99,
@@ -31,6 +32,12 @@ def message_update(update_id=10, text="hello"):
             "text": text,
         },
     }
+    if reply_to_message_id is not None:
+        update["message"]["reply_to_message"] = {
+            "message_id": int(reply_to_message_id),
+            "chat": {"id": 123, "type": "private"},
+        }
+    return update
 
 
 def callback_update(update_id=11, data="r:opaque"):
@@ -62,7 +69,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            2,
+            3,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -366,9 +373,90 @@ class DurableStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.store.status_counts()["outbox"], {"sent": 1})
 
+    def test_sent_outbox_message_creates_restart_safe_reply_route(self):
+        route_spec = {
+            "target_type": "controller",
+            "target_id": "control",
+            "policy": "reply",
+            "ttl_seconds": 10,
+        }
+        message_id = self.store.enqueue_api_call(
+            "job:1:routed-reply",
+            "sendMessage",
+            {"chat_id": 123, "message_thread_id": 7, "text": "routed"},
+            route=route_spec,
+            now=100,
+        )
+        duplicate_id = self.store.enqueue_api_call(
+            "job:1:routed-reply",
+            "sendMessage",
+            {"chat_id": 123, "message_thread_id": 7, "text": "routed"},
+            route=route_spec,
+            now=101,
+        )
+        self.assertEqual(duplicate_id, message_id)
+        with self.assertRaises(StoreError):
+            self.store.enqueue_api_call(
+                "job:1:routed-reply",
+                "sendMessage",
+                {"chat_id": 123, "message_thread_id": 7, "text": "routed"},
+                route={**route_spec, "target_id": "different"},
+                now=101,
+            )
+
+        outbound = self.store.claim_outbox("sender", now=100)
+        self.store.complete_outbox(
+            outbound.message_id,
+            "sender",
+            {"message_id": 501, "chat": {"id": 123}},
+            now=101,
+        )
+        route = self.store.resolve_message_route(
+            chat_id=123,
+            message_thread_id=7,
+            telegram_message_id=501,
+            now=102,
+        )
+        self.assertEqual(route.target_type, "controller")
+        self.assertEqual(route.target_id, "control")
+        self.assertEqual(route.policy, "reply")
+        self.assertIsNone(
+            self.store.resolve_message_route(
+                chat_id=999,
+                message_thread_id=7,
+                telegram_message_id=501,
+                now=102,
+            )
+        )
+        self.assertIsNone(
+            self.store.resolve_message_route(
+                chat_id=123,
+                message_thread_id=8,
+                telegram_message_id=501,
+                now=102,
+            )
+        )
+        self.assertIsNone(
+            self.store.resolve_message_route(
+                chat_id=123,
+                message_thread_id=7,
+                telegram_message_id=502,
+                now=102,
+            )
+        )
+        self.assertIsNone(
+            self.store.resolve_message_route(
+                chat_id=123,
+                message_thread_id=7,
+                telegram_message_id=501,
+                now=111,
+            )
+        )
+        self.assertEqual(self.store.status_counts()["routes"], {"expired": 1})
+
 
 class SchemaCompatibilityTests(unittest.TestCase):
-    def test_schema_one_database_migrates_to_schema_two(self):
+    def test_schema_one_database_migrates_to_current_schema(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "schema-one.sqlite3"
             connection = sqlite3.connect(str(path), isolation_level=None)
@@ -382,12 +470,37 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    2,
+                    3,
                 )
                 self.assertEqual(
                     store.connection.execute(
                         "SELECT COUNT(*) FROM sqlite_master "
                         "WHERE type = 'table' AND name = 'callback_actions'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_schema_two_database_migrates_to_schema_three(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-two.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for statement in MIGRATION_1 + MIGRATION_2:
+                connection.execute(statement)
+            connection.execute("PRAGMA user_version = 2")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    3,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sqlite_master "
+                        "WHERE type = 'table' "
+                        "AND name = 'telegram_message_routes'"
                     ).fetchone()[0],
                     1,
                 )
@@ -562,6 +675,57 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     calls[3][1]["text"],
                     "This button was already used.",
+                )
+
+    def test_reply_to_sent_message_resolves_route_after_store_reopen(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ingest_update(message_update(), now=100)
+                first_job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    first_job,
+                    "worker",
+                )
+                outbound = store.claim_outbox("sender", now=10**12)
+                store.complete_outbox(
+                    outbound.message_id,
+                    "sender",
+                    {"message_id": 501, "chat": {"id": 123}},
+                    now=10**12,
+                )
+                self.assertEqual(
+                    store.status_counts()["routes"],
+                    {"active": 1},
+                )
+
+            with DurableStore(database_path) as reopened:
+                reopened.ingest_update(
+                    message_update(
+                        11,
+                        text="follow up",
+                        reply_to_message_id=501,
+                    ),
+                    now=10**12 + 1,
+                )
+                reply_job = reopened.claim_job("worker", now=10**12 + 1)
+                telegram_control.process_inbox_job(
+                    reopened,
+                    config,
+                    reply_job,
+                    "worker",
+                )
+                queued = reopened.claim_outbox("sender", now=10**12 + 1)
+                self.assertEqual(
+                    queued.params["text"],
+                    "✅ Durable reply route verified.\n\n"
+                    "Received through the stored controller route: follow up",
                 )
 
     def test_handler_queues_reply_instead_of_calling_telegram(self):

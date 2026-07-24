@@ -364,6 +364,9 @@ def process_update(
             "TELEGRAM_CHAT_ID": str(chat["id"]),
             "TELEGRAM_MESSAGE_ID": str(message.get("message_id", "")),
             "TELEGRAM_MESSAGE_THREAD_ID": str(message.get("message_thread_id", "")),
+            "TELEGRAM_REPLY_TO_MESSAGE_ID": str(
+                message.get("reply_to_message", {}).get("message_id", "")
+            ),
             "TELEGRAM_TEXT": str(message.get("text", "")),
             "TELEGRAM_FROM_ID": str(sender.get("id", "")),
             "TELEGRAM_FROM_USERNAME": str(sender.get("username", "")),
