@@ -131,6 +131,33 @@ def claude_agent(**overrides):
 
 
 class CodexEventTests(unittest.TestCase):
+    def test_managed_telegram_turn_exposes_real_session_controls(self):
+        prompt = "Show me the session controls for this topic."
+        runtime = {
+            "TELEGRAM_CONTROL_DB": "/tmp/controller.sqlite3",
+            "TELEGRAM_CONTROL_AGENT_ID": "agent-codex",
+            "TELEGRAM_CONTROL_MAILBOX_ID": "42",
+            "TELEGRAM_CONTROL_WORKER_ID": "worker-1",
+        }
+        managed = provider_adapters.managed_telegram_prompt(
+            codex_agent(runtime_environment=runtime),
+            prompt,
+        )
+        self.assertIn("agent_telegram.py controls", managed)
+        self.assertIn("real controller-owned Telegram buttons", managed)
+        self.assertIn(prompt, managed)
+        self.assertEqual(
+            provider_adapters.managed_telegram_prompt(
+                codex_agent(
+                    runtime_environment={
+                        "TELEGRAM_CONTROL_MAILBOX_ID": "42"
+                    }
+                ),
+                prompt,
+            ),
+            prompt,
+        )
+
     def test_managed_codex_default_is_unrestricted_without_approvals(self):
         self.assertEqual(
             provider_adapters.CodexExecAdapter._sandbox_mode(codex_agent()),

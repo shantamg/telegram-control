@@ -1,6 +1,6 @@
 ---
 name: telegram-session-control
-description: Show the controller-owned agent and session controls in the current Telegram topic from an active Telegram Control-managed Codex or Claude turn. Use implicitly when the user asks to see agent controls, manage this topic or conversation, pause or resume its agent, start a fresh session, resume another session, or asks the agent to open or invoke the /agent interface. The user does not need to mention this skill by name.
+description: Show the real controller-owned Telegram agent/provider session controls in the current topic from an active Telegram Control-managed Codex or Claude turn. Use implicitly when the user asks to see Telegram topic agent controls, manage this topic's Codex or Claude conversation, pause or resume its provider agent, start a fresh provider session, resume another provider session, or asks the agent to open or invoke the /agent interface. Do not confuse these with domain-specific task, monitoring, email, or application controls. The user does not need to mention this skill by name.
 ---
 
 # Telegram Session Control
