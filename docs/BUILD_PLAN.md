@@ -648,8 +648,12 @@ one text update and one voice update were committed, processed, and delivered
 on their first attempts; local Parakeet transcription succeeded; all queues
 drained; and SQLite `quick_check` returned `ok`.
 
-Before activating this path in `launchd`, the remaining checkpoint is a
-controlled LaunchAgent migration followed by a reboot/login reconciliation
+The controlled LaunchAgent migration and forced-restart test also passed on
+July 23, 2026. The supervisor recreated the collector, inbox worker, and outbox
+sender; the database and polling offset survived; and a post-restart Telegram
+message was committed and delivered on its first attempt.
+
+The remaining activation checkpoint is a full reboot/login reconciliation
 test.
 
 ## References

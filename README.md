@@ -57,10 +57,27 @@ Run the durable transport in the foreground:
 /Users/shantam/telegram-control/telegram_control.py run
 ```
 
-The active LaunchAgent still uses the Stage 0 listener. Do not run Stage 0
-`listen` and the Stage 1 collector at the same time because Telegram permits
-only one long poller for a bot. The LaunchAgent will be migrated only after a
-live Stage 1 smoke test passes.
+After the live foreground smoke test passes, migrate the existing LaunchAgent
+in place:
+
+```sh
+/Users/shantam/telegram-control/telegram_control.py install
+```
+
+The durable installer retains the existing LaunchAgent label so the Stage 0
+poller is unloaded before Stage 1 starts. Do not run Stage 0 `listen` alongside
+the Stage 1 collector because Telegram permits only one long poller for a bot.
+Restore Stage 0 at any time with:
+
+```sh
+/Users/shantam/telegram-control/telegram_bridge.py install \
+  --handler /Users/shantam/telegram-control/on_message.py
+```
+
+The active installation was migrated to the durable controller on July 23,
+2026. A forced LaunchAgent restart recreated the supervisor and all three
+workers, preserved the polling offset and queue state, and successfully
+processed a new Telegram message after restart.
 
 For controlled debugging, each loop can run separately:
 

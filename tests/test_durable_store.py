@@ -289,6 +289,26 @@ class SchemaCompatibilityTests(unittest.TestCase):
 
 
 class DurableIntegrationTests(unittest.TestCase):
+    def test_durable_launch_agent_uses_supervisor_and_existing_label(self):
+        plist = telegram_control.launch_agent_plist()
+
+        self.assertEqual(
+            plist["Label"],
+            telegram_control.bridge.LAUNCH_AGENT_LABEL,
+        )
+        self.assertEqual(
+            plist["ProgramArguments"],
+            [
+                telegram_control.sys.executable,
+                str(telegram_control.SCRIPT_PATH),
+                "--db",
+                str(telegram_control.DATABASE_PATH),
+                "run",
+            ],
+        )
+        self.assertTrue(plist["RunAtLoad"])
+        self.assertTrue(plist["KeepAlive"])
+
     def test_inbox_worker_runs_existing_handler_and_creates_durable_reply(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"

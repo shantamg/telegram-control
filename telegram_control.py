@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -204,14 +206,27 @@ def send_outbox_command(args: argparse.Namespace) -> None:
 
 def run_command(args: argparse.Namespace) -> None:
     """Run the three independently restartable loops under a small supervisor."""
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def stop_on_sigterm(_: int, __: Any) -> None:
+        # launchd uses SIGTERM for controlled restarts. SystemExit still runs
+        # the cleanup block but does not write a false alarm to the error log.
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop_on_sigterm)
     commands = [
         [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "collect"],
         [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "work"],
         [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "send-outbox"],
     ]
-    processes = [subprocess.Popen(command) for command in commands]
-    log_event("supervisor_started", child_pids=[process.pid for process in processes])
+    processes: list[subprocess.Popen[Any]] = []
     try:
+        for command in commands:
+            processes.append(subprocess.Popen(command))
+        log_event(
+            "supervisor_started",
+            child_pids=[process.pid for process in processes],
+        )
         while True:
             for process in processes:
                 return_code = process.poll()
@@ -229,6 +244,122 @@ def run_command(args: argparse.Namespace) -> None:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 process.kill()
+        signal.signal(signal.SIGTERM, previous_sigterm)
+
+
+def launch_agent_plist(database_path: Path = DATABASE_PATH) -> dict[str, Any]:
+    return {
+        "Label": bridge.LAUNCH_AGENT_LABEL,
+        "ProgramArguments": [
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--db",
+            str(database_path),
+            "run",
+        ],
+        "WorkingDirectory": str(SCRIPT_PATH.parent),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 5,
+        "ProcessType": "Background",
+        "StandardOutPath": str(bridge.LOG_DIR / "telegram-control.log"),
+        "StandardErrorPath": str(bridge.LOG_DIR / "telegram-control.error.log"),
+    }
+
+
+def write_plist(path: Path, value: dict[str, Any]) -> None:
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("wb") as plist_file:
+        plistlib.dump(value, plist_file)
+    bridge.ensure_private_file(temporary_path)
+    temporary_path.replace(path)
+    bridge.ensure_private_file(path)
+
+
+def configured_launch_agent_mode() -> str:
+    try:
+        with bridge.PLIST_PATH.open("rb") as plist_file:
+            plist = plistlib.load(plist_file)
+    except (FileNotFoundError, OSError, ValueError):
+        return "missing"
+    arguments = [str(value) for value in plist.get("ProgramArguments", [])]
+    if str(SCRIPT_PATH) in arguments and "run" in arguments:
+        return "durable"
+    if str(bridge.SCRIPT_PATH) in arguments and "listen" in arguments:
+        return "stage0"
+    return "unknown"
+
+
+def install_command(args: argparse.Namespace) -> None:
+    config = bridge.load_config()
+    bridge.read_token()
+    handler_path = Path(config["handler_path"]).expanduser().resolve()
+    if not handler_path.is_file():
+        raise StoreError(f"Handler does not exist: {handler_path}")
+    bridge.handler_command(handler_path)
+    with open_store(args.db):
+        pass
+
+    bridge.LOG_DIR.mkdir(parents=True, exist_ok=True)
+    bridge.PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    domain = f"gui/{os.getuid()}"
+    previous_plist: Optional[bytes]
+    try:
+        previous_plist = bridge.PLIST_PATH.read_bytes()
+    except FileNotFoundError:
+        previous_plist = None
+    was_loaded = (
+        bridge.launchctl(
+            "print",
+            f"{domain}/{bridge.LAUNCH_AGENT_LABEL}",
+            check=False,
+        ).returncode
+        == 0
+    )
+
+    bridge.launchctl("bootout", domain, str(bridge.PLIST_PATH), check=False)
+    write_plist(bridge.PLIST_PATH, launch_agent_plist(args.db))
+    result = bridge.launchctl(
+        "bootstrap",
+        domain,
+        str(bridge.PLIST_PATH),
+        check=False,
+    )
+    if result.returncode != 0:
+        bridge.launchctl("bootout", domain, str(bridge.PLIST_PATH), check=False)
+        if previous_plist is None:
+            bridge.PLIST_PATH.unlink(missing_ok=True)
+        else:
+            temporary_path = bridge.PLIST_PATH.with_suffix(".rollback.tmp")
+            temporary_path.write_bytes(previous_plist)
+            bridge.ensure_private_file(temporary_path)
+            temporary_path.replace(bridge.PLIST_PATH)
+            if was_loaded:
+                bridge.launchctl(
+                    "bootstrap",
+                    domain,
+                    str(bridge.PLIST_PATH),
+                    check=False,
+                )
+        raise StoreError(
+            result.stderr.strip()
+            or "launchctl could not install the durable controller."
+        )
+
+    bridge.launchctl(
+        "kickstart",
+        "-k",
+        f"{domain}/{bridge.LAUNCH_AGENT_LABEL}",
+        check=False,
+    )
+    print("Durable Telegram controller installed and started.")
+    print(f"Database: {args.db}")
+    print(f"Logs: {bridge.LOG_DIR / 'telegram-control.log'}")
+    print(f"Errors: {bridge.LOG_DIR / 'telegram-control.error.log'}")
+    print(
+        "Rollback: "
+        f"{bridge.SCRIPT_PATH} install --handler {handler_path}"
+    )
 
 
 def init_command(args: argparse.Namespace) -> None:
@@ -239,11 +370,21 @@ def init_command(args: argparse.Namespace) -> None:
 
 
 def status_command(args: argparse.Namespace) -> None:
+    domain = f"gui/{os.getuid()}"
+    launch_result = bridge.launchctl(
+        "print",
+        f"{domain}/{bridge.LAUNCH_AGENT_LABEL}",
+        check=False,
+    )
     with open_store(args.db) as store:
         status = {
             "database": str(store.path),
             "quick_check": store.quick_check(),
             "poll_offset": store.poll_offset(),
+            "launch_agent": {
+                "configured_mode": configured_launch_agent_mode(),
+                "loaded": launch_result.returncode == 0,
+            },
             "queues": store.status_counts(),
         }
     print(json.dumps(status, indent=2, sort_keys=True))
@@ -329,6 +470,11 @@ def build_parser() -> argparse.ArgumentParser:
         "run", help="Run collector, inbox worker, and outbox sender."
     )
     run_parser.set_defaults(function=run_command)
+
+    install_parser = subparsers.add_parser(
+        "install", help="Replace Stage 0 with the durable background controller."
+    )
+    install_parser.set_defaults(function=install_command)
 
     status_parser = subparsers.add_parser("status", help="Show durable queue status.")
     status_parser.set_defaults(function=status_command)
