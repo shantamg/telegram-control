@@ -18,11 +18,36 @@ MAX_VOICE_BYTES = 20_000_000
 MAX_VOICE_SECONDS = 30 * 60
 TRANSCRIPTION_TIMEOUT_SECONDS = 15 * 60
 TELEGRAM_TEXT_CHUNK = 3_800
+OUTPUT_SEQUENCE = 0
+
+
+def deliver_api_call(method: str, params: dict, operation_name: str) -> None:
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    if database_path and job_id:
+        from durable_store import DurableStore
+
+        with DurableStore(Path(database_path)) as store:
+            store.enqueue_api_call(
+                f"inbox:{job_id}:{operation_name}",
+                method,
+                params,
+            )
+        return
+
+    token = bridge.read_token()
+    bridge.api_call(token, method, **params)
 
 
 def send_message(text: str) -> None:
-    config = bridge.load_config()
-    token = bridge.read_token()
+    global OUTPUT_SEQUENCE
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    if chat_id_text:
+        chat_id = int(chat_id_text)
+    else:
+        chat_id = int(bridge.load_config()["chat_id"])
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    thread_id = int(thread_id_text) if thread_id_text else None
     remaining = text.strip()
     if not remaining:
         remaining = "[empty transcript]"
@@ -37,7 +62,16 @@ def send_message(text: str) -> None:
                 split_at = TELEGRAM_TEXT_CHUNK
             chunk = remaining[:split_at].rstrip()
             remaining = remaining[split_at:].lstrip()
-        bridge.api_call(token, "sendMessage", chat_id=config["chat_id"], text=chunk)
+        OUTPUT_SEQUENCE += 1
+        deliver_api_call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "message_thread_id": thread_id,
+                "text": chunk,
+            },
+            f"message:{OUTPUT_SEQUENCE}",
+        )
 
 
 def convert_to_wav(source: Path, destination: Path) -> None:
@@ -123,14 +157,27 @@ def handle_voice(voice: dict) -> None:
 
 def main() -> int:
     update = json.load(sys.stdin)
-    message = update["message"]
     username = os.environ.get("TELEGRAM_FROM_USERNAME") or "unknown"
 
     try:
-        if "voice" in message:
+        callback_query = update.get("callback_query")
+        message = update.get("message")
+        if callback_query:
+            callback_query_id = str(callback_query.get("id", ""))
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": "This button is not active yet.",
+                    },
+                    "callback-answer",
+                )
+            send_message("Buttons are recorded durably; actions arrive in Stage 2.")
+        elif message and "voice" in message:
             print(f"Received voice message from @{username}.", flush=True)
             handle_voice(message["voice"])
-        elif "text" in message:
+        elif message and "text" in message:
             text = str(message["text"])
             print(f"Received text message from @{username}: {text}", flush=True)
             send_message(f"✅ Mac script ran and received: {text}")

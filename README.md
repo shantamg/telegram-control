@@ -27,6 +27,53 @@ Stage 0 intentionally does not yet route messages into Codex, create agents,
 send synthesized voice responses, provide buttons, or guarantee durable job
 processing. Those are staged in the build plan.
 
+## Stage 1 development path
+
+The first durable-transport slice is now implemented alongside Stage 0. It
+adds:
+
+- a versioned SQLite store using WAL, foreign keys, full synchronization, and
+  an integrity check;
+- atomic update ingestion and polling-offset advancement;
+- post-commit mirroring of the offset for a safe fallback to Stage 0;
+- message and callback-query jobs with expiring leases, retry backoff, and a
+  dead-letter state;
+- an idempotent outbox for Telegram API calls;
+- separate collector, inbox-worker, and outbox-sender loops;
+- deterministic tests for duplicate ingestion, transaction rollback, worker
+  death, stale leases, and durable handler replies.
+
+Initialize a development database and inspect it:
+
+```sh
+/Users/shantam/telegram-control/telegram_control.py init
+/Users/shantam/telegram-control/telegram_control.py status
+/Users/shantam/telegram-control/telegram_control.py doctor
+```
+
+Run the durable transport in the foreground:
+
+```sh
+/Users/shantam/telegram-control/telegram_control.py run
+```
+
+The active LaunchAgent still uses the Stage 0 listener. Do not run Stage 0
+`listen` and the Stage 1 collector at the same time because Telegram permits
+only one long poller for a bot. The LaunchAgent will be migrated only after a
+live Stage 1 smoke test passes.
+
+For controlled debugging, each loop can run separately:
+
+```sh
+/Users/shantam/telegram-control/telegram_control.py collect
+/Users/shantam/telegram-control/telegram_control.py work
+/Users/shantam/telegram-control/telegram_control.py send-outbox
+```
+
+Use `--once` on any individual loop to handle at most one polling request or
+queued item. Dead items are explicitly requeued with
+`telegram_control.py retry inbox` or `telegram_control.py retry outbox`.
+
 ## Prerequisites
 
 - macOS

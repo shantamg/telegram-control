@@ -629,6 +629,29 @@ Stage 1 should be next. Keep its scope narrow:
 Do not add Codex, Claude, tmux, dynamic topics, or TTS during this slice. Durable
 transport is the foundation that makes every later capability safe.
 
+### Implementation checkpoint
+
+The first Stage 1 checkpoint is implemented without replacing the active Stage
+0 LaunchAgent:
+
+- SQLite schema version 1 and repository operations;
+- atomic message/callback ingestion with the polling offset in the same
+  transaction;
+- leased inbox and outbox queues with recovery, exponential retry, and
+  dead-letter states;
+- idempotent durable replies from the existing text/voice handler;
+- collector, worker, sender, supervisor, status, doctor, and retry commands;
+- offline fault-boundary tests.
+
+The live foreground smoke test against the paired bot passed on July 23, 2026:
+one text update and one voice update were committed, processed, and delivered
+on their first attempts; local Parakeet transcription succeeded; all queues
+drained; and SQLite `quick_check` returned `ok`.
+
+Before activating this path in `launchd`, the remaining checkpoint is a
+controlled LaunchAgent migration followed by a reboot/login reconciliation
+test.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)

@@ -328,8 +328,15 @@ def handler_command(handler_path: Path) -> list[str]:
     return [str(handler_path)]
 
 
-def process_update(config: dict[str, Any], update: dict[str, Any]) -> None:
+def process_update(
+    config: dict[str, Any],
+    update: dict[str, Any],
+    extra_environment: Optional[dict[str, str]] = None,
+) -> None:
+    callback_query = update.get("callback_query")
     message = update.get("message")
+    if not message and isinstance(callback_query, dict):
+        message = callback_query.get("message")
     if not message:
         return
 
@@ -342,17 +349,31 @@ def process_update(config: dict[str, Any], update: dict[str, Any]) -> None:
     if not handler_path.is_file():
         raise BridgeError(f"Handler does not exist: {handler_path}")
 
-    sender = message.get("from", {})
+    sender = (
+        callback_query.get("from", {})
+        if isinstance(callback_query, dict)
+        else message.get("from", {})
+    )
+    sender_id = int(sender.get("id", 0))
+    if sender_id and sender_id != int(config["chat_id"]):
+        print(f"Ignored an unauthorized user (update {update['update_id']}).", flush=True)
+        return
     environment = os.environ.copy()
     environment.update(
         {
             "TELEGRAM_CHAT_ID": str(chat["id"]),
             "TELEGRAM_MESSAGE_ID": str(message.get("message_id", "")),
+            "TELEGRAM_MESSAGE_THREAD_ID": str(message.get("message_thread_id", "")),
             "TELEGRAM_TEXT": str(message.get("text", "")),
             "TELEGRAM_FROM_ID": str(sender.get("id", "")),
             "TELEGRAM_FROM_USERNAME": str(sender.get("username", "")),
+            "TELEGRAM_CALLBACK_QUERY_ID": str(
+                callback_query.get("id", "") if isinstance(callback_query, dict) else ""
+            ),
         }
     )
+    if extra_environment:
+        environment.update(extra_environment)
     result = subprocess.run(
         handler_command(handler_path),
         input=json.dumps(update),
