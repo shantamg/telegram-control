@@ -876,11 +876,15 @@ The Stage 4 router-contract and durable-routing slices pass 88 offline tests:
   duplicate choices fail closed;
 - the main agent also receives a compact, typed controller-tool catalog for
   listing or inspecting projects, sending to an existing agent, proposing
-  project-agent creation, asking a question, or responding directly;
+  project-agent creation, renaming a managed topic, asking a question, or
+  responding directly;
 - tool calls use exact JSON envelopes, tool-specific bounded arguments, and
   catalog validation; unknown tools and extra fields fail closed;
 - consequential project-agent creation is always marked for
   controller-enforced confirmation rather than left to model discretion;
+- consequential topic renaming accepts only a managed `message_thread_id` and
+  an explicit 1–128 character name, and is always marked for
+  controller-enforced confirmation;
 - the command handlers remain recovery and power-user wrappers, not the
   intended conversational interface;
 - schema version 10 adds a serialized, leased main-router mailbox whose
@@ -909,6 +913,9 @@ The Stage 4 router-contract and durable-routing slices pass 88 offline tests:
   metadata, and exposes only opaque authorized Confirm/Cancel buttons;
 - confirmation enrolls the project, creates its Telegram topic, and attaches
   the managed agent; cancellation creates nothing;
+- confirmed topic renames revalidate the durable `(chat_id, topic_id)` binding,
+  call Telegram `editForumTopic`, update the stored display name, and append an
+  audit event; cancellation and proposals do not mutate Telegram;
 - the main router rotates before a fresh turn once its current Codex session
   reaches 180,000 cumulative input tokens or 12 completed turns, while
   recovery retries remain attached to their original session;
@@ -927,8 +934,7 @@ The Stage 4 router-contract and durable-routing slices pass 88 offline tests:
   conversational alias changes require the alias to appear explicitly in the
   current user message, and dispatch always resolves aliases to canonical
   project slugs;
-- a versioned eight-case router fixture suite covers every Stage 4 controller
-  tool and
+- a versioned ten-case router fixture suite covers every controller tool and
   can run either fully offline or through isolated live Codex sessions without
   mutating the durable router conversation;
 - the default Codex model passed the initial live benchmark 6/6 and the
@@ -963,4 +969,5 @@ The first Stage 5 provider-adapter slice passes 94 offline tests:
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)
 - [Telegram Bot API — callback queries](https://core.telegram.org/bots/api#callbackquery)
 - [Telegram Bot API — inline keyboards](https://core.telegram.org/bots/api#inlinekeyboardmarkup)
+- [Telegram Bot API — editForumTopic](https://core.telegram.org/bots/api#editforumtopic)
 - [Telegram Bot API — sendVoice](https://core.telegram.org/bots/api#sendvoice)

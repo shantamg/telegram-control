@@ -284,6 +284,11 @@ def router_preview_text(
         body = f"Would propose creating a project agent for {arguments['project']}."
         if topic:
             body += f"\n\nSuggested topic: {topic}"
+    elif call.tool == "rename_topic":
+        body = (
+            f"Would rename topic {arguments['message_thread_id']} "
+            f"to {arguments['name']}."
+        )
     elif call.tool == "ask_user":
         body = f"Would ask:\n\n{arguments['question']}"
         options = arguments["options"]
@@ -525,6 +530,41 @@ def project_creation_proposal(
     )
 
 
+def topic_rename_proposal(
+    store: DurableStore,
+    chat_id: int,
+    user_input: str,
+    arguments: dict[str, Any],
+) -> tuple[str, Optional[dict[str, Any]]]:
+    message_thread_id = int(arguments["message_thread_id"])
+    new_name = str(arguments["name"]).strip()
+    if not alias_appears_in_input(new_name, user_input):
+        raise StoreError(
+            "The new topic name must appear explicitly in the user's request."
+        )
+    binding = store.resolve_surface_binding(chat_id, message_thread_id)
+    if binding is None or binding.message_thread_id is None:
+        raise StoreError("The selected managed Telegram topic no longer exists.")
+    if binding.display_name == new_name:
+        return (f"✅ The topic is already named “{new_name}”.", None)
+    plan = {
+        "binding_id": binding.binding_id,
+        "chat_id": binding.chat_id,
+        "message_thread_id": binding.message_thread_id,
+        "old_name": binding.display_name,
+        "new_name": new_name,
+    }
+    return (
+        "Rename this Telegram topic?\n\n"
+        f"Current name: {binding.display_name}\n"
+        f"New name: {new_name}\n"
+        f"Topic ID: {binding.message_thread_id}\n\n"
+        "Telegram and the durable controller binding will be updated only "
+        "after you confirm.",
+        plan,
+    )
+
+
 def router_rotation_reason(metrics: dict[str, Any]) -> Optional[str]:
     if int(metrics["input_tokens"]) >= ROUTER_MAX_INPUT_TOKENS:
         return (
@@ -576,11 +616,13 @@ def process_router_mailbox_job(
             provider_config={"sandbox": "read-only"},
         )
         projects = store.list_projects()
+        topics = store.list_topic_surfaces(job.chat_id)
         prompt = router_contract.build_main_agent_prompt(
             job.input_text,
             projects,
             store.list_project_agent_states(),
             store.project_alias_map(),
+            topics,
         )
         adapter = provider_adapters.adapter_for(runtime_agent)
         result = adapter.run_turn(
@@ -601,11 +643,17 @@ def process_router_mailbox_job(
             result.final_text,
             {project.slug for project in projects},
             store.project_alias_resolution(),
+            {
+                int(topic.message_thread_id)
+                for topic in topics
+                if topic.message_thread_id is not None
+            },
         )
         dispatch_agent_id = None
         dispatch_message = None
         clarification_options = None
         project_creation_plan = None
+        topic_rename_plan = None
         if call.tool == "send_to_agent":
             target = store.resolve_project_agent(
                 str(call.arguments["project_slug"])
@@ -638,6 +686,13 @@ def process_router_mailbox_job(
         elif call.tool == "create_project_agent":
             response_text, project_creation_plan = project_creation_proposal(
                 store,
+                job.input_text,
+                call.arguments,
+            )
+        elif call.tool == "rename_topic":
+            response_text, topic_rename_plan = topic_rename_proposal(
+                store,
+                job.chat_id,
                 job.input_text,
                 call.arguments,
             )
@@ -720,6 +775,7 @@ def process_router_mailbox_job(
             dispatch_message=dispatch_message,
             clarification_options=clarification_options,
             project_creation_plan=project_creation_plan,
+            topic_rename_plan=topic_rename_plan,
         )
         log_event(
             "router_turn_succeeded",

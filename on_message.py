@@ -596,6 +596,92 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         )
         return
     if action.action_type in {
+        "router_topic_rename_confirm",
+        "router_topic_rename_cancel",
+    }:
+        router_mailbox_id = int(action.payload.get("router_mailbox_id", 0))
+        with DurableStore(Path(database_path)) as store:
+            store.expire_router_topic_rename_actions(router_mailbox_id)
+        if action.action_type == "router_topic_rename_cancel":
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": "Cancelled.",
+                    },
+                    "callback-answer",
+                )
+            send_message("Cancelled. The Telegram topic was not renamed.")
+            return
+
+        required = {
+            "binding_id",
+            "chat_id",
+            "message_thread_id",
+            "old_name",
+            "new_name",
+        }
+        if not required.issubset(action.payload):
+            raise StoreError("Stored topic-rename plan is invalid.")
+        binding_id = int(action.payload["binding_id"])
+        target_chat_id = int(action.payload["chat_id"])
+        target_thread_id = int(action.payload["message_thread_id"])
+        old_name = str(action.payload["old_name"])
+        new_name = str(action.payload["new_name"]).strip()
+        if (
+            target_chat_id != chat_id
+            or binding_id <= 0
+            or target_thread_id <= 0
+            or not old_name
+            or not new_name
+            or len(new_name) > 128
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in new_name
+            )
+        ):
+            raise StoreError("Stored topic-rename plan is invalid.")
+        with DurableStore(Path(database_path)) as store:
+            binding = store.resolve_surface_binding_by_id(binding_id)
+        if (
+            binding is None
+            or binding.chat_id != target_chat_id
+            or binding.message_thread_id != target_thread_id
+            or binding.display_name != old_name
+        ):
+            raise StoreError(
+                "Managed topic changed before the rename was confirmed."
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Renaming topic…",
+                },
+                "callback-answer",
+            )
+        result = bridge.api_call(
+            bridge.read_token(),
+            "editForumTopic",
+            chat_id=target_chat_id,
+            message_thread_id=target_thread_id,
+            name=new_name,
+        )
+        if result is not True:
+            raise StoreError("Telegram returned an invalid topic-rename result.")
+        with DurableStore(Path(database_path)) as store:
+            store.rename_surface_binding(
+                binding_id=binding_id,
+                expected_chat_id=target_chat_id,
+                expected_message_thread_id=target_thread_id,
+                expected_display_name=old_name,
+                new_display_name=new_name,
+            )
+        send_message(f"✅ Renamed “{old_name}” to “{new_name}”.")
+        return
+    if action.action_type in {
         "router_project_confirm",
         "router_project_cancel",
     }:

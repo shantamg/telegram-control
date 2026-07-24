@@ -567,6 +567,51 @@ class DurableStoreTests(unittest.TestCase):
                 now=103,
             )
 
+    def test_topic_surface_rename_is_identity_checked_and_audited(self):
+        binding = self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        renamed = self.store.rename_surface_binding(
+            binding_id=binding.binding_id,
+            expected_chat_id=123,
+            expected_message_thread_id=62,
+            expected_display_name="Stage 2 Test",
+            new_display_name="Telegram Control",
+            now=101,
+        )
+        self.assertEqual(renamed.display_name, "Telegram Control")
+        self.assertEqual(
+            [topic.message_thread_id for topic in self.store.list_topic_surfaces(123)],
+            [62],
+        )
+        event = self.store.connection.execute(
+            "SELECT * FROM events WHERE kind = 'surface_renamed'"
+        ).fetchone()
+        self.assertEqual(
+            json.loads(event["details_json"]),
+            {
+                "chat_id": 123,
+                "message_thread_id": 62,
+                "new_name": "Telegram Control",
+                "old_name": "Stage 2 Test",
+            },
+        )
+        with self.assertRaisesRegex(StoreError, "changed"):
+            self.store.rename_surface_binding(
+                binding_id=binding.binding_id,
+                expected_chat_id=123,
+                expected_message_thread_id=62,
+                expected_display_name="Stage 2 Test",
+                new_display_name="Another Name",
+                now=102,
+            )
+
     def test_surface_card_activates_and_can_be_recreated_after_becoming_stale(self):
         binding = self.store.ensure_surface_binding(
             chat_id=123,
@@ -2422,6 +2467,149 @@ class DurableIntegrationTests(unittest.TestCase):
                         and "Created tc--root--sample-project" in text
                         for text in queued_texts
                     )
+                )
+
+    def test_router_topic_rename_requires_confirmation_then_updates_telegram(self):
+        class FakeRouterAdapter:
+            def run_turn(
+                self,
+                agent,
+                prompt,
+                mailbox_session_id,
+                on_session,
+                heartbeat,
+            ):
+                self.prompt = prompt
+                on_session("router-session-123")
+                heartbeat()
+                return provider_adapters.ProviderTurnResult(
+                    provider_session_id="router-session-123",
+                    final_text=(
+                        '{"tool":"rename_topic","arguments":{'
+                        '"message_thread_id":62,"name":"Telegram Control"}}'
+                    ),
+                    usage={},
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            fake = FakeRouterAdapter()
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Stage 2 Test",
+                    target_type="controller",
+                    target_id="control",
+                    now=99,
+                )
+                store.ingest_update(
+                    message_update(
+                        text=(
+                            "Rename the Stage 2 Test topic to Telegram Control."
+                        )
+                    ),
+                    now=100,
+                )
+                inbox = store.claim_job("inbox", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    inbox,
+                    "inbox",
+                )
+                receipt = store.claim_outbox("sender", now=10**12)
+                store.complete_outbox(
+                    receipt.message_id,
+                    "sender",
+                    {"message_id": 800, "chat": {"id": 123}},
+                    now=10**12,
+                )
+                router_job = store.claim_router_mailbox(
+                    "router",
+                    now=10**12,
+                )
+                with mock.patch.object(
+                    telegram_control.provider_adapters,
+                    "adapter_for",
+                    return_value=fake,
+                ):
+                    telegram_control.process_router_mailbox_job(
+                        store,
+                        router_job,
+                        "router",
+                    )
+                self.assertIn('"message_thread_id":62', fake.prompt)
+                self.assertEqual(
+                    store.resolve_surface_binding(123, 62).display_name,
+                    "Stage 2 Test",
+                )
+                proposal = store.claim_outbox("sender-2", now=10**12)
+                self.assertIn(
+                    "updated only after you confirm",
+                    proposal.params["text"],
+                )
+                buttons = proposal.params["reply_markup"]["inline_keyboard"]
+                self.assertEqual(
+                    [row[0]["text"] for row in buttons],
+                    ["Rename topic", "Cancel"],
+                )
+                update = callback_update(
+                    11,
+                    buttons[0][0]["callback_data"],
+                    message_id=800,
+                )
+                store.ingest_update(update, now=102)
+                job_id = int(
+                    store.connection.execute(
+                        "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+                    ).fetchone()["job_id"]
+                )
+
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(job_id),
+                "TELEGRAM_CHAT_ID": "123",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_MESSAGE_ID": "800",
+                "TELEGRAM_MESSAGE_THREAD_ID": "",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    on_message.bridge,
+                    "read_token",
+                    return_value="test-token",
+                ):
+                    with mock.patch.object(
+                        on_message.bridge,
+                        "api_call",
+                        return_value=True,
+                    ) as api_call:
+                        on_message.handle_callback(
+                            update,
+                            update["callback_query"],
+                        )
+
+            api_call.assert_called_once_with(
+                "test-token",
+                "editForumTopic",
+                chat_id=123,
+                message_thread_id=62,
+                name="Telegram Control",
+            )
+            with DurableStore(database_path) as store:
+                self.assertEqual(
+                    store.resolve_surface_binding(123, 62).display_name,
+                    "Telegram Control",
+                )
+                self.assertEqual(
+                    store.status_counts()["callbacks"],
+                    {"consumed": 1, "expired": 1},
                 )
 
     def test_button_callback_routes_once_through_existing_handler(self):

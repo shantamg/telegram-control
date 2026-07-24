@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
-from durable_store import ManagedProject, StoreError
+from durable_store import ManagedProject, StoreError, SurfaceBinding
 
 
 class RouterContractError(StoreError):
@@ -51,6 +51,12 @@ CONTROLLER_TOOLS = (
         "description": "Send work to an existing managed project agent.",
         "arguments": {"project_slug": "string", "message": "string"},
         "confirmation": False,
+    },
+    {
+        "name": "rename_topic",
+        "description": "Rename an existing managed Telegram topic.",
+        "arguments": {"message_thread_id": "integer", "name": "string"},
+        "confirmation": True,
     },
     {
         "name": "create_project_agent",
@@ -110,6 +116,7 @@ def build_main_agent_prompt(
     projects: Iterable[ManagedProject],
     agent_states: Iterable[dict[str, Any]],
     project_aliases: Optional[dict[str, list[str]]] = None,
+    topics: Iterable[SurfaceBinding] = (),
 ) -> str:
     text = user_input.strip()
     if not text or len(text) > 8000:
@@ -136,6 +143,14 @@ def build_main_agent_prompt(
         }
         for state in agent_states
     ]
+    topic_catalog = [
+        {
+            "message_thread_id": int(topic.message_thread_id),
+            "name": topic.display_name,
+        }
+        for topic in topics
+        if topic.state == "active" and topic.message_thread_id is not None
+    ]
     return (
         "You are the main Telegram Control agent. Decide the next controller "
         "tool to use. Return exactly one JSON object with keys tool and "
@@ -150,6 +165,7 @@ def build_main_agent_prompt(
         f"Tools:\n{json.dumps(CONTROLLER_TOOLS, separators=(',', ':'), sort_keys=True)}"
         f"\n\nProjects:\n{json.dumps(catalog, separators=(',', ':'), sort_keys=True)}"
         f"\n\nAgents:\n{json.dumps(states, separators=(',', ':'), sort_keys=True)}"
+        f"\n\nTopics:\n{json.dumps(topic_catalog, separators=(',', ':'), sort_keys=True)}"
         f"\n\nUser input:\n{json.dumps(text)}"
     )
 
@@ -161,10 +177,18 @@ def _bounded_string(arguments: dict[str, Any], key: str, limit: int) -> str:
     return value.strip()
 
 
+def _topic_name(arguments: dict[str, Any], key: str = "name") -> str:
+    value = _bounded_string(arguments, key, 128)
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise RouterContractError(f"Tool argument {key!r} is invalid.")
+    return value
+
+
 def parse_router_tool_call(
     raw_text: str,
     allowed_project_slugs: set[str],
     project_aliases: Optional[dict[str, str]] = None,
+    allowed_topic_ids: Optional[set[int]] = None,
 ) -> RouterToolCall:
     try:
         value = json.loads(raw_text)
@@ -199,6 +223,21 @@ def parse_router_tool_call(
         normalized = {
             "project_slug": project_slug,
             "message": _bounded_string(arguments, "message", 8000),
+        }
+    elif tool == "rename_topic":
+        if set(arguments) != {"message_thread_id", "name"}:
+            raise RouterContractError("rename_topic arguments are invalid.")
+        message_thread_id = arguments.get("message_thread_id")
+        if (
+            isinstance(message_thread_id, bool)
+            or not isinstance(message_thread_id, int)
+            or message_thread_id <= 0
+            or message_thread_id not in (allowed_topic_ids or set())
+        ):
+            raise RouterContractError("rename_topic selected an unknown topic.")
+        normalized = {
+            "message_thread_id": message_thread_id,
+            "name": _topic_name(arguments),
         }
     elif tool == "create_project_agent":
         required = {"project", "topic_name"}

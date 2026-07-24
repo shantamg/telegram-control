@@ -302,12 +302,13 @@ recognized the existing matching agent without creating a duplicate.
 
 The main-router boundary now has a small typed controller-tool vocabulary:
 list or inspect projects, send work to an existing agent, propose creating a
-project agent, ask a concise question, or respond directly. The prompt includes
-only active project slugs, display names, providers, and compact agent
-state—never catalog filesystem paths. Every tool call is strict JSON and is
-validated again by the controller. Unknown tools, projects, arguments, extra
-fields, and oversized values fail closed; project-agent creation always
-requires controller-enforced confirmation.
+project agent, rename a managed Telegram topic, ask a concise question, or
+respond directly. The prompt includes only active project slugs, display names,
+providers, compact agent state, and managed topic names/IDs—never catalog
+filesystem paths or chat IDs. Every tool call is strict JSON and is validated
+again by the controller. Unknown tools, projects, topics, arguments, extra
+fields, and oversized values fail closed; project-agent creation and topic
+renaming always require controller-enforced confirmation.
 
 Ordinary messages in the root Control chat now enter a dedicated durable
 router mailbox. A supervised worker invokes the main Codex agent with the
@@ -338,6 +339,14 @@ and shows the proposed provider and Telegram topic behind **Create project
 agent** and **Cancel** buttons. Only the authorized confirmation enrolls the
 project, creates its private-chat topic, and attaches the managed agent.
 
+Conversational topic renaming uses the managed binding's stable
+`message_thread_id`; the requested name must appear explicitly in the current
+message. The controller presents the current name, new name, and topic ID
+behind authorized one-time **Rename topic** and **Cancel** buttons. Confirmation
+revalidates the binding, calls Telegram `editForumTopic`, then atomically
+updates and audits the durable display name. Cancellation and unconfirmed
+proposals do not call Telegram.
+
 Enrolled projects can also have durable conversational aliases. Natural
 requests can add or remove an alias when the alias is stated explicitly in the
 current message. Aliases are globally unique, survive restarts and router
@@ -359,7 +368,7 @@ escaped transcript display, main-router work, and the final routed response.
 The router session, validation, clarification, confirmation, and project-agent
 relay rules are identical for text and voice input.
 
-The router contract has a repeatable nine-case quality gate covering every
+The router contract has a repeatable ten-case quality gate covering every
 controller tool. The offline run validates the fixtures and parser without
 calling a model:
 

@@ -1,6 +1,6 @@
 import unittest
 
-from durable_store import ManagedProject
+from durable_store import ManagedProject, SurfaceBinding
 from router_contract import (
     RouterContractError,
     build_main_agent_prompt,
@@ -106,6 +106,27 @@ class RouterContractTests(unittest.TestCase):
         self.assertIn("canonical project slug", prompt)
         self.assertNotIn("/secret/local/path", prompt)
 
+    def test_main_agent_prompt_exposes_managed_topic_identity(self):
+        topic = SurfaceBinding(
+            binding_id=7,
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            state="active",
+        )
+        prompt = build_main_agent_prompt(
+            "rename Stage 2 Test to Telegram Control",
+            [self.project],
+            [],
+            topics=[topic],
+        )
+        self.assertIn('"message_thread_id":62', prompt)
+        self.assertIn('"name":"Stage 2 Test"', prompt)
+        self.assertNotIn('"chat_id":123', prompt)
+
     def test_tool_call_normalizes_safe_dispatch(self):
         call = parse_router_tool_call(
             '{"tool":"send_to_agent","arguments":{'
@@ -143,6 +164,34 @@ class RouterContractTests(unittest.TestCase):
                 '"project":"/tmp/new-project","topic_name":null,'
                 '"provider":"invented"}}',
                 {"telegram-control"},
+            )
+
+    def test_rename_topic_is_catalog_bound_and_requires_confirmation(self):
+        call = parse_router_tool_call(
+            '{"tool":"rename_topic","arguments":{'
+            '"message_thread_id":62,"name":" Telegram Control "}}',
+            {"telegram-control"},
+            allowed_topic_ids={62},
+        )
+        self.assertEqual(
+            call.arguments,
+            {"message_thread_id": 62, "name": "Telegram Control"},
+        )
+        self.assertTrue(call.requires_confirmation)
+
+        with self.assertRaisesRegex(RouterContractError, "unknown topic"):
+            parse_router_tool_call(
+                '{"tool":"rename_topic","arguments":{'
+                '"message_thread_id":63,"name":"Telegram Control"}}',
+                {"telegram-control"},
+                allowed_topic_ids={62},
+            )
+        with self.assertRaisesRegex(RouterContractError, "name"):
+            parse_router_tool_call(
+                '{"tool":"rename_topic","arguments":{'
+                '"message_thread_id":62,"name":"bad\\nname"}}',
+                {"telegram-control"},
+                allowed_topic_ids={62},
             )
 
     def test_configure_agent_tool_supports_patch_and_reset(self):

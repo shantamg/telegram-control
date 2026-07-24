@@ -135,6 +135,7 @@ class AgentMailboxJob:
 class RouterMailboxJob:
     mailbox_id: int
     source_inbox_job_id: int
+    chat_id: int
     input_text: str
     provider_session_id: Optional[str]
     attempts: int
@@ -1755,6 +1756,112 @@ class DurableStore:
         ).fetchone()
         return self._surface_binding_from_row(row) if row is not None else None
 
+    def list_topic_surfaces(self, chat_id: int) -> list[SurfaceBinding]:
+        rows = self.connection.execute(
+            """
+            SELECT *
+            FROM surface_bindings
+            WHERE chat_id = ? AND message_thread_id != 0 AND state = 'active'
+            ORDER BY binding_id
+            """,
+            (int(chat_id),),
+        ).fetchall()
+        return [self._surface_binding_from_row(row) for row in rows]
+
+    def resolve_surface_binding_by_id(
+        self,
+        binding_id: int,
+    ) -> Optional[SurfaceBinding]:
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM surface_bindings
+            WHERE binding_id = ? AND state = 'active'
+            """,
+            (int(binding_id),),
+        ).fetchone()
+        return self._surface_binding_from_row(row) if row is not None else None
+
+    def rename_surface_binding(
+        self,
+        binding_id: int,
+        expected_chat_id: int,
+        expected_message_thread_id: int,
+        expected_display_name: str,
+        new_display_name: str,
+        now: Optional[float] = None,
+    ) -> SurfaceBinding:
+        name = new_display_name.strip()
+        if (
+            not name
+            or len(name) > 128
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in name
+            )
+        ):
+            raise StoreError(
+                "Topic name must contain 1 to 128 printable characters."
+            )
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self.connection.execute(
+                """
+                UPDATE surface_bindings
+                SET display_name = ?, updated_at = ?
+                WHERE binding_id = ? AND chat_id = ?
+                    AND message_thread_id = ? AND display_name = ?
+                    AND state = 'active' AND message_thread_id != 0
+                """,
+                (
+                    name,
+                    timestamp,
+                    int(binding_id),
+                    int(expected_chat_id),
+                    int(expected_message_thread_id),
+                    expected_display_name,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError(
+                    "Managed topic changed before its rename could be recorded."
+                )
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('surface_renamed', 'surface', ?, ?, ?)
+                """,
+                (
+                    str(int(binding_id)),
+                    json.dumps(
+                        {
+                            "chat_id": int(expected_chat_id),
+                            "message_thread_id": int(
+                                expected_message_thread_id
+                            ),
+                            "old_name": expected_display_name,
+                            "new_name": name,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                ),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM surface_bindings WHERE binding_id = ?",
+                (int(binding_id),),
+            ).fetchone()
+            binding = self._surface_binding_from_row(row)
+            self.connection.execute("COMMIT")
+            return binding
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
     @staticmethod
     def _managed_agent_from_row(row: sqlite3.Row) -> ManagedAgent:
         return ManagedAgent(
@@ -2623,6 +2730,7 @@ class DurableStore:
         return RouterMailboxJob(
             mailbox_id=mailbox_id,
             source_inbox_job_id=int(claimed["source_inbox_job_id"]),
+            chat_id=int(claimed["chat_id"]),
             input_text=str(claimed["input_text"]),
             provider_session_id=(
                 str(claimed["provider_session_id"])
@@ -2807,6 +2915,7 @@ class DurableStore:
         dispatch_message: Optional[str] = None,
         clarification_options: Optional[list[str]] = None,
         project_creation_plan: Optional[dict[str, Any]] = None,
+        topic_rename_plan: Optional[dict[str, Any]] = None,
         now: Optional[float] = None,
     ) -> None:
         if not preview_text or len(preview_text) > 3800:
@@ -2832,6 +2941,18 @@ class DurableStore:
             }
         ):
             raise StoreError("Router project-creation plan is invalid.")
+        if topic_rename_plan is not None and (
+            tool_name != "rename_topic"
+            or set(topic_rename_plan)
+            != {
+                "binding_id",
+                "chat_id",
+                "message_thread_id",
+                "old_name",
+                "new_name",
+            }
+        ):
+            raise StoreError("Router topic-rename plan is invalid.")
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -2969,6 +3090,67 @@ class DurableStore:
                     if not inserted:
                         raise StoreError(
                             "Could not allocate a project-confirmation token."
+                        )
+            if topic_rename_plan is not None:
+                if row["authorized_user_id"] is None:
+                    raise StoreError("Router topic rename has no authorized user.")
+                if int(topic_rename_plan["chat_id"]) != int(row["chat_id"]):
+                    raise StoreError("Router topic rename targets another chat.")
+                for index, (action_type, label) in enumerate(
+                    (
+                        ("router_topic_rename_confirm", "Rename topic"),
+                        ("router_topic_rename_cancel", "Cancel"),
+                    )
+                ):
+                    inserted = False
+                    for _ in range(5):
+                        token = secrets.token_urlsafe(6)
+                        payload = dict(topic_rename_plan)
+                        payload["label"] = label
+                        payload["router_mailbox_id"] = int(mailbox_id)
+                        try:
+                            self.connection.execute(
+                                """
+                                INSERT INTO callback_actions(
+                                    operation_id, token, action_type,
+                                    payload_json, chat_id, message_thread_id,
+                                    authorized_user_id, one_time, state,
+                                    expires_at, created_at, updated_at
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active',
+                                    ?, ?, ?)
+                                """,
+                                (
+                                    (
+                                        f"router:{int(mailbox_id)}:"
+                                        f"topic-rename:{index}"
+                                    ),
+                                    token,
+                                    action_type,
+                                    json.dumps(
+                                        payload,
+                                        separators=(",", ":"),
+                                        sort_keys=True,
+                                    ),
+                                    int(row["chat_id"]),
+                                    (
+                                        int(row["message_thread_id"])
+                                        if int(row["message_thread_id"]) != 0
+                                        else None
+                                    ),
+                                    int(row["authorized_user_id"]),
+                                    timestamp + 10 * 60,
+                                    timestamp,
+                                    timestamp,
+                                ),
+                            )
+                        except sqlite3.IntegrityError:
+                            continue
+                        inserted = True
+                        break
+                    if not inserted:
+                        raise StoreError(
+                            "Could not allocate a topic-rename confirmation token."
                         )
             self.connection.execute(
                 """
@@ -3155,6 +3337,21 @@ class DurableStore:
             WHERE operation_id LIKE ? AND state = 'active'
             """,
             (timestamp, f"router:{int(mailbox_id)}:project:%"),
+        )
+
+    def expire_router_topic_rename_actions(
+        self,
+        mailbox_id: int,
+        now: Optional[float] = None,
+    ) -> None:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute(
+            """
+            UPDATE callback_actions
+            SET state = 'expired', updated_at = ?
+            WHERE operation_id LIKE ? AND state = 'active'
+            """,
+            (timestamp, f"router:{int(mailbox_id)}:topic-rename:%"),
         )
 
     def attach_enrolled_project(

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from durable_store import ManagedProject, StoreError
+from durable_store import ManagedProject, StoreError, SurfaceBinding
 from router_contract import (
     CONTROLLER_TOOLS,
     build_main_agent_prompt,
@@ -81,6 +81,19 @@ def fixture_project() -> ManagedProject:
     )
 
 
+def fixture_topic() -> SurfaceBinding:
+    return SurfaceBinding(
+        binding_id=1,
+        chat_id=123,
+        message_thread_id=62,
+        surface_type="project",
+        display_name="Stage 2 Test",
+        target_type="controller",
+        target_id="control",
+        state="active",
+    )
+
+
 def router_prompt(input_text: str) -> str:
     return build_main_agent_prompt(
         input_text,
@@ -92,6 +105,7 @@ def router_prompt(input_text: str) -> str:
                 "session": True,
             }
         ],
+        topics=[fixture_topic()],
     )
 
 
@@ -100,7 +114,11 @@ def evaluate_output(case: RouterCase, raw_output: str) -> dict[str, Any]:
     error: Optional[str] = None
     actual_tool: Optional[str] = None
     try:
-        call = parse_router_tool_call(raw_output, {"telegram-control"})
+        call = parse_router_tool_call(
+            raw_output,
+            {"telegram-control"},
+            allowed_topic_ids={62},
+        )
         actual_tool = call.tool
     except StoreError as exc:
         error = str(exc)
