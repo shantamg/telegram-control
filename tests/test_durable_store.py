@@ -1559,6 +1559,69 @@ class DurableIntegrationTests(unittest.TestCase):
                     "Stage 4 is progressing normally.",
                 )
 
+    def test_project_inspection_is_read_only_and_path_safe(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            with DurableStore(database_path) as store:
+                store.enroll_project(
+                    slug="telegram-control",
+                    display_name="Telegram Control",
+                    provider="codex",
+                    project_path="/secret/local/path",
+                    now=99,
+                )
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Telegram Control",
+                    target_type="controller",
+                    target_id="control",
+                    now=99,
+                )
+                store.attach_enrolled_project(
+                    123,
+                    62,
+                    "telegram-control",
+                    now=99,
+                )
+                completed = [
+                    telegram_control.subprocess.CompletedProcess(
+                        ["git", "branch"],
+                        0,
+                        stdout="main\n",
+                        stderr="",
+                    ),
+                    telegram_control.subprocess.CompletedProcess(
+                        ["git", "status"],
+                        0,
+                        stdout="",
+                        stderr="",
+                    ),
+                ]
+                with mock.patch.object(
+                    telegram_control.subprocess,
+                    "run",
+                    side_effect=completed,
+                ) as run:
+                    text = telegram_control.project_inspection_text(
+                        store,
+                        "telegram-control",
+                    )
+
+                self.assertEqual(run.call_count, 2)
+                self.assertIn("🔎 Telegram Control", text)
+                self.assertIn("Agent: registered", text)
+                self.assertIn("Session: not started", text)
+                self.assertIn("Git: main · clean", text)
+                self.assertNotIn("/secret/local/path", text)
+                catalog = telegram_control.project_catalog_text(store)
+                self.assertIn(
+                    "telegram-control — Telegram Control (codex) · registered",
+                    catalog,
+                )
+                self.assertNotIn("/secret/local/path", catalog)
+
     def test_button_callback_routes_once_through_existing_handler(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"

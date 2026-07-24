@@ -292,6 +292,12 @@ mailbox. The root receipt briefly reports the destination, then is replaced by
 the project agent's eventual response. Project-agent creation remains
 confirmation-gated.
 
+The read-only `list_projects`, enrolled-project `inspect_project`, and
+`respond` tools also execute directly. Project inspection reports compact
+agent, provider-session, console, branch, and working-tree state without
+exposing the enrolled filesystem path. Inspection of an unknown path remains a
+preview until the controller can prove that the path came from the user.
+
 The earlier strict `route`, `clarify`, or `reject` schema remains as a compact
 classification and evaluation primitive. It is not intended to become a
 user-facing command language.

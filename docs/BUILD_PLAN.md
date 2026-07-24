@@ -865,7 +865,7 @@ to enrolled Git projects; repeated turns, restart resume, voice input, explicit
 tmux disposal/recreation, pause/resume, inspection, and guarded session
 replacement all operate through durable logical agent state.
 
-The Stage 4 router-contract and durable-preview slices pass 74 offline tests:
+The Stage 4 router-contract and durable-routing slices pass 75 offline tests:
 
 - router prompts contain only path-safe active catalog metadata;
 - normalized output is limited to exact `route`, `clarify`, and `reject`
@@ -895,8 +895,11 @@ The Stage 4 router-contract and durable-preview slices pass 74 offline tests:
 - validated `send_to_agent` calls are now atomically appended to the selected
   project agent mailbox, and the project response replaces the root routing
   receipt rather than leaking into the project topic;
-- read-only tools, clarification buttons, and confirmation-backed creation
-  remain staged behind the same controller validation boundary.
+- `list_projects`, `respond`, and inspection of an enrolled project execute
+  directly; inspection reports agent/session/console and Git state without
+  exposing its stored path;
+- unknown-path inspection, clarification buttons, and confirmation-backed
+  creation remain staged behind the same controller validation boundary.
 
 ## References
 

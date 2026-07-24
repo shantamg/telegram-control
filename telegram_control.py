@@ -302,6 +302,80 @@ def router_preview_text(
     return preview
 
 
+def project_inspection_text(store: DurableStore, project_key: str) -> Optional[str]:
+    project = store.resolve_project(project_key)
+    if project is None:
+        return None
+    agent = store.resolve_project_agent(project.slug)
+    if agent is None:
+        agent_status = "not created"
+        session_status = "not started"
+        console_status = "not started"
+    else:
+        agent_status = agent.lifecycle_state
+        session_status = (
+            "persisted" if agent.provider_session_id is not None else "not started"
+        )
+        console = store.resolve_agent_console(agent.agent_id)
+        console_status = console.state if console is not None else "not started"
+
+    git_status = "unavailable"
+    try:
+        branch_result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=project.project_path,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        changes_result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=project.project_path,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if branch_result.returncode == 0 and changes_result.returncode == 0:
+            branch = branch_result.stdout.strip() or "detached HEAD"
+            changes = [
+                line for line in changes_result.stdout.splitlines() if line.strip()
+            ]
+            working_tree = (
+                "clean"
+                if not changes
+                else f"{len(changes)} changed path{'s' if len(changes) != 1 else ''}"
+            )
+            git_status = f"{branch} · {working_tree}"
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    return (
+        f"🔎 {project.display_name}\n\n"
+        f"Provider: {project.provider}\n"
+        f"Agent: {agent_status}\n"
+        f"Session: {session_status}\n"
+        f"Console: {console_status}\n"
+        f"Git: {git_status}"
+    )
+
+
+def project_catalog_text(store: DurableStore) -> str:
+    projects = store.list_projects()
+    if not projects:
+        return "No projects are enrolled yet."
+    lines = ["Enrolled projects", ""]
+    for project in projects:
+        agent = store.resolve_project_agent(project.slug)
+        state = agent.lifecycle_state if agent is not None else "not created"
+        lines.append(
+            f"{project.slug} — {project.display_name} "
+            f"({project.provider}) · {state}"
+        )
+    return "\n".join(lines)
+
+
 def process_router_mailbox_job(
     store: DurableStore,
     job: RouterMailboxJob,
@@ -341,7 +415,6 @@ def process_router_mailbox_job(
             result.final_text,
             {project.slug for project in projects},
         )
-        preview = router_preview_text(store, call)
         dispatch_agent_id = None
         dispatch_message = None
         if call.tool == "send_to_agent":
@@ -354,6 +427,23 @@ def process_router_mailbox_job(
                 )
             dispatch_agent_id = target.agent_id
             dispatch_message = str(call.arguments["message"])
+            response_text = router_preview_text(store, call)
+        elif call.tool == "inspect_project":
+            inspection = project_inspection_text(
+                store,
+                str(call.arguments["project"]),
+            )
+            response_text = (
+                inspection
+                if inspection is not None
+                else router_preview_text(store, call)
+            )
+        elif call.tool == "list_projects":
+            response_text = project_catalog_text(store)
+        elif call.tool == "respond":
+            response_text = str(call.arguments["message"])
+        else:
+            response_text = router_preview_text(store, call)
         store.complete_router_mailbox(
             job.mailbox_id,
             worker_id,
@@ -361,7 +451,7 @@ def process_router_mailbox_job(
             result.final_text,
             call.tool,
             call.arguments,
-            preview,
+            response_text,
             result.usage,
             dispatch_agent_id=dispatch_agent_id,
             dispatch_message=dispatch_message,
