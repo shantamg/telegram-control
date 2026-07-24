@@ -167,7 +167,8 @@ topic against a local Git repository with:
 Registration atomically creates the project agent and changes the topic binding
 from `controller/control` to `agent/<agent_id>`. Repeating the same registration
 returns the existing agent; mismatched registrations and invalid slugs fail
-closed. Send `/agent` inside the topic for a path-safe registry summary.
+closed. Send `/agent` inside the topic for a path-safe registry, session,
+console, and latest provider-usage summary.
 
 The live registry test passed on July 23, 2026. **Stage 2 Test** is bound to
 `tc--root--telegram-control` using the Codex provider and reports `registered`

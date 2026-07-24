@@ -1707,6 +1707,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     response.params["text"],
                 )
                 self.assertIn("State: registered", response.params["text"])
+                self.assertNotIn("Last turn:", response.params["text"])
                 route_json = store.connection.execute(
                     "SELECT route_json FROM outbox_messages WHERE message_id = ?",
                     (response.message_id,),
@@ -1817,6 +1818,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(response.method, "editMessageText")
                 self.assertEqual(response.params["message_id"], 500)
                 self.assertEqual(response.params["text"], "Codex adapter response")
+                usage = store.latest_agent_usage(agent.agent_id)
+                self.assertEqual(usage["input_tokens"], 50)
+                self.assertEqual(usage["output_tokens"], 5)
 
     def test_handler_queues_reply_instead_of_calling_telegram(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

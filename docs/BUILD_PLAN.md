@@ -802,6 +802,11 @@ on July 23, 2026:
   the controller 8.9 seconds after its message timestamp; after ingestion, the
   controller queued it in 0.46 seconds.
 
+`/agent` also reports the normalized input, cached-input, and output token
+counts from the latest successful provider turn. It intentionally does not
+claim a context-window percentage until the adapter can identify the effective
+model and its limit reliably.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)

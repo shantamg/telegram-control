@@ -293,12 +293,27 @@ def send_agent_status() -> None:
             if agent is not None
             else None
         )
+        usage = (
+            store.latest_agent_usage(agent.agent_id)
+            if agent is not None
+            else None
+        )
     if agent is None:
         send_message("This Telegram surface has no managed agent.")
         return
     project_name = Path(agent.project_path).name if agent.project_path else "controller"
     session = "not started" if not agent.provider_session_id else "persisted"
     console_state = console.state if console is not None else "stopped"
+    usage_line = ""
+    if usage is not None:
+        input_tokens = int(usage.get("input_tokens", 0))
+        cached_tokens = int(usage.get("cached_input_tokens", 0))
+        output_tokens = int(usage.get("output_tokens", 0))
+        usage_line = (
+            "\nLast turn: "
+            f"{input_tokens:,} input ({cached_tokens:,} cached) · "
+            f"{output_tokens:,} output"
+        )
     send_message(
         "Managed agent\n\n"
         f"Name: {agent.hierarchical_name}\n"
@@ -308,6 +323,7 @@ def send_agent_status() -> None:
         f"State: {agent.lifecycle_state}\n"
         f"Session: {session}\n"
         f"Console: {console_state}"
+        f"{usage_line}"
     )
 
 

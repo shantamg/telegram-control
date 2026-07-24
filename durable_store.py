@@ -1521,6 +1521,24 @@ class DurableStore:
         ).fetchone()
         return self._agent_console_from_row(row) if row is not None else None
 
+    def latest_agent_usage(self, agent_id: str) -> Optional[dict[str, Any]]:
+        row = self.connection.execute(
+            """
+            SELECT usage_json
+            FROM agent_mailbox
+            WHERE agent_id = ? AND state = 'succeeded' AND usage_json IS NOT NULL
+            ORDER BY mailbox_id DESC
+            LIMIT 1
+            """,
+            (agent_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        usage = json.loads(row["usage_json"])
+        if not isinstance(usage, dict):
+            raise StoreError("Stored agent usage metadata is invalid.")
+        return usage
+
     def reserve_agent_console(
         self,
         agent_id: str,
