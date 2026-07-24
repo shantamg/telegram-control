@@ -1166,7 +1166,6 @@ class DurableStore:
                 card_spec = json.loads(row["card_json"])
                 if card_spec.get("kind") == "agent_turn":
                     try:
-                        mailbox_id = int(card_spec["mailbox_id"])
                         mode = str(card_spec["mode"])
                     except (KeyError, TypeError, ValueError):
                         raise StoreError(
@@ -1185,14 +1184,24 @@ class DurableStore:
                             raise StoreError(
                                 "Telegram result cannot identify its agent receipt."
                             ) from None
-                        mailbox = self.connection.execute(
-                            """
-                            SELECT state, response_text
-                            FROM agent_mailbox
-                            WHERE mailbox_id = ?
-                            """,
-                            (mailbox_id,),
-                        ).fetchone()
+                        if "source_inbox_job_id" in card_spec:
+                            mailbox = self.connection.execute(
+                                """
+                            SELECT mailbox_id, state, input_text, response_text
+                                FROM agent_mailbox
+                                WHERE source_inbox_job_id = ?
+                                """,
+                                (int(card_spec["source_inbox_job_id"]),),
+                            ).fetchone()
+                        else:
+                            mailbox = self.connection.execute(
+                                """
+                                SELECT mailbox_id, state, input_text, response_text
+                                FROM agent_mailbox
+                                WHERE mailbox_id = ?
+                                """,
+                                (int(card_spec["mailbox_id"]),),
+                            ).fetchone()
                         if (
                             mailbox is not None
                             and str(mailbox["state"]) == "succeeded"
@@ -1200,6 +1209,7 @@ class DurableStore:
                             and len(str(mailbox["response_text"])) <= 3800
                         ):
                             params = json.loads(row["params_json"])
+                            mailbox_id = int(mailbox["mailbox_id"])
                             self.enqueue_api_call(
                                 operation_id=(
                                     f"agent-mailbox:{mailbox_id}:final-edit"
@@ -1217,10 +1227,36 @@ class DurableStore:
                                 },
                                 now=timestamp,
                             )
+                        elif (
+                            mailbox is not None
+                            and card_spec.get("input_kind") == "voice"
+                        ):
+                            stage = (
+                                "working"
+                                if str(mailbox["state"]) == "leased"
+                                else "sending"
+                            )
+                            self.enqueue_agent_voice_status(
+                                int(card_spec["source_inbox_job_id"]),
+                                stage,
+                                str(mailbox["input_text"]),
+                                now=timestamp,
+                            )
                     elif mode == "final_edit":
+                        try:
+                            int(card_spec["mailbox_id"])
+                        except (KeyError, TypeError, ValueError):
+                            raise StoreError(
+                                "Outbox agent-turn edit metadata is invalid."
+                            ) from None
                         if row["method"] != "editMessageText":
                             raise StoreError(
                                 "Only editMessageText can finish an agent turn card."
+                            )
+                    elif mode == "status_edit":
+                        if row["method"] != "editMessageText":
+                            raise StoreError(
+                                "Only editMessageText can update agent turn status."
                             )
                     else:
                         raise StoreError("Outbox agent-turn mode is invalid.")
@@ -1874,8 +1910,46 @@ class DurableStore:
         now: Optional[float] = None,
     ) -> int:
         timestamp = time.time() if now is None else float(now)
-        thread_id = int(message_thread_id) if message_thread_id is not None else 0
         self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            mailbox_id = self.enqueue_agent_message(
+                agent_id=agent_id,
+                source_inbox_job_id=source_inbox_job_id,
+                input_text=input_text,
+                now=timestamp,
+            )
+            self.enqueue_agent_receipt(
+                agent_id,
+                source_inbox_job_id,
+                chat_id,
+                message_thread_id,
+                receipt_text,
+                input_kind="text",
+                now=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return mailbox_id
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def enqueue_agent_receipt(
+        self,
+        agent_id: str,
+        source_inbox_job_id: int,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        receipt_text: str,
+        input_kind: str = "text",
+        now: Optional[float] = None,
+    ) -> int:
+        if input_kind not in {"text", "voice"}:
+            raise StoreError("Managed agent receipt input kind is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        thread_id = int(message_thread_id) if message_thread_id is not None else 0
+        owns_transaction = not self.connection.in_transaction
+        if owns_transaction:
+            self.connection.execute("BEGIN IMMEDIATE")
         try:
             binding = self.connection.execute(
                 """
@@ -1889,14 +1963,8 @@ class DurableStore:
             ).fetchone()
             if binding is None:
                 raise StoreError("Managed agent receipt route is no longer valid.")
-            mailbox_id = self.enqueue_agent_message(
-                agent_id=agent_id,
-                source_inbox_job_id=source_inbox_job_id,
-                input_text=input_text,
-                now=timestamp,
-            )
-            self.enqueue_api_call(
-                operation_id=f"agent-mailbox:{mailbox_id}:receipt",
+            message_id = self.enqueue_api_call(
+                operation_id=f"agent-input:{int(source_inbox_job_id)}:receipt",
                 method="sendMessage",
                 params={
                     "chat_id": int(chat_id),
@@ -1915,9 +1983,97 @@ class DurableStore:
                 },
                 card={
                     "kind": "agent_turn",
-                    "mailbox_id": mailbox_id,
+                    "source_inbox_job_id": int(source_inbox_job_id),
+                    "input_kind": input_kind,
                     "mode": "receipt",
                 },
+                now=timestamp,
+            )
+            if owns_transaction:
+                self.connection.execute("COMMIT")
+            return message_id
+        except BaseException:
+            if owns_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def agent_voice_status_text(stage: str, input_text: str) -> str:
+        transcript = input_text.strip()
+        if len(transcript) > 3400:
+            transcript = transcript[:3397].rstrip() + "…"
+        if stage == "sending":
+            return f"📤 Sending:\n\n{transcript}"
+        if stage == "working":
+            return f"🧠 Codex is working…\n\nYou said:\n{transcript}"
+        raise StoreError("Managed voice status stage is invalid.")
+
+    def enqueue_agent_voice_status(
+        self,
+        source_inbox_job_id: int,
+        stage: str,
+        input_text: str,
+        now: Optional[float] = None,
+    ) -> Optional[int]:
+        timestamp = time.time() if now is None else float(now)
+        receipt = self.connection.execute(
+            """
+            SELECT params_json, card_json, telegram_result_json
+            FROM outbox_messages
+            WHERE operation_id = ? AND state = 'sent'
+            """,
+            (f"agent-input:{int(source_inbox_job_id)}:receipt",),
+        ).fetchone()
+        if receipt is None or receipt["telegram_result_json"] is None:
+            return None
+        card = json.loads(receipt["card_json"])
+        if card.get("input_kind") != "voice":
+            return None
+        result = json.loads(receipt["telegram_result_json"])
+        params = json.loads(receipt["params_json"])
+        try:
+            message_id = int(result["message_id"])
+            chat_id = int(params["chat_id"])
+        except (KeyError, TypeError, ValueError):
+            raise StoreError("Stored Telegram voice receipt is invalid.") from None
+        return self.enqueue_api_call(
+            operation_id=(
+                f"agent-input:{int(source_inbox_job_id)}:status:{stage}"
+            ),
+            method="editMessageText",
+            params={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": self.agent_voice_status_text(stage, input_text),
+            },
+            card={
+                "kind": "agent_turn",
+                "source_inbox_job_id": int(source_inbox_job_id),
+                "mode": "status_edit",
+            },
+            now=timestamp,
+        )
+
+    def enqueue_agent_voice_message(
+        self,
+        agent_id: str,
+        source_inbox_job_id: int,
+        input_text: str,
+        now: Optional[float] = None,
+    ) -> int:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            mailbox_id = self.enqueue_agent_message(
+                agent_id,
+                source_inbox_job_id,
+                input_text,
+                now=timestamp,
+            )
+            self.enqueue_agent_voice_status(
+                source_inbox_job_id,
+                "sending",
+                input_text,
                 now=timestamp,
             )
             self.connection.execute("COMMIT")
@@ -2134,7 +2290,7 @@ class DurableStore:
         try:
             row = self.connection.execute(
                 """
-                SELECT m.agent_id, a.surface_binding_id
+                SELECT m.agent_id, m.source_inbox_job_id, a.surface_binding_id
                 FROM agent_mailbox AS m
                 JOIN agents AS a ON a.agent_id = m.agent_id
                 WHERE m.mailbox_id = ? AND m.state = 'leased'
@@ -2191,8 +2347,17 @@ class DurableStore:
                 FROM outbox_messages
                 WHERE operation_id = ?
                 """,
-                (f"agent-mailbox:{mailbox_id}:receipt",),
+                (f"agent-input:{int(row['source_inbox_job_id'])}:receipt",),
             ).fetchone()
+            if receipt is None:
+                receipt = self.connection.execute(
+                    """
+                    SELECT state, params_json, telegram_result_json
+                    FROM outbox_messages
+                    WHERE operation_id = ?
+                    """,
+                    (f"agent-mailbox:{mailbox_id}:receipt",),
+                ).fetchone()
             replaces_receipt = receipt is not None and len(response_chunks) == 1
             if (
                 replaces_receipt

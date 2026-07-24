@@ -86,6 +86,18 @@ def topic_message_update(update_id=10, text="hello", thread_id=62):
     return update
 
 
+def topic_voice_update(update_id=10, thread_id=62):
+    update = topic_message_update(update_id, thread_id=thread_id)
+    message = update["message"]
+    message.pop("text")
+    message["voice"] = {
+        "file_id": "voice-file",
+        "file_size": 1024,
+        "duration": 3,
+    }
+    return update
+
+
 class DurableStoreTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -770,7 +782,10 @@ class DurableStoreTests(unittest.TestCase):
         )
 
         receipt = self.store.claim_outbox("sender", now=104)
-        self.assertEqual(receipt.operation_id, f"agent-mailbox:{mailbox_id}:receipt")
+        self.assertEqual(
+            receipt.operation_id,
+            f"agent-input:{int(inbox['job_id'])}:receipt",
+        )
         self.store.complete_outbox(
             receipt.message_id,
             "sender",
@@ -1821,6 +1836,107 @@ class DurableIntegrationTests(unittest.TestCase):
                 usage = store.latest_agent_usage(agent.agent_id)
                 self.assertEqual(usage["input_tokens"], 50)
                 self.assertEqual(usage["output_tokens"], 5)
+
+    def test_topic_voice_transcript_routes_to_agent_and_reuses_turn_card(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Stage 2 Test",
+                    target_type="controller",
+                    target_id="control",
+                )
+                agent, _ = store.register_project_agent(
+                    chat_id=123,
+                    surface_name="Stage 2 Test",
+                    slug="telegram-control",
+                    provider="codex",
+                    project_path="/tmp/telegram-control",
+                )
+                store.ingest_update(topic_voice_update(), now=100)
+                job = store.connection.execute(
+                    "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+                ).fetchone()
+
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(job["job_id"]),
+                "TELEGRAM_CHAT_ID": "123",
+                "TELEGRAM_MESSAGE_THREAD_ID": "62",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(on_message.bridge, "download_telegram_file"):
+                    with mock.patch.object(on_message, "convert_to_wav"):
+                        with mock.patch.object(
+                            on_message,
+                            "transcribe_wav",
+                            return_value="inspect the voice route",
+                        ):
+                            on_message.handle_voice(
+                                topic_voice_update()["message"]["voice"]
+                            )
+
+            with DurableStore(database_path) as store:
+                receipt = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(receipt.params["text"], "🎙️ Transcribing…")
+                self.assertEqual(
+                    receipt.card["source_inbox_job_id"],
+                    int(job["job_id"]),
+                )
+                store.complete_outbox(
+                    receipt.message_id,
+                    "sender",
+                    {"message_id": 800, "chat": {"id": 123}},
+                    now=101,
+                )
+                mailbox = store.claim_agent_mailbox("agent", now=10**12)
+                self.assertEqual(mailbox.agent_id, agent.agent_id)
+                self.assertEqual(mailbox.input_text, "inspect the voice route")
+                store.enqueue_agent_voice_status(
+                    mailbox.source_inbox_job_id,
+                    "working",
+                    mailbox.input_text,
+                    now=102,
+                )
+                store.complete_agent_mailbox(
+                    mailbox.mailbox_id,
+                    "agent",
+                    "session-voice",
+                    "voice route complete",
+                    ["voice route complete"],
+                    {},
+                    now=103,
+                )
+                sending_edit = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(
+                    sending_edit.params["text"],
+                    "📤 Sending:\n\ninspect the voice route",
+                )
+                store.complete_outbox(
+                    sending_edit.message_id,
+                    "sender",
+                    True,
+                    now=104,
+                )
+                working_edit = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(
+                    working_edit.params["text"],
+                    "🧠 Codex is working…\n\n"
+                    "You said:\ninspect the voice route",
+                )
+                store.complete_outbox(
+                    working_edit.message_id,
+                    "sender",
+                    True,
+                    now=105,
+                )
+                final_edit = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(final_edit.method, "editMessageText")
+                self.assertEqual(final_edit.params["message_id"], 800)
+                self.assertEqual(final_edit.params["text"], "voice route complete")
 
     def test_handler_queues_reply_instead_of_calling_telegram(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

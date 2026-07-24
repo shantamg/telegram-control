@@ -228,6 +228,18 @@ second final message. One observed slow receipt was traced to an isolated
 8.9-second delay before the Telegram update reached the controller; the
 controller queued the receipt within 0.46 seconds of ingestion.
 
+Voice notes sent inside a managed agent topic use that same turn card. The
+`🎙️ Transcribing…` receipt is queued before local download, ffmpeg conversion,
+and Parakeet V3 transcription. The same message then shows `📤 Sending:` with
+the transcript, changes to `🧠 Codex is working…`, and finally becomes the
+agent's response. Durable outbox ordering prevents a delayed progress edit from
+overwriting the final answer. Voice notes outside a managed agent surface
+retain the original transcript-only behavior.
+
+The live managed-voice test passed on July 23, 2026: one voice note progressed
+through every status stage and returned the requested exact Codex response in
+the same Telegram message.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

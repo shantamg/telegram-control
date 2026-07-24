@@ -807,6 +807,23 @@ counts from the latest successful provider turn. It intentionally does not
 claim a context-window percentage until the adapter can identify the effective
 model and its limit reliably.
 
+The managed voice-input slice passed 58 offline tests and its live test on
+July 23, 2026:
+
+- a voice update on an agent surface durably creates its single turn card
+  before local audio preprocessing;
+- Handy/Parakeet transcription becomes the mailbox input for the existing
+  persisted provider conversation;
+- receipt delivery and transcription/mailbox creation may complete in either
+  order without losing the final in-place edit;
+- the one Telegram message progresses through `Transcribing`, `Sending` with
+  the visible transcript, `Codex is working`, and the final response;
+- status edits are durably ordered before the final edit so delayed delivery
+  cannot regress a completed turn to an earlier stage;
+- non-agent surfaces preserve the existing transcript-only voice behavior;
+- a live voice note visibly progressed through transcription, transcript
+  sending, Codex work, and the exact final response in one Telegram message.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)

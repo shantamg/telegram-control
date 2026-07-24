@@ -528,7 +528,35 @@ def handle_voice(voice: dict) -> None:
     if duration > MAX_VOICE_SECONDS:
         raise bridge.BridgeError("Voice message is longer than the configured 30-minute limit.")
 
-    send_message("🎙️ Voice message received. Transcribing locally with Parakeet V3…")
+    binding = current_surface_binding()
+    managed_agent = None
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    if (
+        binding is not None
+        and binding.target_type == "agent"
+        and database_path
+        and job_id
+    ):
+        with DurableStore(Path(database_path)) as store:
+            managed_agent = store.resolve_agent(binding.target_id)
+            if managed_agent is None or managed_agent.role not in {
+                "project",
+                "worker",
+            }:
+                raise StoreError("Managed agent route is no longer valid.")
+            chat_id, thread_id = surface_coordinates()
+            store.enqueue_agent_receipt(
+                agent_id=managed_agent.agent_id,
+                source_inbox_job_id=int(job_id),
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                receipt_text="🎙️ Transcribing…",
+                input_kind="voice",
+            )
+    else:
+        send_message("🎙️ Voice message received. Transcribing locally with Parakeet V3…")
+
     with tempfile.TemporaryDirectory(prefix="telegram-voice-") as temporary_directory:
         temp_dir = Path(temporary_directory)
         source_path = temp_dir / "voice.ogg"
@@ -541,7 +569,18 @@ def handle_voice(voice: dict) -> None:
         convert_to_wav(source_path, wav_path)
         transcript = transcribe_wav(wav_path)
 
-    if transcript:
+    if managed_agent is not None:
+        agent_input = transcript or (
+            "The user's voice note contained no detectable speech. "
+            "Briefly ask them to try recording it again."
+        )
+        with DurableStore(Path(database_path)) as store:
+            store.enqueue_agent_voice_message(
+                agent_id=managed_agent.agent_id,
+                source_inbox_job_id=int(job_id),
+                input_text=agent_input,
+            )
+    elif transcript:
         send_message(f"📝 Transcript:\n\n{transcript}")
     else:
         send_message("📝 Parakeet did not detect any speech in that voice message.")

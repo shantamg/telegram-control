@@ -183,6 +183,11 @@ def process_agent_mailbox_job(
         agent = store.resolve_agent(job.agent_id)
         if agent is None:
             raise StoreError("Managed agent no longer exists.")
+        store.enqueue_agent_voice_status(
+            job.source_inbox_job_id,
+            "working",
+            job.input_text,
+        )
         adapter = provider_adapters.adapter_for(agent)
         result = adapter.run_turn(
             agent,
