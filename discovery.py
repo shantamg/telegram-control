@@ -348,6 +348,39 @@ def validate_repository_workspace(
     return root_real, workdir_real
 
 
+def validate_agent_workspace(
+    workspace_root: str,
+    working_directory: Optional[str] = None,
+    git_repository_root: Optional[str] = None,
+) -> tuple[str, str, Optional[str]]:
+    """Validate an arbitrary agent workspace with optional Git metadata.
+
+    A workspace is fundamentally an existing directory boundary, not a Git
+    repository. When Git metadata is recorded, it must identify that exact
+    workspace root so the coding-project behavior remains deterministic
+    without expanding a non-Git workspace's boundary to a parent repository.
+    """
+    root_real, workdir_real = validate_workspace_paths(
+        workspace_root,
+        working_directory,
+    )
+    if git_repository_root is None:
+        return root_real, workdir_real, None
+    git_real = str(Path(os.path.realpath(git_repository_root)))
+    if git_real != root_real or _git_root_of(Path(root_real)) != git_real:
+        raise StoreError(
+            "The stored Git repository root is no longer valid for this "
+            "workspace."
+        )
+    return root_real, workdir_real, git_real
+
+
+def exact_git_root(path: str) -> Optional[str]:
+    """Return path itself only when it is the root of a Git repository."""
+    real = str(Path(os.path.realpath(path)))
+    return real if _git_root_of(Path(real)) == real else None
+
+
 def execute_discovery_tool(
     tool: str,
     arguments: dict[str, Any],

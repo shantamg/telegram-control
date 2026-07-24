@@ -84,11 +84,16 @@ def open_agent_console(
     if not agent.project_path or not Path(agent.project_path).is_dir():
         raise StoreError("Managed agent project directory is unavailable.")
     launch_directory = agent.working_directory or agent.project_path
-    root_real, workdir_real = discovery.validate_repository_workspace(
+    root_real, workdir_real, git_root = discovery.validate_agent_workspace(
         agent.project_path,
         agent.working_directory,
+        agent.git_repository_root,
     )
-    if root_real != agent.project_path or workdir_real != launch_directory:
+    if (
+        root_real != agent.project_path
+        or workdir_real != launch_directory
+        or git_root != agent.git_repository_root
+    ):
         raise StoreError(
             "Managed agent workspace paths no longer resolve to their "
             "enrolled locations."

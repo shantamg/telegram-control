@@ -100,6 +100,8 @@ class RouterContractTests(unittest.TestCase):
         )
         self.assertIn('"name":"create_project_agent"', prompt)
         self.assertIn('"project_slug":"telegram-control"', prompt)
+        self.assertIn("capable persistent conversational agent", prompt)
+        self.assertIn("Workspaces do not need to be Git repositories", prompt)
         self.assertNotIn("/secret/local/path", prompt)
 
     def test_main_agent_prompt_exposes_alias_with_canonical_slug(self):

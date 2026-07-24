@@ -195,14 +195,15 @@ def process_agent_mailbox_job(
         if agent.project_path:
             # Launch-time revalidation: the stored paths must still resolve
             # to themselves (no symlink swap) with the working directory
-            # contained in the repository root.
-            root_real, workdir_real = discovery.validate_repository_workspace(
+            # contained in the confirmed workspace boundary.
+            root_real, workdir_real, git_root = discovery.validate_agent_workspace(
                 agent.project_path,
                 agent.working_directory,
+                agent.git_repository_root,
             )
             if root_real != agent.project_path or workdir_real != (
                 agent.working_directory or agent.project_path
-            ):
+            ) or git_root != agent.git_repository_root:
                 raise StoreError(
                     "Managed agent workspace paths no longer resolve to "
                     "their enrolled locations."
@@ -475,6 +476,7 @@ def project_inspection_text(
     project = store.resolve_project(project_key)
     if project is not None:
         project_path = project.project_path
+        git_repository_root = project.git_repository_root
         display_name = project.display_name
         provider = project.provider
         agent = store.resolve_project_agent(project.slug)
@@ -496,30 +498,11 @@ def project_inspection_text(
         requested_path = Path(os.path.realpath(Path(raw_path).expanduser()))
         if not requested_path.is_dir():
             return None
-        remaining = (
-            5.0
-            if deadline is None
-            else min(5.0, deadline - time.monotonic())
+        project_path = str(requested_path)
+        git_repository_root = discovery.exact_git_root(project_path)
+        display_name = (
+            requested_path.name.replace("-", " ").replace("_", " ").title()
         )
-        if remaining <= 0:
-            return None
-        try:
-            root_result = subprocess.run(
-                ["git", "-C", str(requested_path), "rev-parse", "--show-toplevel"],
-                capture_output=True,
-                text=True,
-                timeout=remaining,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if root_result.returncode != 0:
-            return None
-        git_root = Path(root_result.stdout.strip()).resolve()
-        if git_root != requested_path:
-            return None
-        project_path = str(git_root)
-        display_name = git_root.name.replace("-", " ").replace("_", " ").title()
         provider = "not enrolled"
         agent = None
     if agent is None:
@@ -534,8 +517,10 @@ def project_inspection_text(
         console = store.resolve_agent_console(agent.agent_id)
         console_status = console.state if console is not None else "not started"
 
-    git_status = "unavailable"
+    git_status = "not a Git repository"
     try:
+        if git_repository_root is None:
+            raise RuntimeError("no Git repository")
         remaining = (
             5.0
             if deadline is None
@@ -545,7 +530,7 @@ def project_inspection_text(
             raise subprocess.TimeoutExpired("git", 0)
         branch_result = subprocess.run(
             ["git", "branch", "--show-current"],
-            cwd=project_path,
+            cwd=git_repository_root,
             capture_output=True,
             text=True,
             timeout=remaining,
@@ -560,7 +545,7 @@ def project_inspection_text(
             raise subprocess.TimeoutExpired("git", 0)
         changes_result = subprocess.run(
             ["git", "status", "--porcelain"],
-            cwd=project_path,
+            cwd=git_repository_root,
             capture_output=True,
             text=True,
             timeout=remaining,
@@ -577,7 +562,7 @@ def project_inspection_text(
                 else f"{len(changes)} changed path{'s' if len(changes) != 1 else ''}"
             )
             git_status = f"{branch} · {working_tree}"
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, RuntimeError, subprocess.TimeoutExpired):
         pass
 
     return (
@@ -700,14 +685,15 @@ def project_creation_proposal(
                 ),
                 None,
             )
-        repository_root = enrolled.project_path
+        workspace_root = enrolled.project_path
         working_directory = enrolled.working_directory
+        git_repository_root = enrolled.git_repository_root
         slug = enrolled.slug
         display_name = enrolled.display_name
         provider = enrolled.provider
         provenance.append(
             {
-                "value": repository_root,
+                "value": workspace_root,
                 "source": "enrolled_project",
                 "derived_from": enrolled.slug,
             }
@@ -717,7 +703,7 @@ def project_creation_proposal(
             project_reference,
             user_input,
             refs,
-            "repository root",
+            "workspace root",
         )
         workdir_text: Optional[str] = None
         if workdir_reference is not None:
@@ -727,10 +713,12 @@ def project_creation_proposal(
                 refs,
                 "working directory",
             )
-        # Full validation: real paths, Git root, and containment. The same
-        # check runs again at confirmation and at agent launch.
-        repository_root, working_directory = (
-            discovery.validate_repository_workspace(
+        # Full validation: real paths and containment. Git is optional
+        # metadata, detected only when the selected workspace is itself an
+        # exact repository root. The same check runs again at confirmation
+        # and every agent launch.
+        workspace_root, working_directory, _ = (
+            discovery.validate_agent_workspace(
                 str(Path(root_reference).expanduser()),
                 (
                     str(Path(workdir_text).expanduser())
@@ -739,6 +727,7 @@ def project_creation_proposal(
                 ),
             )
         )
+        git_repository_root = discovery.exact_git_root(workspace_root)
         provenance.append(root_provenance)
         if workdir_reference is not None:
             provenance.append(workdir_provenance)
@@ -749,7 +738,7 @@ def project_creation_proposal(
             display_name = identity_name
         else:
             source_name = (
-                Path(working_directory).name or Path(repository_root).name
+                Path(working_directory).name or Path(workspace_root).name
             )
             display_name = (
                 source_name.replace("-", " ").replace("_", " ").title()
@@ -759,7 +748,7 @@ def project_creation_proposal(
             raise StoreError("A safe project slug could not be derived.")
         collision = store.resolve_project(slug)
         if collision is not None and (
-            collision.project_path != repository_root
+            collision.project_path != workspace_root
             or collision.working_directory != working_directory
         ):
             raise StoreError("Another enrolled project already uses this slug.")
@@ -783,8 +772,9 @@ def project_creation_proposal(
         "slug": slug,
         "display_name": display_name,
         "provider": provider,
-        "project_path": repository_root,
+        "project_path": workspace_root,
         "working_directory": working_directory,
+        "git_repository_root": git_repository_root,
         "topic_name": resolved_topic,
         "provider_config": provider_config,
         "provenance": provenance,
@@ -793,18 +783,19 @@ def project_creation_proposal(
     effort_text = str(provider_config.get("effort", "provider default"))
     workdir_line = (
         f"Working directory: {working_directory}\n"
-        if working_directory != repository_root
+        if working_directory != workspace_root
         else ""
     )
     return (
         control_message(
-            f"I found the {display_name} repository at {repository_root}.\n"
+            f"I found the {display_name} workspace at {workspace_root}.\n"
             f"{workdir_line}"
+            f"Git: {'repository detected' if git_repository_root else 'not required'}\n"
             f"Provider: {provider}\n"
             f"Model: {model_text}\n"
             f"Effort: {effort_text}\n"
             f"Telegram topic: {resolved_topic}\n\n"
-            "I validated the Git repository and working directory. Nothing "
+            "I validated the workspace boundary and working directory. Nothing "
             "will be created until you confirm."
         ),
         plan,
@@ -1932,15 +1923,11 @@ def provision_topic_command(args: argparse.Namespace) -> None:
 def register_agent_command(args: argparse.Namespace) -> None:
     requested_path = Path(args.project_path).expanduser().resolve()
     if not requested_path.is_dir():
-        raise StoreError(f"Project directory does not exist: {requested_path}")
-    git_result = subprocess.run(
-        ["git", "-C", str(requested_path), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
+        raise StoreError(f"Workspace directory does not exist: {requested_path}")
+    project_path, working_directory, _ = discovery.validate_agent_workspace(
+        str(requested_path)
     )
-    if git_result.returncode != 0:
-        raise StoreError("Managed Codex projects must be Git repositories.")
-    project_path = str(Path(git_result.stdout.strip()).resolve())
+    git_repository_root = discovery.exact_git_root(project_path)
     config = bridge.load_config()
     with open_store(args.db) as store:
         agent, created = store.register_project_agent(
@@ -1949,6 +1936,8 @@ def register_agent_command(args: argparse.Namespace) -> None:
             slug=args.slug,
             provider=args.provider,
             project_path=project_path,
+            working_directory=working_directory,
+            git_repository_root=git_repository_root,
         )
     print(
         json.dumps(
@@ -1970,15 +1959,11 @@ def register_agent_command(args: argparse.Namespace) -> None:
 def enroll_project_command(args: argparse.Namespace) -> None:
     requested_path = Path(args.project_path).expanduser().resolve()
     if not requested_path.is_dir():
-        raise StoreError(f"Project directory does not exist: {requested_path}")
-    git_result = subprocess.run(
-        ["git", "-C", str(requested_path), "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
+        raise StoreError(f"Workspace directory does not exist: {requested_path}")
+    project_path, working_directory, _ = discovery.validate_agent_workspace(
+        str(requested_path)
     )
-    if git_result.returncode != 0:
-        raise StoreError("Managed projects must be Git repositories.")
-    project_path = str(Path(git_result.stdout.strip()).resolve())
+    git_repository_root = discovery.exact_git_root(project_path)
     display_name = args.name or args.slug.replace("-", " ").title()
     with open_store(args.db) as store:
         project, created = store.enroll_project(
@@ -1986,6 +1971,8 @@ def enroll_project_command(args: argparse.Namespace) -> None:
             display_name=display_name,
             provider=args.provider,
             project_path=project_path,
+            working_directory=working_directory,
+            git_repository_root=git_repository_root,
         )
     print(
         json.dumps(
@@ -2175,7 +2162,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     register_parser.add_argument("surface", help="Existing managed topic name.")
     register_parser.add_argument("slug", help="Lowercase hierarchical agent slug.")
-    register_parser.add_argument("project_path", help="Local Git project directory.")
+    register_parser.add_argument("project_path", help="Local workspace directory.")
     register_parser.add_argument(
         "--provider",
         choices=("codex", "claude"),
@@ -2185,10 +2172,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     enroll_parser = subparsers.add_parser(
         "enroll-project",
-        help="Enroll a validated local Git repository for Telegram selection.",
+        help="Enroll a validated local workspace for Telegram selection.",
     )
     enroll_parser.add_argument("slug", help="Stable lowercase project slug.")
-    enroll_parser.add_argument("project_path", help="Local Git project directory.")
+    enroll_parser.add_argument("project_path", help="Local workspace directory.")
     enroll_parser.add_argument("--name", help="User-facing project name.")
     enroll_parser.add_argument(
         "--provider",

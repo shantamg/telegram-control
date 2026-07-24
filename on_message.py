@@ -421,8 +421,8 @@ def send_agent_status() -> None:
         project_name = store.agent_speaker_header(agent.agent_id)
     workspace_lines = ""
     if agent.project_path:
-        repository_name = Path(agent.project_path).name
-        workspace_lines = f"\nRepository: {repository_name}"
+        workspace_name = Path(agent.project_path).name
+        workspace_lines = f"\nWorkspace: {workspace_name}"
         workdir = agent.working_directory or agent.project_path
         if workdir != agent.project_path:
             try:
@@ -432,6 +432,11 @@ def send_agent_status() -> None:
                 workspace_lines += (
                     f"\nWorking directory: {Path(workdir).name}"
                 )
+        workspace_lines += (
+            "\nGit: repository detected"
+            if agent.git_repository_root is not None
+            else "\nGit: not required"
+        )
     session = "not started" if not agent.provider_session_id else "persisted"
     console_state = console.state if console is not None else "stopped"
     usage_line = ""
@@ -976,27 +981,33 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "provider",
             "project_path",
             "working_directory",
+            "git_repository_root",
             "topic_name",
             "provider_config",
             "provenance",
         }
         if not required.issubset(action.payload):
             raise StoreError("Stored project-creation plan is invalid.")
-        # TOCTOU re-check: the confirmed paths are fully revalidated —
-        # existence, Git root, and symlink-resolved containment — exactly as
-        # at proposal time.
-        repository_root, working_directory = (
-            discovery.validate_repository_workspace(
+        # TOCTOU re-check: the confirmed workspace, optional Git metadata,
+        # and symlink-resolved containment are validated exactly as at
+        # proposal time.
+        workspace_root, working_directory, git_repository_root = (
+            discovery.validate_agent_workspace(
                 str(action.payload["project_path"]),
                 str(action.payload["working_directory"]),
+                (
+                    str(action.payload["git_repository_root"])
+                    if action.payload["git_repository_root"] is not None
+                    else None
+                ),
             )
         )
-        if repository_root != str(action.payload["project_path"]) or (
+        if workspace_root != str(action.payload["project_path"]) or (
             working_directory != str(action.payload["working_directory"])
-        ):
+        ) or git_repository_root != action.payload["git_repository_root"]:
             raise StoreError(
-                "The confirmed paths no longer resolve to the validated "
-                "locations."
+                "The confirmed workspace no longer resolves to the "
+                "validated locations."
             )
         slug = str(action.payload["slug"])
         display_name = str(action.payload["display_name"])
@@ -1033,8 +1044,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 slug=slug,
                 display_name=display_name,
                 provider=provider,
-                project_path=repository_root,
+                project_path=workspace_root,
                 working_directory=working_directory,
+                git_repository_root=git_repository_root,
             )
             existing_agent = store.resolve_project_agent(slug)
             existing_surface = store.resolve_named_surface(

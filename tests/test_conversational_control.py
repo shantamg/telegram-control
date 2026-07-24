@@ -203,7 +203,7 @@ class DiscoveryToolTests(unittest.TestCase):
             escaped.symlink_to(outside)
             root, workdir = validate_workspace_paths(str(lovely), str(peter))
             self.assertEqual((root, workdir), (str(lovely), str(peter)))
-            with self.assertRaisesRegex(StoreError, "inside the repository"):
+            with self.assertRaisesRegex(StoreError, "inside the workspace"):
                 validate_workspace_paths(str(lovely), str(escaped))
             with self.assertRaisesRegex(StoreError, "not the root"):
                 discovery.validate_repository_workspace(str(peter), None)
@@ -264,6 +264,90 @@ class ConversationalControlTests(unittest.TestCase):
                     job,
                     "router",
                 )
+
+    def test_non_git_directory_can_become_agent_workspace(self):
+        life = Path(os.path.realpath(self.home / "life"))
+        notes = life / "notes"
+        notes.mkdir(parents=True)
+        response, plan = telegram_control.project_creation_proposal(
+            self.store,
+            "Add a workspace called Life for my life notes directory.",
+            {
+                "project": "loc_life",
+                "name": "Life",
+                "working_directory": "loc_notes",
+                "topic_name": "Life",
+                "provider": "codex",
+                "model": None,
+                "effort": None,
+            },
+            {
+                "loc_life": {
+                    "path": str(life),
+                    "derived_from": "my life directory",
+                },
+                "loc_notes": {
+                    "path": str(notes),
+                    "derived_from": "life notes directory",
+                },
+            },
+        )
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan["project_path"], str(life))
+        self.assertEqual(plan["working_directory"], str(notes))
+        self.assertIsNone(plan["git_repository_root"])
+        self.assertIn("Git: not required", response)
+
+        action = self.store.create_callback_action(
+            operation_id="router:41:workspace:0",
+            action_type="router_project_confirm",
+            payload={
+                "router_mailbox_id": 41,
+                "label": "Create workspace agent",
+                **plan,
+            },
+            chat_id=123,
+            authorized_user_id=123,
+            ttl_seconds=10**12,
+            now=100,
+        )
+        confirm_update = callback_update(41, f"a:{action.token}")
+        self.store.ingest_update(confirm_update, now=101)
+        job_row = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 41"
+        ).fetchone()
+        environment = {
+            "TELEGRAM_CONTROL_DB": str(self.database_path),
+            "TELEGRAM_CONTROL_JOB_ID": str(int(job_row["job_id"])),
+            "TELEGRAM_CHAT_ID": "123",
+            "TELEGRAM_FROM_ID": "123",
+            "TELEGRAM_MESSAGE_ID": "700",
+            "TELEGRAM_MESSAGE_THREAD_ID": "",
+        }
+        with mock.patch.dict(os.environ, environment, clear=False):
+            with mock.patch.object(
+                on_message.bridge,
+                "read_token",
+                return_value="test-token",
+            ), mock.patch.object(
+                on_message.bridge,
+                "api_call",
+                return_value={"message_thread_id": 91},
+            ):
+                on_message.handle_callback(
+                    confirm_update,
+                    confirm_update["callback_query"],
+                )
+        project = self.store.resolve_project("life")
+        self.assertIsNotNone(project)
+        self.assertEqual(project.workspace_root, str(life))
+        self.assertEqual(project.working_directory, str(notes))
+        self.assertIsNone(project.git_repository_root)
+        agent = self.store.resolve_project_agent("life")
+        self.assertIsNotNone(agent)
+        self.assertEqual(agent.workspace_root, str(life))
+        self.assertEqual(agent.working_directory, str(notes))
+        self.assertIsNone(agent.git_repository_root)
 
     def test_lovely_request_resolves_workdir_and_proposes_creation(self):
         user_text = (
@@ -565,6 +649,7 @@ class ConversationalControlTests(unittest.TestCase):
             "provider": "codex",
             "project_path": str(self.lovely),
             "working_directory": real_peter,
+            "git_repository_root": str(self.lovely),
             "topic_name": "Peter App",
             "provider_config": {},
             "provenance": [
@@ -688,7 +773,7 @@ class SchemaFourteenMigrationTests(unittest.TestCase):
                     store.connection.execute(
                         "PRAGMA user_version"
                     ).fetchone()[0],
-                    15,
+                    16,
                 )
                 project = store.resolve_project("legacy")
                 self.assertEqual(project.project_id, "project_legacy")
@@ -697,9 +782,17 @@ class SchemaFourteenMigrationTests(unittest.TestCase):
                     project.working_directory,
                     "/tmp/legacy-repo",
                 )
+                self.assertEqual(
+                    project.git_repository_root,
+                    "/tmp/legacy-repo",
+                )
                 agent = store.resolve_agent("agent_legacy")
                 self.assertEqual(agent.provider_session_id, "session-legacy")
                 self.assertEqual(agent.working_directory, "/tmp/legacy-repo")
+                self.assertEqual(
+                    agent.git_repository_root,
+                    "/tmp/legacy-repo",
+                )
                 self.assertEqual(
                     store.project_alias_resolution(),
                     {"old name": "legacy"},

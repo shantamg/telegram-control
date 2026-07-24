@@ -1133,6 +1133,28 @@ directories to projects and agents, and persists per-turn discovery state;
 schema v15 persists the Telegram mutation boundary and reconciliation state.
 No live Lovely mutation is performed without user confirmation.
 
+## Chunk: workspace agents and full conversational Control
+
+Schema v16 removes the accidental Git-only enrollment rule. The durable
+`project_path` column remains in place for migration compatibility but is now
+the agent's confirmed `workspace_root`; `git_repository_root` is nullable
+metadata. Existing enrolled coding projects are backfilled as Git workspaces,
+while new agents may attach to any existing authorized directory, including a
+notes tree such as `~/life`. The working directory must remain inside that
+workspace after realpath resolution at proposal, confirmation, and every
+launch. The filesystem root is never enrollable, a containing parent
+repository never widens the boundary, and consequential creation still
+requires an authorized one-time confirmation.
+
+Control should feel like an agent, not a command parser. The current persistent
+Codex turn is instructed to answer and reason normally, with the JSON tool
+envelope treated as private controller plumbing. The next refinement replaces
+that envelope with Codex app-server dynamic tools: ordinary assistant text
+becomes the response directly, while validated controller operations are
+offered as callable tools that can be used repeatedly in one turn. Mutations
+continue to create confirmation proposals rather than gaining direct Telegram,
+database, or credential access.
+
 Live steering of running Codex/Claude turns (interrupt and mid-turn input)
 follows this chunk.
 

@@ -506,17 +506,18 @@ a bounded, durable multi-step investigation:
   resumes from recorded history, and step/time/path bounds end a runaway
   investigation with a precise message.
 - Every discovered directory receives a controller-issued opaque ref ID.
-  A creation proposal may identify its repository root and working directory
+  A creation proposal may identify its workspace root and working directory
   only by those refs or by text you yourself wrote; a model-invented path or
   forged ref fails closed, and confirmation payloads carry full
   `{value, source, derived_from}` provenance.
-- Projects now separate `repository_root` from `working_directory`: the
-  agent runs (structured turns and tmux console alike) in the working
-  directory, which must stay inside the Git root through symlink-resolved
-  containment checks enforced at proposal, confirmation, and every launch.
-  Several projects can share one repository with sibling working
-  directories; existing projects migrated with working directory equal to
-  their root, and nothing else — IDs, sessions, topics, aliases — changed.
+- Managed agents attach to an arbitrary existing workspace directory; Git is
+  optional metadata, not an enrollment requirement. The agent runs
+  (structured turns and tmux console alike) in a working directory that must
+  stay inside the confirmed workspace through symlink-resolved containment
+  checks at proposal, confirmation, and every launch. A notes directory such
+  as `~/life` is therefore a valid workspace. If the workspace itself is a Git
+  root, branch and cleanliness metadata remain available without widening the
+  authorized boundary to a containing parent repository.
 - Mutations stay confirmation-gated behind authorized one-time buttons, now
   including agent model/effort configuration changes. So a request like
   “add a project called Lovely, the Peter app subdirectory of the lovely

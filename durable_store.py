@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 CONTROL_SPEAKER = "🎛 Control"
 
@@ -123,6 +123,12 @@ class ManagedAgent:
     lifecycle_state: str
     provider_config: dict[str, Any]
     working_directory: Optional[str] = None
+    git_repository_root: Optional[str] = None
+
+    @property
+    def workspace_root(self) -> Optional[str]:
+        """Application-facing name for the legacy project_path column."""
+        return self.project_path
 
 
 @dataclass(frozen=True)
@@ -161,6 +167,12 @@ class ManagedProject:
     project_path: str
     state: str
     working_directory: str = ""
+    git_repository_root: Optional[str] = None
+
+    @property
+    def workspace_root(self) -> str:
+        """Application-facing name for the legacy project_path column."""
+        return self.project_path
 
 
 @dataclass(frozen=True)
@@ -619,6 +631,35 @@ MIGRATION_15 = (
     """,
 )
 
+MIGRATION_16 = (
+    # Existing coding projects used project_path as their Git root. Keep that
+    # legacy column as the generic workspace boundary and record Git
+    # separately so ordinary note/document directories are equally valid.
+    """
+    ALTER TABLE managed_projects
+    ADD COLUMN git_repository_root TEXT
+    """,
+    """
+    UPDATE managed_projects SET git_repository_root = project_path
+    """,
+    """
+    ALTER TABLE agents
+    ADD COLUMN git_repository_root TEXT
+    """,
+    """
+    UPDATE agents SET git_repository_root = project_path
+    WHERE project_path IS NOT NULL
+    """,
+    # Creation confirmations from schema v15 do not record whether Git was
+    # optional, so they cannot be revalidated under the workspace model.
+    """
+    UPDATE callback_actions
+    SET state = 'expired', updated_at = updated_at
+    WHERE action_type IN ('router_project_confirm', 'router_project_cancel')
+        AND state = 'active'
+    """,
+)
+
 
 ROUTER_INPUT_LIMIT = 8_000
 REPLY_QUOTE_LIMIT = 1_000
@@ -724,23 +765,25 @@ def extract_user_request(input_text: str) -> str:
 
 
 def validate_workspace_paths(
-    repository_root: str,
+    workspace_root: str,
     working_directory: Optional[str] = None,
 ) -> tuple[str, str]:
-    """Resolve and containment-check a repository root and working directory.
+    """Resolve and containment-check a workspace root and working directory.
 
     Both paths are resolved through symlinks to real paths; the working
-    directory must exist and remain inside the resolved repository root, so
+    directory must exist and remain inside the resolved workspace root, so
     a symlink cannot escape it. Returns the resolved (root, workdir) pair.
     Used at proposal, confirmation, and launch time so the checks cannot be
     bypassed by state changing between steps.
     """
-    if not repository_root or not Path(repository_root).is_absolute():
-        raise StoreError("The repository root must be an absolute path.")
-    root_real = Path(os.path.realpath(repository_root))
+    if not workspace_root or not Path(workspace_root).is_absolute():
+        raise StoreError("The workspace root must be an absolute path.")
+    root_real = Path(os.path.realpath(workspace_root))
     if not root_real.is_dir():
-        raise StoreError("The repository root does not exist.")
-    workdir_text = working_directory or repository_root
+        raise StoreError("The workspace root does not exist.")
+    if root_real == Path(root_real.anchor):
+        raise StoreError("The filesystem root cannot be enrolled as a workspace.")
+    workdir_text = working_directory or workspace_root
     if not Path(workdir_text).is_absolute():
         raise StoreError("The working directory must be an absolute path.")
     workdir_real = Path(os.path.realpath(workdir_text))
@@ -751,7 +794,7 @@ def validate_workspace_paths(
         and root_real not in workdir_real.parents
     ):
         raise StoreError(
-            "The working directory must stay inside the repository root."
+            "The working directory must stay inside the workspace root."
         )
     return str(root_real), str(workdir_real)
 
@@ -954,6 +997,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 15
                 self.connection.execute("PRAGMA user_version = 15")
+            if current < 16:
+                for statement in MIGRATION_16:
+                    self.connection.execute(statement)
+                current = 16
+                self.connection.execute("PRAGMA user_version = 16")
             # Referential integrity is audited before the commit so a failed
             # check rolls the whole migration back instead of stranding an
             # upgraded-but-broken database.
@@ -2751,6 +2799,11 @@ class DurableStore:
                 if row["working_directory"] is not None
                 else None
             ),
+            git_repository_root=(
+                str(row["git_repository_root"])
+                if row["git_repository_root"] is not None
+                else None
+            ),
         )
 
     def resolve_agent(self, agent_id: str) -> Optional[ManagedAgent]:
@@ -2781,6 +2834,11 @@ class DurableStore:
                 if row["working_directory"] is not None
                 else row["project_path"]
             ),
+            git_repository_root=(
+                str(row["git_repository_root"])
+                if row["git_repository_root"] is not None
+                else None
+            ),
         )
 
     def enroll_project(
@@ -2790,6 +2848,7 @@ class DurableStore:
         provider: str,
         project_path: str,
         working_directory: Optional[str] = None,
+        git_repository_root: Optional[str] = None,
         now: Optional[float] = None,
     ) -> tuple[ManagedProject, bool]:
         if (
@@ -2811,6 +2870,11 @@ class DurableStore:
         workdir = working_directory or project_path
         if not Path(workdir).is_absolute():
             raise StoreError("Managed working directory must be absolute.")
+        if (
+            git_repository_root is not None
+            and not Path(git_repository_root).is_absolute()
+        ):
+            raise StoreError("Managed Git repository root must be absolute.")
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -2820,13 +2884,22 @@ class DurableStore:
             ).fetchone()
             if existing is not None:
                 project = self._managed_project_from_row(existing)
-                expected = (slug, name, provider, project_path, workdir, "active")
+                expected = (
+                    slug,
+                    name,
+                    provider,
+                    project_path,
+                    workdir,
+                    git_repository_root,
+                    "active",
+                )
                 actual = (
                     project.slug,
                     project.display_name,
                     project.provider,
                     project.project_path,
                     project.working_directory,
+                    project.git_repository_root,
                     project.state,
                 )
                 if actual != expected:
@@ -2858,9 +2931,10 @@ class DurableStore:
                 """
                 INSERT INTO managed_projects(
                     project_id, slug, display_name, provider, project_path,
-                    working_directory, state, created_at, updated_at
+                    working_directory, git_repository_root, state,
+                    created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
                 """,
                 (
                     project_id,
@@ -2869,6 +2943,7 @@ class DurableStore:
                     provider,
                     project_path,
                     workdir,
+                    git_repository_root,
                     timestamp,
                     timestamp,
                 ),
@@ -4049,6 +4124,7 @@ class DurableStore:
                 "provider",
                 "project_path",
                 "working_directory",
+                "git_repository_root",
                 "topic_name",
                 "provider_config",
                 "provenance",
@@ -4576,6 +4652,7 @@ class DurableStore:
                 project.provider,
                 project.project_path,
                 project.working_directory,
+                project.git_repository_root,
                 binding.binding_id,
             )
             actual = (
@@ -4583,6 +4660,7 @@ class DurableStore:
                 agent.provider,
                 agent.project_path,
                 agent.working_directory or agent.project_path,
+                agent.git_repository_root,
                 agent.surface_binding_id,
             )
             if actual != expected:
@@ -4606,6 +4684,7 @@ class DurableStore:
             project_path=project.project_path,
             provider_config=provider_config,
             working_directory=project.working_directory,
+            git_repository_root=project.git_repository_root,
             now=now,
         )
 
@@ -4876,6 +4955,7 @@ class DurableStore:
         project_path: str,
         provider_config: Optional[dict[str, Any]] = None,
         working_directory: Optional[str] = None,
+        git_repository_root: Optional[str] = None,
         now: Optional[float] = None,
     ) -> tuple[ManagedAgent, bool]:
         if (
@@ -4894,6 +4974,11 @@ class DurableStore:
         workdir = working_directory or project_path
         if not Path(workdir).is_absolute():
             raise StoreError("Agent working directory must be absolute.")
+        if (
+            git_repository_root is not None
+            and not Path(git_repository_root).is_absolute()
+        ):
+            raise StoreError("Agent Git repository root must be absolute.")
         normalized_config = validate_provider_config(provider, provider_config)
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
@@ -4927,6 +5012,7 @@ class DurableStore:
                     provider,
                     project_path,
                     workdir,
+                    git_repository_root,
                     binding.binding_id,
                 )
                 actual = (
@@ -4934,6 +5020,7 @@ class DurableStore:
                     existing.provider,
                     existing.project_path,
                     existing.working_directory or existing.project_path,
+                    existing.git_repository_root,
                     existing.surface_binding_id,
                 )
                 if actual != expected:
@@ -4994,11 +5081,12 @@ class DurableStore:
                 INSERT INTO agents(
                     agent_id, parent_agent_id, role, slug,
                     hierarchical_name, provider, project_path,
-                    working_directory, provider_session_id,
+                    working_directory, git_repository_root,
+                    provider_session_id,
                     surface_binding_id, lifecycle_state,
                     provider_config_json, created_at, updated_at
                 )
-                VALUES (?, ?, 'project', ?, ?, ?, ?, ?, NULL, ?,
+                VALUES (?, ?, 'project', ?, ?, ?, ?, ?, ?, NULL, ?,
                     'registered', ?, ?, ?)
                 """,
                 (
@@ -5009,6 +5097,7 @@ class DurableStore:
                     provider,
                     project_path,
                     workdir,
+                    git_repository_root,
                     binding.binding_id,
                     json.dumps(
                         normalized_config,

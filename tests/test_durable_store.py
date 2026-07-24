@@ -31,6 +31,7 @@ from durable_store import (
     DurableStore,
     IncompatibleSchemaError,
     LeaseLostError,
+    SCHEMA_VERSION,
     StoreError,
 )
 
@@ -150,7 +151,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            15,
+            SCHEMA_VERSION,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -2384,7 +2385,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    15,
+                    SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2408,7 +2409,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    15,
+                    SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2433,7 +2434,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    15,
+                    SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2457,7 +2458,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    15,
+                    SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2483,7 +2484,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    15,
+                    SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2514,7 +2515,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    15,
+                    SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2546,7 +2547,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    15,
+                    SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2579,7 +2580,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    15,
+                    SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2613,7 +2614,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    15,
+                    SCHEMA_VERSION,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2648,7 +2649,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    15,
+                    SCHEMA_VERSION,
                 )
                 columns = {
                     str(row["name"])
@@ -3023,6 +3024,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     display_name="Telegram Control",
                     provider="codex",
                     project_path="/secret/local/path",
+                    git_repository_root="/secret/local/path",
                     now=99,
                 )
                 store.ensure_surface_binding(
@@ -3639,6 +3641,7 @@ class DurableIntegrationTests(unittest.TestCase):
                         "provider": "codex",
                         "project_path": real_root,
                         "working_directory": real_root,
+                        "git_repository_root": real_root,
                         "topic_name": "Sample Project",
                         "provider_config": {
                             "model": "gpt-5.6-sol",

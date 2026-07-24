@@ -13,8 +13,9 @@ from durable_store import DurableStore, StoreError
 class TmuxConsoleTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
-        # A real, isolated Git repository: console launch revalidates the
-        # stored canonical paths and the exact Git root.
+        # An isolated workspace. Git happens to be present, but registration
+        # deliberately records no Git metadata so console launch exercises
+        # the optional-Git workspace path.
         created = Path(self.temporary_directory.name) / "project"
         created.mkdir()
         subprocess.run(
@@ -53,8 +54,12 @@ class TmuxConsoleTests(unittest.TestCase):
 
     @mock.patch.object(
         tmux_console.discovery,
-        "validate_repository_workspace",
-        side_effect=lambda root, workdir=None: (root, workdir or root),
+        "validate_agent_workspace",
+        side_effect=lambda root, workdir=None, git_root=None: (
+            root,
+            workdir or root,
+            git_root,
+        ),
     )
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=False)
     @mock.patch.object(tmux_console, "codex_binary", return_value="/bin/codex")
@@ -79,11 +84,20 @@ class TmuxConsoleTests(unittest.TestCase):
         self.assertIn("--sandbox", command)
         self.assertIn("workspace-write", command)
         self.assertEqual(command[-1], self.session_id)
+        _validate.assert_called_once_with(
+            str(self.project_path),
+            str(self.project_path),
+            None,
+        )
 
     @mock.patch.object(
         tmux_console.discovery,
-        "validate_repository_workspace",
-        side_effect=lambda root, workdir=None: (root, workdir or root),
+        "validate_agent_workspace",
+        side_effect=lambda root, workdir=None, git_root=None: (
+            root,
+            workdir or root,
+            git_root,
+        ),
     )
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=False)
     @mock.patch.object(tmux_console, "codex_binary", return_value="/bin/codex")
@@ -109,8 +123,12 @@ class TmuxConsoleTests(unittest.TestCase):
 
     @mock.patch.object(
         tmux_console.discovery,
-        "validate_repository_workspace",
-        side_effect=lambda root, workdir=None: (root, workdir or root),
+        "validate_agent_workspace",
+        side_effect=lambda root, workdir=None, git_root=None: (
+            root,
+            workdir or root,
+            git_root,
+        ),
     )
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=False)
     @mock.patch.object(tmux_console, "claude_binary", return_value="/bin/claude")

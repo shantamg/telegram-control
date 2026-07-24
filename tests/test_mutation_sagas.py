@@ -60,6 +60,7 @@ class TelegramMutationSagaTests(unittest.TestCase):
                     "provider": "codex",
                     "project_path": str(self.root),
                     "working_directory": str(self.root),
+                    "git_repository_root": str(self.root),
                     "topic_name": "Sample Project",
                     "provider_config": {
                         "model": "gpt-5.6-sol",

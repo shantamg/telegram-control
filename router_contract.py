@@ -64,8 +64,8 @@ DISCOVERY_TOOLS = (
         "name": "inspect_directory",
         "description": (
             "Read-only: inspect one directory (by ref ID or absolute path "
-            "inside authorized locations): existence, Git root, and "
-            "subdirectories."
+            "inside authorized locations): existence, optional Git metadata, "
+            "and subdirectories."
         ),
         "arguments": {"path": "string (ref ID or absolute path)"},
         "confirmation": False,
@@ -75,21 +75,21 @@ DISCOVERY_TOOLS = (
 CONTROLLER_TOOLS = (
     {
         "name": "list_projects",
-        "description": "List enrolled projects and active managed agents.",
+        "description": "List enrolled workspaces and active managed agents.",
         "arguments": {},
         "confirmation": False,
     },
     {
         "name": "inspect_project",
         "description": (
-            "Inspect an enrolled slug or a user-supplied local path read-only."
+            "Inspect an enrolled workspace or user-supplied local path read-only."
         ),
         "arguments": {"project": "string"},
         "confirmation": False,
     },
     {
         "name": "send_to_agent",
-        "description": "Send work to an existing managed project agent.",
+        "description": "Send work to an existing managed workspace agent.",
         "arguments": {"project_slug": "string", "message": "string"},
         "confirmation": False,
     },
@@ -102,10 +102,12 @@ CONTROLLER_TOOLS = (
     {
         "name": "create_project_agent",
         "description": (
-            "Propose enrolling a project and creating its agent/topic. "
-            "Identify the repository by enrolled slug, a discovery ref ID, "
+            "Propose enrolling a workspace and creating its agent/topic. "
+            "The workspace may be a code repository, notes directory, or any "
+            "other existing authorized directory; Git is optional. Identify "
+            "the workspace by enrolled slug, a discovery ref ID, "
             "or text the user wrote; optionally give a working_directory "
-            "(ref ID or path inside the repository) when the agent should "
+            "(ref ID or path inside the workspace) when the agent should "
             "run in a subdirectory."
         ),
         "arguments": {
@@ -211,20 +213,26 @@ def build_main_agent_prompt(
         else ""
     )
     return (
-        "You are Control, the main Telegram Control agent. Decide the next "
-        "tool to use. Return exactly one JSON object with keys tool and "
-        "arguments, with no markdown or commentary.\n\n"
+        "You are Control, a capable persistent conversational agent and the "
+        "coordinator for Telegram workspace agents. Reason normally, answer "
+        "questions, help plan work, and use controller tools only when they "
+        "are actually useful. The JSON envelope is merely the private wire "
+        "format between you and the controller; it is not a menu the user "
+        "must understand and must not make your replies feel like commands. "
+        "For ordinary conversation or advice, use respond with a complete, "
+        "useful natural-language answer. Return exactly one JSON object with "
+        "keys tool and arguments, with no markdown outside that object.\n\n"
         "You may investigate before acting: call the read-only discovery "
         "tools (find_directory, inspect_directory) as many times as needed; "
         "after each call the controller replies with a message beginning "
         "'Discovery result'. Discovered directories carry controller-issued "
         "ref IDs like loc_1a2b3c4d. When you finally propose "
-        "create_project_agent, identify the repository and any working "
+        "create_project_agent, identify the workspace and any working "
         "directory ONLY by an enrolled slug, a discovery ref ID, or text the "
         "user themselves wrote — an invented path is rejected. Discovery is "
         "bounded; if a reference stays ambiguous, use ask_user with the "
         "concrete candidates instead of guessing.\n\n"
-        "Every request must end with exactly one terminal tool: respond, "
+        "After any needed investigation, end with exactly one terminal tool: respond, "
         "ask_user, send_to_agent, list_projects, inspect_project, or a "
         "confirmation-gated mutation (create_project_agent, rename_topic, "
         "configure_agent, set_project_alias, remove_project_alias). The "
@@ -232,6 +240,9 @@ def build_main_agent_prompt(
         "confirmation for consequential tools. Never invent a tool, project, "
         "path, or completed result, and never claim an action happened "
         "unless the controller reported it.\n\n"
+        "Do not reduce broad requests to the tool catalog. You may discuss "
+        "anything the user asks; the catalog only describes controller-side "
+        "operations. Workspaces do not need to be Git repositories.\n\n"
         f"{reply_context_rule}"
         "When a user names an alias, return the canonical project slug shown "
         "in the catalog. Preserve explicit provider, model, and effort choices. "
