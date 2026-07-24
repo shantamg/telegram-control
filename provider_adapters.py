@@ -4,19 +4,38 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+import queue
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
+import time
+import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Optional, Protocol
+from typing import Any, Callable, Iterable, Literal, Optional, Protocol
 
 from durable_store import ManagedAgent, StoreError
 
 
 class ProviderAdapterError(StoreError):
     """Raised when a provider cannot complete a normalized turn."""
+
+
+class ProviderTurnCancelled(ProviderAdapterError):
+    """Raised after a running provider turn has been cancelled."""
+
+
+@dataclass(frozen=True)
+class ProviderControl:
+    """One durable live-control request for the currently running turn."""
+
+    control_id: int
+    kind: Literal["steer", "cancel"]
+    text: str = ""
+    expected_turn_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -46,8 +65,163 @@ class ProviderAdapter(Protocol):
         mailbox_session_id: Optional[str],
         on_session: Callable[[str], None],
         heartbeat: Callable[[], None],
+        on_progress: Optional[Callable[[str, str], None]] = None,
+        poll_control: Optional[Callable[[], Optional[ProviderControl]]] = None,
+        on_control: Optional[
+            Callable[[ProviderControl, Literal["applied", "rejected"], str], None]
+        ] = None,
     ) -> ProviderTurnResult:
         ...
+
+
+_END_OF_STREAM = object()
+_NO_LINE = object()
+
+
+def _validate_control(control: Any) -> ProviderControl:
+    if not isinstance(control, ProviderControl):
+        raise ProviderAdapterError("Provider control callback returned an invalid value.")
+    if type(control.control_id) is not int or control.control_id <= 0:
+        raise ProviderAdapterError("Provider control ID must be a positive integer.")
+    if control.kind not in {"steer", "cancel"}:
+        raise ProviderAdapterError("Provider control kind is invalid.")
+    if control.kind == "steer" and not control.text.strip():
+        raise ProviderAdapterError("A steer control requires non-empty text.")
+    if control.expected_turn_id is not None and not control.expected_turn_id:
+        raise ProviderAdapterError("Expected provider turn ID cannot be empty.")
+    return control
+
+
+def _emit_progress(
+    callback: Optional[Callable[[str, str], None]],
+    stage: str,
+    detail: str,
+) -> None:
+    """Emit only adapter-authored, path/prompt-free progress descriptions."""
+
+    if callback is not None:
+        callback(stage, detail)
+
+
+def _emit_control(
+    callback: Optional[
+        Callable[[ProviderControl, Literal["applied", "rejected"], str], None]
+    ],
+    control: ProviderControl,
+    outcome: Literal["applied", "rejected"],
+    detail: str,
+) -> None:
+    if callback is not None:
+        callback(control, outcome, detail)
+
+
+def _start_line_reader(stream: Any) -> "queue.Queue[Any]":
+    lines: "queue.Queue[Any]" = queue.Queue()
+
+    def read_lines() -> None:
+        try:
+            for line in stream:
+                lines.put(line)
+        except BaseException as exc:
+            lines.put(exc)
+        finally:
+            lines.put(_END_OF_STREAM)
+
+    thread = threading.Thread(target=read_lines, daemon=True)
+    thread.start()
+    return lines
+
+
+def _write_json_line(process: Any, payload: dict[str, Any]) -> None:
+    if process.stdin is None:
+        raise ProviderAdapterError("Provider input stream is unavailable.")
+    try:
+        process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+    except (BrokenPipeError, OSError, ValueError) as exc:
+        raise ProviderAdapterError("Provider input stream closed unexpectedly.") from exc
+
+
+def _read_json_line(
+    lines: "queue.Queue[Any]",
+    timeout_seconds: float,
+) -> Any:
+    try:
+        item = lines.get(timeout=max(0.0, timeout_seconds))
+    except queue.Empty:
+        return _NO_LINE
+    if item is _END_OF_STREAM:
+        return _END_OF_STREAM
+    if isinstance(item, BaseException):
+        raise ProviderAdapterError("Provider output stream failed.") from item
+    try:
+        value = json.loads(str(item))
+    except json.JSONDecodeError:
+        raise ProviderAdapterError("Provider emitted invalid JSONL output.") from None
+    if not isinstance(value, dict):
+        raise ProviderAdapterError("Provider emitted an invalid event.")
+    return value
+
+
+def _terminate_process_group(process: Any, grace_seconds: float = 2.0) -> None:
+    """Terminate the process group created for one adapter invocation."""
+
+    if process.poll() is not None:
+        return
+    signalled = False
+    pid = getattr(process, "pid", None)
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            signalled = True
+        except (OSError, ProcessLookupError):
+            pass
+    if not signalled:
+        try:
+            process.terminate()
+        except (AttributeError, OSError, ProcessLookupError):
+            pass
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except (subprocess.TimeoutExpired, TimeoutError):
+        pass
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            try:
+                process.kill()
+            except (AttributeError, OSError, ProcessLookupError):
+                pass
+    else:
+        try:
+            process.kill()
+        except (AttributeError, OSError, ProcessLookupError):
+            pass
+    try:
+        process.wait(timeout=grace_seconds)
+    except (subprocess.TimeoutExpired, TimeoutError):
+        pass
+
+
+def _finish_process(process: Any) -> None:
+    if process.stdin is not None and not getattr(process.stdin, "closed", False):
+        try:
+            process.stdin.close()
+        except (OSError, ValueError):
+            pass
+    if process.poll() is None:
+        try:
+            process.wait(timeout=2.0)
+        except (subprocess.TimeoutExpired, TimeoutError):
+            _terminate_process_group(process)
+
+
+def _safe_rpc_error_detail(provider: str, action: str, error: Any) -> str:
+    code = error.get("code") if isinstance(error, dict) else None
+    suffix = f" (code {code})" if isinstance(code, int) else ""
+    return f"{provider} rejected {action}{suffix}."
 
 
 def consume_codex_events(
@@ -161,9 +335,16 @@ def consume_claude_events(
 
 
 class CodexExecAdapter:
-    """Structured local Codex adapter using the stable JSONL exec surface."""
+    """Codex app-server adapter with native same-turn steering and interrupt."""
 
-    def __init__(self, binary: Optional[str] = None, timeout_seconds: int = 90 * 60):
+    def __init__(
+        self,
+        binary: Optional[str] = None,
+        timeout_seconds: int = 90 * 60,
+        poll_interval_seconds: float = 1.0,
+        control_timeout_seconds: float = 30.0,
+        _popen_factory: Callable[..., Any] = subprocess.Popen,
+    ):
         self.binary = binary or shutil.which("codex")
         if not self.binary:
             for candidate in (
@@ -176,15 +357,114 @@ class CodexExecAdapter:
         if not self.binary:
             raise ProviderAdapterError("Codex CLI is not installed.")
         self.timeout_seconds = int(timeout_seconds)
+        self.poll_interval_seconds = max(0.01, float(poll_interval_seconds))
+        self.control_timeout_seconds = max(0.01, float(control_timeout_seconds))
+        self._popen_factory = _popen_factory
 
     def capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
             streaming=True,
             resume=True,
-            interrupt=False,
+            interrupt=True,
             structured_events=True,
             interactive_console=True,
         )
+
+    @staticmethod
+    def _thread_request(
+        persisted_session: Optional[str],
+        launch_directory: str,
+        model: Optional[Any],
+        sandbox: str,
+    ) -> tuple[str, dict[str, Any]]:
+        params: dict[str, Any] = {
+            "cwd": launch_directory,
+            "sandbox": sandbox,
+            "approvalPolicy": "never",
+        }
+        if model:
+            params["model"] = str(model)
+        if persisted_session:
+            params["threadId"] = persisted_session
+            return "thread/resume", params
+        return "thread/start", params
+
+    @staticmethod
+    def _turn_request(
+        thread_id: str,
+        prompt: str,
+        launch_directory: str,
+        model: Optional[Any],
+        effort: Optional[Any],
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+            "cwd": launch_directory,
+        }
+        if model:
+            params["model"] = str(model)
+        if effort:
+            params["effort"] = str(effort)
+        return params
+
+    @staticmethod
+    def _normalize_usage(payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        last = payload.get("last")
+        if not isinstance(last, dict):
+            return {}
+        return {
+            "input_tokens": int(last.get("inputTokens", 0)),
+            "cached_input_tokens": int(last.get("cachedInputTokens", 0)),
+            "output_tokens": int(last.get("outputTokens", 0)),
+            "reasoning_output_tokens": int(
+                last.get("reasoningOutputTokens", 0)
+            ),
+            "total_tokens": int(last.get("totalTokens", 0)),
+        }
+
+    def _wait_for_rpc(
+        self,
+        process: Any,
+        lines: "queue.Queue[Any]",
+        request_id: int,
+        deadline: float,
+        heartbeat: Callable[[], None],
+    ) -> dict[str, Any]:
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                raise ProviderAdapterError("Codex app-server request timed out.")
+            heartbeat()
+            message = _read_json_line(
+                lines,
+                min(self.poll_interval_seconds, deadline - now),
+            )
+            if message is _NO_LINE:
+                continue
+            if message is _END_OF_STREAM:
+                raise ProviderAdapterError("Codex app-server exited unexpectedly.")
+            if message.get("id") != request_id:
+                if "method" in message and "id" in message:
+                    raise ProviderAdapterError(
+                        "Codex requested unsupported interactive input."
+                    )
+                continue
+            if "error" in message:
+                detail = _safe_rpc_error_detail(
+                    "Codex",
+                    "app-server request",
+                    message.get("error"),
+                )
+                raise ProviderAdapterError(detail)
+            result = message.get("result")
+            if not isinstance(result, dict):
+                raise ProviderAdapterError(
+                    "Codex app-server returned an invalid response."
+                )
+            return result
 
     def run_turn(
         self,
@@ -193,6 +473,11 @@ class CodexExecAdapter:
         mailbox_session_id: Optional[str],
         on_session: Callable[[str], None],
         heartbeat: Callable[[], None],
+        on_progress: Optional[Callable[[str, str], None]] = None,
+        poll_control: Optional[Callable[[], Optional[ProviderControl]]] = None,
+        on_control: Optional[
+            Callable[[ProviderControl, Literal["applied", "rejected"], str], None]
+        ] = None,
     ) -> ProviderTurnResult:
         if not agent.project_path:
             raise ProviderAdapterError("Codex agent has no project path.")
@@ -202,41 +487,6 @@ class CodexExecAdapter:
         sandbox = str(agent.provider_config.get("sandbox", "workspace-write"))
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
-        if persisted_session:
-            command = [
-                self.binary,
-                "exec",
-                "--sandbox",
-                sandbox,
-                "resume",
-                "--json",
-            ]
-            if model:
-                command.extend(["--model", str(model)])
-            if effort:
-                command.extend(
-                    ["--config", f'model_reasoning_effort="{effort}"']
-                )
-            command.extend([persisted_session, "-"])
-        else:
-            command = [
-                self.binary,
-                "exec",
-                "--json",
-                "--color",
-                "never",
-                "--sandbox",
-                sandbox,
-                "--cd",
-                launch_directory,
-            ]
-            if model:
-                command.extend(["--model", str(model)])
-            if effort:
-                command.extend(
-                    ["--config", f'model_reasoning_effort="{effort}"']
-                )
-            command.append("-")
         effective_prompt = prompt
         if recovery:
             effective_prompt = (
@@ -247,70 +497,439 @@ class CodexExecAdapter:
                 f"Original request:\n{prompt}"
             )
 
-        events: list[dict[str, Any]] = []
-        timed_out = threading.Event()
+        deadline = time.monotonic() + self.timeout_seconds
+        command = [self.binary, "app-server", "--stdio"]
+        _emit_progress(on_progress, "starting", "Starting Codex.")
         with tempfile.TemporaryFile(mode="w+t") as stderr_file:
-            process = subprocess.Popen(
+            process = self._popen_factory(
                 command,
                 cwd=launch_directory,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,
                 text=True,
+                bufsize=1,
+                start_new_session=True,
             )
-
-            def kill_on_timeout() -> None:
-                timed_out.set()
-                if process.poll() is None:
-                    process.kill()
-
-            timer = threading.Timer(self.timeout_seconds, kill_on_timeout)
-            timer.daemon = True
-            timer.start()
             try:
-                assert process.stdin is not None
-                process.stdin.write(effective_prompt)
-                process.stdin.close()
-                assert process.stdout is not None
-                for line in process.stdout:
+                if process.stdout is None:
+                    raise ProviderAdapterError(
+                        "Codex app-server output stream is unavailable."
+                    )
+                lines = _start_line_reader(process.stdout)
+                request_id = 1
+                _write_json_line(
+                    process,
+                    {
+                        "id": request_id,
+                        "method": "initialize",
+                        "params": {
+                            "clientInfo": {
+                                "name": "telegram-control",
+                                "title": "Telegram Control",
+                                "version": "1",
+                            }
+                        },
+                    },
+                )
+                self._wait_for_rpc(
+                    process,
+                    lines,
+                    request_id,
+                    deadline,
+                    heartbeat,
+                )
+                _write_json_line(process, {"method": "initialized"})
+
+                request_id += 1
+                thread_method, thread_params = self._thread_request(
+                    persisted_session,
+                    launch_directory,
+                    model,
+                    sandbox,
+                )
+                _write_json_line(
+                    process,
+                    {
+                        "id": request_id,
+                        "method": thread_method,
+                        "params": thread_params,
+                    },
+                )
+                thread_result = self._wait_for_rpc(
+                    process,
+                    lines,
+                    request_id,
+                    deadline,
+                    heartbeat,
+                )
+                thread = thread_result.get("thread")
+                thread_id = (
+                    str(thread.get("id", ""))
+                    if isinstance(thread, dict)
+                    else ""
+                )
+                if not thread_id:
+                    raise ProviderAdapterError(
+                        "Codex app-server returned an empty thread ID."
+                    )
+                if persisted_session is not None and thread_id != persisted_session:
+                    raise ProviderAdapterError(
+                        "Codex changed the persisted thread ID."
+                    )
+                on_session(thread_id)
+                _emit_progress(on_progress, "session_ready", thread_id)
+
+                request_id += 1
+                _write_json_line(
+                    process,
+                    {
+                        "id": request_id,
+                        "method": "turn/start",
+                        "params": self._turn_request(
+                            thread_id,
+                            effective_prompt,
+                            launch_directory,
+                            model,
+                            effort,
+                        ),
+                    },
+                )
+                turn_result = self._wait_for_rpc(
+                    process,
+                    lines,
+                    request_id,
+                    deadline,
+                    heartbeat,
+                )
+                turn = turn_result.get("turn")
+                turn_id = (
+                    str(turn.get("id", ""))
+                    if isinstance(turn, dict)
+                    else ""
+                )
+                if not turn_id:
+                    raise ProviderAdapterError(
+                        "Codex app-server returned an empty turn ID."
+                    )
+                _emit_progress(on_progress, "turn_started", turn_id)
+
+                final_text = ""
+                usage: dict[str, Any] = {}
+                completed = False
+                pending: Optional[
+                    tuple[int, ProviderControl, float]
+                ] = None
+                while not completed:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        raise ProviderAdapterError("Codex turn timed out.")
                     heartbeat()
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        raise ProviderAdapterError(
-                            "Codex emitted invalid JSONL output."
-                        ) from None
-                    if not isinstance(event, dict):
-                        raise ProviderAdapterError(
-                            "Codex emitted an invalid event."
+
+                    if pending is None and poll_control is not None:
+                        candidate = poll_control()
+                        if candidate is not None:
+                            control = _validate_control(candidate)
+                            if (
+                                control.expected_turn_id is not None
+                                and control.expected_turn_id != turn_id
+                            ):
+                                _emit_control(
+                                    on_control,
+                                    control,
+                                    "rejected",
+                                    "Control targeted a stale provider turn.",
+                                )
+                            else:
+                                request_id += 1
+                                if control.kind == "steer":
+                                    method = "turn/steer"
+                                    params = {
+                                        "threadId": thread_id,
+                                        "expectedTurnId": turn_id,
+                                        "input": [
+                                            {
+                                                "type": "text",
+                                                "text": control.text,
+                                            }
+                                        ],
+                                    }
+                                    progress_stage = "steering"
+                                    progress_detail = (
+                                        "Sending guidance to the active Codex turn."
+                                    )
+                                else:
+                                    method = "turn/interrupt"
+                                    params = {
+                                        "threadId": thread_id,
+                                        "turnId": turn_id,
+                                    }
+                                    progress_stage = "cancelling"
+                                    progress_detail = (
+                                        "Interrupting the active Codex turn."
+                                    )
+                                _emit_progress(
+                                    on_progress,
+                                    progress_stage,
+                                    progress_detail,
+                                )
+                                _write_json_line(
+                                    process,
+                                    {
+                                        "id": request_id,
+                                        "method": method,
+                                        "params": params,
+                                    },
+                                )
+                                pending = (
+                                    request_id,
+                                    control,
+                                    now + self.control_timeout_seconds,
+                                )
+
+                    if pending is not None and now >= pending[2]:
+                        _pending_id, control, _pending_deadline = pending
+                        if control.kind == "cancel":
+                            _terminate_process_group(process)
+                            _emit_control(
+                                on_control,
+                                control,
+                                "applied",
+                                "Codex did not acknowledge interrupt; "
+                                "its local process group was terminated.",
+                            )
+                            raise ProviderTurnCancelled(
+                                "Codex turn was cancelled by local fallback."
+                            )
+                        _emit_control(
+                            on_control,
+                            control,
+                            "rejected",
+                            "Codex did not acknowledge steering before timeout.",
                         )
-                    events.append(event)
-                    if event.get("type") == "thread.started":
-                        session_id = str(event.get("thread_id", ""))
-                        if session_id:
-                            on_session(session_id)
-                return_code = process.wait()
+                        pending = None
+
+                    wait_for = min(self.poll_interval_seconds, deadline - now)
+                    if pending is not None:
+                        wait_for = min(wait_for, max(0.0, pending[2] - now))
+                    message = _read_json_line(lines, wait_for)
+                    if message is _NO_LINE:
+                        continue
+                    if message is _END_OF_STREAM:
+                        if pending is not None and pending[1].kind == "cancel":
+                            control = pending[1]
+                            _emit_control(
+                                on_control,
+                                control,
+                                "applied",
+                                "Codex exited while processing the interrupt.",
+                            )
+                            raise ProviderTurnCancelled(
+                                "Codex turn was cancelled."
+                            )
+                        raise ProviderAdapterError(
+                            "Codex app-server exited before turn completion."
+                        )
+
+                    if "id" in message and "method" in message:
+                        raise ProviderAdapterError(
+                            "Codex requested unsupported interactive input."
+                        )
+                    if "id" in message:
+                        if pending is None or message.get("id") != pending[0]:
+                            continue
+                        control = pending[1]
+                        if "error" in message:
+                            _emit_control(
+                                on_control,
+                                control,
+                                "rejected",
+                                _safe_rpc_error_detail(
+                                    "Codex",
+                                    control.kind,
+                                    message.get("error"),
+                                ),
+                            )
+                            pending = None
+                            continue
+                        result = message.get("result")
+                        if not isinstance(result, dict):
+                            _emit_control(
+                                on_control,
+                                control,
+                                "rejected",
+                                "Codex returned an invalid control response.",
+                            )
+                            pending = None
+                            continue
+                        if control.kind == "steer":
+                            returned_turn = str(result.get("turnId", ""))
+                            if returned_turn != turn_id:
+                                _emit_control(
+                                    on_control,
+                                    control,
+                                    "rejected",
+                                    "Codex acknowledged a different provider turn.",
+                                )
+                                pending = None
+                                continue
+                            _emit_control(
+                                on_control,
+                                control,
+                                "applied",
+                                "Guidance was accepted by the active Codex turn.",
+                            )
+                            _emit_progress(
+                                on_progress,
+                                "working",
+                                "Codex is continuing with the new guidance.",
+                            )
+                            pending = None
+                            continue
+                        _emit_control(
+                            on_control,
+                            control,
+                            "applied",
+                            "Codex acknowledged the interrupt.",
+                        )
+                        raise ProviderTurnCancelled("Codex turn was cancelled.")
+
+                    method = str(message.get("method", ""))
+                    params = message.get("params")
+                    if not isinstance(params, dict):
+                        continue
+                    if method == "item/agentMessage/delta":
+                        if (
+                            params.get("threadId") == thread_id
+                            and params.get("turnId") == turn_id
+                        ):
+                            _emit_progress(
+                                on_progress,
+                                "responding",
+                                "Codex is preparing its response.",
+                            )
+                    elif method == "item/started":
+                        if (
+                            params.get("threadId") == thread_id
+                            and params.get("turnId") == turn_id
+                        ):
+                            item = params.get("item")
+                            item_type = (
+                                str(item.get("type", "work"))
+                                if isinstance(item, dict)
+                                else "work"
+                            )
+                            safe_types = {
+                                "commandExecution": "Running a project operation.",
+                                "fileChange": "Preparing a project change.",
+                                "reasoning": "Reasoning about the request.",
+                                "webSearch": "Looking up requested information.",
+                                "mcpToolCall": "Using an approved tool.",
+                                "collabAgentToolCall": "Coordinating agent work.",
+                            }
+                            _emit_progress(
+                                on_progress,
+                                "working",
+                                safe_types.get(item_type, "Codex is working."),
+                            )
+                    elif method == "item/completed":
+                        if (
+                            params.get("threadId") == thread_id
+                            and params.get("turnId") == turn_id
+                        ):
+                            item = params.get("item")
+                            if (
+                                isinstance(item, dict)
+                                and item.get("type") == "agentMessage"
+                            ):
+                                text = str(item.get("text", "")).strip()
+                                if text:
+                                    final_text = text
+                    elif method == "thread/tokenUsage/updated":
+                        if (
+                            params.get("threadId") == thread_id
+                            and params.get("turnId") == turn_id
+                        ):
+                            usage = self._normalize_usage(
+                                params.get("tokenUsage")
+                            )
+                    elif method == "error":
+                        if (
+                            params.get("threadId") == thread_id
+                            and params.get("turnId") == turn_id
+                            and not bool(params.get("willRetry"))
+                        ):
+                            error = params.get("error")
+                            message_text = (
+                                str(error.get("message", ""))
+                                if isinstance(error, dict)
+                                else ""
+                            )
+                            raise ProviderAdapterError(
+                                message_text or "Codex turn failed."
+                            )
+                    elif method == "turn/completed":
+                        completed_turn = params.get("turn")
+                        if (
+                            params.get("threadId") != thread_id
+                            or not isinstance(completed_turn, dict)
+                            or completed_turn.get("id") != turn_id
+                        ):
+                            continue
+                        status = str(completed_turn.get("status", ""))
+                        if pending is not None:
+                            control = pending[1]
+                            if control.kind == "cancel" and status == "interrupted":
+                                _emit_control(
+                                    on_control,
+                                    control,
+                                    "applied",
+                                    "Codex reported the turn interrupted.",
+                                )
+                                raise ProviderTurnCancelled(
+                                    "Codex turn was cancelled."
+                                )
+                            _emit_control(
+                                on_control,
+                                control,
+                                "rejected",
+                                "The Codex turn completed before control "
+                                "acknowledgment.",
+                            )
+                            pending = None
+                        if status == "interrupted":
+                            raise ProviderTurnCancelled(
+                                "Codex turn was interrupted."
+                            )
+                        if status != "completed":
+                            error = completed_turn.get("error")
+                            detail = (
+                                str(error.get("message", ""))
+                                if isinstance(error, dict)
+                                else ""
+                            )
+                            raise ProviderAdapterError(
+                                detail or "Codex turn failed."
+                            )
+                        completed = True
+
+                if not final_text:
+                    raise ProviderAdapterError(
+                        "Codex completed without a final agent message."
+                    )
+                _emit_progress(on_progress, "completed", "Codex turn completed.")
+                result = ProviderTurnResult(
+                    provider_session_id=thread_id,
+                    final_text=final_text,
+                    usage=usage,
+                )
             finally:
-                timer.cancel()
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
-            stderr_file.seek(0)
-            stderr = stderr_file.read().strip()
-        if timed_out.is_set():
-            raise ProviderAdapterError("Codex turn timed out.")
-        if return_code != 0:
-            raise ProviderAdapterError(
-                stderr[-2000:] or f"Codex exited with status {return_code}."
-            )
-        return consume_codex_events(
-            events,
-            existing_session_id=persisted_session,
-        )
+                _finish_process(process)
+        return result
 
 
 class ClaudePrintAdapter:
-    """Structured local Claude adapter using persistent stream-JSON sessions."""
+    """Bidirectional Claude stream-JSON adapter with SDK live control."""
 
     PERMISSION_MODES = {
         "acceptEdits",
@@ -320,7 +939,14 @@ class ClaudePrintAdapter:
         "plan",
     }
 
-    def __init__(self, binary: Optional[str] = None, timeout_seconds: int = 90 * 60):
+    def __init__(
+        self,
+        binary: Optional[str] = None,
+        timeout_seconds: int = 90 * 60,
+        poll_interval_seconds: float = 1.0,
+        control_timeout_seconds: float = 30.0,
+        _popen_factory: Callable[..., Any] = subprocess.Popen,
+    ):
         self.binary = binary or shutil.which("claude")
         if not self.binary:
             for candidate in (
@@ -334,12 +960,15 @@ class ClaudePrintAdapter:
         if not self.binary:
             raise ProviderAdapterError("Claude Code CLI is not installed.")
         self.timeout_seconds = int(timeout_seconds)
+        self.poll_interval_seconds = max(0.01, float(poll_interval_seconds))
+        self.control_timeout_seconds = max(0.01, float(control_timeout_seconds))
+        self._popen_factory = _popen_factory
 
     def capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
             streaming=True,
             resume=True,
-            interrupt=False,
+            interrupt=True,
             structured_events=True,
             interactive_console=True,
         )
@@ -348,6 +977,7 @@ class ClaudePrintAdapter:
         self,
         agent: ManagedAgent,
         persisted_session: Optional[str],
+        fresh_session_id: Optional[str] = None,
     ) -> list[str]:
         permission_mode = str(
             agent.provider_config.get("permission_mode", "bypassPermissions")
@@ -359,6 +989,9 @@ class ClaudePrintAdapter:
             "--print",
             "--output-format",
             "stream-json",
+            "--input-format",
+            "stream-json",
+            "--replay-user-messages",
             "--verbose",
             "--permission-mode",
             permission_mode,
@@ -371,7 +1004,58 @@ class ClaudePrintAdapter:
             command.extend(["--effort", str(effort)])
         if persisted_session:
             command.extend(["--resume", persisted_session])
+        elif fresh_session_id:
+            command.extend(["--session-id", fresh_session_id])
         return command
+
+    @staticmethod
+    def _user_message(
+        text: str,
+        session_id: str,
+        message_id: str,
+    ) -> dict[str, Any]:
+        return {
+            "type": "user",
+            "uuid": message_id,
+            "message": {"role": "user", "content": text},
+            "parent_tool_use_id": None,
+            "session_id": session_id,
+        }
+
+    def _wait_for_control_response(
+        self,
+        lines: "queue.Queue[Any]",
+        request_id: str,
+        deadline: float,
+        heartbeat: Callable[[], None],
+    ) -> dict[str, Any]:
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                raise ProviderAdapterError("Claude control request timed out.")
+            heartbeat()
+            message = _read_json_line(
+                lines,
+                min(self.poll_interval_seconds, deadline - now),
+            )
+            if message is _NO_LINE:
+                continue
+            if message is _END_OF_STREAM:
+                raise ProviderAdapterError("Claude exited during initialization.")
+            if message.get("type") != "control_response":
+                continue
+            response = message.get("response")
+            if (
+                not isinstance(response, dict)
+                or response.get("request_id") != request_id
+            ):
+                continue
+            if response.get("subtype") == "error":
+                raise ProviderAdapterError(
+                    "Claude rejected the SDK initialization request."
+                )
+            result = response.get("response")
+            return result if isinstance(result, dict) else {}
 
     def run_turn(
         self,
@@ -380,13 +1064,19 @@ class ClaudePrintAdapter:
         mailbox_session_id: Optional[str],
         on_session: Callable[[str], None],
         heartbeat: Callable[[], None],
+        on_progress: Optional[Callable[[str, str], None]] = None,
+        poll_control: Optional[Callable[[], Optional[ProviderControl]]] = None,
+        on_control: Optional[
+            Callable[[ProviderControl, Literal["applied", "rejected"], str], None]
+        ] = None,
     ) -> ProviderTurnResult:
         if not agent.project_path:
             raise ProviderAdapterError("Claude agent has no project path.")
         launch_directory = agent.working_directory or agent.project_path
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
-        command = self.command(agent, persisted_session)
+        session_id = persisted_session or str(uuid.uuid4())
+        command = self.command(agent, persisted_session, session_id)
         effective_prompt = prompt
         if recovery:
             effective_prompt = (
@@ -397,75 +1087,297 @@ class ClaudePrintAdapter:
                 f"Original request:\n{prompt}"
             )
 
+        deadline = time.monotonic() + self.timeout_seconds
         events: list[dict[str, Any]] = []
-        timed_out = threading.Event()
+        _emit_progress(on_progress, "starting", "Starting Claude.")
         with tempfile.TemporaryFile(mode="w+t") as stderr_file:
-            process = subprocess.Popen(
+            process = self._popen_factory(
                 command,
                 cwd=launch_directory,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,
                 text=True,
+                bufsize=1,
+                start_new_session=True,
             )
-
-            def kill_on_timeout() -> None:
-                timed_out.set()
-                if process.poll() is None:
-                    process.kill()
-
-            timer = threading.Timer(self.timeout_seconds, kill_on_timeout)
-            timer.daemon = True
-            timer.start()
             try:
-                assert process.stdin is not None
-                process.stdin.write(effective_prompt)
-                process.stdin.close()
-                assert process.stdout is not None
+                if process.stdout is None:
+                    raise ProviderAdapterError(
+                        "Claude output stream is unavailable."
+                    )
+                lines = _start_line_reader(process.stdout)
+                initialize_request_id = "tc-initialize"
+                _write_json_line(
+                    process,
+                    {
+                        "type": "control_request",
+                        "request_id": initialize_request_id,
+                        "request": {
+                            "subtype": "initialize",
+                            "hooks": None,
+                        },
+                    },
+                )
+                self._wait_for_control_response(
+                    lines,
+                    initialize_request_id,
+                    deadline,
+                    heartbeat,
+                )
+
+                initial_message_id = str(uuid.uuid4())
+                _write_json_line(
+                    process,
+                    self._user_message(
+                        effective_prompt,
+                        session_id,
+                        initial_message_id,
+                    ),
+                )
+                turn_id = f"claude-turn-{uuid.uuid4()}"
+                _emit_progress(on_progress, "turn_started", turn_id)
+
                 notified_session = False
-                for line in process.stdout:
+                pending: Optional[
+                    tuple[ProviderControl, str, float]
+                ] = None
+                while True:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        raise ProviderAdapterError("Claude turn timed out.")
                     heartbeat()
-                    try:
-                        event = json.loads(line)
-                    except json.JSONDecodeError:
-                        raise ProviderAdapterError(
-                            "Claude emitted invalid JSONL output."
-                        ) from None
-                    if not isinstance(event, dict):
-                        raise ProviderAdapterError(
-                            "Claude emitted an invalid event."
+
+                    if pending is None and poll_control is not None:
+                        candidate_control = poll_control()
+                        if candidate_control is not None:
+                            control = _validate_control(candidate_control)
+                            if (
+                                control.expected_turn_id is not None
+                                and control.expected_turn_id != turn_id
+                            ):
+                                _emit_control(
+                                    on_control,
+                                    control,
+                                    "rejected",
+                                    "Control targeted a stale provider turn.",
+                                )
+                            elif control.kind == "steer":
+                                steer_message_id = str(uuid.uuid4())
+                                _emit_progress(
+                                    on_progress,
+                                    "steering",
+                                    "Sending guidance to the active Claude turn.",
+                                )
+                                _write_json_line(
+                                    process,
+                                    self._user_message(
+                                        control.text,
+                                        session_id,
+                                        steer_message_id,
+                                    ),
+                                )
+                                pending = (
+                                    control,
+                                    steer_message_id,
+                                    now + self.control_timeout_seconds,
+                                )
+                            else:
+                                control_request_id = (
+                                    f"tc-control-{control.control_id}"
+                                )
+                                _emit_progress(
+                                    on_progress,
+                                    "cancelling",
+                                    "Interrupting the active Claude turn.",
+                                )
+                                _write_json_line(
+                                    process,
+                                    {
+                                        "type": "control_request",
+                                        "request_id": control_request_id,
+                                        "request": {"subtype": "interrupt"},
+                                    },
+                                )
+                                pending = (
+                                    control,
+                                    control_request_id,
+                                    now + self.control_timeout_seconds,
+                                )
+
+                    if pending is not None and now >= pending[2]:
+                        control = pending[0]
+                        if control.kind == "cancel":
+                            _terminate_process_group(process)
+                            _emit_control(
+                                on_control,
+                                control,
+                                "applied",
+                                "Claude did not acknowledge interrupt; "
+                                "its local process group was terminated.",
+                            )
+                            raise ProviderTurnCancelled(
+                                "Claude turn was cancelled by local fallback."
+                            )
+                        _emit_control(
+                            on_control,
+                            control,
+                            "rejected",
+                            "Claude did not acknowledge steering before timeout.",
                         )
-                    events.append(event)
+                        pending = None
+
+                    wait_for = min(self.poll_interval_seconds, deadline - now)
+                    if pending is not None:
+                        wait_for = min(wait_for, max(0.0, pending[2] - now))
+                    event = _read_json_line(lines, wait_for)
+                    if event is _NO_LINE:
+                        continue
+                    if event is _END_OF_STREAM:
+                        if pending is not None and pending[0].kind == "cancel":
+                            control = pending[0]
+                            _emit_control(
+                                on_control,
+                                control,
+                                "applied",
+                                "Claude exited while processing the interrupt.",
+                            )
+                            raise ProviderTurnCancelled(
+                                "Claude turn was cancelled."
+                            )
+                        raise ProviderAdapterError(
+                            "Claude exited before turn completion."
+                        )
+
+                    if event.get("type") == "control_request":
+                        provider_request_id = event.get("request_id")
+                        if provider_request_id is not None:
+                            _write_json_line(
+                                process,
+                                {
+                                    "type": "control_response",
+                                    "response": {
+                                        "subtype": "error",
+                                        "request_id": provider_request_id,
+                                        "error": (
+                                            "Interactive controller requests "
+                                            "are unavailable."
+                                        ),
+                                    },
+                                },
+                            )
+                        continue
+
+                    if event.get("type") == "control_response":
+                        response = event.get("response")
+                        if (
+                            pending is None
+                            or pending[0].kind != "cancel"
+                            or not isinstance(response, dict)
+                            or response.get("request_id") != pending[1]
+                        ):
+                            continue
+                        control = pending[0]
+                        if response.get("subtype") == "success":
+                            _emit_control(
+                                on_control,
+                                control,
+                                "applied",
+                                "Claude acknowledged the interrupt.",
+                            )
+                            raise ProviderTurnCancelled(
+                                "Claude turn was cancelled."
+                            )
+                        _terminate_process_group(process)
+                        _emit_control(
+                            on_control,
+                            control,
+                            "applied",
+                            "Claude rejected the SDK interrupt; "
+                            "its local process group was terminated.",
+                        )
+                        raise ProviderTurnCancelled(
+                            "Claude turn was cancelled by local fallback."
+                        )
+
                     candidate = event.get("session_id")
                     if candidate and not notified_session:
                         candidate_text = str(candidate)
-                        if (
-                            persisted_session is not None
-                            and candidate_text != persisted_session
-                        ):
+                        if candidate_text != session_id:
                             raise ProviderAdapterError(
                                 "Claude changed the persisted session ID."
                             )
                         on_session(candidate_text)
+                        _emit_progress(
+                            on_progress,
+                            "session_ready",
+                            candidate_text,
+                        )
                         notified_session = True
-                return_code = process.wait()
+
+                    if (
+                        pending is not None
+                        and pending[0].kind == "steer"
+                        and event.get("type") == "user"
+                        and event.get("uuid") == pending[1]
+                    ):
+                        control = pending[0]
+                        _emit_control(
+                            on_control,
+                            control,
+                            "applied",
+                            "Guidance was accepted by the active Claude turn.",
+                        )
+                        _emit_progress(
+                            on_progress,
+                            "working",
+                            "Claude is continuing with the new guidance.",
+                        )
+                        pending = None
+
+                    events.append(event)
+                    event_type = str(event.get("type", ""))
+                    if event_type == "assistant":
+                        _emit_progress(
+                            on_progress,
+                            "responding",
+                            "Claude is preparing its response.",
+                        )
+                    elif event_type in {"stream_event", "system"}:
+                        _emit_progress(
+                            on_progress,
+                            "working",
+                            "Claude is working.",
+                        )
+                    elif event_type == "result":
+                        if pending is not None:
+                            control = pending[0]
+                            if control.kind == "steer":
+                                _emit_control(
+                                    on_control,
+                                    control,
+                                    "rejected",
+                                    "The Claude turn completed before steering "
+                                    "acknowledgment.",
+                                )
+                                pending = None
+                            else:
+                                # The SDK control response can follow the turn's
+                                # result; keep stdin open until it is definitive.
+                                continue
+                        result = consume_claude_events(
+                            events,
+                            existing_session_id=persisted_session,
+                        )
+                        _emit_progress(
+                            on_progress,
+                            "completed",
+                            "Claude turn completed.",
+                        )
+                        break
             finally:
-                timer.cancel()
-                if process.poll() is None:
-                    process.kill()
-                    process.wait()
-            stderr_file.seek(0)
-            stderr = stderr_file.read().strip()
-        if timed_out.is_set():
-            raise ProviderAdapterError("Claude turn timed out.")
-        if return_code != 0:
-            raise ProviderAdapterError(
-                stderr[-2000:] or f"Claude exited with status {return_code}."
-            )
-        return consume_claude_events(
-            events,
-            existing_session_id=persisted_session,
-        )
+                _finish_process(process)
+        return result
 
 
 def adapter_for(agent: ManagedAgent) -> ProviderAdapter:

@@ -1,7 +1,133 @@
+import json
+import queue
+import subprocess
 import unittest
+import uuid
 
 import provider_adapters
 from durable_store import ManagedAgent
+
+
+_FAKE_EOF = object()
+
+
+class FakeStdout:
+    def __init__(self):
+        self.items = queue.Queue()
+
+    def emit(self, payload):
+        self.items.put(json.dumps(payload) + "\n")
+
+    def close(self):
+        self.items.put(_FAKE_EOF)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.items.get()
+        if item is _FAKE_EOF:
+            raise StopIteration
+        return item
+
+
+class FakeStdin:
+    def __init__(self, process):
+        self.process = process
+        self.buffer = ""
+        self.closed = False
+
+    def write(self, value):
+        if self.closed:
+            raise ValueError("closed")
+        self.buffer += value
+        while "\n" in self.buffer:
+            line, self.buffer = self.buffer.split("\n", 1)
+            if line:
+                payload = json.loads(line)
+                self.process.payloads.append(payload)
+                self.process.on_payload(payload)
+        return len(value)
+
+    def flush(self):
+        return None
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.process.returncode = 0
+            self.process.stdout.close()
+
+
+class FakeProcess:
+    def __init__(self, on_payload):
+        self.on_payload = on_payload
+        self.payloads = []
+        self.stdout = FakeStdout()
+        self.stdin = FakeStdin(self)
+        self.returncode = None
+        self.pid = None
+        self.terminated = False
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("fake-provider", timeout)
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+        self.stdout.close()
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+        self.stdout.close()
+
+
+class FakePopenFactory:
+    def __init__(self, process):
+        self.process = process
+        self.command = None
+        self.kwargs = None
+
+    def __call__(self, command, **kwargs):
+        self.command = command
+        self.kwargs = kwargs
+        return self.process
+
+
+def codex_agent(**overrides):
+    values = {
+        "agent_id": "agent-codex",
+        "parent_agent_id": None,
+        "role": "project",
+        "slug": "project",
+        "hierarchical_name": "tc--root--project",
+        "provider": "codex",
+        "project_path": "/tmp/project",
+        "provider_session_id": None,
+        "surface_binding_id": None,
+        "lifecycle_state": "registered",
+        "provider_config": {},
+        "working_directory": "/tmp/project/app",
+    }
+    values.update(overrides)
+    return ManagedAgent(**values)
+
+
+def claude_agent(**overrides):
+    values = {
+        **codex_agent().__dict__,
+        "agent_id": "agent-claude",
+        "provider": "claude",
+    }
+    values.update(overrides)
+    return ManagedAgent(**values)
 
 
 class CodexEventTests(unittest.TestCase):
@@ -177,6 +303,574 @@ class ClaudeEventTests(unittest.TestCase):
             "permission mode",
         ):
             adapter.command(invalid, None)
+
+
+class LiveControlContractTests(unittest.TestCase):
+    @staticmethod
+    def emit_codex_completion(process, text="Codex final"):
+        process.stdout.emit(
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {
+                        "id": "message-1",
+                        "type": "agentMessage",
+                        "text": text,
+                    },
+                },
+            }
+        )
+        process.stdout.emit(
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "tokenUsage": {
+                        "last": {
+                            "inputTokens": 12,
+                            "cachedInputTokens": 7,
+                            "outputTokens": 3,
+                            "reasoningOutputTokens": 1,
+                            "totalTokens": 16,
+                        },
+                        "total": {},
+                    },
+                },
+            }
+        )
+        process.stdout.emit(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {
+                        "id": "turn-1",
+                        "items": [],
+                        "status": "completed",
+                    },
+                },
+            }
+        )
+
+    @staticmethod
+    def codex_handshake(process, payload):
+        method = payload.get("method")
+        if method == "initialize":
+            process.stdout.emit({"id": payload["id"], "result": {"userAgent": "test"}})
+        elif method == "thread/start":
+            process.stdout.emit(
+                {
+                    "id": payload["id"],
+                    "result": {"thread": {"id": "thread-1"}},
+                }
+            )
+        elif method == "thread/resume":
+            process.stdout.emit(
+                {
+                    "id": payload["id"],
+                    "result": {"thread": {"id": payload["params"]["threadId"]}},
+                }
+            )
+        elif method == "turn/start":
+            process.stdout.emit(
+                {
+                    "id": payload["id"],
+                    "result": {
+                        "turn": {
+                            "id": "turn-1",
+                            "items": [],
+                            "status": "inProgress",
+                        }
+                    },
+                }
+            )
+
+    def test_provider_control_validation_and_capabilities(self):
+        control = provider_adapters.ProviderControl(
+            control_id=4,
+            kind="steer",
+            text="New direction",
+            expected_turn_id="turn-1",
+        )
+        self.assertEqual(provider_adapters._validate_control(control), control)
+        with self.assertRaisesRegex(
+            provider_adapters.ProviderAdapterError,
+            "non-empty",
+        ):
+            provider_adapters._validate_control(
+                provider_adapters.ProviderControl(5, "steer")
+            )
+        self.assertTrue(
+            provider_adapters.CodexExecAdapter(binary="/bin/codex")
+            .capabilities()
+            .interrupt
+        )
+        self.assertTrue(
+            provider_adapters.ClaudePrintAdapter(binary="/bin/claude")
+            .capabilities()
+            .interrupt
+        )
+
+    def test_codex_app_server_sends_exact_native_steer_and_safe_progress(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "turn/steer":
+                process.stdout.emit(
+                    {
+                        "id": payload["id"],
+                        "result": {"turnId": "turn-1"},
+                    }
+                )
+                self.emit_codex_completion(process)
+
+        process.on_payload = handle
+        factory = FakePopenFactory(process)
+        controls = [
+            provider_adapters.ProviderControl(
+                11,
+                "steer",
+                "Use the safer approach.",
+                "turn-1",
+            )
+        ]
+        outcomes = []
+        progress = []
+        sessions = []
+        adapter = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex",
+            poll_interval_seconds=0.01,
+            _popen_factory=factory,
+        )
+        result = adapter.run_turn(
+            codex_agent(
+                provider_config={
+                    "model": "gpt-test",
+                    "effort": "high",
+                    "sandbox": "workspace-write",
+                }
+            ),
+            "SECRET prompt at /private/project",
+            None,
+            sessions.append,
+            lambda: None,
+            lambda stage, detail: progress.append((stage, detail)),
+            lambda: controls.pop(0) if controls else None,
+            lambda control, outcome, detail: outcomes.append(
+                (control.control_id, outcome, detail)
+            ),
+        )
+
+        self.assertEqual(factory.command, ["/bin/codex", "app-server", "--stdio"])
+        self.assertEqual(factory.kwargs["cwd"], "/tmp/project/app")
+        self.assertTrue(factory.kwargs["start_new_session"])
+        self.assertEqual(process.payloads[0]["method"], "initialize")
+        self.assertEqual(process.payloads[1], {"method": "initialized"})
+        self.assertEqual(
+            process.payloads[2],
+            {
+                "id": 2,
+                "method": "thread/start",
+                "params": {
+                    "cwd": "/tmp/project/app",
+                    "sandbox": "workspace-write",
+                    "approvalPolicy": "never",
+                    "model": "gpt-test",
+                },
+            },
+        )
+        self.assertEqual(
+            process.payloads[3]["params"],
+            {
+                "threadId": "thread-1",
+                "input": [
+                    {"type": "text", "text": "SECRET prompt at /private/project"}
+                ],
+                "cwd": "/tmp/project/app",
+                "model": "gpt-test",
+                "effort": "high",
+            },
+        )
+        self.assertEqual(
+            process.payloads[4],
+            {
+                "id": 4,
+                "method": "turn/steer",
+                "params": {
+                    "threadId": "thread-1",
+                    "expectedTurnId": "turn-1",
+                    "input": [
+                        {"type": "text", "text": "Use the safer approach."}
+                    ],
+                },
+            },
+        )
+        self.assertEqual(sessions, ["thread-1"])
+        self.assertEqual(outcomes[0][0:2], (11, "applied"))
+        self.assertEqual(result.provider_session_id, "thread-1")
+        self.assertEqual(result.final_text, "Codex final")
+        self.assertEqual(result.usage["cached_input_tokens"], 7)
+        rendered_progress = repr(progress)
+        self.assertNotIn("SECRET", rendered_progress)
+        self.assertNotIn("/private/project", rendered_progress)
+
+    def test_codex_rejects_stale_and_provider_error_controls(self):
+        process = FakeProcess(lambda payload: None)
+        control_queue = [
+            provider_adapters.ProviderControl(
+                20, "steer", "stale", "old-turn"
+            ),
+            provider_adapters.ProviderControl(
+                21, "steer", "provider rejects", "turn-1"
+            ),
+        ]
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "turn/steer":
+                process.stdout.emit(
+                    {
+                        "id": payload["id"],
+                        "error": {
+                            "code": -32602,
+                            "message": "SECRET reflected message",
+                        },
+                    }
+                )
+                self.emit_codex_completion(process)
+
+        process.on_payload = handle
+        outcomes = []
+        adapter = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex",
+            poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        )
+        result = adapter.run_turn(
+            codex_agent(),
+            "prompt",
+            None,
+            lambda _session: None,
+            lambda: None,
+            poll_control=lambda: control_queue.pop(0) if control_queue else None,
+            on_control=lambda control, outcome, detail: outcomes.append(
+                (control.control_id, outcome, detail)
+            ),
+        )
+
+        self.assertEqual(result.final_text, "Codex final")
+        self.assertEqual([item[0:2] for item in outcomes], [(20, "rejected"), (21, "rejected")])
+        self.assertNotIn("SECRET", repr(outcomes))
+
+    def test_codex_polls_during_silence_and_acknowledges_cancel(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "turn/interrupt":
+                process.stdout.emit({"id": payload["id"], "result": {}})
+
+        process.on_payload = handle
+        polls = []
+        heartbeats = []
+        outcomes = []
+
+        def poll_control():
+            polls.append(True)
+            if len(polls) == 3:
+                return provider_adapters.ProviderControl(
+                    30, "cancel", expected_turn_id="turn-1"
+                )
+            return None
+
+        adapter = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex",
+            poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        )
+        with self.assertRaises(provider_adapters.ProviderTurnCancelled):
+            adapter.run_turn(
+                codex_agent(),
+                "long task",
+                None,
+                lambda _session: None,
+                lambda: heartbeats.append(True),
+                poll_control=poll_control,
+                on_control=lambda control, outcome, detail: outcomes.append(
+                    (control.control_id, outcome, detail)
+                ),
+            )
+        self.assertGreaterEqual(len(heartbeats), 3)
+        self.assertEqual(outcomes[0][0:2], (30, "applied"))
+        interrupt = [
+            payload
+            for payload in process.payloads
+            if payload.get("method") == "turn/interrupt"
+        ]
+        self.assertEqual(
+            interrupt[0]["params"],
+            {"threadId": "thread-1", "turnId": "turn-1"},
+        )
+
+    @staticmethod
+    def claude_initialize(process, payload):
+        if (
+            payload.get("type") == "control_request"
+            and payload.get("request", {}).get("subtype") == "initialize"
+        ):
+            process.stdout.emit(
+                {
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": payload["request_id"],
+                        "response": {"commands": []},
+                    },
+                }
+            )
+
+    @staticmethod
+    def emit_claude_result(process, session_id, text="Claude final"):
+        process.stdout.emit(
+            {
+                "type": "assistant",
+                "session_id": session_id,
+                "uuid": str(uuid.uuid4()),
+                "message": {"content": [{"type": "text", "text": text}]},
+            }
+        )
+        process.stdout.emit(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "session_id": session_id,
+                "uuid": str(uuid.uuid4()),
+                "result": text,
+                "usage": {"input_tokens": 8, "output_tokens": 2},
+            }
+        )
+
+    def test_claude_streams_uuid_messages_and_applies_live_steer(self):
+        process = FakeProcess(lambda payload: None)
+        user_messages = []
+
+        def handle(payload):
+            self.claude_initialize(process, payload)
+            if payload.get("type") == "user":
+                user_messages.append(payload)
+                if len(user_messages) == 1:
+                    process.stdout.emit(
+                        {
+                            "type": "system",
+                            "subtype": "init",
+                            "session_id": payload["session_id"],
+                        }
+                    )
+                else:
+                    process.stdout.emit(dict(payload))
+                    self.emit_claude_result(process, payload["session_id"])
+
+        process.on_payload = handle
+        factory = FakePopenFactory(process)
+        controls = [
+            provider_adapters.ProviderControl(
+                41,
+                "steer",
+                "Focus on tests.",
+            )
+        ]
+        outcomes = []
+        progress = []
+        adapter = provider_adapters.ClaudePrintAdapter(
+            binary="/bin/claude",
+            poll_interval_seconds=0.01,
+            _popen_factory=factory,
+        )
+        result = adapter.run_turn(
+            claude_agent(),
+            "SECRET prompt at /private/project",
+            None,
+            lambda _session: None,
+            lambda: None,
+            lambda stage, detail: progress.append((stage, detail)),
+            lambda: controls.pop(0) if controls else None,
+            lambda control, outcome, detail: outcomes.append(
+                (control.control_id, outcome, detail)
+            ),
+        )
+
+        self.assertIn("--input-format", factory.command)
+        self.assertIn("--replay-user-messages", factory.command)
+        self.assertIn("--session-id", factory.command)
+        self.assertEqual(factory.kwargs["cwd"], "/tmp/project/app")
+        self.assertTrue(factory.kwargs["start_new_session"])
+        self.assertEqual(len(user_messages), 2)
+        self.assertEqual(user_messages[1]["message"]["content"], "Focus on tests.")
+        for message in user_messages:
+            uuid.UUID(message["uuid"])
+            uuid.UUID(message["session_id"])
+            self.assertIsNone(message["parent_tool_use_id"])
+        self.assertEqual(outcomes[0][0:2], (41, "applied"))
+        self.assertEqual(result.final_text, "Claude final")
+        self.assertNotIn("SECRET", repr(progress))
+        self.assertNotIn("/private/project", repr(progress))
+
+    def test_claude_uses_sdk_interrupt_and_polls_during_silence(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.claude_initialize(process, payload)
+            if payload.get("type") == "user":
+                process.stdout.emit(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": payload["session_id"],
+                    }
+                )
+            if payload.get("request", {}).get("subtype") == "interrupt":
+                process.stdout.emit(
+                    {
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": payload["request_id"],
+                            "response": {},
+                        },
+                    }
+                )
+
+        process.on_payload = handle
+        polls = []
+        heartbeats = []
+        outcomes = []
+
+        def poll_control():
+            polls.append(True)
+            if len(polls) == 3:
+                return provider_adapters.ProviderControl(52, "cancel")
+            return None
+
+        adapter = provider_adapters.ClaudePrintAdapter(
+            binary="/bin/claude",
+            poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        )
+        with self.assertRaises(provider_adapters.ProviderTurnCancelled):
+            adapter.run_turn(
+                claude_agent(),
+                "long task",
+                None,
+                lambda _session: None,
+                lambda: heartbeats.append(True),
+                poll_control=poll_control,
+                on_control=lambda control, outcome, detail: outcomes.append(
+                    (control.control_id, outcome, detail)
+                ),
+            )
+
+        self.assertGreaterEqual(len(heartbeats), 3)
+        self.assertEqual(outcomes[0][0:2], (52, "applied"))
+        interrupt = [
+            payload
+            for payload in process.payloads
+            if payload.get("request", {}).get("subtype") == "interrupt"
+        ]
+        self.assertEqual(
+            interrupt,
+            [
+                {
+                    "type": "control_request",
+                    "request_id": "tc-control-52",
+                    "request": {"subtype": "interrupt"},
+                }
+            ],
+        )
+
+    def test_claude_cancel_error_uses_owned_process_group_fallback(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.claude_initialize(process, payload)
+            if payload.get("type") == "user":
+                process.stdout.emit(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": payload["session_id"],
+                    }
+                )
+            if payload.get("request", {}).get("subtype") == "interrupt":
+                process.stdout.emit(
+                    {
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "error",
+                            "request_id": payload["request_id"],
+                            "error": "SECRET reflected error",
+                        },
+                    }
+                )
+
+        process.on_payload = handle
+        outcomes = []
+        controls = [provider_adapters.ProviderControl(60, "cancel")]
+        adapter = provider_adapters.ClaudePrintAdapter(
+            binary="/bin/claude",
+            poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        )
+        with self.assertRaises(provider_adapters.ProviderTurnCancelled):
+            adapter.run_turn(
+                claude_agent(),
+                "long task",
+                None,
+                lambda _session: None,
+                lambda: None,
+                poll_control=lambda: controls.pop(0) if controls else None,
+                on_control=lambda control, outcome, detail: outcomes.append(
+                    (control.control_id, outcome, detail)
+                ),
+            )
+        self.assertTrue(process.terminated)
+        self.assertEqual(outcomes[0][0:2], (60, "applied"))
+        self.assertIn("local process group", outcomes[0][2])
+        self.assertNotIn("SECRET", outcomes[0][2])
+
+    def test_optional_callbacks_preserve_existing_claude_call_shape(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.claude_initialize(process, payload)
+            if payload.get("type") == "user":
+                process.stdout.emit(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": payload["session_id"],
+                    }
+                )
+                self.emit_claude_result(process, payload["session_id"])
+
+        process.on_payload = handle
+        adapter = provider_adapters.ClaudePrintAdapter(
+            binary="/bin/claude",
+            poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        )
+        result = adapter.run_turn(
+            claude_agent(),
+            "ordinary turn",
+            None,
+            lambda _session: None,
+            lambda: None,
+        )
+        self.assertEqual(result.final_text, "Claude final")
 
 
 if __name__ == "__main__":
