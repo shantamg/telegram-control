@@ -303,6 +303,26 @@ def send_agent_status() -> None:
     )
 
 
+def enqueue_agent_input(agent_id: str, text: str) -> None:
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    if not database_path or not job_id:
+        raise StoreError("Managed agent input requires the durable controller.")
+    with DurableStore(Path(database_path)) as store:
+        agent = store.resolve_agent(agent_id)
+        if agent is None or agent.role not in {"project", "worker"}:
+            raise StoreError("Managed agent route is no longer valid.")
+        store.enqueue_agent_message(
+            agent_id=agent.agent_id,
+            source_inbox_job_id=int(job_id),
+            input_text=text,
+        )
+    send_message(
+        f"… Received by {agent.hierarchical_name}.\n"
+        f"Queued for {agent.provider.title()}."
+    )
+
+
 def handle_callback(update: dict, callback_query: dict) -> None:
     callback_query_id = str(callback_query.get("id", ""))
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
@@ -533,6 +553,8 @@ def main() -> int:
                         "✅ Durable reply route verified.\n\n"
                         f"Received through the stored controller route: {text}"
                     )
+                elif route is not None and route.target_type == "agent":
+                    enqueue_agent_input(route.target_id, text)
                 else:
                     send_message(
                         "That replied-to message has no active durable route."
@@ -544,10 +566,7 @@ def main() -> int:
                     send_message("This topic has no durable controller binding.")
                 elif thread_id and binding is not None:
                     if binding.target_type == "agent":
-                        send_message(
-                            f"✅ Routed to registered agent {binding.display_name}.\n\n"
-                            "Codex execution is not enabled for this agent yet."
-                        )
+                        enqueue_agent_input(binding.target_id, text)
                     else:
                         send_message(
                             f"✅ {binding.display_name} route verified: {text}",

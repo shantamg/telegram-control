@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 import on_message
+import provider_adapters
 import telegram_control
 from durable_store import (
     MIGRATION_1,
@@ -18,6 +19,7 @@ from durable_store import (
     MIGRATION_3,
     MIGRATION_4,
     MIGRATION_5,
+    MIGRATION_6,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -97,7 +99,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            6,
+            7,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -651,6 +653,79 @@ class DurableStoreTests(unittest.TestCase):
                 project_path="/tmp/telegram-control",
             )
 
+    def test_agent_mailbox_is_serialized_and_completes_to_routed_outbox(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Stage 2 Test",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        self.store.ingest_update(topic_message_update(10, "first"), now=100)
+        self.store.ingest_update(topic_message_update(11, "second"), now=101)
+        jobs = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs ORDER BY job_id"
+        ).fetchall()
+        first_id = self.store.enqueue_agent_message(
+            agent.agent_id,
+            int(jobs[0]["job_id"]),
+            "first",
+            now=100,
+        )
+        self.store.enqueue_agent_message(
+            agent.agent_id,
+            int(jobs[1]["job_id"]),
+            "second",
+            now=101,
+        )
+
+        first = self.store.claim_agent_mailbox("agent-a", now=100)
+        self.assertEqual(first.mailbox_id, first_id)
+        self.assertIsNone(self.store.claim_agent_mailbox("agent-b", now=101))
+        self.store.attach_agent_mailbox_session(
+            first.mailbox_id,
+            "agent-a",
+            "session-123",
+            now=102,
+        )
+        self.store.complete_agent_mailbox(
+            first.mailbox_id,
+            "agent-a",
+            "session-123",
+            "done",
+            ["done"],
+            {"input_tokens": 10, "output_tokens": 2},
+            now=103,
+        )
+
+        second = self.store.claim_agent_mailbox("agent-b", now=103)
+        self.assertEqual(second.input_text, "second")
+        self.assertEqual(
+            self.store.resolve_agent(agent.agent_id).provider_session_id,
+            "session-123",
+        )
+        outbound = self.store.claim_outbox("sender", now=103)
+        self.assertEqual(outbound.params["message_thread_id"], 62)
+        self.assertEqual(outbound.params["text"], "done")
+        route = json.loads(
+            self.store.connection.execute(
+                "SELECT route_json FROM outbox_messages WHERE message_id = ?",
+                (outbound.message_id,),
+            ).fetchone()["route_json"]
+        )
+        self.assertEqual(route["target_type"], "agent")
+        self.assertEqual(route["target_id"], agent.agent_id)
+
 
 class SchemaCompatibilityTests(unittest.TestCase):
     def test_schema_one_database_migrates_to_current_schema(self):
@@ -667,7 +742,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    6,
+                    7,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -691,7 +766,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    6,
+                    7,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -716,7 +791,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    6,
+                    7,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -740,7 +815,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    6,
+                    7,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -766,12 +841,43 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    6,
+                    7,
                 )
                 self.assertEqual(
                     store.connection.execute(
                         "SELECT COUNT(*) FROM sqlite_master "
                         "WHERE type = 'table' AND name = 'agents'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_schema_six_database_migrates_to_current_schema(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-six.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for statement in (
+                MIGRATION_1
+                + MIGRATION_2
+                + MIGRATION_3
+                + MIGRATION_4
+                + MIGRATION_5
+                + MIGRATION_6
+            ):
+                connection.execute(statement)
+            connection.execute("PRAGMA user_version = 6")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    7,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'agent_mailbox'"
                     ).fetchone()[0],
                     1,
                 )
@@ -1393,6 +1499,104 @@ class DurableIntegrationTests(unittest.TestCase):
                     (response.message_id,),
                 ).fetchone()["route_json"]
                 self.assertEqual(json.loads(route_json)["target_id"], agent.agent_id)
+
+    def test_topic_message_runs_through_adapter_and_durable_mailbox(self):
+        class FakeAdapter:
+            def run_turn(
+                self,
+                agent,
+                prompt,
+                mailbox_session_id,
+                on_session,
+                heartbeat,
+            ):
+                self.assertions = (
+                    agent.hierarchical_name,
+                    prompt,
+                    mailbox_session_id,
+                )
+                on_session("session-123")
+                heartbeat()
+                return provider_adapters.ProviderTurnResult(
+                    provider_session_id="session-123",
+                    final_text="Codex adapter response",
+                    usage={"input_tokens": 50, "output_tokens": 5},
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            fake = FakeAdapter()
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Stage 2 Test",
+                    target_type="controller",
+                    target_id="control",
+                )
+                agent, _ = store.register_project_agent(
+                    chat_id=123,
+                    surface_name="Stage 2 Test",
+                    slug="telegram-control",
+                    provider="codex",
+                    project_path="/tmp/telegram-control",
+                )
+                store.ingest_update(
+                    topic_message_update(10, "inspect this repository"),
+                    now=100,
+                )
+                inbox = store.claim_job("inbox-worker", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    inbox,
+                    "inbox-worker",
+                )
+                self.assertEqual(
+                    store.status_counts()["agent_mailbox"],
+                    {"queued": 1},
+                )
+                receipt = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(
+                    receipt.params["text"],
+                    "… Received by tc--root--telegram-control.\n"
+                    "Queued for Codex.",
+                )
+                mailbox = store.claim_agent_mailbox("agent-worker", now=10**12)
+                with mock.patch.object(
+                    telegram_control.provider_adapters,
+                    "adapter_for",
+                    return_value=fake,
+                ):
+                    telegram_control.process_agent_mailbox_job(
+                        store,
+                        mailbox,
+                        "agent-worker",
+                    )
+
+                self.assertEqual(
+                    fake.assertions,
+                    (
+                        "tc--root--telegram-control",
+                        "inspect this repository",
+                        None,
+                    ),
+                )
+                self.assertEqual(
+                    store.status_counts()["agent_mailbox"],
+                    {"succeeded": 1},
+                )
+                self.assertEqual(
+                    store.resolve_agent(agent.agent_id).provider_session_id,
+                    "session-123",
+                )
+                response = store.claim_outbox("sender-2", now=10**12)
+                self.assertEqual(response.params["text"], "Codex adapter response")
 
     def test_handler_queues_reply_instead_of_calling_telegram(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

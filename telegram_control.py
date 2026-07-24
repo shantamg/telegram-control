@@ -18,8 +18,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 import telegram_bridge as bridge
+import provider_adapters
 from durable_store import (
     SCHEMA_VERSION,
+    AgentMailboxJob,
     DurableStore,
     InboxJob,
     OutboxMessage,
@@ -154,6 +156,96 @@ def work_command(args: argparse.Namespace) -> None:
                 return
 
 
+def chunk_telegram_text(text: str, limit: int = 3800) -> list[str]:
+    remaining = text.strip() or "[empty agent response]"
+    chunks = []
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at < limit // 2:
+            split_at = remaining.rfind(" ", 0, limit)
+        if split_at < limit // 2:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    return chunks
+
+
+def process_agent_mailbox_job(
+    store: DurableStore,
+    job: AgentMailboxJob,
+    worker_id: str,
+) -> None:
+    try:
+        agent = store.resolve_agent(job.agent_id)
+        if agent is None:
+            raise StoreError("Managed agent no longer exists.")
+        adapter = provider_adapters.adapter_for(agent)
+        result = adapter.run_turn(
+            agent,
+            job.input_text,
+            job.provider_session_id,
+            on_session=lambda session_id: store.attach_agent_mailbox_session(
+                job.mailbox_id,
+                worker_id,
+                session_id,
+            ),
+            heartbeat=lambda: store.heartbeat_agent_mailbox(
+                job.mailbox_id,
+                worker_id,
+            ),
+        )
+        store.complete_agent_mailbox(
+            job.mailbox_id,
+            worker_id,
+            result.provider_session_id,
+            result.final_text,
+            chunk_telegram_text(result.final_text),
+            result.usage,
+        )
+        log_event(
+            "agent_turn_succeeded",
+            mailbox_id=job.mailbox_id,
+            agent_id=job.agent_id,
+            attempts=job.attempts,
+            provider_session_id=result.provider_session_id,
+        )
+    except (provider_adapters.ProviderAdapterError, OSError, StoreError) as exc:
+        state = store.fail_agent_mailbox(
+            job.mailbox_id,
+            worker_id,
+            str(exc),
+        )
+        log_event(
+            "agent_turn_failed",
+            mailbox_id=job.mailbox_id,
+            agent_id=job.agent_id,
+            attempts=job.attempts,
+            state=state,
+            error=str(exc),
+        )
+
+
+def work_agents_command(args: argparse.Namespace) -> None:
+    worker_id = process_name("agent")
+    with open_store(args.db) as store:
+        while True:
+            job = store.claim_agent_mailbox(
+                worker_id,
+                lease_seconds=args.lease_seconds,
+            )
+            if job is None:
+                if args.once:
+                    return
+                time.sleep(args.idle_sleep)
+                continue
+            process_agent_mailbox_job(store, job, worker_id)
+            if args.once:
+                return
+
+
 def send_outbox_message(
     store: DurableStore,
     token: str,
@@ -234,6 +326,7 @@ def run_command(args: argparse.Namespace) -> None:
     commands = [
         [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "collect"],
         [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "work"],
+        [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "work-agents"],
         [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "send-outbox"],
     ]
     processes: list[subprocess.Popen[Any]] = []
@@ -275,6 +368,9 @@ def launch_agent_plist(database_path: Path = DATABASE_PATH) -> dict[str, Any]:
             "run",
         ],
         "WorkingDirectory": str(SCRIPT_PATH.parent),
+        "EnvironmentVariables": {
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        },
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 5,
@@ -587,6 +683,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_loop_arguments(work_parser, lease_seconds=20 * 60)
     work_parser.set_defaults(function=work_command)
 
+    agent_work_parser = subparsers.add_parser(
+        "work-agents",
+        help="Process serialized managed-agent mailbox items.",
+    )
+    add_loop_arguments(agent_work_parser, lease_seconds=2 * 60 * 60)
+    agent_work_parser.set_defaults(function=work_agents_command)
+
     outbox_parser = subparsers.add_parser(
         "send-outbox", help="Deliver durable Telegram API calls."
     )
@@ -644,7 +747,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.set_defaults(function=doctor_command)
 
     retry_parser = subparsers.add_parser("retry", help="Requeue dead items.")
-    retry_parser.add_argument("queue", choices=("inbox", "outbox"))
+    retry_parser.add_argument("queue", choices=("inbox", "outbox", "agent"))
     retry_parser.set_defaults(function=retry_command)
     return parser
 

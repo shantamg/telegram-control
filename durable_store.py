@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 class StoreError(RuntimeError):
@@ -117,6 +117,17 @@ class ManagedAgent:
     provider_session_id: Optional[str]
     surface_binding_id: Optional[int]
     lifecycle_state: str
+    provider_config: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class AgentMailboxJob:
+    mailbox_id: int
+    agent_id: str
+    source_inbox_job_id: int
+    input_text: str
+    provider_session_id: Optional[str]
+    attempts: int
 
 
 MIGRATION_1 = (
@@ -330,6 +341,43 @@ MIGRATION_6 = (
     """,
 )
 
+MIGRATION_7 = (
+    """
+    ALTER TABLE agents
+    ADD COLUMN provider_config_json TEXT NOT NULL DEFAULT '{}'
+    """,
+    """
+    CREATE TABLE agent_mailbox (
+        mailbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL
+            REFERENCES agents(agent_id) ON DELETE RESTRICT,
+        source_inbox_job_id INTEGER NOT NULL UNIQUE
+            REFERENCES inbox_jobs(job_id) ON DELETE RESTRICT,
+        input_text TEXT NOT NULL,
+        provider_session_id TEXT,
+        state TEXT NOT NULL
+            CHECK (state IN ('queued', 'leased', 'succeeded', 'dead')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        available_at REAL NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at REAL,
+        last_error TEXT,
+        response_text TEXT,
+        usage_json TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX agent_mailbox_ready
+    ON agent_mailbox(state, available_at, mailbox_id)
+    """,
+    """
+    CREATE INDEX agent_mailbox_agent
+    ON agent_mailbox(agent_id, state, mailbox_id)
+    """,
+)
+
 
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
@@ -405,6 +453,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 6
                 self.connection.execute("PRAGMA user_version = 6")
+            if current < 7:
+                for statement in MIGRATION_7:
+                    self.connection.execute(statement)
+                current = 7
+                self.connection.execute("PRAGMA user_version = 7")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -1344,6 +1397,7 @@ class DurableStore:
                 else None
             ),
             lifecycle_state=str(row["lifecycle_state"]),
+            provider_config=json.loads(row["provider_config_json"]),
         )
 
     def resolve_agent(self, agent_id: str) -> Optional[ManagedAgent]:
@@ -1536,6 +1590,388 @@ class DurableStore:
             agent = self._managed_agent_from_row(row)
             self.connection.execute("COMMIT")
             return agent, True
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def enqueue_agent_message(
+        self,
+        agent_id: str,
+        source_inbox_job_id: int,
+        input_text: str,
+        now: Optional[float] = None,
+    ) -> int:
+        text = input_text.strip()
+        if not text:
+            raise StoreError("Agent mailbox input cannot be empty.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute(
+            """
+            INSERT INTO agent_mailbox(
+                agent_id, source_inbox_job_id, input_text,
+                provider_session_id, state, attempts, available_at,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, NULL, 'queued', 0, ?, ?, ?)
+            ON CONFLICT(source_inbox_job_id) DO NOTHING
+            """,
+            (
+                agent_id,
+                int(source_inbox_job_id),
+                text,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        row = self.connection.execute(
+            """
+            SELECT mailbox_id, agent_id, input_text
+            FROM agent_mailbox
+            WHERE source_inbox_job_id = ?
+            """,
+            (int(source_inbox_job_id),),
+        ).fetchone()
+        if row is None:
+            raise StoreError("Could not enqueue the managed agent message.")
+        if str(row["agent_id"]) != agent_id or str(row["input_text"]) != text:
+            raise StoreError(
+                "Inbox job was reused for a different managed agent message."
+            )
+        return int(row["mailbox_id"])
+
+    def claim_agent_mailbox(
+        self,
+        worker_id: str,
+        now: Optional[float] = None,
+        lease_seconds: float = 2 * 60 * 60,
+    ) -> Optional[AgentMailboxJob]:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            expired = self.connection.execute(
+                """
+                SELECT DISTINCT agent_id
+                FROM agent_mailbox
+                WHERE state = 'leased' AND lease_expires_at <= ?
+                """,
+                (timestamp,),
+            ).fetchall()
+            self.connection.execute(
+                """
+                UPDATE agent_mailbox
+                SET state = 'queued', lease_owner = NULL,
+                    lease_expires_at = NULL, available_at = ?, updated_at = ?
+                WHERE state = 'leased' AND lease_expires_at <= ?
+                """,
+                (timestamp, timestamp, timestamp),
+            )
+            for row in expired:
+                self.connection.execute(
+                    """
+                    UPDATE agents
+                    SET lifecycle_state = 'registered', updated_at = ?
+                    WHERE agent_id = ? AND lifecycle_state = 'running'
+                    """,
+                    (timestamp, str(row["agent_id"])),
+                )
+            row = self.connection.execute(
+                """
+                SELECT m.*
+                FROM agent_mailbox AS m
+                WHERE m.state = 'queued' AND m.available_at <= ?
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM agent_mailbox AS active
+                        WHERE active.agent_id = m.agent_id
+                            AND active.state = 'leased'
+                    )
+                ORDER BY m.mailbox_id
+                LIMIT 1
+                """,
+                (timestamp,),
+            ).fetchone()
+            if row is None:
+                self.connection.execute("COMMIT")
+                return None
+            mailbox_id = int(row["mailbox_id"])
+            cursor = self.connection.execute(
+                """
+                UPDATE agent_mailbox
+                SET state = 'leased', attempts = attempts + 1,
+                    lease_owner = ?, lease_expires_at = ?, updated_at = ?
+                WHERE mailbox_id = ? AND state = 'queued'
+                """,
+                (
+                    worker_id,
+                    timestamp + float(lease_seconds),
+                    timestamp,
+                    mailbox_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("Agent mailbox claim lost its queue race.")
+            self.connection.execute(
+                """
+                UPDATE agents
+                SET lifecycle_state = 'running', updated_at = ?
+                WHERE agent_id = ?
+                    AND lifecycle_state IN ('registered', 'stopped', 'failed')
+                """,
+                (timestamp, str(row["agent_id"])),
+            )
+            claimed = self.connection.execute(
+                "SELECT * FROM agent_mailbox WHERE mailbox_id = ?",
+                (mailbox_id,),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return AgentMailboxJob(
+            mailbox_id=mailbox_id,
+            agent_id=str(claimed["agent_id"]),
+            source_inbox_job_id=int(claimed["source_inbox_job_id"]),
+            input_text=str(claimed["input_text"]),
+            provider_session_id=(
+                str(claimed["provider_session_id"])
+                if claimed["provider_session_id"] is not None
+                else None
+            ),
+            attempts=int(claimed["attempts"]),
+        )
+
+    def attach_agent_mailbox_session(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        provider_session_id: str,
+        now: Optional[float] = None,
+    ) -> None:
+        if not provider_session_id:
+            raise StoreError("Provider session ID cannot be empty.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT agent_id, provider_session_id
+                FROM agent_mailbox
+                WHERE mailbox_id = ? AND state = 'leased'
+                    AND lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Agent mailbox lease for {mailbox_id} is no longer owned."
+                )
+            existing = row["provider_session_id"]
+            if existing is not None and str(existing) != provider_session_id:
+                raise StoreError("Agent mailbox provider session changed unexpectedly.")
+            self.connection.execute(
+                """
+                UPDATE agent_mailbox
+                SET provider_session_id = ?, updated_at = ?
+                WHERE mailbox_id = ?
+                """,
+                (provider_session_id, timestamp, int(mailbox_id)),
+            )
+            agent = self.connection.execute(
+                """
+                UPDATE agents
+                SET provider_session_id = ?, updated_at = ?
+                WHERE agent_id = ?
+                    AND (provider_session_id IS NULL OR provider_session_id = ?)
+                """,
+                (
+                    provider_session_id,
+                    timestamp,
+                    str(row["agent_id"]),
+                    provider_session_id,
+                ),
+            )
+            if agent.rowcount != 1:
+                raise StoreError("Managed agent provider session changed unexpectedly.")
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def heartbeat_agent_mailbox(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        lease_seconds: float = 2 * 60 * 60,
+        now: Optional[float] = None,
+    ) -> None:
+        timestamp = time.time() if now is None else float(now)
+        cursor = self.connection.execute(
+            """
+            UPDATE agent_mailbox
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE mailbox_id = ? AND state = 'leased'
+                AND lease_owner = ?
+            """,
+            (
+                timestamp + float(lease_seconds),
+                timestamp,
+                int(mailbox_id),
+                worker_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise LeaseLostError(
+                f"Agent mailbox lease for {mailbox_id} is no longer owned."
+            )
+
+    def complete_agent_mailbox(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        provider_session_id: str,
+        response_text: str,
+        response_chunks: list[str],
+        usage: dict[str, Any],
+        now: Optional[float] = None,
+    ) -> None:
+        if not response_chunks or any(not chunk for chunk in response_chunks):
+            raise StoreError("Agent response chunks are invalid.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT m.agent_id, a.surface_binding_id
+                FROM agent_mailbox AS m
+                JOIN agents AS a ON a.agent_id = m.agent_id
+                WHERE m.mailbox_id = ? AND m.state = 'leased'
+                    AND m.lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Agent mailbox lease for {mailbox_id} is no longer owned."
+                )
+            binding = self.connection.execute(
+                """
+                SELECT *
+                FROM surface_bindings
+                WHERE binding_id = ? AND target_type = 'agent'
+                    AND target_id = ? AND state = 'active'
+                """,
+                (int(row["surface_binding_id"]), str(row["agent_id"])),
+            ).fetchone()
+            if binding is None:
+                raise StoreError("Managed agent surface binding is no longer valid.")
+            self.connection.execute(
+                """
+                UPDATE agent_mailbox
+                SET provider_session_id = ?, state = 'succeeded',
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    response_text = ?, usage_json = ?, updated_at = ?
+                WHERE mailbox_id = ? AND state = 'leased'
+                    AND lease_owner = ?
+                """,
+                (
+                    provider_session_id,
+                    response_text,
+                    json.dumps(usage, separators=(",", ":"), sort_keys=True),
+                    timestamp,
+                    int(mailbox_id),
+                    worker_id,
+                ),
+            )
+            self.connection.execute(
+                """
+                UPDATE agents
+                SET provider_session_id = ?, lifecycle_state = 'registered',
+                    updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (provider_session_id, timestamp, str(row["agent_id"])),
+            )
+            thread_id = int(binding["message_thread_id"])
+            for index, chunk in enumerate(response_chunks, start=1):
+                self.enqueue_api_call(
+                    operation_id=f"agent-mailbox:{mailbox_id}:response:{index}",
+                    method="sendMessage",
+                    params={
+                        "chat_id": int(binding["chat_id"]),
+                        "message_thread_id": thread_id if thread_id != 0 else None,
+                        "text": chunk,
+                    },
+                    route={
+                        "target_type": "agent",
+                        "target_id": str(row["agent_id"]),
+                        "policy": "reply",
+                        "ttl_seconds": 30 * 24 * 60 * 60,
+                    },
+                    now=timestamp,
+                )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def fail_agent_mailbox(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        error: str,
+        now: Optional[float] = None,
+        max_attempts: int = 3,
+        base_delay: float = 10.0,
+    ) -> str:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT agent_id, attempts
+                FROM agent_mailbox
+                WHERE mailbox_id = ? AND state = 'leased'
+                    AND lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Agent mailbox lease for {mailbox_id} is no longer owned."
+                )
+            attempts = int(row["attempts"])
+            state = "dead" if attempts >= max_attempts else "queued"
+            delay = base_delay * (2 ** max(0, attempts - 1))
+            self.connection.execute(
+                """
+                UPDATE agent_mailbox
+                SET state = ?, available_at=?, lease_owner = NULL,
+                    lease_expires_at = NULL, last_error = ?, updated_at = ?
+                WHERE mailbox_id = ?
+                """,
+                (
+                    state,
+                    timestamp if state == "dead" else timestamp + delay,
+                    str(error)[:2000],
+                    timestamp,
+                    int(mailbox_id),
+                ),
+            )
+            self.connection.execute(
+                """
+                UPDATE agents
+                SET lifecycle_state = ?, updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (
+                    "failed" if state == "dead" else "registered",
+                    timestamp,
+                    str(row["agent_id"]),
+                ),
+            )
+            self.connection.execute("COMMIT")
+            return state
         except BaseException:
             self.connection.execute("ROLLBACK")
             raise
@@ -1735,8 +2171,18 @@ class DurableStore:
                 """,
                 (timestamp, timestamp),
             )
+        elif queue == "agent":
+            cursor = self.connection.execute(
+                """
+                UPDATE agent_mailbox
+                SET state = 'queued', attempts = 0, available_at = ?,
+                    last_error = NULL, updated_at = ?
+                WHERE state = 'dead'
+                """,
+                (timestamp, timestamp),
+            )
         else:
-            raise StoreError("Queue must be 'inbox' or 'outbox'.")
+            raise StoreError("Queue must be 'inbox', 'outbox', or 'agent'.")
         return int(cursor.rowcount)
 
     def status_counts(self) -> dict[str, dict[str, int]]:
@@ -1750,6 +2196,7 @@ class DurableStore:
             ("surfaces", "surface_bindings"),
             ("cards", "surface_cards"),
             ("agents", "agents"),
+            ("agent_mailbox", "agent_mailbox"),
         ):
             if label == "updates":
                 state_column = "ingest_state"

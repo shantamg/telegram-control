@@ -747,6 +747,22 @@ control. Codex begins with `codex exec --json` and persisted session IDs; Claude
 and other harnesses can implement the same contract. tmux remains a separate
 human console and explicit takeover/recovery surface, not the durable protocol.
 
+The first provider-adapter and mailbox slice passed 50 offline tests and its
+live test on July 23, 2026:
+
+- schema version 7 adds one serialized durable mailbox per managed agent;
+- the provider-neutral adapter contract separates session creation/resume,
+  structured events, usage, and capabilities from Telegram and persistence;
+- the Codex adapter uses JSONL events, checkpoints `thread.started` before
+  completion, captures the final public message and token usage, and defaults
+  to `workspace-write` rather than unrestricted/yolo execution;
+- a fourth supervised worker owns agent mailbox leases and routes durable final
+  responses back to the bound topic;
+- accepted turns produce an immediate receipt while final output is still a
+  separate message; a later turn-card slice can edit the receipt in place;
+- two live read-only turns succeeded on their first attempts, with a controller
+  restart between them and the same persisted Codex session ID on both.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)

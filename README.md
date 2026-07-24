@@ -173,11 +173,30 @@ The live registry test passed on July 23, 2026. **Stage 2 Test** is bound to
 `tc--root--telegram-control` using the Codex provider and reports `registered`
 with no provider session started.
 
+Schema version 7 adds a serialized durable mailbox per managed agent and a
+provider-neutral execution contract. The first adapter uses structured JSONL
+from `codex exec --json`, checkpoints `thread.started` before turn completion,
+parses the final public agent message and usage metadata, and resumes the stored
+session ID. Codex runs with `workspace-write` by default; unrestricted/yolo
+mode is never enabled by the controller.
+
+Each accepted agent turn immediately sends a small receipt, then delivers the
+final response as a separate routed message. A later UI slice can turn that
+receipt into a throttled self-editing progress card without changing the
+mailbox or adapter.
+
+The live adapter test passed on July 23, 2026. Two read-only Telegram turns
+completed through the serialized mailbox on their first attempts. The
+controller was restarted between turns, both used the same persisted Codex
+session ID, and the second turn produced an immediate receipt followed by the
+final response.
+
 For controlled debugging, each loop can run separately:
 
 ```sh
 /Users/shantam/telegram-control/telegram_control.py collect
 /Users/shantam/telegram-control/telegram_control.py work
+/Users/shantam/telegram-control/telegram_control.py work-agents
 /Users/shantam/telegram-control/telegram_control.py send-outbox
 ```
 
