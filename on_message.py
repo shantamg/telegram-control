@@ -378,6 +378,35 @@ def try_enqueue_agent_steer(route, text: str) -> bool:
     return control is not None
 
 
+def requests_agent_control_panel(text: str) -> bool:
+    """Recognize explicit natural aliases for the controller's /agent UI."""
+    normalized = " ".join(str(text).strip().casefold().split())
+    normalized = normalized.rstrip(" .!?")
+    polite = r"(?:(?:can|could|would)\s+you\s+|please\s+)?"
+    action = r"(?:show|open|display|invoke|bring\s+up)"
+    patterns = (
+        (
+            polite
+            + r"show\s+me\s+(?:the\s+)?session\s+controls\s+for\s+"
+            r"(?:this|the\s+current)\s+topic"
+        ),
+        (
+            polite
+            + action
+            + r"(?:\s+me)?\s+(?:the\s+)?(?:telegram\s+)?"
+            r"(?:agent|session)\s+controls"
+            r"(?:\s+for\s+(?:this|the\s+current)\s+topic)?"
+        ),
+        (
+            polite
+            + action
+            + r"(?:\s+me)?\s+(?:the\s+)?/agent"
+            r"(?:\s+(?:interface|controls))?"
+        ),
+    )
+    return any(re.fullmatch(pattern, normalized) for pattern in patterns)
+
+
 def send_agent_status() -> None:
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     if not database_path:
@@ -2616,6 +2645,8 @@ def main() -> int:
             elif agent_create is not None:
                 create_agent_from_catalog(agent_create.group(1))
             elif text.strip().lower() in {"/agent", "/agent status"}:
+                send_agent_status()
+            elif requests_agent_control_panel(text):
                 send_agent_status()
             elif replied_message_id:
                 route = resolve_replied_message_route()

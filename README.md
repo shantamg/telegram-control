@@ -509,14 +509,15 @@ Telegram topic, and writes only validated messages or one-time controller
 actions to the durable outbox. It does not receive the Telegram bot token.
 Session controls are allowed only on the managed agent's own bound topic and
 remain controller-validated and confirmation-gated; an agent cannot change
-its own session pointer. Every managed provider turn also receives a short
-controller-authored runtime hint for this panel, so an older persisted session
-does not depend on refreshing its original skill catalog and cannot mistake a
-request for Telegram session controls for domain-specific controls. Stable
-caller-provided keys and a content hash make text and voice retries
-idempotent. Canonical skill definitions live under `skills/` and are installed
-in both the Codex and Claude user skill directories. Voice messages send their
-bounded text to Microsoft Edge TTS.
+its own session pointer. Stable caller-provided keys and a content hash make
+text and voice retries idempotent. Canonical skill definitions live under
+`skills/` and are installed in both the Codex and Claude user skill
+directories. Voice messages send their bounded text to Microsoft Edge TTS.
+An explicit request to show or open this topic's agent/session controls is
+also a narrow harness-level alias for `/agent`: it renders the panel directly
+without invoking the provider or adding anything to its conversation history.
+Domain-specific requests such as email-monitoring controls do not match this
+alias.
 
 ## Live Codex worker control
 

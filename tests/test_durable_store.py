@@ -7923,6 +7923,70 @@ class DurableIntegrationTests(unittest.TestCase):
                 ).fetchone()["route_json"]
                 self.assertEqual(json.loads(route_json)["target_id"], agent.agent_id)
 
+                store.complete_outbox(
+                    response.message_id,
+                    "sender",
+                    {"message_id": 700, "chat": {"id": 123}},
+                    now=101,
+                )
+                store.ingest_update(
+                    topic_message_update(
+                        11,
+                        "Show me the session controls for this topic.",
+                    ),
+                    now=102,
+                )
+                natural_job = store.claim_job("worker", now=102)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    natural_job,
+                    "worker",
+                )
+                natural_response = store.claim_outbox("sender", now=10**12)
+                self.assertIn(
+                    "Name: tc--root--telegram-control",
+                    natural_response.params["text"],
+                )
+                self.assertEqual(
+                    [
+                        button["text"]
+                        for row in natural_response.params["reply_markup"][
+                            "inline_keyboard"
+                        ]
+                        for button in row
+                    ],
+                    labels,
+                )
+                mailbox_count = store.connection.execute(
+                    "SELECT COUNT(*) AS count FROM agent_mailbox"
+                ).fetchone()["count"]
+                self.assertEqual(mailbox_count, 0)
+
+    def test_agent_control_natural_alias_is_narrow(self):
+        accepted = (
+            "Show me the session controls for this topic.",
+            "Could you open the agent controls?",
+            "Bring up /agent",
+            "Display the Telegram session controls.",
+        )
+        rejected = (
+            "What controls should an email monitoring session have?",
+            "Show me the controls for this email monitoring session.",
+            "Explain how agent session controls work.",
+            "Start monitoring my email in this topic.",
+        )
+        for text in accepted:
+            self.assertTrue(
+                on_message.requests_agent_control_panel(text),
+                text,
+            )
+        for text in rejected:
+            self.assertFalse(
+                on_message.requests_agent_control_panel(text),
+                text,
+            )
+
     def test_agent_can_confirm_resuming_discovered_codex_session(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"

@@ -76,31 +76,6 @@ class ProviderAdapter(Protocol):
 
 _END_OF_STREAM = object()
 _NO_LINE = object()
-_TELEGRAM_MANAGED_RUNTIME_KEYS = frozenset(
-    {
-        "TELEGRAM_CONTROL_DB",
-        "TELEGRAM_CONTROL_AGENT_ID",
-        "TELEGRAM_CONTROL_MAILBOX_ID",
-        "TELEGRAM_CONTROL_WORKER_ID",
-    }
-)
-
-
-def managed_telegram_prompt(agent: ManagedAgent, prompt: str) -> str:
-    """Expose the controller panel reliably, including to older sessions."""
-    if not _TELEGRAM_MANAGED_RUNTIME_KEYS.issubset(agent.runtime_environment):
-        return prompt
-    return (
-        "[Telegram Control runtime]\n"
-        "If the user asks to show or manage this Telegram topic's actual "
-        "agent/provider session controls, run this command before your final "
-        "response:\n"
-        "/usr/bin/python3 "
-        "/Users/shantam/telegram-control/agent_telegram.py controls\n"
-        "This creates the real controller-owned Telegram buttons. Do not "
-        "substitute an imagined or domain-specific list of controls.\n\n"
-        f"[User request]\n{prompt}"
-    )
 
 
 def _validate_control(control: Any) -> ProviderControl:
@@ -518,14 +493,14 @@ class CodexExecAdapter:
         sandbox = self._sandbox_mode(agent)
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
-        effective_prompt = managed_telegram_prompt(agent, prompt)
+        effective_prompt = prompt
         if recovery:
             effective_prompt = (
                 "The controller lost the completion status for the previous "
                 "delivery of this request. Inspect the existing conversation "
                 "and project state, then finish or report the result without "
                 "repeating work that already completed.\n\n"
-                f"Original request:\n{effective_prompt}"
+                f"Original request:\n{prompt}"
             )
 
         deadline = time.monotonic() + self.timeout_seconds
@@ -1111,14 +1086,14 @@ class ClaudePrintAdapter:
         recovery = mailbox_session_id is not None
         session_id = persisted_session or str(uuid.uuid4())
         command = self.command(agent, persisted_session, session_id)
-        effective_prompt = managed_telegram_prompt(agent, prompt)
+        effective_prompt = prompt
         if recovery:
             effective_prompt = (
                 "The controller lost the completion status for the previous "
                 "delivery of this request. Inspect the existing conversation "
                 "and project state, then finish or report the result without "
                 "repeating work that already completed.\n\n"
-                f"Original request:\n{effective_prompt}"
+                f"Original request:\n{prompt}"
             )
 
         deadline = time.monotonic() + self.timeout_seconds
