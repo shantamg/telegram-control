@@ -455,6 +455,39 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
         )
 
 
+def enqueue_router_input(text: str) -> None:
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    if not database_path or not job_id:
+        raise StoreError("Main-router input requires the durable controller.")
+    chat_id, thread_id = surface_coordinates()
+    with DurableStore(Path(database_path)) as store:
+        binding = store.resolve_surface_binding(chat_id, thread_id)
+        if binding is None:
+            binding = store.ensure_surface_binding(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                surface_type="control",
+                display_name="Control",
+                target_type="controller",
+                target_id="control",
+            )
+        if (
+            binding.surface_type != "control"
+            or binding.target_type != "controller"
+            or binding.target_id != "control"
+        ):
+            raise StoreError("Main router surface is no longer valid.")
+        store.enqueue_router_message_with_receipt(
+            source_inbox_job_id=int(job_id),
+            input_text=text,
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            receipt_text="🧭 <b>Routing…</b>",
+            receipt_parse_mode="HTML",
+        )
+
+
 def handle_callback(update: dict, callback_query: dict) -> None:
     callback_query_id = str(callback_query.get("id", ""))
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
@@ -861,10 +894,7 @@ def main() -> int:
                             include_inspect_button=True,
                         )
                 else:
-                    send_message(
-                        f"✅ Mac script ran and received: {text}",
-                        include_inspect_button=True,
-                    )
+                    enqueue_router_input(text)
         else:
             send_message("Send me a text or Telegram voice message.")
         return 0

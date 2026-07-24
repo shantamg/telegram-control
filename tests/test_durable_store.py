@@ -22,6 +22,8 @@ from durable_store import (
     MIGRATION_6,
     MIGRATION_7,
     MIGRATION_8,
+    MIGRATION_9,
+    MIGRATION_10,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -113,7 +115,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            9,
+            10,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -1048,7 +1050,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    9,
+                    10,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1072,7 +1074,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    9,
+                    10,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1097,7 +1099,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    9,
+                    10,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1121,7 +1123,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    9,
+                    10,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1147,7 +1149,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    9,
+                    10,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1178,7 +1180,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    9,
+                    10,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1210,7 +1212,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    9,
+                    10,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1243,12 +1245,46 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    9,
+                    10,
                 )
                 self.assertEqual(
                     store.connection.execute(
                         "SELECT COUNT(*) FROM sqlite_master "
                         "WHERE type = 'table' AND name = 'managed_projects'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_schema_nine_database_migrates_to_current_schema(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-nine.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for statement in (
+                MIGRATION_1
+                + MIGRATION_2
+                + MIGRATION_3
+                + MIGRATION_4
+                + MIGRATION_5
+                + MIGRATION_6
+                + MIGRATION_7
+                + MIGRATION_8
+                + MIGRATION_9
+            ):
+                connection.execute(statement)
+            connection.execute("PRAGMA user_version = 9")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    10,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'router_mailbox'"
                     ).fetchone()[0],
                     1,
                 )
@@ -1323,7 +1359,7 @@ class DurableIntegrationTests(unittest.TestCase):
         self.assertTrue(plist["RunAtLoad"])
         self.assertTrue(plist["KeepAlive"])
 
-    def test_inbox_worker_runs_existing_handler_and_creates_durable_reply(self):
+    def test_control_message_enters_durable_router_mailbox(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"
             config = {
@@ -1342,11 +1378,113 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(reply.params["chat_id"], 123)
                 self.assertEqual(
                     reply.params["text"],
-                    "✅ Mac script ran and received: hello",
+                    "🧭 <b>Routing…</b>",
                 )
-                button = reply.params["reply_markup"]["inline_keyboard"][0][0]
-                self.assertEqual(button["text"], "Inspect transport")
-                self.assertRegex(button["callback_data"], r"^a:[A-Za-z0-9_-]{6,32}$")
+                self.assertEqual(reply.params["parse_mode"], "HTML")
+                self.assertEqual(
+                    store.status_counts()["router_mailbox"],
+                    {"queued": 1},
+                )
+
+    def test_router_worker_builds_path_safe_prompt_and_edits_preview(self):
+        class FakeRouterAdapter:
+            def run_turn(
+                self,
+                agent,
+                prompt,
+                mailbox_session_id,
+                on_session,
+                heartbeat,
+            ):
+                self.agent = agent
+                self.prompt = prompt
+                self.mailbox_session_id = mailbox_session_id
+                on_session("router-session-123")
+                heartbeat()
+                return provider_adapters.ProviderTurnResult(
+                    provider_session_id="router-session-123",
+                    final_text=(
+                        '{"tool":"send_to_agent","arguments":{'
+                        '"project_slug":"telegram-control",'
+                        '"message":"Summarize Stage 4"}}'
+                    ),
+                    usage={"input_tokens": 25, "output_tokens": 8},
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            fake = FakeRouterAdapter()
+            with DurableStore(database_path) as store:
+                store.enroll_project(
+                    slug="telegram-control",
+                    display_name="Telegram Control",
+                    provider="codex",
+                    project_path="/secret/local/path",
+                    now=99,
+                )
+                store.ingest_update(
+                    message_update(
+                        text="Ask Telegram Control to summarize Stage 4"
+                    ),
+                    now=100,
+                )
+                inbox = store.claim_job("inbox-worker", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    inbox,
+                    "inbox-worker",
+                )
+                receipt = store.claim_outbox("sender", now=10**12)
+                router_job = store.claim_router_mailbox(
+                    "router-worker",
+                    now=10**12,
+                )
+                with mock.patch.object(
+                    telegram_control.provider_adapters,
+                    "adapter_for",
+                    return_value=fake,
+                ):
+                    telegram_control.process_router_mailbox_job(
+                        store,
+                        router_job,
+                        "router-worker",
+                    )
+                store.complete_outbox(
+                    receipt.message_id,
+                    "sender",
+                    {"message_id": 700, "chat": {"id": 123}},
+                    now=10**12,
+                )
+
+                self.assertEqual(fake.agent.hierarchical_name, "tc--root")
+                self.assertEqual(
+                    fake.agent.project_path,
+                    str(Path(telegram_control.__file__).resolve().parent),
+                )
+                self.assertIsNone(fake.mailbox_session_id)
+                self.assertIn('"slug":"telegram-control"', fake.prompt)
+                self.assertNotIn("/secret/local/path", fake.prompt)
+                self.assertEqual(
+                    store.status_counts()["router_mailbox"],
+                    {"succeeded": 1},
+                )
+                self.assertEqual(
+                    store.resolve_main_agent().provider_session_id,
+                    "router-session-123",
+                )
+                preview = store.claim_outbox("sender-2", now=10**12)
+                self.assertEqual(preview.method, "editMessageText")
+                self.assertEqual(preview.params["message_id"], 700)
+                self.assertIn(
+                    "Would send this to Telegram Control",
+                    preview.params["text"],
+                )
+                self.assertIn("No action was executed.", preview.params["text"])
 
     def test_button_callback_routes_once_through_existing_handler(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1356,7 +1494,16 @@ class DurableIntegrationTests(unittest.TestCase):
                 "handler_path": str(Path(on_message.__file__).resolve()),
             }
             with DurableStore(database_path) as store:
-                store.ingest_update(message_update(), now=100)
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Stage 2 Test",
+                    target_type="controller",
+                    target_id="control",
+                    now=99,
+                )
+                store.ingest_update(topic_message_update(), now=100)
                 first_job = store.claim_job("worker", now=100)
                 telegram_control.process_inbox_job(
                     store,
@@ -1369,7 +1516,11 @@ class DurableIntegrationTests(unittest.TestCase):
                 ).fetchone()
 
                 store.ingest_update(
-                    callback_update(11, f"a:{action['token']}"),
+                    callback_update(
+                        11,
+                        f"a:{action['token']}",
+                        message_thread_id=62,
+                    ),
                     now=101,
                 )
                 callback_job = store.claim_job("worker", now=101)
@@ -1381,7 +1532,11 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
 
                 store.ingest_update(
-                    callback_update(12, f"a:{action['token']}"),
+                    callback_update(
+                        12,
+                        f"a:{action['token']}",
+                        message_thread_id=62,
+                    ),
                     now=102,
                 )
                 replay_job = store.claim_job("worker", now=102)

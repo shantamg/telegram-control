@@ -14,11 +14,13 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
 import telegram_bridge as bridge
 import provider_adapters
+import router_contract
 import tmux_console
 from durable_store import (
     SCHEMA_VERSION,
@@ -26,6 +28,7 @@ from durable_store import (
     DurableStore,
     InboxJob,
     OutboxMessage,
+    RouterMailboxJob,
     StoreError,
 )
 
@@ -252,6 +255,141 @@ def work_agents_command(args: argparse.Namespace) -> None:
                 return
 
 
+def router_preview_text(
+    store: DurableStore,
+    call: router_contract.RouterToolCall,
+) -> str:
+    arguments = call.arguments
+    if call.tool == "send_to_agent":
+        project = store.resolve_project(str(arguments["project_slug"]))
+        destination = project.display_name if project is not None else str(
+            arguments["project_slug"]
+        )
+        body = (
+            f"Would send this to {destination}:\n\n"
+            f"{arguments['message']}"
+        )
+    elif call.tool == "list_projects":
+        body = "Would list the enrolled projects and their active agents."
+    elif call.tool == "inspect_project":
+        body = f"Would inspect {arguments['project']} read-only."
+    elif call.tool == "create_project_agent":
+        topic = arguments.get("topic_name")
+        body = f"Would propose creating a project agent for {arguments['project']}."
+        if topic:
+            body += f"\n\nSuggested topic: {topic}"
+    elif call.tool == "ask_user":
+        body = f"Would ask:\n\n{arguments['question']}"
+        options = arguments["options"]
+        if options:
+            body += "\n\nChoices: " + " · ".join(options)
+    else:
+        body = f"Would reply:\n\n{arguments['message']}"
+    confirmation = (
+        "\n\nConfirmation would be required."
+        if call.requires_confirmation
+        else ""
+    )
+    preview = (
+        "🧭 Router preview\n\n"
+        f"{body}{confirmation}\n\n"
+        "No action was executed."
+    )
+    if len(preview) > 3800:
+        preview = preview[:3799].rstrip() + "…"
+    return preview
+
+
+def process_router_mailbox_job(
+    store: DurableStore,
+    job: RouterMailboxJob,
+    worker_id: str,
+) -> None:
+    try:
+        main_agent = store.resolve_main_agent()
+        if main_agent is None:
+            raise StoreError("Main router agent no longer exists.")
+        runtime_agent = replace(
+            main_agent,
+            project_path=str(SCRIPT_PATH.parent),
+            provider_config={"sandbox": "read-only"},
+        )
+        projects = store.list_projects()
+        prompt = router_contract.build_main_agent_prompt(
+            job.input_text,
+            projects,
+            store.list_project_agent_states(),
+        )
+        adapter = provider_adapters.adapter_for(runtime_agent)
+        result = adapter.run_turn(
+            runtime_agent,
+            prompt,
+            job.provider_session_id,
+            on_session=lambda session_id: store.attach_router_mailbox_session(
+                job.mailbox_id,
+                worker_id,
+                session_id,
+            ),
+            heartbeat=lambda: store.heartbeat_router_mailbox(
+                job.mailbox_id,
+                worker_id,
+            ),
+        )
+        call = router_contract.parse_router_tool_call(
+            result.final_text,
+            {project.slug for project in projects},
+        )
+        preview = router_preview_text(store, call)
+        store.complete_router_mailbox(
+            job.mailbox_id,
+            worker_id,
+            result.provider_session_id,
+            result.final_text,
+            call.tool,
+            call.arguments,
+            preview,
+            result.usage,
+        )
+        log_event(
+            "router_turn_succeeded",
+            mailbox_id=job.mailbox_id,
+            attempts=job.attempts,
+            tool=call.tool,
+            provider_session_id=result.provider_session_id,
+        )
+    except (provider_adapters.ProviderAdapterError, OSError, StoreError) as exc:
+        state = store.fail_router_mailbox(
+            job.mailbox_id,
+            worker_id,
+            str(exc),
+        )
+        log_event(
+            "router_turn_failed",
+            mailbox_id=job.mailbox_id,
+            attempts=job.attempts,
+            state=state,
+            error=str(exc),
+        )
+
+
+def work_router_command(args: argparse.Namespace) -> None:
+    worker_id = process_name("router")
+    with open_store(args.db) as store:
+        while True:
+            job = store.claim_router_mailbox(
+                worker_id,
+                lease_seconds=args.lease_seconds,
+            )
+            if job is None:
+                if args.once:
+                    return
+                time.sleep(args.idle_sleep)
+                continue
+            process_router_mailbox_job(store, job, worker_id)
+            if args.once:
+                return
+
+
 def send_outbox_message(
     store: DurableStore,
     token: str,
@@ -293,6 +431,10 @@ def send_outbox_message(
                 store.enqueue_agent_response_fallback(
                     int(message.card["mailbox_id"])
                 )
+            elif message.card.get("kind") == "router_turn":
+                store.enqueue_router_response_fallback(
+                    int(message.card["mailbox_id"])
+                )
             else:
                 store.mark_surface_card_stale(int(message.card["card_id"]))
         log_event(
@@ -325,7 +467,7 @@ def send_outbox_command(args: argparse.Namespace) -> None:
 
 
 def run_command(args: argparse.Namespace) -> None:
-    """Run the three independently restartable loops under a small supervisor."""
+    """Run the independently restartable controller loops under a supervisor."""
     previous_sigterm = signal.getsignal(signal.SIGTERM)
 
     def stop_on_sigterm(_: int, __: Any) -> None:
@@ -337,6 +479,7 @@ def run_command(args: argparse.Namespace) -> None:
     commands = [
         [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "collect"],
         [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "work"],
+        [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "work-router"],
         [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "work-agents"],
         [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "send-outbox"],
     ]
@@ -780,6 +923,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_loop_arguments(agent_work_parser, lease_seconds=2 * 60 * 60)
     agent_work_parser.set_defaults(function=work_agents_command)
 
+    router_work_parser = subparsers.add_parser(
+        "work-router",
+        help="Process serialized main-router mailbox items.",
+    )
+    add_loop_arguments(router_work_parser, lease_seconds=10 * 60)
+    router_work_parser.set_defaults(function=work_router_command)
+
     outbox_parser = subparsers.add_parser(
         "send-outbox", help="Deliver durable Telegram API calls."
     )
@@ -872,7 +1022,10 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_parser.set_defaults(function=doctor_command)
 
     retry_parser = subparsers.add_parser("retry", help="Requeue dead items.")
-    retry_parser.add_argument("queue", choices=("inbox", "outbox", "agent"))
+    retry_parser.add_argument(
+        "queue",
+        choices=("inbox", "outbox", "agent", "router"),
+    )
     retry_parser.set_defaults(function=retry_command)
     return parser
 

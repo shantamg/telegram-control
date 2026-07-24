@@ -283,6 +283,13 @@ validated again by the controller. Unknown tools, projects, arguments, extra
 fields, and oversized values fail closed; project-agent creation always
 requires controller-enforced confirmation.
 
+Ordinary messages in the root Control chat now enter a dedicated durable
+router mailbox. A supervised worker invokes the main Codex agent with the
+path-safe catalog, persists its provider session, validates the selected tool,
+and replaces a `🧭 Routing…` receipt with a preview. This checkpoint does not
+execute the tool, so routing judgment can be tested independently from side
+effects.
+
 The earlier strict `route`, `clarify`, or `reject` schema remains as a compact
 classification and evaluation primitive. It is not intended to become a
 user-facing command language.
@@ -292,13 +299,15 @@ For controlled debugging, each loop can run separately:
 ```sh
 /Users/shantam/telegram-control/telegram_control.py collect
 /Users/shantam/telegram-control/telegram_control.py work
+/Users/shantam/telegram-control/telegram_control.py work-router
 /Users/shantam/telegram-control/telegram_control.py work-agents
 /Users/shantam/telegram-control/telegram_control.py send-outbox
 ```
 
 Use `--once` on any individual loop to handle at most one polling request or
 queued item. Dead items are explicitly requeued with
-`telegram_control.py retry inbox` or `telegram_control.py retry outbox`.
+`telegram_control.py retry inbox`, `telegram_control.py retry router`, or the
+corresponding agent/outbox queue name.
 
 ## Prerequisites
 

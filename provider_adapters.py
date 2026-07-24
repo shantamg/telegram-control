@@ -138,7 +138,14 @@ class CodexExecAdapter:
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
         if persisted_session:
-            command = [self.binary, "exec", "resume", "--json"]
+            command = [
+                self.binary,
+                "exec",
+                "--sandbox",
+                sandbox,
+                "resume",
+                "--json",
+            ]
             if model:
                 command.extend(["--model", str(model)])
             command.extend([persisted_session, "-"])

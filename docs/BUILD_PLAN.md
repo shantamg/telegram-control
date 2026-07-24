@@ -865,7 +865,7 @@ to enrolled Git projects; repeated turns, restart resume, voice input, explicit
 tmux disposal/recreation, pause/resume, inspection, and guarded session
 replacement all operate through durable logical agent state.
 
-The Stage 4 router-contract slices pass 72 offline tests:
+The Stage 4 router-contract and durable-preview slices pass 74 offline tests:
 
 - router prompts contain only path-safe active catalog metadata;
 - normalized output is limited to exact `route`, `clarify`, and `reject`
@@ -883,8 +883,15 @@ The Stage 4 router-contract slices pass 72 offline tests:
   controller-enforced confirmation rather than left to model discretion;
 - the command handlers remain recovery and power-user wrappers, not the
   intended conversational interface;
-- no Telegram dispatch is enabled in this slice; the next checkpoint adds a
-  durable router mailbox and preview-only live evaluation before real routing.
+- schema version 10 adds a serialized, leased main-router mailbox whose
+  provider session survives controller restarts;
+- root Control messages immediately receive one self-editing routing receipt;
+  the supervised router worker builds the path-safe prompt, validates one tool
+  call, and replaces the receipt with a human-readable preview;
+- receipt/result races and failed edits have durable completion and fallback
+  paths;
+- the preview executes no tool; live evaluation comes before enabling
+  read-only tools, clarification buttons, confirmations, or real dispatch.
 
 ## References
 

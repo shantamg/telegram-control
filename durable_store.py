@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 
 class StoreError(RuntimeError):
@@ -125,6 +125,15 @@ class ManagedAgent:
 class AgentMailboxJob:
     mailbox_id: int
     agent_id: str
+    source_inbox_job_id: int
+    input_text: str
+    provider_session_id: Optional[str]
+    attempts: int
+
+
+@dataclass(frozen=True)
+class RouterMailboxJob:
+    mailbox_id: int
     source_inbox_job_id: int
     input_text: str
     provider_session_id: Optional[str]
@@ -433,6 +442,38 @@ MIGRATION_9 = (
     """,
 )
 
+MIGRATION_10 = (
+    """
+    CREATE TABLE router_mailbox (
+        mailbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        source_inbox_job_id INTEGER NOT NULL UNIQUE
+            REFERENCES inbox_jobs(job_id) ON DELETE RESTRICT,
+        chat_id INTEGER NOT NULL,
+        message_thread_id INTEGER NOT NULL DEFAULT 0,
+        input_text TEXT NOT NULL,
+        provider_session_id TEXT,
+        state TEXT NOT NULL
+            CHECK (state IN ('queued', 'leased', 'succeeded', 'dead')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        available_at REAL NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at REAL,
+        last_error TEXT,
+        raw_output TEXT,
+        tool_name TEXT,
+        arguments_json TEXT,
+        preview_text TEXT,
+        usage_json TEXT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX router_mailbox_ready
+    ON router_mailbox(state, available_at, mailbox_id)
+    """,
+)
+
 
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
@@ -523,6 +564,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 9
                 self.connection.execute("PRAGMA user_version = 9")
+            if current < 10:
+                for statement in MIGRATION_10:
+                    self.connection.execute(statement)
+                current = 10
+                self.connection.execute("PRAGMA user_version = 10")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -1199,6 +1245,62 @@ class DurableStore:
                 )
             if row["card_json"] is not None:
                 card_spec = json.loads(row["card_json"])
+                if card_spec.get("kind") == "router_turn":
+                    try:
+                        mode = str(card_spec["mode"])
+                    except (KeyError, TypeError, ValueError):
+                        raise StoreError(
+                            "Outbox router-turn metadata is invalid."
+                        ) from None
+                    if mode == "receipt":
+                        if row["method"] != "sendMessage" or not isinstance(
+                            result, dict
+                        ):
+                            raise StoreError(
+                                "Only sendMessage can deliver a router receipt."
+                            )
+                        try:
+                            int(result["message_id"])
+                            source_inbox_job_id = int(
+                                card_spec["source_inbox_job_id"]
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            raise StoreError(
+                                "Telegram result cannot identify its router receipt."
+                            ) from None
+                        mailbox = self.connection.execute(
+                            """
+                            SELECT mailbox_id, state, preview_text
+                            FROM router_mailbox
+                            WHERE source_inbox_job_id = ?
+                            """,
+                            (source_inbox_job_id,),
+                        ).fetchone()
+                        if (
+                            mailbox is not None
+                            and str(mailbox["state"]) in {"succeeded", "dead"}
+                            and mailbox["preview_text"] is not None
+                        ):
+                            self._enqueue_router_final_edit(
+                                int(mailbox["mailbox_id"]),
+                                str(mailbox["preview_text"]),
+                                timestamp,
+                            )
+                    elif mode == "final_edit":
+                        try:
+                            int(card_spec["mailbox_id"])
+                        except (KeyError, TypeError, ValueError):
+                            raise StoreError(
+                                "Outbox router-turn edit metadata is invalid."
+                            ) from None
+                        if row["method"] != "editMessageText":
+                            raise StoreError(
+                                "Only editMessageText can finish a router turn card."
+                            )
+                    else:
+                        raise StoreError("Outbox router-turn mode is invalid.")
+                    self.connection.execute("COMMIT")
+                    return
                 if card_spec.get("kind") == "agent_turn":
                     try:
                         mode = str(card_spec["mode"])
@@ -1686,6 +1788,522 @@ class DurableStore:
             """
         ).fetchall()
         return [self._managed_project_from_row(row) for row in rows]
+
+    def list_project_agent_states(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT p.slug AS project_slug,
+                COALESCE(a.lifecycle_state, 'not_created') AS state,
+                a.provider_session_id
+            FROM managed_projects AS p
+            LEFT JOIN agents AS a
+                ON a.role = 'project'
+                AND a.slug = p.slug
+                AND a.project_path = p.project_path
+            WHERE p.state = 'active'
+            ORDER BY p.slug
+            """
+        ).fetchall()
+        return [
+            {
+                "project_slug": str(row["project_slug"]),
+                "state": str(row["state"]),
+                "session": row["provider_session_id"] is not None,
+            }
+            for row in rows
+        ]
+
+    def _ensure_main_agent(self, timestamp: float) -> ManagedAgent:
+        row = self.connection.execute(
+            "SELECT * FROM agents WHERE hierarchical_name = 'tc--root'"
+        ).fetchone()
+        if row is None:
+            agent_id = f"agent_{secrets.token_urlsafe(12)}"
+            self.connection.execute(
+                """
+                INSERT INTO agents(
+                    agent_id, parent_agent_id, role, slug,
+                    hierarchical_name, provider, project_path,
+                    provider_session_id, surface_binding_id,
+                    lifecycle_state, created_at, updated_at
+                )
+                VALUES (?, NULL, 'main', 'root', 'tc--root', 'codex',
+                    NULL, NULL, NULL, 'registered', ?, ?)
+                """,
+                (agent_id, timestamp, timestamp),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+        return self._managed_agent_from_row(row)
+
+    def resolve_main_agent(self) -> Optional[ManagedAgent]:
+        row = self.connection.execute(
+            "SELECT * FROM agents WHERE hierarchical_name = 'tc--root'"
+        ).fetchone()
+        return self._managed_agent_from_row(row) if row is not None else None
+
+    def enqueue_router_message_with_receipt(
+        self,
+        source_inbox_job_id: int,
+        input_text: str,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        receipt_text: str,
+        receipt_parse_mode: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> int:
+        text = input_text.strip()
+        if not text or len(text) > 8000:
+            raise StoreError("Router input must contain 1 to 8000 characters.")
+        if receipt_parse_mode not in {None, "HTML"}:
+            raise StoreError("Router receipt parse mode is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        thread_id = int(message_thread_id) if message_thread_id is not None else 0
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            binding = self.connection.execute(
+                """
+                SELECT 1
+                FROM surface_bindings
+                WHERE chat_id = ? AND message_thread_id = ?
+                    AND surface_type = 'control'
+                    AND target_type = 'controller' AND target_id = 'control'
+                    AND state = 'active'
+                """,
+                (int(chat_id), thread_id),
+            ).fetchone()
+            if binding is None:
+                raise StoreError("Main router surface is no longer valid.")
+            main_agent = self._ensure_main_agent(timestamp)
+            self.connection.execute(
+                """
+                INSERT INTO router_mailbox(
+                    source_inbox_job_id, chat_id, message_thread_id,
+                    input_text, provider_session_id, state, attempts,
+                    available_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+                ON CONFLICT(source_inbox_job_id) DO NOTHING
+                """,
+                (
+                    int(source_inbox_job_id),
+                    int(chat_id),
+                    thread_id,
+                    text,
+                    main_agent.provider_session_id,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = self.connection.execute(
+                """
+                SELECT mailbox_id, chat_id, message_thread_id, input_text
+                FROM router_mailbox
+                WHERE source_inbox_job_id = ?
+                """,
+                (int(source_inbox_job_id),),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Could not enqueue the main-router message.")
+            expected = (int(chat_id), thread_id, text)
+            actual = (
+                int(row["chat_id"]),
+                int(row["message_thread_id"]),
+                str(row["input_text"]),
+            )
+            if actual != expected:
+                raise StoreError("Inbox job was reused for a different router message.")
+            params: dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "message_thread_id": (
+                    int(message_thread_id)
+                    if message_thread_id is not None
+                    else None
+                ),
+                "text": receipt_text,
+            }
+            if receipt_parse_mode is not None:
+                params["parse_mode"] = receipt_parse_mode
+            self.enqueue_api_call(
+                operation_id=f"router-input:{int(source_inbox_job_id)}:receipt",
+                method="sendMessage",
+                params=params,
+                route={
+                    "target_type": "controller",
+                    "target_id": "control",
+                    "policy": "reply",
+                    "ttl_seconds": 30 * 24 * 60 * 60,
+                },
+                card={
+                    "kind": "router_turn",
+                    "source_inbox_job_id": int(source_inbox_job_id),
+                    "mode": "receipt",
+                },
+                now=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return int(row["mailbox_id"])
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def claim_router_mailbox(
+        self,
+        worker_id: str,
+        now: Optional[float] = None,
+        lease_seconds: float = 10 * 60,
+    ) -> Optional[RouterMailboxJob]:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                """
+                UPDATE router_mailbox
+                SET state = 'queued', lease_owner = NULL,
+                    lease_expires_at = NULL, available_at = ?, updated_at = ?
+                WHERE state = 'leased' AND lease_expires_at <= ?
+                """,
+                (timestamp, timestamp, timestamp),
+            )
+            row = self.connection.execute(
+                """
+                SELECT *
+                FROM router_mailbox
+                WHERE state = 'queued' AND available_at <= ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM router_mailbox
+                        WHERE state = 'leased'
+                    )
+                ORDER BY mailbox_id
+                LIMIT 1
+                """,
+                (timestamp,),
+            ).fetchone()
+            if row is None:
+                self.connection.execute("COMMIT")
+                return None
+            mailbox_id = int(row["mailbox_id"])
+            cursor = self.connection.execute(
+                """
+                UPDATE router_mailbox
+                SET state = 'leased', attempts = attempts + 1,
+                    lease_owner = ?, lease_expires_at = ?, updated_at = ?
+                WHERE mailbox_id = ? AND state = 'queued'
+                """,
+                (
+                    worker_id,
+                    timestamp + float(lease_seconds),
+                    timestamp,
+                    mailbox_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("Router mailbox claim lost its queue race.")
+            claimed = self.connection.execute(
+                "SELECT * FROM router_mailbox WHERE mailbox_id = ?",
+                (mailbox_id,),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return RouterMailboxJob(
+            mailbox_id=mailbox_id,
+            source_inbox_job_id=int(claimed["source_inbox_job_id"]),
+            input_text=str(claimed["input_text"]),
+            provider_session_id=(
+                str(claimed["provider_session_id"])
+                if claimed["provider_session_id"] is not None
+                else None
+            ),
+            attempts=int(claimed["attempts"]),
+        )
+
+    def attach_router_mailbox_session(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        provider_session_id: str,
+        now: Optional[float] = None,
+    ) -> None:
+        if not provider_session_id or len(provider_session_id) > 256:
+            raise StoreError("Router provider session ID is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT provider_session_id
+                FROM router_mailbox
+                WHERE mailbox_id = ? AND state = 'leased'
+                    AND lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Router mailbox lease for {mailbox_id} is no longer owned."
+                )
+            current = row["provider_session_id"]
+            if current is not None and str(current) != provider_session_id:
+                raise StoreError("Router provider session changed unexpectedly.")
+            self.connection.execute(
+                """
+                UPDATE router_mailbox
+                SET provider_session_id = ?, updated_at = ?
+                WHERE mailbox_id = ?
+                """,
+                (provider_session_id, timestamp, int(mailbox_id)),
+            )
+            main_agent = self._ensure_main_agent(timestamp)
+            if (
+                main_agent.provider_session_id is not None
+                and main_agent.provider_session_id != provider_session_id
+            ):
+                raise StoreError("Main-router provider session changed unexpectedly.")
+            self.connection.execute(
+                """
+                UPDATE agents
+                SET provider_session_id = ?, updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (provider_session_id, timestamp, main_agent.agent_id),
+            )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def heartbeat_router_mailbox(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        lease_seconds: float = 10 * 60,
+        now: Optional[float] = None,
+    ) -> None:
+        timestamp = time.time() if now is None else float(now)
+        cursor = self.connection.execute(
+            """
+            UPDATE router_mailbox
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE mailbox_id = ? AND state = 'leased' AND lease_owner = ?
+            """,
+            (
+                timestamp + float(lease_seconds),
+                timestamp,
+                int(mailbox_id),
+                worker_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise LeaseLostError(
+                f"Router mailbox lease for {mailbox_id} is no longer owned."
+            )
+
+    def _enqueue_router_final_edit(
+        self,
+        mailbox_id: int,
+        preview_text: str,
+        timestamp: float,
+    ) -> bool:
+        row = self.connection.execute(
+            """
+            SELECT r.chat_id, o.telegram_result_json
+            FROM router_mailbox AS r
+            JOIN outbox_messages AS o
+                ON o.operation_id =
+                    'router-input:' || r.source_inbox_job_id || ':receipt'
+            WHERE r.mailbox_id = ? AND o.state = 'sent'
+                AND o.telegram_result_json IS NOT NULL
+            """,
+            (int(mailbox_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            telegram_message_id = int(
+                json.loads(row["telegram_result_json"])["message_id"]
+            )
+        except (KeyError, TypeError, ValueError):
+            raise StoreError("Stored Telegram router receipt is invalid.") from None
+        self.enqueue_api_call(
+            operation_id=f"router-mailbox:{int(mailbox_id)}:final-edit",
+            method="editMessageText",
+            params={
+                "chat_id": int(row["chat_id"]),
+                "message_id": telegram_message_id,
+                "text": preview_text,
+            },
+            card={
+                "kind": "router_turn",
+                "mailbox_id": int(mailbox_id),
+                "mode": "final_edit",
+            },
+            now=timestamp,
+        )
+        return True
+
+    def complete_router_mailbox(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        provider_session_id: str,
+        raw_output: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        preview_text: str,
+        usage: dict[str, Any],
+        now: Optional[float] = None,
+    ) -> None:
+        if not preview_text or len(preview_text) > 3800:
+            raise StoreError("Router preview text is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT 1
+                FROM router_mailbox
+                WHERE mailbox_id = ? AND state = 'leased' AND lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Router mailbox lease for {mailbox_id} is no longer owned."
+                )
+            self.connection.execute(
+                """
+                UPDATE router_mailbox
+                SET provider_session_id = ?, state = 'succeeded',
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    raw_output = ?, tool_name = ?, arguments_json = ?,
+                    preview_text = ?, usage_json = ?, last_error = NULL,
+                    updated_at = ?
+                WHERE mailbox_id = ?
+                """,
+                (
+                    provider_session_id,
+                    raw_output,
+                    tool_name,
+                    json.dumps(arguments, separators=(",", ":"), sort_keys=True),
+                    preview_text,
+                    json.dumps(usage, separators=(",", ":"), sort_keys=True),
+                    timestamp,
+                    int(mailbox_id),
+                ),
+            )
+            main_agent = self._ensure_main_agent(timestamp)
+            self.connection.execute(
+                """
+                UPDATE agents
+                SET provider_session_id = ?, lifecycle_state = 'registered',
+                    updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (provider_session_id, timestamp, main_agent.agent_id),
+            )
+            self._enqueue_router_final_edit(mailbox_id, preview_text, timestamp)
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def fail_router_mailbox(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        error: str,
+        now: Optional[float] = None,
+        max_attempts: int = 3,
+        base_delay: float = 10.0,
+    ) -> str:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT attempts
+                FROM router_mailbox
+                WHERE mailbox_id = ? AND state = 'leased' AND lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Router mailbox lease for {mailbox_id} is no longer owned."
+                )
+            attempts = int(row["attempts"])
+            state = "dead" if attempts >= max_attempts else "queued"
+            delay = base_delay * (2 ** max(0, attempts - 1))
+            final_text = (
+                "❌ I couldn’t safely interpret that request. Please try "
+                "rephrasing it."
+            )
+            self.connection.execute(
+                """
+                UPDATE router_mailbox
+                SET state = ?, available_at = ?, lease_owner = NULL,
+                    lease_expires_at = NULL, last_error = ?,
+                    preview_text = CASE WHEN ? = 'dead' THEN ? ELSE preview_text END,
+                    updated_at = ?
+                WHERE mailbox_id = ?
+                """,
+                (
+                    state,
+                    timestamp if state == "dead" else timestamp + delay,
+                    str(error)[:2000],
+                    state,
+                    final_text,
+                    timestamp,
+                    int(mailbox_id),
+                ),
+            )
+            if state == "dead":
+                self._enqueue_router_final_edit(mailbox_id, final_text, timestamp)
+            self.connection.execute("COMMIT")
+            return state
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def enqueue_router_response_fallback(
+        self,
+        mailbox_id: int,
+        now: Optional[float] = None,
+    ) -> int:
+        timestamp = time.time() if now is None else float(now)
+        row = self.connection.execute(
+            """
+            SELECT chat_id, message_thread_id, preview_text
+            FROM router_mailbox
+            WHERE mailbox_id = ? AND state IN ('succeeded', 'dead')
+                AND preview_text IS NOT NULL
+            """,
+            (int(mailbox_id),),
+        ).fetchone()
+        if row is None:
+            raise StoreError("Completed router response is unavailable for fallback.")
+        thread_id = int(row["message_thread_id"])
+        return self.enqueue_api_call(
+            operation_id=f"router-mailbox:{int(mailbox_id)}:final-fallback",
+            method="sendMessage",
+            params={
+                "chat_id": int(row["chat_id"]),
+                "message_thread_id": thread_id if thread_id != 0 else None,
+                "text": str(row["preview_text"]),
+            },
+            route={
+                "target_type": "controller",
+                "target_id": "control",
+                "policy": "reply",
+                "ttl_seconds": 30 * 24 * 60 * 60,
+            },
+            now=timestamp,
+        )
 
     def attach_enrolled_project(
         self,
@@ -3031,8 +3649,20 @@ class DurableStore:
                 """,
                 (timestamp, timestamp),
             )
+        elif queue == "router":
+            cursor = self.connection.execute(
+                """
+                UPDATE router_mailbox
+                SET state = 'queued', attempts = 0, available_at = ?,
+                    last_error = NULL, updated_at = ?
+                WHERE state = 'dead'
+                """,
+                (timestamp, timestamp),
+            )
         else:
-            raise StoreError("Queue must be 'inbox', 'outbox', or 'agent'.")
+            raise StoreError(
+                "Queue must be 'inbox', 'outbox', 'agent', or 'router'."
+            )
         return int(cursor.rowcount)
 
     def status_counts(self) -> dict[str, dict[str, int]]:
@@ -3049,6 +3679,7 @@ class DurableStore:
             ("agent_mailbox", "agent_mailbox"),
             ("agent_consoles", "agent_consoles"),
             ("projects", "managed_projects"),
+            ("router_mailbox", "router_mailbox"),
         ):
             if label == "updates":
                 state_column = "ingest_state"
