@@ -400,6 +400,18 @@ Voice response modes:
 
 The mode can be global, per project/topic, or selected on a response button.
 
+The first shipped slice uses the least intrusive `ask` behavior: every
+completed managed-agent answer remains text-first and offers a one-time
+**Listen via Microsoft TTS** button. Speech is generated only after the owner
+taps the explicitly labeled control. The
+durable `sendVoice` upload has the same agent reply route plus a **Replay**
+button; failures retain the text and create a fresh retry control. Generated
+files live in an owner-only spool, are atomically published, bounded to 20 MB,
+and deleted after confirmed delivery or terminal failure. Stale cleanup
+protects every file referenced by a queued or leased upload. Automatic
+`summary`, `full`, and `off` preferences remain presentation policy layered
+over this path, not a new worker or schema.
+
 ## Stages and acceptance gates
 
 ### Stage 0 — Preserve and document the POC
@@ -1226,7 +1238,13 @@ Remaining release work:
    window can be seized or steered through a second app-server process.
    Discovery and confirmation revalidation use capped date traversal, file
    counts, metadata bytes, index bytes/lines, and wall time so accumulated
-   Codex history cannot monopolize the Telegram inbox worker.
+   Codex history cannot monopolize the Telegram inbox worker. Dormant-session
+   adoption has passed a live context-continuity test. The first voice-output
+   slice is implemented as on-demand **Listen** / **Replay** controls with
+   durable `sendVoice`, text fallback, bounded private speech files, and
+   cleanup; live playback and reply-route verification remain before choosing
+   whether automatic per-topic `summary` / `full` / `off` preferences add
+   enough value.
 4. Run the full acceptance matrix and an independent Codex review before each
    live schema migration and deployment.
 

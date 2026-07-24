@@ -3,11 +3,14 @@ import signal
 import socket
 import threading
 import time
+import tempfile
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest import mock
 
 import telegram_bridge
+import voice_responses
 
 
 VALID_TOKEN = "123456789:" + ("A" * 35)
@@ -194,6 +197,65 @@ class PerformApiCallTests(unittest.TestCase):
                     "size limit",
                 ):
                     telegram_bridge.perform_api_call("token", "getUpdates", {})
+
+    def test_voice_upload_uses_bounded_multipart_request(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            speech_dir = Path(temporary_directory) / "speech"
+            speech_dir.mkdir(mode=0o700)
+            voice_path = speech_dir / "reply.ogg"
+            voice_path.write_bytes(b"opus-audio")
+            voice_path.chmod(0o600)
+            captured = {}
+
+            def urlopen(request, timeout):
+                captured["request"] = request
+                captured["timeout"] = timeout
+                return FakeHTTPBody(
+                    b'{"ok":true,"result":{"message_id":42}}'
+                )
+
+            with mock.patch.object(
+                voice_responses,
+                "SPEECH_DIR",
+                speech_dir,
+            ), mock.patch.object(
+                telegram_bridge.urllib.request,
+                "urlopen",
+                side_effect=urlopen,
+            ):
+                result = telegram_bridge.perform_api_call(
+                    "token",
+                    "sendVoice",
+                    {
+                        "chat_id": 123,
+                        "message_thread_id": 62,
+                        "__voice_file_path": str(voice_path),
+                        "caption": "Lovely",
+                    },
+                )
+
+        self.assertEqual(result, {"message_id": 42})
+        request = captured["request"]
+        self.assertTrue(
+            request.headers["Content-type"].startswith(
+                "multipart/form-data; boundary="
+            )
+        )
+        self.assertIn(b'name="chat_id"\r\n\r\n123\r\n', request.data)
+        self.assertIn(b'name="voice"; filename="voice.ogg"', request.data)
+        self.assertIn(b"Content-Type: audio/ogg\r\n\r\nopus-audio", request.data)
+        self.assertNotIn(b"__voice_file_path", request.data)
+
+    def test_voice_file_is_rejected_for_non_voice_method(self):
+        with self.assertRaisesRegex(
+            telegram_bridge.BridgeError,
+            "only be used with sendVoice",
+        ):
+            telegram_bridge.perform_api_call(
+                "token",
+                "sendMessage",
+                {"__voice_file_path": "/tmp/not-used.ogg"},
+            )
 
 
 class ApiCallSubprocessTests(unittest.TestCase):

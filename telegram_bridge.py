@@ -17,8 +17,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Optional
+
+import voice_responses
 
 
 APP_NAME = "telegram-bridge"
@@ -132,14 +135,54 @@ def perform_api_call(
     deadline by killing the child. Standard urllib handling is retained, so
     system HTTPS-proxy configuration keeps working.
     """
+    request_params = dict(params)
+    voice_file_path = request_params.pop("__voice_file_path", None)
     encoded_params: dict[str, str] = {}
-    for key, value in params.items():
+    for key, value in request_params.items():
         if value is None:
             continue
         encoded_params[key] = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
+    headers: dict[str, str] = {}
+    if voice_file_path is None:
+        request_data = urllib.parse.urlencode(encoded_params).encode("utf-8")
+    else:
+        if method != "sendVoice":
+            raise BridgeError("A voice file can only be used with sendVoice.")
+        try:
+            voice_path = voice_responses.validate_voice_path(
+                str(voice_file_path)
+            )
+            voice_bytes = voice_path.read_bytes()
+        except OSError:
+            raise BridgeError("The queued voice file is unavailable.") from None
+        except voice_responses.VoiceResponseError as exc:
+            raise BridgeError(str(exc)) from None
+        boundary = f"telegram-control-{uuid.uuid4().hex}"
+        body = bytearray()
+        for key, value in encoded_params.items():
+            body.extend(f"--{boundary}\r\n".encode("ascii"))
+            body.extend(
+                (
+                    f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+                ).encode("utf-8")
+            )
+            body.extend(value.encode("utf-8"))
+            body.extend(b"\r\n")
+        body.extend(f"--{boundary}\r\n".encode("ascii"))
+        body.extend(
+            b'Content-Disposition: form-data; name="voice"; '
+            b'filename="voice.ogg"\r\n'
+        )
+        body.extend(b"Content-Type: audio/ogg\r\n\r\n")
+        body.extend(voice_bytes)
+        body.extend(b"\r\n")
+        body.extend(f"--{boundary}--\r\n".encode("ascii"))
+        request_data = bytes(body)
+        headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
     request = urllib.request.Request(
         f"{base_url}/bot{token}/{method}",
-        data=urllib.parse.urlencode(encoded_params).encode("utf-8"),
+        data=request_data,
+        headers=headers,
         method="POST",
     )
     error_status: Optional[int] = None

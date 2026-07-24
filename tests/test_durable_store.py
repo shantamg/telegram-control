@@ -154,6 +154,46 @@ class DurableStoreTests(unittest.TestCase):
         self.store.close()
         self.temporary_directory.cleanup()
 
+    def _completed_agent_response_with_voice_button(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Stage 2 Test",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        self.store.ingest_update(topic_message_update(10, "speak this"), now=100)
+        inbox = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+        ).fetchone()
+        mailbox_id = self.store.enqueue_agent_message(
+            agent.agent_id,
+            int(inbox["job_id"]),
+            "speak this",
+            now=101,
+        )
+        mailbox = self.store.claim_agent_mailbox("agent", now=102)
+        self.store.complete_agent_mailbox(
+            mailbox.mailbox_id,
+            "agent",
+            "session-voice-response",
+            "The durable voice response is ready.",
+            {},
+            now=2_000_000_000,
+        )
+        response = self.store.claim_outbox("sender", now=2_000_000_001)
+        return agent, mailbox_id, response
+
     def test_configures_and_migrates_database(self):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
@@ -1183,6 +1223,294 @@ class DurableStoreTests(unittest.TestCase):
         )
         self.assertEqual(route["target_type"], "agent")
         self.assertEqual(route["target_id"], agent.agent_id)
+
+    def test_completed_agent_response_offers_bound_voice_action(self):
+        agent, mailbox_id, response = (
+            self._completed_agent_response_with_voice_button()
+        )
+        button = response.params["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(button["text"], "🔊 Listen via Microsoft TTS")
+        action = self.store.connection.execute(
+            """
+            SELECT * FROM callback_actions
+            WHERE operation_id = ?
+            """,
+            (f"agent-mailbox:{mailbox_id}:voice-reply",),
+        ).fetchone()
+        self.assertEqual(button["callback_data"], f"a:{action['token']}")
+        self.assertEqual(action["action_type"], "agent_voice_reply")
+        self.assertEqual(int(action["chat_id"]), 123)
+        self.assertEqual(int(action["message_thread_id"]), 62)
+        self.assertEqual(int(action["authorized_user_id"]), 123)
+        self.assertEqual(
+            json.loads(action["payload_json"]),
+            {"agent_id": agent.agent_id, "mailbox_id": mailbox_id},
+        )
+
+    def test_voice_callback_enqueues_voice_note_with_same_agent_route(self):
+        agent, mailbox_id, response = (
+            self._completed_agent_response_with_voice_button()
+        )
+        callback_data = response.params["reply_markup"]["inline_keyboard"][0][0][
+            "callback_data"
+        ]
+        callback = callback_update(
+            11,
+            callback_data,
+            message_id=700,
+            message_thread_id=62,
+        )
+        self.store.ingest_update(callback, now=105)
+        callback_job = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+        ).fetchone()
+        voice_path = Path(self.temporary_directory.name) / "reply.ogg"
+        voice_path.write_bytes(b"voice")
+        environment = {
+            "TELEGRAM_CONTROL_DB": str(self.database_path),
+            "TELEGRAM_CONTROL_JOB_ID": str(int(callback_job["job_id"])),
+            "TELEGRAM_CHAT_ID": "123",
+            "TELEGRAM_FROM_ID": "123",
+            "TELEGRAM_MESSAGE_ID": "700",
+            "TELEGRAM_MESSAGE_THREAD_ID": "62",
+        }
+
+        with mock.patch.dict(os.environ, environment, clear=False):
+            with mock.patch.object(
+                on_message.voice_responses,
+                "synthesize_voice",
+                return_value=voice_path,
+            ) as synthesize:
+                on_message.handle_callback(
+                    callback,
+                    callback["callback_query"],
+                )
+
+        synthesize.assert_called_once_with(
+            "The durable voice response is ready.",
+            f"agent-{mailbox_id}-request-{int(callback_job['job_id'])}",
+            protected_paths=set(),
+        )
+        voice = self.store.connection.execute(
+            """
+            SELECT method, params_json, route_json
+            FROM outbox_messages
+            WHERE operation_id = ?
+            """,
+            (f"inbox:{int(callback_job['job_id'])}:agent-voice",),
+        ).fetchone()
+        self.assertEqual(voice["method"], "sendVoice")
+        params = json.loads(voice["params_json"])
+        self.assertEqual(params["__voice_file_path"], str(voice_path))
+        self.assertEqual(params["message_thread_id"], 62)
+        self.assertEqual(
+            params["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "🔊 Replay via Microsoft TTS",
+        )
+        self.assertEqual(
+            json.loads(voice["route_json"]),
+            {
+                "policy": "reply",
+                "target_id": agent.agent_id,
+                "target_type": "agent",
+                "ttl_seconds": 30 * 24 * 60 * 60,
+            },
+        )
+
+    def test_voice_generation_failure_preserves_retry_control(self):
+        _agent, _mailbox_id, response = (
+            self._completed_agent_response_with_voice_button()
+        )
+        callback_data = response.params["reply_markup"]["inline_keyboard"][0][0][
+            "callback_data"
+        ]
+        callback = callback_update(
+            11,
+            callback_data,
+            message_id=700,
+            message_thread_id=62,
+        )
+        self.store.ingest_update(callback, now=105)
+        callback_job = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+        ).fetchone()
+        environment = {
+            "TELEGRAM_CONTROL_DB": str(self.database_path),
+            "TELEGRAM_CONTROL_JOB_ID": str(int(callback_job["job_id"])),
+            "TELEGRAM_CHAT_ID": "123",
+            "TELEGRAM_FROM_ID": "123",
+            "TELEGRAM_MESSAGE_ID": "700",
+            "TELEGRAM_MESSAGE_THREAD_ID": "62",
+        }
+
+        with mock.patch.dict(os.environ, environment, clear=False):
+            with mock.patch.object(
+                on_message.voice_responses,
+                "synthesize_voice",
+                side_effect=on_message.voice_responses.VoiceResponseError(
+                    "offline"
+                ),
+            ):
+                on_message.handle_callback(
+                    callback,
+                    callback["callback_query"],
+                )
+
+        fallback = self.store.connection.execute(
+            """
+            SELECT params_json
+            FROM outbox_messages
+            WHERE operation_id = ?
+            """,
+            (f"inbox:{int(callback_job['job_id'])}:agent-voice-failed",),
+        ).fetchone()
+        params = json.loads(fallback["params_json"])
+        self.assertIn("complete text response", params["text"])
+        self.assertEqual(
+            params["reply_markup"]["inline_keyboard"][0][0]["text"],
+            "Try Microsoft TTS again",
+        )
+
+    def test_sent_voice_note_installs_reply_route(self):
+        agent, mailbox_id, _response = (
+            self._completed_agent_response_with_voice_button()
+        )
+        voice_message_id = self.store.enqueue_agent_voice_response(
+            mailbox_id=mailbox_id,
+            agent_id=agent.agent_id,
+            source_inbox_job_id=1,
+            chat_id=123,
+            message_thread_id=62,
+            authorized_user_id=123,
+            voice_file_path="/private/voice.ogg",
+            now=105,
+        )
+        self.store.connection.execute(
+            """
+            UPDATE outbox_messages
+            SET state = 'leased', lease_owner = 'sender', lease_expires_at = ?
+            WHERE message_id = ?
+            """,
+            (10**12, voice_message_id),
+        )
+        self.store.complete_outbox(
+            voice_message_id,
+            "sender",
+            {"message_id": 808, "chat": {"id": 123}},
+            now=106,
+        )
+        route = self.store.resolve_message_route(
+            123,
+            808,
+            message_thread_id=62,
+            now=107,
+        )
+        self.assertIsNotNone(route)
+        self.assertEqual(route.target_type, "agent")
+        self.assertEqual(route.target_id, agent.agent_id)
+
+    def test_voice_file_is_removed_after_successful_delivery(self):
+        self.store.enqueue_api_call(
+            "voice:success",
+            "sendVoice",
+            {
+                "chat_id": 123,
+                "message_thread_id": 62,
+                "__voice_file_path": "/private/reply.ogg",
+            },
+        )
+        message = self.store.claim_outbox("sender", now=10**12)
+        with mock.patch.object(
+            telegram_control.bridge,
+            "api_call",
+            return_value={"message_id": 808, "chat": {"id": 123}},
+        ), mock.patch.object(
+            telegram_control.voice_responses,
+            "remove_voice_file",
+        ) as remove:
+            telegram_control.send_outbox_message(
+                self.store,
+                "token",
+                message,
+                "sender",
+            )
+        remove.assert_called_once_with("/private/reply.ogg")
+
+    def test_voice_file_is_removed_after_terminal_delivery_failure(self):
+        message_id = self.store.enqueue_api_call(
+            "voice:failure",
+            "sendVoice",
+            {
+                "chat_id": 123,
+                "message_thread_id": 62,
+                "__voice_file_path": "/private/reply.ogg",
+            },
+        )
+        self.store.connection.execute(
+            "UPDATE outbox_messages SET attempts = 7 WHERE message_id = ?",
+            (message_id,),
+        )
+        message = self.store.claim_outbox("sender", now=10**12)
+        with mock.patch.object(
+            telegram_control.bridge,
+            "api_call",
+            side_effect=telegram_control.bridge.BridgeError("offline"),
+        ), mock.patch.object(
+            telegram_control.voice_responses,
+            "remove_voice_file",
+        ) as remove:
+            telegram_control.send_outbox_message(
+                self.store,
+                "token",
+                message,
+                "sender",
+            )
+        remove.assert_called_once_with("/private/reply.ogg")
+        state = self.store.connection.execute(
+            "SELECT state FROM outbox_messages WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+        self.assertEqual(state["state"], "dead")
+
+    def test_pending_voice_paths_cover_queued_and_leased_uploads(self):
+        first_id = self.store.enqueue_api_call(
+            "voice:queued",
+            "sendVoice",
+            {
+                "chat_id": 123,
+                "__voice_file_path": "/private/queued.ogg",
+            },
+        )
+        second_id = self.store.enqueue_api_call(
+            "voice:leased",
+            "sendVoice",
+            {
+                "chat_id": 123,
+                "__voice_file_path": "/private/leased.ogg",
+            },
+        )
+        self.store.connection.execute(
+            """
+            UPDATE outbox_messages
+            SET state = 'leased', lease_owner = 'sender',
+                lease_expires_at = ?
+            WHERE message_id = ?
+            """,
+            (10**12, second_id),
+        )
+        self.assertEqual(
+            self.store.pending_voice_file_paths(),
+            {"/private/queued.ogg", "/private/leased.ogg"},
+        )
+        self.store.connection.execute(
+            "UPDATE outbox_messages SET state = 'dead' WHERE message_id = ?",
+            (first_id,),
+        )
+        self.store.connection.execute(
+            "UPDATE outbox_messages SET state = 'sent' WHERE message_id = ?",
+            (second_id,),
+        )
+        self.assertEqual(self.store.pending_voice_file_paths(), set())
 
     def test_fast_agent_completion_edits_receipt_after_it_is_sent(self):
         self.store.ensure_surface_binding(

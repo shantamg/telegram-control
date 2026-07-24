@@ -472,6 +472,18 @@ continuity:
   and the one Telegram message progresses to the agent's final response. The
   stored route is revalidated durably before any mailbox work is created, so
   foreign, stale, or mismatched voice replies fail closed exactly like text.
+- Completed managed-agent answers include a one-time
+  **🔊 Listen via Microsoft TTS** button.
+  It synthesizes that already-stored answer on demand with `edge-tts`, encodes
+  it as a bounded OGG/Opus Telegram voice note, and keeps the complete text as
+  the canonical fallback. The voice note and its **Replay** button are bound
+  to the same authorized user, chat, topic, and durable agent reply route.
+  Generation is network-dependent and sends the bounded speakable text to
+  Microsoft’s Edge TTS service only after the owner taps the button; a failure
+  leaves the text untouched and offers **Try voice again**. Private temporary
+  speech files are published atomically and removed only after confirmed
+  delivery or terminal failure. Stale cleanup consults queued and leased
+  outbox references before removing completed audio.
 
 ## Live Codex worker control
 
@@ -625,6 +637,7 @@ a bounded, durable multi-step investigation:
 - Telegram and a bot created with [@BotFather](https://t.me/BotFather)
 - Handy with the Parakeet V3 model installed
 - `ffmpeg` at `/opt/homebrew/bin/ffmpeg`
+- `edge-tts` at `~/.local/bin/edge-tts` for optional spoken responses
 
 The current local transcription helper is:
 

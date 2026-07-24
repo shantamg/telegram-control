@@ -17,6 +17,7 @@ import discovery
 import router_contract
 import telegram_bridge as bridge
 import tmux_console
+import voice_responses
 from durable_store import (
     CallbackActionError,
     DurableStore,
@@ -876,6 +877,79 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 },
                 "callback-answer",
             )
+        return
+    if action.action_type == "agent_voice_reply":
+        mailbox_id = int(action.payload.get("mailbox_id", 0))
+        agent_id = str(action.payload.get("agent_id", ""))
+        if mailbox_id <= 0 or not agent_id:
+            raise StoreError("Stored voice-response action is invalid.")
+        try:
+            with DurableStore(Path(database_path)) as store:
+                response_text, _speaker = store.resolve_agent_voice_text(
+                    mailbox_id,
+                    agent_id,
+                )
+                protected_voice_paths = store.pending_voice_file_paths()
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Generating via Microsoft TTS…",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "voice-button-clear",
+        )
+        source_job_id = int(os.environ["TELEGRAM_CONTROL_JOB_ID"])
+        voice_path = None
+        try:
+            voice_path = voice_responses.synthesize_voice(
+                response_text,
+                f"agent-{mailbox_id}-request-{source_job_id}",
+                protected_paths=protected_voice_paths,
+            )
+            with DurableStore(Path(database_path)) as store:
+                store.enqueue_agent_voice_response(
+                    mailbox_id=mailbox_id,
+                    agent_id=agent_id,
+                    source_inbox_job_id=source_job_id,
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    authorized_user_id=user_id,
+                    voice_file_path=str(voice_path),
+                )
+        except (voice_responses.VoiceResponseError, StoreError):
+            if voice_path is not None:
+                voice_responses.remove_voice_file(str(voice_path))
+            with DurableStore(Path(database_path)) as store:
+                store.enqueue_agent_voice_failure(
+                    mailbox_id=mailbox_id,
+                    agent_id=agent_id,
+                    source_inbox_job_id=source_job_id,
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    authorized_user_id=user_id,
+                )
         return
     if action.action_type == "router_clarification":
         router_mailbox_id = int(action.payload.get("router_mailbox_id", 0))

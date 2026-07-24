@@ -27,6 +27,7 @@ import telegram_bridge as bridge
 import provider_adapters
 import router_contract
 import tmux_console
+import voice_responses
 from durable_store import (
     SCHEMA_VERSION,
     AgentMailboxJob,
@@ -1841,6 +1842,9 @@ def send_outbox_message(
                 delivered=True,
             )
             return
+        voice_file_path = message.params.get("__voice_file_path")
+        if voice_file_path is not None:
+            voice_responses.remove_voice_file(str(voice_file_path))
         log_event(
             "outbox_sent",
             message_id=message.message_id,
@@ -1898,6 +1902,10 @@ def handle_outbox_send_failure(
             pass
         else:
             store.mark_surface_card_stale(int(message.card["card_id"]))
+    if state == "dead" and message.params.get("__voice_file_path") is not None:
+        voice_responses.remove_voice_file(
+            str(message.params["__voice_file_path"])
+        )
     log_event(
         "outbox_failed",
         message_id=message.message_id,

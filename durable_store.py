@@ -2396,9 +2396,11 @@ class DurableStore:
                 )
 
             if row["route_json"] is not None:
-                if row["method"] != "sendMessage" or not isinstance(result, dict):
+                if row["method"] not in {"sendMessage", "sendVoice"} or not isinstance(
+                    result, dict
+                ):
                     raise StoreError(
-                        "Only a successful sendMessage result can create a reply route."
+                        "Only a successful message result can create a reply route."
                     )
                 params = json.loads(row["params_json"])
                 route = json.loads(row["route_json"])
@@ -2420,13 +2422,13 @@ class DurableStore:
                     chat_id = int(params["chat_id"])
                 except (KeyError, TypeError, ValueError):
                     raise StoreError(
-                        "Telegram sendMessage result cannot be routed."
+                        "Telegram message result cannot be routed."
                     ) from None
                 result_chat = result.get("chat")
                 if isinstance(result_chat, dict) and "id" in result_chat:
                     if int(result_chat["id"]) != chat_id:
                         raise StoreError(
-                            "Telegram sendMessage result has an unexpected chat."
+                            "Telegram message result has an unexpected chat."
                         )
                 thread_id = int(params.get("message_thread_id") or 0)
                 self.connection.execute(
@@ -2586,8 +2588,9 @@ class DurableStore:
                         if "source_inbox_job_id" in card_spec:
                             mailbox = self.connection.execute(
                                 """
-                                SELECT mailbox_id, agent_id, state,
-                                    input_text, response_text, reply_chat_id,
+                            SELECT mailbox_id, agent_id, state,
+                                    source_inbox_job_id, input_text,
+                                    response_text, reply_chat_id,
                                     provider_turn_id, last_error
                                 FROM agent_mailbox
                                 WHERE source_inbox_job_id = ?
@@ -2597,8 +2600,9 @@ class DurableStore:
                         else:
                             mailbox = self.connection.execute(
                                 """
-                                SELECT mailbox_id, agent_id, state,
-                                    input_text, response_text, reply_chat_id,
+                            SELECT mailbox_id, agent_id, state,
+                                    source_inbox_job_id, input_text,
+                                    response_text, reply_chat_id,
                                     provider_turn_id, last_error
                                 FROM agent_mailbox
                                 WHERE mailbox_id = ?
@@ -2638,6 +2642,26 @@ class DurableStore:
                                     "chat_id": int(params["chat_id"]),
                                     "message_id": telegram_message_id,
                                     "text": edit_text,
+                                    "reply_markup": (
+                                        self._agent_voice_button_markup(
+                                            mailbox_id,
+                                            str(mailbox["agent_id"]),
+                                            int(
+                                                mailbox[
+                                                    "source_inbox_job_id"
+                                                ]
+                                            ),
+                                            int(params["chat_id"]),
+                                            int(
+                                                params.get(
+                                                    "message_thread_id"
+                                                )
+                                                or 0
+                                            ),
+                                            timestamp,
+                                        )
+                                        or {"inline_keyboard": []}
+                                    ),
                                 },
                                 card={
                                     "kind": "agent_turn",
@@ -2750,6 +2774,22 @@ class DurableStore:
                             )
                     else:
                         raise StoreError("Outbox agent-control mode is invalid.")
+                    self.connection.execute("COMMIT")
+                    return
+                if card_spec.get("kind") == "agent_voice":
+                    if row["method"] != "sendVoice" or not isinstance(
+                        result, dict
+                    ):
+                        raise StoreError(
+                            "Only sendVoice can deliver an agent voice response."
+                        )
+                    try:
+                        int(card_spec["mailbox_id"])
+                        int(result["message_id"])
+                    except (KeyError, TypeError, ValueError):
+                        raise StoreError(
+                            "Telegram result cannot identify its voice response."
+                        ) from None
                     self.connection.execute("COMMIT")
                     return
                 try:
@@ -4814,6 +4854,71 @@ class DurableStore:
             ]
         }
 
+    def _authorized_user_for_inbox_job(self, job_id: int) -> Optional[int]:
+        row = self.connection.execute(
+            "SELECT payload_json FROM inbox_jobs WHERE job_id = ?",
+            (int(job_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+            source = payload.get("message") or payload.get("callback_query", {}).get(
+                "message"
+            )
+            sender = (
+                payload.get("message", {}).get("from")
+                or payload.get("callback_query", {}).get("from")
+            )
+            if not isinstance(source, dict) or not isinstance(sender, dict):
+                return None
+            return int(sender["id"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _agent_voice_button_markup(
+        self,
+        mailbox_id: int,
+        agent_id: str,
+        source_inbox_job_id: int,
+        chat_id: int,
+        message_thread_id: int,
+        timestamp: float,
+    ) -> Optional[dict[str, Any]]:
+        authorized_user_id = self._authorized_user_for_inbox_job(
+            source_inbox_job_id
+        )
+        if authorized_user_id is None:
+            return None
+        action = self.create_callback_action(
+            operation_id=f"agent-mailbox:{int(mailbox_id)}:voice-reply",
+            action_type="agent_voice_reply",
+            payload={
+                "agent_id": str(agent_id),
+                "mailbox_id": int(mailbox_id),
+            },
+            chat_id=int(chat_id),
+            message_thread_id=(
+                int(message_thread_id)
+                if int(message_thread_id) != 0
+                else None
+            ),
+            authorized_user_id=authorized_user_id,
+            one_time=True,
+            ttl_seconds=30 * 24 * 60 * 60,
+            now=timestamp,
+        )
+        return {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "🔊 Listen via Microsoft TTS",
+                        "callback_data": f"a:{action.token}",
+                    }
+                ]
+            ]
+        }
+
     def _enqueue_router_final_edit(
         self,
         mailbox_id: int,
@@ -4824,7 +4929,8 @@ class DurableStore:
     ) -> bool:
         row = self.connection.execute(
             """
-            SELECT r.chat_id, o.telegram_result_json
+            SELECT r.chat_id, r.message_thread_id,
+                r.source_inbox_job_id, o.telegram_result_json
             FROM router_mailbox AS r
             JOIN outbox_messages AS o
                 ON o.operation_id =
@@ -4848,6 +4954,29 @@ class DurableStore:
             "text": preview_text,
         }
         reply_markup = self._router_reply_markup(mailbox_id)
+        if (
+            reply_markup is None
+            and operation_suffix == "agent-final-edit"
+            and route_retarget is not None
+            and route_retarget.get("target_type") == "agent"
+        ):
+            agent_mailbox = self.connection.execute(
+                """
+                SELECT mailbox_id, agent_id
+                FROM agent_mailbox
+                WHERE source_inbox_job_id = ? AND state = 'succeeded'
+                """,
+                (int(row["source_inbox_job_id"]),),
+            ).fetchone()
+            if agent_mailbox is not None:
+                reply_markup = self._agent_voice_button_markup(
+                    int(agent_mailbox["mailbox_id"]),
+                    str(agent_mailbox["agent_id"]),
+                    int(row["source_inbox_job_id"]),
+                    int(row["chat_id"]),
+                    int(row["message_thread_id"]),
+                    timestamp,
+                )
         if reply_markup is not None:
             params["reply_markup"] = reply_markup
         elif operation_suffix in {
@@ -8390,6 +8519,14 @@ class DurableStore:
                     )
                 self.connection.execute("COMMIT")
                 return
+            voice_reply_markup = self._agent_voice_button_markup(
+                int(mailbox_id),
+                str(row["agent_id"]),
+                int(row["source_inbox_job_id"]),
+                delivery_chat_id,
+                delivery_thread_id,
+                timestamp,
+            )
             receipt = self.connection.execute(
                 """
                 SELECT state, params_json, telegram_result_json
@@ -8434,7 +8571,11 @@ class DurableStore:
                         "chat_id": delivery_chat_id,
                         "message_id": receipt_message_id,
                         "text": final_text,
-                        "reply_markup": {"inline_keyboard": []},
+                        "reply_markup": (
+                            voice_reply_markup
+                            if voice_reply_markup is not None
+                            else {"inline_keyboard": []}
+                        ),
                     },
                     card={
                         "kind": "agent_turn",
@@ -8448,19 +8589,29 @@ class DurableStore:
                 labeled_chunks[1:] if receipt_sent
                 else ([] if replaces_receipt else labeled_chunks)
             )
+            receipt_will_host_button = (
+                receipt is not None and str(receipt["state"]) != "dead"
+            )
             for index, chunk in enumerate(chunks_to_send, start=1):
+                response_params: dict[str, Any] = {
+                    "chat_id": delivery_chat_id,
+                    "message_thread_id": (
+                        delivery_thread_id
+                        if delivery_thread_id != 0
+                        else None
+                    ),
+                    "text": chunk,
+                }
+                if (
+                    not receipt_will_host_button
+                    and index == len(chunks_to_send)
+                    and voice_reply_markup is not None
+                ):
+                    response_params["reply_markup"] = voice_reply_markup
                 self.enqueue_api_call(
                     operation_id=f"agent-mailbox:{mailbox_id}:response:{index}",
                     method="sendMessage",
-                    params={
-                        "chat_id": delivery_chat_id,
-                        "message_thread_id": (
-                            delivery_thread_id
-                            if delivery_thread_id != 0
-                            else None
-                        ),
-                        "text": chunk,
-                    },
+                    params=response_params,
                     route={
                         "target_type": "agent",
                         "target_id": str(row["agent_id"]),
@@ -8613,7 +8764,7 @@ class DurableStore:
         row = self.connection.execute(
             """
             SELECT m.agent_id, m.response_text, m.reply_chat_id,
-                m.reply_message_thread_id
+                m.reply_message_thread_id, m.source_inbox_job_id
             FROM agent_mailbox AS m
             WHERE m.mailbox_id = ? AND m.state = 'succeeded'
             """,
@@ -8648,19 +8799,181 @@ class DurableStore:
             str(row["agent_id"]),
             str(row["response_text"]),
         )[0]
+        reply_markup = self._agent_voice_button_markup(
+            int(mailbox_id),
+            str(row["agent_id"]),
+            int(row["source_inbox_job_id"]),
+            fallback_chat_id,
+            thread_id,
+            timestamp,
+        )
+        fallback_params: dict[str, Any] = {
+            "chat_id": fallback_chat_id,
+            "message_thread_id": thread_id if thread_id != 0 else None,
+            "text": fallback_text,
+        }
+        if reply_markup is not None:
+            fallback_params["reply_markup"] = reply_markup
         return self.enqueue_api_call(
             operation_id=f"agent-mailbox:{mailbox_id}:final-fallback",
             method="sendMessage",
-            params={
-                "chat_id": fallback_chat_id,
-                "message_thread_id": thread_id if thread_id != 0 else None,
-                "text": fallback_text,
-            },
+            params=fallback_params,
             route={
                 "target_type": "agent",
                 "target_id": str(row["agent_id"]),
                 "policy": "reply",
                 "ttl_seconds": 30 * 24 * 60 * 60,
+            },
+            now=timestamp,
+        )
+
+    def resolve_agent_voice_text(
+        self,
+        mailbox_id: int,
+        agent_id: str,
+    ) -> tuple[str, str]:
+        row = self.connection.execute(
+            """
+            SELECT response_text
+            FROM agent_mailbox
+            WHERE mailbox_id = ? AND agent_id = ? AND state = 'succeeded'
+                AND response_text IS NOT NULL
+            """,
+            (int(mailbox_id), str(agent_id)),
+        ).fetchone()
+        if row is None:
+            raise StoreError("The completed agent response is unavailable.")
+        return str(row["response_text"]), self.agent_speaker_header(agent_id)
+
+    def pending_voice_file_paths(self) -> set[str]:
+        paths = set()
+        rows = self.connection.execute(
+            """
+            SELECT params_json
+            FROM outbox_messages
+            WHERE method = 'sendVoice' AND state IN ('queued', 'leased')
+            """
+        ).fetchall()
+        for row in rows:
+            try:
+                value = json.loads(row["params_json"]).get(
+                    "__voice_file_path"
+                )
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(value, str) and value:
+                paths.add(value)
+        return paths
+
+    def enqueue_agent_voice_response(
+        self,
+        *,
+        mailbox_id: int,
+        agent_id: str,
+        source_inbox_job_id: int,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        authorized_user_id: int,
+        voice_file_path: str,
+        now: Optional[float] = None,
+    ) -> int:
+        timestamp = time.time() if now is None else float(now)
+        self.resolve_agent_voice_text(mailbox_id, agent_id)
+        replay = self.create_callback_action(
+            operation_id=(
+                f"inbox:{int(source_inbox_job_id)}:agent-voice-replay"
+            ),
+            action_type="agent_voice_reply",
+            payload={
+                "agent_id": str(agent_id),
+                "mailbox_id": int(mailbox_id),
+            },
+            chat_id=int(chat_id),
+            message_thread_id=message_thread_id,
+            authorized_user_id=int(authorized_user_id),
+            one_time=True,
+            ttl_seconds=30 * 24 * 60 * 60,
+            now=timestamp,
+        )
+        return self.enqueue_api_call(
+            operation_id=f"inbox:{int(source_inbox_job_id)}:agent-voice",
+            method="sendVoice",
+            params={
+                "chat_id": int(chat_id),
+                "message_thread_id": message_thread_id,
+                "__voice_file_path": str(voice_file_path),
+                "caption": self.agent_speaker_header(agent_id),
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [
+                            {
+                        "text": "🔊 Replay via Microsoft TTS",
+                                "callback_data": f"a:{replay.token}",
+                            }
+                        ]
+                    ]
+                },
+            },
+            route={
+                "target_type": "agent",
+                "target_id": str(agent_id),
+                "policy": "reply",
+                "ttl_seconds": 30 * 24 * 60 * 60,
+            },
+            card={
+                "kind": "agent_voice",
+                "mailbox_id": int(mailbox_id),
+            },
+            now=timestamp,
+        )
+
+    def enqueue_agent_voice_failure(
+        self,
+        *,
+        mailbox_id: int,
+        agent_id: str,
+        source_inbox_job_id: int,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        authorized_user_id: int,
+        now: Optional[float] = None,
+    ) -> int:
+        timestamp = time.time() if now is None else float(now)
+        self.resolve_agent_voice_text(mailbox_id, agent_id)
+        retry = self.create_callback_action(
+            operation_id=f"inbox:{int(source_inbox_job_id)}:agent-voice-retry",
+            action_type="agent_voice_reply",
+            payload={
+                "agent_id": str(agent_id),
+                "mailbox_id": int(mailbox_id),
+            },
+            chat_id=int(chat_id),
+            message_thread_id=message_thread_id,
+            authorized_user_id=int(authorized_user_id),
+            one_time=True,
+            ttl_seconds=30 * 24 * 60 * 60,
+            now=timestamp,
+        )
+        return self.enqueue_api_call(
+            operation_id=f"inbox:{int(source_inbox_job_id)}:agent-voice-failed",
+            method="sendMessage",
+            params={
+                "chat_id": int(chat_id),
+                "message_thread_id": message_thread_id,
+                "text": (
+                    "🔇 I couldn’t generate the voice note. The complete "
+                    "text response is still available above."
+                ),
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "Try Microsoft TTS again",
+                                "callback_data": f"a:{retry.token}",
+                            }
+                        ]
+                    ]
+                },
             },
             now=timestamp,
         )
