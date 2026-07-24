@@ -305,13 +305,44 @@ def router_preview_text(
     return preview
 
 
-def project_inspection_text(store: DurableStore, project_key: str) -> Optional[str]:
+def project_inspection_text(
+    store: DurableStore,
+    project_key: str,
+    user_input: Optional[str] = None,
+) -> Optional[str]:
     project = store.resolve_project(project_key)
-    if project is None:
-        return None
-    agent = store.resolve_project_agent(project.slug)
+    if project is not None:
+        project_path = project.project_path
+        display_name = project.display_name
+        provider = project.provider
+        agent = store.resolve_project_agent(project.slug)
+    else:
+        if user_input is None or project_key not in user_input:
+            return None
+        requested_path = Path(project_key).expanduser().resolve()
+        if not requested_path.is_dir():
+            return None
+        try:
+            root_result = subprocess.run(
+                ["git", "-C", str(requested_path), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if root_result.returncode != 0:
+            return None
+        git_root = Path(root_result.stdout.strip()).resolve()
+        if git_root != requested_path:
+            return None
+        project_path = str(git_root)
+        display_name = git_root.name.replace("-", " ").replace("_", " ").title()
+        provider = "not enrolled"
+        agent = None
     if agent is None:
-        agent_status = "not created"
+        agent_status = "not enrolled" if project is None else "not created"
         session_status = "not started"
         console_status = "not started"
     else:
@@ -326,7 +357,7 @@ def project_inspection_text(store: DurableStore, project_key: str) -> Optional[s
     try:
         branch_result = subprocess.run(
             ["git", "branch", "--show-current"],
-            cwd=project.project_path,
+            cwd=project_path,
             capture_output=True,
             text=True,
             timeout=5,
@@ -334,7 +365,7 @@ def project_inspection_text(store: DurableStore, project_key: str) -> Optional[s
         )
         changes_result = subprocess.run(
             ["git", "status", "--porcelain"],
-            cwd=project.project_path,
+            cwd=project_path,
             capture_output=True,
             text=True,
             timeout=5,
@@ -355,8 +386,8 @@ def project_inspection_text(store: DurableStore, project_key: str) -> Optional[s
         pass
 
     return (
-        f"🔎 {project.display_name}\n\n"
-        f"Provider: {project.provider}\n"
+        f"🔎 {display_name}\n\n"
+        f"Provider: {provider}\n"
         f"Agent: {agent_status}\n"
         f"Session: {session_status}\n"
         f"Console: {console_status}\n"
@@ -545,6 +576,7 @@ def process_router_mailbox_job(
             inspection = project_inspection_text(
                 store,
                 str(call.arguments["project"]),
+                job.input_text,
             )
             response_text = (
                 inspection

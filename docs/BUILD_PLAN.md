@@ -920,7 +920,9 @@ The Stage 4 router-contract and durable-routing slices pass 81 offline tests:
 - root Control voice notes use local Parakeet transcription and one
   self-editing Telegram receipt before entering the same durable main-router
   contract as text;
-- unknown-path inspection remains staged behind the same validation boundary.
+- unenrolled Git roots can be inspected read-only only when the exact path
+  appears in the current user request; the response omits the local path, and
+  invented, missing, nested, or non-Git paths fail closed.
 
 ## References
 

@@ -295,8 +295,9 @@ confirmation-gated.
 The read-only `list_projects`, enrolled-project `inspect_project`, and
 `respond` tools also execute directly. Project inspection reports compact
 agent, provider-session, console, branch, and working-tree state without
-exposing the enrolled filesystem path. Inspection of an unknown path remains a
-preview until the controller can prove that the path came from the user.
+exposing the enrolled filesystem path. An unenrolled Git root can also be
+inspected read-only when its path appears explicitly in the current user
+request; invented, missing, nested, and non-Git paths still fail closed.
 
 The `ask_user` tool renders its bounded choices as authorized, one-time
 Telegram buttons. Selecting one expires the sibling choices and queues a new

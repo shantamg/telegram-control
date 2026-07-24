@@ -1755,6 +1755,34 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 self.assertNotIn("/secret/local/path", catalog)
 
+                unmanaged_root = (
+                    Path(temporary_directory) / "unmanaged-project"
+                ).resolve()
+                unmanaged_root.mkdir()
+                initialized = telegram_control.subprocess.run(
+                    ["git", "init", str(unmanaged_root)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(initialized.returncode, 0)
+                unmanaged = telegram_control.project_inspection_text(
+                    store,
+                    str(unmanaged_root),
+                    f"Inspect the repository at {unmanaged_root}",
+                )
+                self.assertIn("🔎 Unmanaged Project", unmanaged)
+                self.assertIn("Provider: not enrolled", unmanaged)
+                self.assertIn("Agent: not enrolled", unmanaged)
+                self.assertNotIn(str(unmanaged_root), unmanaged)
+                self.assertIsNone(
+                    telegram_control.project_inspection_text(
+                        store,
+                        str(unmanaged_root),
+                        "Inspect a repository I did not identify",
+                    )
+                )
+
     def test_router_clarification_buttons_resume_with_selected_answer(self):
         class FakeRouterAdapter:
             def run_turn(
