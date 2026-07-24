@@ -782,6 +782,26 @@ July 23, 2026:
   while the console ran, then completed on its first attempt immediately after
   `console-close`.
 
+The self-editing turn-message slice passed 57 offline tests and its live test
+on July 23, 2026:
+
+- the user-facing receipt is the compact `⏳ Working…`; routing and session
+  details remain available through `/agent`;
+- receipt creation is atomic with mailbox enqueue and carries durable,
+  provider-neutral turn metadata;
+- a normal single-message result edits the receipt in place instead of adding a
+  second bot response;
+- both receipt-first and provider-first races resolve to the same idempotent
+  final edit after Telegram supplies the message ID;
+- a permanent edit rejection falls back to a normal routed response so the
+  final answer is not lost;
+- long responses preserve the existing multi-message chunking behavior;
+- the live receipt was replaced by the exact Codex response with no duplicate
+  final message;
+- the first live receipt appeared slowly because that Telegram update reached
+  the controller 8.9 seconds after its message timestamp; after ingestion, the
+  controller queued it in 0.46 seconds.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)

@@ -1164,6 +1164,68 @@ class DurableStore:
                 )
             if row["card_json"] is not None:
                 card_spec = json.loads(row["card_json"])
+                if card_spec.get("kind") == "agent_turn":
+                    try:
+                        mailbox_id = int(card_spec["mailbox_id"])
+                        mode = str(card_spec["mode"])
+                    except (KeyError, TypeError, ValueError):
+                        raise StoreError(
+                            "Outbox agent-turn metadata is invalid."
+                        ) from None
+                    if mode == "receipt":
+                        if row["method"] != "sendMessage" or not isinstance(
+                            result, dict
+                        ):
+                            raise StoreError(
+                                "Only sendMessage can deliver an agent receipt."
+                            )
+                        try:
+                            telegram_message_id = int(result["message_id"])
+                        except (KeyError, TypeError, ValueError):
+                            raise StoreError(
+                                "Telegram result cannot identify its agent receipt."
+                            ) from None
+                        mailbox = self.connection.execute(
+                            """
+                            SELECT state, response_text
+                            FROM agent_mailbox
+                            WHERE mailbox_id = ?
+                            """,
+                            (mailbox_id,),
+                        ).fetchone()
+                        if (
+                            mailbox is not None
+                            and str(mailbox["state"]) == "succeeded"
+                            and mailbox["response_text"] is not None
+                            and len(str(mailbox["response_text"])) <= 3800
+                        ):
+                            params = json.loads(row["params_json"])
+                            self.enqueue_api_call(
+                                operation_id=(
+                                    f"agent-mailbox:{mailbox_id}:final-edit"
+                                ),
+                                method="editMessageText",
+                                params={
+                                    "chat_id": int(params["chat_id"]),
+                                    "message_id": telegram_message_id,
+                                    "text": str(mailbox["response_text"]),
+                                },
+                                card={
+                                    "kind": "agent_turn",
+                                    "mailbox_id": mailbox_id,
+                                    "mode": "final_edit",
+                                },
+                                now=timestamp,
+                            )
+                    elif mode == "final_edit":
+                        if row["method"] != "editMessageText":
+                            raise StoreError(
+                                "Only editMessageText can finish an agent turn card."
+                            )
+                    else:
+                        raise StoreError("Outbox agent-turn mode is invalid.")
+                    self.connection.execute("COMMIT")
+                    return
                 try:
                     card_id = int(card_spec["card_id"])
                     mode = str(card_spec["mode"])
@@ -1783,6 +1845,69 @@ class DurableStore:
             )
         return int(row["mailbox_id"])
 
+    def enqueue_agent_message_with_receipt(
+        self,
+        agent_id: str,
+        source_inbox_job_id: int,
+        input_text: str,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        receipt_text: str,
+        now: Optional[float] = None,
+    ) -> int:
+        timestamp = time.time() if now is None else float(now)
+        thread_id = int(message_thread_id) if message_thread_id is not None else 0
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            binding = self.connection.execute(
+                """
+                SELECT 1
+                FROM surface_bindings
+                WHERE chat_id = ? AND message_thread_id = ?
+                    AND target_type = 'agent' AND target_id = ?
+                    AND state = 'active'
+                """,
+                (int(chat_id), thread_id, agent_id),
+            ).fetchone()
+            if binding is None:
+                raise StoreError("Managed agent receipt route is no longer valid.")
+            mailbox_id = self.enqueue_agent_message(
+                agent_id=agent_id,
+                source_inbox_job_id=source_inbox_job_id,
+                input_text=input_text,
+                now=timestamp,
+            )
+            self.enqueue_api_call(
+                operation_id=f"agent-mailbox:{mailbox_id}:receipt",
+                method="sendMessage",
+                params={
+                    "chat_id": int(chat_id),
+                    "message_thread_id": (
+                        int(message_thread_id)
+                        if message_thread_id is not None
+                        else None
+                    ),
+                    "text": receipt_text,
+                },
+                route={
+                    "target_type": "agent",
+                    "target_id": agent_id,
+                    "policy": "reply",
+                    "ttl_seconds": 30 * 24 * 60 * 60,
+                },
+                card={
+                    "kind": "agent_turn",
+                    "mailbox_id": mailbox_id,
+                    "mode": "receipt",
+                },
+                now=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return mailbox_id
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
     def claim_agent_mailbox(
         self,
         worker_id: str,
@@ -2042,7 +2167,44 @@ class DurableStore:
                 (provider_session_id, timestamp, str(row["agent_id"])),
             )
             thread_id = int(binding["message_thread_id"])
-            for index, chunk in enumerate(response_chunks, start=1):
+            receipt = self.connection.execute(
+                """
+                SELECT state, params_json, telegram_result_json
+                FROM outbox_messages
+                WHERE operation_id = ?
+                """,
+                (f"agent-mailbox:{mailbox_id}:receipt",),
+            ).fetchone()
+            replaces_receipt = receipt is not None and len(response_chunks) == 1
+            if (
+                replaces_receipt
+                and str(receipt["state"]) == "sent"
+                and receipt["telegram_result_json"] is not None
+            ):
+                receipt_result = json.loads(receipt["telegram_result_json"])
+                try:
+                    receipt_message_id = int(receipt_result["message_id"])
+                except (KeyError, TypeError, ValueError):
+                    raise StoreError(
+                        "Stored Telegram receipt result is invalid."
+                    ) from None
+                self.enqueue_api_call(
+                    operation_id=f"agent-mailbox:{mailbox_id}:final-edit",
+                    method="editMessageText",
+                    params={
+                        "chat_id": int(binding["chat_id"]),
+                        "message_id": receipt_message_id,
+                        "text": response_chunks[0],
+                    },
+                    card={
+                        "kind": "agent_turn",
+                        "mailbox_id": mailbox_id,
+                        "mode": "final_edit",
+                    },
+                    now=timestamp,
+                )
+            chunks_to_send = [] if replaces_receipt else response_chunks
+            for index, chunk in enumerate(chunks_to_send, start=1):
                 self.enqueue_api_call(
                     operation_id=f"agent-mailbox:{mailbox_id}:response:{index}",
                     method="sendMessage",
@@ -2124,6 +2286,44 @@ class DurableStore:
         except BaseException:
             self.connection.execute("ROLLBACK")
             raise
+
+    def enqueue_agent_response_fallback(
+        self,
+        mailbox_id: int,
+        now: Optional[float] = None,
+    ) -> int:
+        timestamp = time.time() if now is None else float(now)
+        row = self.connection.execute(
+            """
+            SELECT m.agent_id, m.response_text, b.chat_id, b.message_thread_id
+            FROM agent_mailbox AS m
+            JOIN agents AS a ON a.agent_id = m.agent_id
+            JOIN surface_bindings AS b ON b.binding_id = a.surface_binding_id
+            WHERE m.mailbox_id = ? AND m.state = 'succeeded'
+                AND b.target_type = 'agent' AND b.target_id = m.agent_id
+                AND b.state = 'active'
+            """,
+            (int(mailbox_id),),
+        ).fetchone()
+        if row is None or row["response_text"] is None:
+            raise StoreError("Completed agent response is unavailable for fallback.")
+        thread_id = int(row["message_thread_id"])
+        return self.enqueue_api_call(
+            operation_id=f"agent-mailbox:{mailbox_id}:final-fallback",
+            method="sendMessage",
+            params={
+                "chat_id": int(row["chat_id"]),
+                "message_thread_id": thread_id if thread_id != 0 else None,
+                "text": str(row["response_text"]),
+            },
+            route={
+                "target_type": "agent",
+                "target_id": str(row["agent_id"]),
+                "policy": "reply",
+                "ttl_seconds": 30 * 24 * 60 * 60,
+            },
+            now=timestamp,
+        )
 
     @staticmethod
     def _surface_card_from_row(row: sqlite3.Row) -> SurfaceCard:

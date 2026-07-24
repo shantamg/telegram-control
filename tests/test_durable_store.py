@@ -727,6 +727,128 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(route["target_type"], "agent")
         self.assertEqual(route["target_id"], agent.agent_id)
 
+    def test_fast_agent_completion_edits_receipt_after_it_is_sent(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Stage 2 Test",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        self.store.ingest_update(topic_message_update(10, "fast"), now=100)
+        inbox = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+        ).fetchone()
+        mailbox_id = self.store.enqueue_agent_message_with_receipt(
+            agent.agent_id,
+            int(inbox["job_id"]),
+            "fast",
+            123,
+            62,
+            "… queued",
+            now=101,
+        )
+        mailbox = self.store.claim_agent_mailbox("agent", now=102)
+        self.store.complete_agent_mailbox(
+            mailbox.mailbox_id,
+            "agent",
+            "session-123",
+            "fast result",
+            ["fast result"],
+            {},
+            now=103,
+        )
+
+        receipt = self.store.claim_outbox("sender", now=104)
+        self.assertEqual(receipt.operation_id, f"agent-mailbox:{mailbox_id}:receipt")
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=105,
+        )
+        final_edit = self.store.claim_outbox("sender", now=106)
+        self.assertEqual(final_edit.method, "editMessageText")
+        self.assertEqual(final_edit.params["message_id"], 700)
+        self.assertEqual(final_edit.params["text"], "fast result")
+
+    def test_failed_agent_turn_edit_falls_back_to_routed_message(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Stage 2 Test",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        self.store.ingest_update(topic_message_update(10, "turn"), now=100)
+        inbox = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+        ).fetchone()
+        self.store.enqueue_agent_message_with_receipt(
+            agent.agent_id,
+            int(inbox["job_id"]),
+            "turn",
+            123,
+            62,
+            "… queued",
+            now=101,
+        )
+        receipt = self.store.claim_outbox("sender", now=102)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=103,
+        )
+        mailbox = self.store.claim_agent_mailbox("agent", now=104)
+        self.store.complete_agent_mailbox(
+            mailbox.mailbox_id,
+            "agent",
+            "session-123",
+            "durable result",
+            ["durable result"],
+            {},
+            now=105,
+        )
+        final_edit = self.store.claim_outbox("sender", now=106)
+        with mock.patch.object(
+            telegram_control.bridge,
+            "api_call",
+            side_effect=telegram_control.bridge.BridgeError(
+                "Bad Request: message to edit not found"
+            ),
+        ):
+            telegram_control.send_outbox_message(
+                self.store,
+                "token",
+                final_edit,
+                "sender",
+            )
+        fallback = self.store.claim_outbox("sender", now=10**12)
+        self.assertEqual(fallback.method, "sendMessage")
+        self.assertEqual(fallback.params["text"], "durable result")
+        self.assertEqual(fallback.params["message_thread_id"], 62)
+
     def test_agent_console_reservation_pauses_mailbox_claims(self):
         self.store.ensure_surface_binding(
             chat_id=123,
@@ -1655,8 +1777,13 @@ class DurableIntegrationTests(unittest.TestCase):
                 receipt = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     receipt.params["text"],
-                    "… Received by tc--root--telegram-control.\n"
-                    "Queued for Codex.",
+                    "⏳ Working…",
+                )
+                store.complete_outbox(
+                    receipt.message_id,
+                    "sender",
+                    {"message_id": 500, "chat": {"id": 123}},
+                    now=10**12,
                 )
                 mailbox = store.claim_agent_mailbox("agent-worker", now=10**12)
                 with mock.patch.object(
@@ -1687,6 +1814,8 @@ class DurableIntegrationTests(unittest.TestCase):
                     "session-123",
                 )
                 response = store.claim_outbox("sender-2", now=10**12)
+                self.assertEqual(response.method, "editMessageText")
+                self.assertEqual(response.params["message_id"], 500)
                 self.assertEqual(response.params["text"], "Codex adapter response")
 
     def test_handler_queues_reply_instead_of_calling_telegram(self):

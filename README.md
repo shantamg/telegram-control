@@ -180,10 +180,14 @@ parses the final public agent message and usage metadata, and resumes the stored
 session ID. Codex runs with `workspace-write` by default; unrestricted/yolo
 mode is never enabled by the controller.
 
-Each accepted agent turn immediately sends a small receipt, then delivers the
-final response as a separate routed message. A later UI slice can turn that
-receipt into a throttled self-editing progress card without changing the
-mailbox or adapter.
+Each accepted agent turn immediately sends a compact `⏳ Working…` receipt.
+For normal
+single-message responses, completion edits that same Telegram message into the
+final answer. The receipt and completion paths are race-safe: if the provider
+finishes first, the final edit is created when Telegram returns the receipt's
+message ID. If Telegram later rejects the edit, the answer falls back to a new
+routed message instead of being lost. Responses requiring multiple Telegram
+chunks retain the receipt and use separate final messages.
 
 The live adapter test passed on July 23, 2026. Two read-only Telegram turns
 completed through the serialized mailbox on their first attempts. The
@@ -216,6 +220,12 @@ The live console test passed on July 23, 2026. The real Codex TUI resumed the
 same conversation in tmux, `/agent` reported `Console: running`, and a Telegram
 turn remained queued until `console-close`. It then completed on its first
 mailbox attempt with the expected response.
+
+The live self-editing turn test passed on July 23, 2026. The durable receipt was
+delivered first and then replaced in place by the exact Codex response, with no
+second final message. One observed slow receipt was traced to an isolated
+8.9-second delay before the Telegram update reached the controller; the
+controller queued the receipt within 0.46 seconds of ingestion.
 
 For controlled debugging, each loop can run separately:
 

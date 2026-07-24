@@ -267,7 +267,7 @@ def send_outbox_message(
         permanent_card_edit_failure = (
             message.method == "editMessageText"
             and message.card is not None
-            and message.card.get("mode") == "edit"
+            and message.card.get("mode") in {"edit", "final_edit"}
             and any(
                 marker in error.lower()
                 for marker in (
@@ -284,7 +284,12 @@ def send_outbox_message(
             max_attempts=message.attempts if permanent_card_edit_failure else 8,
         )
         if permanent_card_edit_failure and state == "dead":
-            store.mark_surface_card_stale(int(message.card["card_id"]))
+            if message.card.get("kind") == "agent_turn":
+                store.enqueue_agent_response_fallback(
+                    int(message.card["mailbox_id"])
+                )
+            else:
+                store.mark_surface_card_stale(int(message.card["card_id"]))
         log_event(
             "outbox_failed",
             message_id=message.message_id,

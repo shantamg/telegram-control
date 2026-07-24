@@ -320,15 +320,16 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
         agent = store.resolve_agent(agent_id)
         if agent is None or agent.role not in {"project", "worker"}:
             raise StoreError("Managed agent route is no longer valid.")
-        store.enqueue_agent_message(
+        chat_id, thread_id = surface_coordinates()
+        receipt = "⏳ Working…"
+        store.enqueue_agent_message_with_receipt(
             agent_id=agent.agent_id,
             source_inbox_job_id=int(job_id),
             input_text=text,
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            receipt_text=receipt,
         )
-    send_message(
-        f"… Received by {agent.hierarchical_name}.\n"
-        f"Queued for {agent.provider.title()}."
-    )
 
 
 def handle_callback(update: dict, callback_query: dict) -> None:
