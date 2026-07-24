@@ -574,7 +574,10 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
         )
 
 
-def enqueue_router_input(text: str) -> None:
+def enqueue_router_input(
+    text: str,
+    replied_message_id: Optional[int] = None,
+) -> None:
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
     if not database_path or not job_id:
@@ -582,7 +585,7 @@ def enqueue_router_input(text: str) -> None:
     chat_id, thread_id = surface_coordinates()
     with DurableStore(Path(database_path)) as store:
         binding = store.resolve_surface_binding(chat_id, thread_id)
-        if binding is None:
+        if binding is None and replied_message_id is None:
             binding = store.ensure_surface_binding(
                 chat_id=chat_id,
                 message_thread_id=thread_id,
@@ -591,8 +594,9 @@ def enqueue_router_input(text: str) -> None:
                 target_type="controller",
                 target_id="control",
             )
-        if (
-            binding.target_type != "controller"
+        if replied_message_id is None and (
+            binding is None
+            or binding.target_type != "controller"
             or binding.target_id != "control"
         ):
             raise StoreError("Main router surface is no longer valid.")
@@ -604,6 +608,7 @@ def enqueue_router_input(text: str) -> None:
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
             receipt_text="🧭 <b>Control is routing…</b>",
             receipt_parse_mode="HTML",
+            replied_message_id=replied_message_id,
         )
 
 
@@ -670,6 +675,46 @@ def forum_is_authorized_or_prompt() -> bool:
         },
     )
     return False
+
+
+def ensure_bound_forum_subject():
+    """Turn a topic in a bound private forum into a durable conversation."""
+    if os.environ.get("TELEGRAM_CHAT_TYPE") != "supergroup":
+        return None
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    if not database_path or not chat_id_text or not thread_id_text:
+        raise StoreError(
+            "Private forum subjects require the durable controller."
+        )
+    chat_id = int(chat_id_text)
+    thread_id = int(thread_id_text)
+    with DurableStore(Path(database_path)) as store:
+        if store.resolve_forum_workspace(chat_id) is None:
+            # Until the forum is bound, its topics remain Control surfaces so
+            # the main router can complete the conversational binding flow.
+            return None
+        existing = store.resolve_forum_subject(chat_id, thread_id)
+        if existing is not None:
+            return existing, False
+        binding = store.resolve_surface_binding(chat_id, thread_id)
+        if binding is not None and binding.target_type == "agent":
+            # Schema v19 deliberately does not rewrite existing project-agent
+            # topics. They keep their current durable agent/session route;
+            # only unclaimed Control topics are provisioned as subjects.
+            return None
+        topic_name = os.environ.get("TELEGRAM_TOPIC_NAME", "").strip()
+        display_name = (
+            binding.display_name
+            if binding is not None
+            else topic_name or f"Topic {thread_id}"
+        )
+        return store.ensure_forum_subject(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            display_name=display_name,
+        )
 
 
 def handle_callback(update: dict, callback_query: dict) -> None:
@@ -1800,6 +1845,17 @@ def handle_voice(update: dict, voice: dict) -> None:
                 input_kind="voice",
                 parse_mode="HTML",
             )
+    elif router_reply_route is not None and database_path and job_id:
+        chat_id, thread_id = surface_coordinates()
+        routes_to_main_router = True
+        with DurableStore(Path(database_path)) as store:
+            store.enqueue_router_voice_receipt(
+                source_inbox_job_id=int(job_id),
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=authorized_user_id,
+                replied_message_id=router_reply_route.telegram_message_id,
+            )
     elif (
         binding is not None
         and binding.target_type == "agent"
@@ -1917,6 +1973,11 @@ def handle_voice(update: dict, voice: dict) -> None:
                 chat_id=chat_id,
                 message_thread_id=thread_id,
                 authorized_user_id=authorized_user_id,
+                replied_message_id=(
+                    router_reply_route.telegram_message_id
+                    if router_reply_route is not None
+                    else None
+                ),
             )
     elif transcript:
         send_message(f"📝 Transcript:\n\n{transcript}")
@@ -1936,6 +1997,8 @@ def main() -> int:
         elif message and "voice" in message:
             print(f"Received voice message from @{username}.", flush=True)
             if forum_is_authorized_or_prompt():
+                if not os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID"):
+                    ensure_bound_forum_subject()
                 handle_voice(update, message["voice"])
         elif message and "text" in message:
             text = str(message["text"])
@@ -1948,7 +2011,11 @@ def main() -> int:
                 text.strip().lower(),
             )
             if text.strip().lower() == "/status":
-                send_status_card(update)
+                binding = current_surface_binding()
+                if binding is not None and binding.target_type == "agent":
+                    send_agent_status()
+                else:
+                    send_status_card(update)
             elif text.strip().lower() == "/projects":
                 send_project_catalog()
             elif agent_create is not None:
@@ -1963,7 +2030,8 @@ def main() -> int:
                     and route.target_id == "control"
                 ):
                     enqueue_router_input(
-                        build_router_reply_input(update, route, text)
+                        build_router_reply_input(update, route, text),
+                        replied_message_id=route.telegram_message_id,
                     )
                 elif route is not None and route.target_type == "agent":
                     if not try_enqueue_agent_steer(route, text):
@@ -1981,6 +2049,7 @@ def main() -> int:
                         "That replied-to message has no active durable route."
                     )
             else:
+                ensure_bound_forum_subject()
                 binding = current_surface_binding()
                 thread_id = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID")
                 if thread_id and binding is None:

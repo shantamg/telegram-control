@@ -1206,10 +1206,12 @@ than prerequisites for basic messaging and voice use.
 
 Remaining release work:
 
-1. Detect and conversationally bind private forum groups to arbitrary
-   workspaces; Git metadata remains optional.
+1. ~~Detect and conversationally bind private forum groups to arbitrary
+   workspaces; Git metadata remains optional.~~ Completed in schema v18.
 2. Give each forum topic lightweight durable subject state and conversational
-   worker/session controls, with proactive crash and hang reporting.
+   worker/session controls. Schema v19 implements subject provisioning and
+   reuses the existing worker controls; proactive crash and hang reporting
+   remains.
 3. Add adoption of discoverable existing Codex sessions, voice replies, and
    status presentation polish.
 4. Run the full acceptance matrix and an independent Codex review before each
@@ -1258,8 +1260,30 @@ movement, false Git metadata, callback replay, and silent rebinding fail
 closed. Schema-17 migration and end-to-end request/proposal/confirmation
 fixtures cover those boundaries before live deployment. The permanent-edit
 fallback also preserves the active confirmation keyboard if Telegram can no
-longer edit the original routing receipt. Topic subjects remain the next chunk
-and do not yet inherit an agent merely because the forum workspace is bound.
+longer edit the original routing receipt. A workspace binding alone still does
+not create workers; schema v19 provisions each topic lazily on its first
+ordinary message.
+
+### Forum-subject checkpoint
+
+Schema v19 adds one durable `forum_subjects` record per provisioned topic in a
+bound private forum. The first ordinary text or voice message atomically
+creates the subject, converts the topic surface to a task route, and attaches a
+managed Codex worker that inherits the forum's validated workspace, working
+directory, optional exact Git root, and provider configuration. Subsequent
+messages reuse the same agent and persisted provider session. Topic display
+name changes update the subject and route labels without replacing the
+subject's durable identity.
+
+This deliberately reuses the existing agent mailbox, progress-card,
+reply-to-steer, Stop, pause/resume, and new-session machinery. It does not add
+another controller process, queue, daemon, or actor framework. Until a forum
+has a confirmed workspace binding, its topics remain Control surfaces so the
+global router can complete the conversational binding flow. Commands and exact
+replies do not trigger provisioning: `/status` remains read-only, existing
+project-agent topics retain their current route/session, and historical
+Control reply routes continue to reach Control with bounded text or voice
+context after a topic has become a subject.
 
 ## References
 

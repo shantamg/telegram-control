@@ -524,7 +524,19 @@ directory, and presents a one-time **Bind forum workspace** confirmation. The
 durable forum record stores the realpath-resolved boundary, optional exact Git
 root, and Codex model/effort defaults. Repeating the same confirmation is
 idempotent; silently rebinding an active forum to another directory is
-rejected. Topic-level subject state is the next layer built on this boundary.
+rejected.
+
+After a forum is bound, the first ordinary text or voice message in each topic
+atomically creates one durable subject, one topic route, and one managed Codex
+worker. Later messages reuse that subject and its persisted provider session;
+topic renames update the user-facing subject label without changing its
+identity. The worker inherits the forum's exact workspace boundary, working
+directory, optional Git metadata, and model/effort defaults. Existing managed
+agent mailboxes provide receipts, editable progress, reply-to-steer, Stop,
+pause/resume, and explicit new-session controls—no new daemon or actor runtime
+is introduced. Read-only commands such as `/status` do not create a subject,
+and exact replies to earlier Control messages keep their durable Control route
+for both text and voice even after the topic becomes a subject.
 
 Live setup:
 
@@ -533,7 +545,11 @@ Live setup:
    suppress ordinary text and voice.
 3. Send any harmless text or voice request in a topic.
 4. Tap **Authorize forum**, then resend the request.
-5. Confirm the topic shows the normal routing status card.
+5. Ask Control to bind the forum to an existing absolute workspace path and
+   tap **Bind forum workspace**.
+6. Send an ordinary request in any topic. Its first request creates the
+   subject; later requests continue the same Codex session. Send `/status` in
+   that topic to inspect or control its managed agent.
 
 Replies that legitimately remain with the main router (receipts, direct
 responses, relayed continuation chunks, fallback deliveries) now carry bounded

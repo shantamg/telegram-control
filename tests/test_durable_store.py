@@ -32,6 +32,7 @@ from durable_store import (
     MIGRATION_15,
     MIGRATION_16,
     MIGRATION_17,
+    MIGRATION_18,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -677,6 +678,137 @@ class DurableStoreTests(unittest.TestCase):
                 chat_id=-100888,
                 forum_binding_id=forum.binding_id,
                 project_path=str(workspace),
+            )
+
+    def test_bound_forum_subject_is_atomic_idempotent_and_topic_named(self):
+        workspace = Path(self.temporary_directory.name) / "life"
+        workspace.mkdir()
+        notes = workspace / "notes"
+        notes.mkdir()
+        forum = self.store.ensure_surface_binding(
+            chat_id=-100777,
+            surface_type="control",
+            display_name="Life",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        self.store.ensure_surface_binding(
+            chat_id=-100777,
+            message_thread_id=62,
+            surface_type="control",
+            display_name="Journal",
+            target_type="controller",
+            target_id="control",
+            now=101,
+        )
+        self.store.bind_forum_workspace(
+            chat_id=-100777,
+            forum_binding_id=forum.binding_id,
+            project_path=str(workspace),
+            working_directory=str(notes),
+            provider="codex",
+            provider_config={"model": "gpt-5.6-sol", "effort": "high"},
+            now=102,
+        )
+
+        subject, created = self.store.ensure_forum_subject(
+            chat_id=-100777,
+            message_thread_id=62,
+            display_name="Journal",
+            now=103,
+        )
+        self.assertTrue(created)
+        self.assertEqual(subject.display_name, "Journal")
+        self.assertEqual(subject.memory, {})
+        binding = self.store.resolve_surface_binding(-100777, 62)
+        self.assertEqual(binding.surface_type, "task")
+        self.assertEqual(binding.target_type, "agent")
+        self.assertEqual(binding.target_id, subject.agent_id)
+        agent = self.store.resolve_agent(subject.agent_id)
+        self.assertEqual(agent.role, "worker")
+        self.assertEqual(agent.provider, "codex")
+        self.assertEqual(agent.project_path, os.path.realpath(workspace))
+        self.assertEqual(agent.working_directory, os.path.realpath(notes))
+        self.assertEqual(agent.surface_binding_id, binding.binding_id)
+        self.assertEqual(
+            agent.provider_config,
+            {"model": "gpt-5.6-sol", "effort": "high"},
+        )
+        self.assertEqual(
+            self.store.agent_speaker_header(agent.agent_id),
+            "Journal",
+        )
+
+        duplicate, duplicate_created = self.store.ensure_forum_subject(
+            chat_id=-100777,
+            message_thread_id=62,
+            display_name="Journal",
+            now=104,
+        )
+        self.assertFalse(duplicate_created)
+        self.assertEqual(duplicate, subject)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM forum_subjects"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM events WHERE kind = 'forum_subject_created'"
+            ).fetchone()[0],
+            1,
+        )
+
+        customized, customized_created = self.store.ensure_forum_subject(
+            chat_id=-100777,
+            message_thread_id=62,
+            display_name="Journal",
+            purpose_text="Keep daily reflections organized.",
+            now=105,
+        )
+        self.assertFalse(customized_created)
+        self.assertEqual(customized.subject_id, subject.subject_id)
+        self.assertEqual(
+            customized.purpose_text,
+            "Keep daily reflections organized.",
+        )
+        self.store.rename_surface_binding(
+            binding_id=binding.binding_id,
+            expected_chat_id=-100777,
+            expected_message_thread_id=62,
+            expected_display_name="Journal",
+            new_display_name="Daily Journal",
+            now=106,
+        )
+        renamed = self.store.resolve_forum_subject(-100777, 62)
+        self.assertEqual(renamed.subject_id, subject.subject_id)
+        self.assertEqual(renamed.display_name, "Daily Journal")
+        self.assertEqual(
+            renamed.purpose_text,
+            "Keep daily reflections organized.",
+        )
+        self.assertEqual(
+            self.store.resolve_surface_binding(-100777, 62).display_name,
+            "Daily Journal",
+        )
+        self.assertEqual(
+            self.store.agent_speaker_header(agent.agent_id),
+            "Daily Journal",
+        )
+
+        with self.assertRaisesRegex(StoreError, "not bound"):
+            self.store.ensure_forum_subject(
+                chat_id=-100888,
+                message_thread_id=62,
+                display_name="Journal",
+            )
+        with self.assertRaisesRegex(StoreError, "supergroup"):
+            self.store.ensure_forum_subject(
+                chat_id=123,
+                message_thread_id=62,
+                display_name="Journal",
             )
 
     def test_topic_surface_rename_is_identity_checked_and_audited(self):
@@ -3418,6 +3550,81 @@ class SchemaCompatibilityTests(unittest.TestCase):
                 self.assertIsNone(store.resolve_forum_workspace(-100777))
                 self.assertEqual(store.quick_check(), "ok")
 
+    def test_schema_eighteen_database_adds_empty_forum_subjects(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-eighteen.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for migration in (
+                MIGRATION_1,
+                MIGRATION_2,
+                MIGRATION_3,
+                MIGRATION_4,
+                MIGRATION_5,
+                MIGRATION_6,
+                MIGRATION_7,
+                MIGRATION_8,
+                MIGRATION_9,
+                MIGRATION_10,
+                MIGRATION_11,
+                MIGRATION_12,
+                MIGRATION_13,
+                MIGRATION_14,
+                MIGRATION_15,
+                MIGRATION_16,
+                MIGRATION_17,
+                MIGRATION_18,
+            ):
+                for statement in migration:
+                    connection.execute(statement)
+            connection.execute(
+                """
+                INSERT INTO surface_bindings(
+                    binding_id, chat_id, message_thread_id, surface_type,
+                    display_name, target_type, target_id, state,
+                    created_at, updated_at
+                )
+                VALUES (
+                    61, -100777, 0, 'control', 'Life', 'controller',
+                    'control', 'active', 100, 100
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO forum_workspaces(
+                    chat_id, forum_binding_id, display_name, project_path,
+                    working_directory, git_repository_root, provider,
+                    provider_config_json, state, created_at, updated_at
+                )
+                VALUES (
+                    -100777, 61, 'Life', '/tmp/life', '/tmp/life', NULL,
+                    'codex', '{}', 'active', 100, 100
+                )
+                """
+            )
+            connection.execute("PRAGMA user_version = 18")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """
+                        SELECT COUNT(*) FROM sqlite_master
+                        WHERE type = 'table' AND name = 'forum_subjects'
+                        """
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertIsNotNone(store.resolve_forum_workspace(-100777))
+                self.assertIsNone(store.resolve_forum_subject(-100777, 62))
+                self.assertEqual(store.quick_check(), "ok")
+
     def test_cli_fails_cleanly_for_non_database_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "corrupt.sqlite3"
@@ -5933,6 +6140,593 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     store.status_counts()["router_mailbox"],
                     {"queued": 1},
+                )
+
+    def test_bound_forum_topic_auto_provisions_and_reuses_subject_agent(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+
+            def forum_update(update_id, text):
+                update = topic_message_update(update_id, text)
+                update["message"]["chat"] = {
+                    "id": -100777,
+                    "type": "supergroup",
+                    "title": "Life",
+                    "is_forum": True,
+                }
+                update["message"]["reply_to_message"]["chat"] = dict(
+                    update["message"]["chat"]
+                )
+                update["message"]["reply_to_message"]["forum_topic_created"][
+                    "name"
+                ] = "Journal"
+                return update
+
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                store.ensure_surface_binding(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    surface_type="control",
+                    display_name="Journal",
+                    target_type="controller",
+                    target_id="control",
+                    now=91,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace),
+                    provider="codex",
+                    now=92,
+                )
+
+                store.ingest_update(
+                    forum_update(10, "Help me organize today's notes."),
+                    now=100,
+                )
+                first_job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    first_job,
+                    "worker",
+                )
+
+                subject = store.resolve_forum_subject(-100777, 62)
+                self.assertIsNotNone(subject)
+                binding = store.resolve_surface_binding(-100777, 62)
+                self.assertEqual(binding.surface_type, "task")
+                self.assertEqual(binding.target_type, "agent")
+                self.assertEqual(binding.target_id, subject.agent_id)
+                self.assertEqual(
+                    store.status_counts()["agent_mailbox"],
+                    {"queued": 1},
+                )
+                self.assertEqual(
+                    store.status_counts().get("router_mailbox", {}),
+                    {},
+                )
+                first_mailbox = store.connection.execute(
+                    """
+                    SELECT agent_id, input_text
+                    FROM agent_mailbox
+                    WHERE source_inbox_job_id = ?
+                    """,
+                    (first_job.job_id,),
+                ).fetchone()
+                self.assertEqual(
+                    str(first_mailbox["agent_id"]),
+                    subject.agent_id,
+                )
+                self.assertEqual(
+                    str(first_mailbox["input_text"]),
+                    "Help me organize today's notes.",
+                )
+                receipt = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(receipt.params["message_thread_id"], 62)
+                self.assertIn("Queued for Journal", receipt.params["text"])
+
+                followup = forum_update(
+                    11,
+                    "Add groceries as a separate section.",
+                )
+                followup["message"].pop("reply_to_message")
+                store.ingest_update(followup, now=101)
+                second_job = store.claim_job("worker-2", now=101)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    second_job,
+                    "worker-2",
+                )
+                reused = store.resolve_forum_subject(-100777, 62)
+                self.assertEqual(reused.subject_id, subject.subject_id)
+                self.assertEqual(reused.agent_id, subject.agent_id)
+                self.assertEqual(reused.display_name, "Journal")
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM forum_subjects"
+                    ).fetchone()[0],
+                    1,
+                )
+                second_mailbox = store.connection.execute(
+                    """
+                    SELECT agent_id, input_text
+                    FROM agent_mailbox
+                    WHERE source_inbox_job_id = ?
+                    """,
+                    (second_job.job_id,),
+                ).fetchone()
+                self.assertEqual(
+                    str(second_mailbox["agent_id"]),
+                    subject.agent_id,
+                )
+                self.assertEqual(
+                    str(second_mailbox["input_text"]),
+                    "Add groceries as a separate section.",
+                )
+
+    def test_bound_forum_status_is_read_only_and_does_not_create_subject(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            update = topic_message_update(10, "/status")
+            update["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            update["message"]["reply_to_message"]["chat"] = dict(
+                update["message"]["chat"]
+            )
+            update["message"]["reply_to_message"]["forum_topic_created"][
+                "name"
+            ] = "Journal"
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                topic = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    surface_type="control",
+                    display_name="Journal",
+                    target_type="controller",
+                    target_id="control",
+                    now=91,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace),
+                    provider="codex",
+                    now=92,
+                )
+                store.ingest_update(update, now=100)
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    job,
+                    "worker",
+                )
+                self.assertIsNone(store.resolve_forum_subject(-100777, 62))
+                preserved = store.resolve_surface_binding(-100777, 62)
+                self.assertEqual(preserved.binding_id, topic.binding_id)
+                self.assertEqual(preserved.target_type, "controller")
+                self.assertEqual(preserved.target_id, "control")
+
+    def test_bound_forum_preserves_preexisting_project_agent_topic(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            update = topic_message_update(
+                10,
+                "Continue with the existing project session.",
+            )
+            update["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            update["message"]["reply_to_message"]["chat"] = dict(
+                update["message"]["chat"]
+            )
+            update["message"]["reply_to_message"]["forum_topic_created"][
+                "name"
+            ] = "Existing Project"
+
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace),
+                    provider="codex",
+                    now=91,
+                )
+                store.ensure_surface_binding(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Existing Project",
+                    target_type="controller",
+                    target_id="control",
+                    now=92,
+                )
+                store.enroll_project(
+                    slug="existing-project",
+                    display_name="Existing Project",
+                    provider="codex",
+                    project_path=str(workspace),
+                    now=93,
+                )
+                legacy_agent, created = store.attach_enrolled_project(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    project_slug="existing-project",
+                    now=94,
+                )
+                self.assertTrue(created)
+
+                store.ingest_update(update, now=100)
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    job,
+                    "worker",
+                )
+
+                self.assertIsNone(store.resolve_forum_subject(-100777, 62))
+                preserved = store.resolve_agent_for_surface(-100777, 62)
+                self.assertEqual(preserved.agent_id, legacy_agent.agent_id)
+                mailbox = store.connection.execute(
+                    """
+                    SELECT agent_id, input_text
+                    FROM agent_mailbox
+                    WHERE source_inbox_job_id = ?
+                    """,
+                    (job.job_id,),
+                ).fetchone()
+                self.assertEqual(
+                    str(mailbox["agent_id"]),
+                    legacy_agent.agent_id,
+                )
+                self.assertEqual(
+                    str(mailbox["input_text"]),
+                    "Continue with the existing project session.",
+                )
+
+    def test_subject_preserves_historical_control_reply_routes_for_text_and_voice(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+
+            def forum_update(update_id, text):
+                update = topic_message_update(update_id, text)
+                update["message"]["chat"] = {
+                    "id": -100777,
+                    "type": "supergroup",
+                    "title": "Life",
+                    "is_forum": True,
+                }
+                update["message"]["reply_to_message"]["chat"] = dict(
+                    update["message"]["chat"]
+                )
+                update["message"]["reply_to_message"]["forum_topic_created"][
+                    "name"
+                ] = "Journal"
+                return update
+
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                store.ensure_surface_binding(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    surface_type="control",
+                    display_name="Journal",
+                    target_type="controller",
+                    target_id="control",
+                    now=91,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace),
+                    provider="codex",
+                    now=92,
+                )
+                old_message = store.enqueue_api_call(
+                    operation_id="test:historical-control-message",
+                    method="sendMessage",
+                    params={
+                        "chat_id": -100777,
+                        "message_thread_id": 62,
+                        "text": "The forum workspace is bound.",
+                    },
+                    route={
+                        "target_type": "controller",
+                        "target_id": "control",
+                        "policy": "reply",
+                        "ttl_seconds": 3600,
+                    },
+                    now=10**12,
+                )
+                old_outbox = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(old_outbox.message_id, old_message)
+                store.complete_outbox(
+                    old_message,
+                    "sender",
+                    {
+                        "message_id": 500,
+                        "chat": {"id": -100777},
+                    },
+                    now=10**12,
+                )
+
+                store.ingest_update(
+                    forum_update(10, "Start a journal for me."),
+                    now=100,
+                )
+                first_job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    first_job,
+                    "worker",
+                )
+                subject = store.resolve_forum_subject(-100777, 62)
+                self.assertIsNotNone(subject)
+
+                text_reply = forum_update(11, "Why is that useful?")
+                text_reply["message"]["reply_to_message"] = {
+                    "message_id": 500,
+                    "message_thread_id": 62,
+                    "chat": dict(text_reply["message"]["chat"]),
+                    "text": "The forum workspace is bound.",
+                }
+                store.ingest_update(text_reply, now=101)
+                text_job = store.claim_job("worker-2", now=101)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    text_job,
+                    "worker-2",
+                )
+                text_router = store.connection.execute(
+                    """
+                    SELECT input_text
+                    FROM router_mailbox
+                    WHERE source_inbox_job_id = ?
+                    """,
+                    (text_job.job_id,),
+                ).fetchone()
+                self.assertIsNotNone(text_router)
+                self.assertEqual(
+                    router_contract.extract_user_request(
+                        str(text_router["input_text"])
+                    ),
+                    "Why is that useful?",
+                )
+
+                voice_reply = topic_voice_update(12)
+                voice_reply["message"]["chat"] = dict(
+                    text_reply["message"]["chat"]
+                )
+                voice_reply["message"]["reply_to_message"] = {
+                    "message_id": 500,
+                    "message_thread_id": 62,
+                    "chat": dict(text_reply["message"]["chat"]),
+                    "text": "The forum workspace is bound.",
+                }
+                store.ingest_update(voice_reply, now=102)
+                voice_job = store.connection.execute(
+                    "SELECT job_id FROM inbox_jobs WHERE update_id = 12"
+                ).fetchone()
+
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(voice_job["job_id"]),
+                "TELEGRAM_CHAT_ID": "-100777",
+                "TELEGRAM_CHAT_TYPE": "supergroup",
+                "TELEGRAM_CHAT_TITLE": "Life",
+                "TELEGRAM_TOPIC_NAME": "",
+                "TELEGRAM_MESSAGE_THREAD_ID": "62",
+                "TELEGRAM_REPLY_TO_MESSAGE_ID": "500",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_FROM_USERNAME": "tester",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    on_message.sys,
+                    "stdin",
+                    StringIO(json.dumps(voice_reply)),
+                ):
+                    with mock.patch.object(
+                        on_message.bridge,
+                        "download_telegram_file",
+                    ):
+                        with mock.patch.object(on_message, "convert_to_wav"):
+                            with mock.patch.object(
+                                on_message,
+                                "transcribe_wav",
+                                return_value="Explain it in one sentence.",
+                            ):
+                                self.assertEqual(on_message.main(), 0)
+
+            with DurableStore(database_path) as store:
+                voice_router = store.connection.execute(
+                    """
+                    SELECT input_text
+                    FROM router_mailbox
+                    WHERE source_inbox_job_id = ?
+                    """,
+                    (int(voice_job["job_id"]),),
+                ).fetchone()
+                self.assertIsNotNone(voice_router)
+                self.assertEqual(
+                    router_contract.extract_user_request(
+                        str(voice_router["input_text"])
+                    ),
+                    "Explain it in one sentence.",
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM agent_mailbox"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    store.resolve_forum_subject(-100777, 62).subject_id,
+                    subject.subject_id,
+                )
+
+    def test_bound_forum_voice_auto_provisions_subject_before_transcription(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            update = topic_voice_update(10)
+            update["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            update["message"]["reply_to_message"]["chat"] = dict(
+                update["message"]["chat"]
+            )
+            update["message"]["reply_to_message"]["forum_topic_created"][
+                "name"
+            ] = "Journal"
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace),
+                    provider="codex",
+                    now=91,
+                )
+                store.ingest_update(update, now=100)
+                job = store.connection.execute(
+                    "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+                ).fetchone()
+
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(job["job_id"]),
+                "TELEGRAM_CHAT_ID": "-100777",
+                "TELEGRAM_CHAT_TYPE": "supergroup",
+                "TELEGRAM_CHAT_TITLE": "Life",
+                "TELEGRAM_TOPIC_NAME": "Journal",
+                "TELEGRAM_MESSAGE_THREAD_ID": "62",
+                "TELEGRAM_REPLY_TO_MESSAGE_ID": "",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_FROM_USERNAME": "tester",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    on_message.sys,
+                    "stdin",
+                    StringIO(json.dumps(update)),
+                ):
+                    with mock.patch.object(
+                        on_message.bridge,
+                        "download_telegram_file",
+                    ):
+                        with mock.patch.object(on_message, "convert_to_wav"):
+                            with mock.patch.object(
+                                on_message,
+                                "transcribe_wav",
+                                return_value="capture this thought",
+                            ):
+                                self.assertEqual(on_message.main(), 0)
+
+            with DurableStore(database_path) as store:
+                subject = store.resolve_forum_subject(-100777, 62)
+                self.assertIsNotNone(subject)
+                mailbox = store.connection.execute(
+                    """
+                    SELECT agent_id, input_text
+                    FROM agent_mailbox
+                    WHERE source_inbox_job_id = ?
+                    """,
+                    (int(job["job_id"]),),
+                ).fetchone()
+                self.assertEqual(str(mailbox["agent_id"]), subject.agent_id)
+                self.assertEqual(
+                    str(mailbox["input_text"]),
+                    "capture this thought",
+                )
+                transcribing = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(
+                    transcribing.params["text"],
+                    "🎙️ <b>Journal is transcribing…</b>",
                 )
 
     def test_new_private_forum_requires_confirmation_before_control(self):

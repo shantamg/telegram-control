@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import os
 import re
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 CONTROL_SPEAKER = "🎛 Control"
 
@@ -206,6 +207,19 @@ class ForumWorkspace:
     def workspace_root(self) -> str:
         """Application-facing name for the legacy project_path column."""
         return self.project_path
+
+
+@dataclass(frozen=True)
+class ForumSubject:
+    subject_id: str
+    forum_chat_id: int
+    message_thread_id: int
+    surface_binding_id: int
+    agent_id: str
+    display_name: str
+    purpose_text: str
+    memory: dict[str, Any]
+    state: str
 
 
 @dataclass(frozen=True)
@@ -835,6 +849,36 @@ MIGRATION_18 = (
     """,
 )
 
+MIGRATION_19 = (
+    # A subject is the durable Telegram-facing conversation for one topic.
+    # Its current Codex execution session remains an ordinary managed agent,
+    # so existing pause/new-session/steer/Stop behavior is reused rather than
+    # introducing another process or mailbox implementation.
+    """
+    CREATE TABLE forum_subjects (
+        subject_id TEXT PRIMARY KEY,
+        forum_chat_id INTEGER NOT NULL
+            REFERENCES forum_workspaces(chat_id) ON DELETE RESTRICT,
+        message_thread_id INTEGER NOT NULL,
+        surface_binding_id INTEGER NOT NULL UNIQUE
+            REFERENCES surface_bindings(binding_id) ON DELETE RESTRICT,
+        agent_id TEXT NOT NULL UNIQUE
+            REFERENCES agents(agent_id) ON DELETE RESTRICT,
+        display_name TEXT NOT NULL,
+        purpose_text TEXT NOT NULL,
+        memory_json TEXT NOT NULL DEFAULT '{}',
+        state TEXT NOT NULL CHECK (state IN ('active', 'archived')),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE(forum_chat_id, message_thread_id)
+    )
+    """,
+    """
+    CREATE INDEX forum_subjects_state
+    ON forum_subjects(forum_chat_id, state, display_name)
+    """,
+)
+
 
 ROUTER_INPUT_LIMIT = 8_000
 REPLY_QUOTE_LIMIT = 1_000
@@ -1214,6 +1258,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 18
                 self.connection.execute("PRAGMA user_version = 18")
+            if current < 19:
+                for statement in MIGRATION_19:
+                    self.connection.execute(statement)
+                current = 19
+                self.connection.execute("PRAGMA user_version = 19")
             # Referential integrity is audited before the commit so a failed
             # check rolls the whole migration back instead of stranding an
             # upgraded-but-broken database.
@@ -2992,6 +3041,349 @@ class DurableStore:
         ).fetchone()
         return self._forum_workspace_from_row(row) if row is not None else None
 
+    @staticmethod
+    def _forum_subject_from_row(row: sqlite3.Row) -> ForumSubject:
+        memory = json.loads(row["memory_json"])
+        if not isinstance(memory, dict):
+            raise StoreError("Forum subject memory is invalid.")
+        return ForumSubject(
+            subject_id=str(row["subject_id"]),
+            forum_chat_id=int(row["forum_chat_id"]),
+            message_thread_id=int(row["message_thread_id"]),
+            surface_binding_id=int(row["surface_binding_id"]),
+            agent_id=str(row["agent_id"]),
+            display_name=str(row["display_name"]),
+            purpose_text=str(row["purpose_text"]),
+            memory=memory,
+            state=str(row["state"]),
+        )
+
+    def resolve_forum_subject(
+        self,
+        chat_id: int,
+        message_thread_id: int,
+    ) -> Optional[ForumSubject]:
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM forum_subjects
+            WHERE forum_chat_id = ? AND message_thread_id = ?
+                AND state = 'active'
+            """,
+            (int(chat_id), int(message_thread_id)),
+        ).fetchone()
+        return self._forum_subject_from_row(row) if row is not None else None
+
+    def ensure_forum_subject(
+        self,
+        chat_id: int,
+        message_thread_id: int,
+        display_name: str,
+        purpose_text: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> tuple[ForumSubject, bool]:
+        """Provision one durable conversational subject for a bound topic.
+
+        The subject reuses the existing managed-agent mailbox and provider
+        adapter. Provisioning is one transaction so the subject, worker, and
+        Telegram route can never be observed partially attached.
+        """
+        forum_chat_id = int(chat_id)
+        thread_id = int(message_thread_id)
+        if forum_chat_id >= 0:
+            raise StoreError("A forum subject requires a supergroup chat.")
+        if thread_id <= 0:
+            raise StoreError("A forum subject requires a Telegram topic.")
+        name = " ".join(display_name.strip().split())
+        if (
+            not name
+            or len(name) > 128
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in name
+            )
+        ):
+            raise StoreError("Forum subject display name is invalid.")
+        requested_purpose = (
+            " ".join(purpose_text.strip().split())
+            if purpose_text is not None
+            else None
+        )
+        purpose = (
+            requested_purpose
+            if requested_purpose is not None
+            else f"Conversation for the Telegram topic {name}."
+        )
+        if (
+            not purpose
+            or len(purpose) > 1000
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in purpose
+            )
+        ):
+            raise StoreError("Forum subject purpose is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        digest = hashlib.sha256(
+            f"{forum_chat_id}:{thread_id}".encode("utf-8")
+        ).hexdigest()
+        subject_id = f"subject_{digest[:24]}"
+        agent_slug = f"topic-{digest[:16]}"
+        hierarchical_name = f"tc--root--{agent_slug}"
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            workspace_row = self.connection.execute(
+                """
+                SELECT w.*
+                FROM forum_workspaces AS w
+                JOIN surface_bindings AS root
+                    ON root.binding_id = w.forum_binding_id
+                WHERE w.chat_id = ? AND w.state = 'active'
+                    AND root.chat_id = w.chat_id
+                    AND root.message_thread_id = 0
+                    AND root.surface_type = 'control'
+                    AND root.target_type = 'controller'
+                    AND root.target_id = 'control'
+                    AND root.state = 'active'
+                """,
+                (forum_chat_id,),
+            ).fetchone()
+            if workspace_row is None:
+                raise StoreError(
+                    "This private forum is not bound to a workspace yet."
+                )
+            workspace = self._forum_workspace_from_row(workspace_row)
+
+            existing_row = self.connection.execute(
+                """
+                SELECT *
+                FROM forum_subjects
+                WHERE forum_chat_id = ? AND message_thread_id = ?
+                """,
+                (forum_chat_id, thread_id),
+            ).fetchone()
+            if existing_row is not None:
+                existing = self._forum_subject_from_row(existing_row)
+                binding_row = self.connection.execute(
+                    """
+                    SELECT *
+                    FROM surface_bindings
+                    WHERE binding_id = ? AND chat_id = ?
+                        AND message_thread_id = ? AND state = 'active'
+                    """,
+                    (
+                        existing.surface_binding_id,
+                        forum_chat_id,
+                        thread_id,
+                    ),
+                ).fetchone()
+                agent_row = self.connection.execute(
+                    """
+                    SELECT *
+                    FROM agents
+                    WHERE agent_id = ? AND surface_binding_id = ?
+                    """,
+                    (existing.agent_id, existing.surface_binding_id),
+                ).fetchone()
+                if (
+                    existing.state != "active"
+                    or binding_row is None
+                    or agent_row is None
+                    or str(binding_row["target_type"]) != "agent"
+                    or str(binding_row["target_id"]) != existing.agent_id
+                ):
+                    raise StoreError(
+                        "The forum subject has an inconsistent durable route."
+                    )
+                desired_purpose = (
+                    existing.purpose_text
+                    if requested_purpose is None
+                    else purpose
+                )
+                if (
+                    existing.display_name != name
+                    or existing.purpose_text != desired_purpose
+                ):
+                    self.connection.execute(
+                        """
+                        UPDATE forum_subjects
+                        SET display_name = ?, purpose_text = ?, updated_at = ?
+                        WHERE subject_id = ?
+                        """,
+                        (
+                            name,
+                            desired_purpose,
+                            timestamp,
+                            existing.subject_id,
+                        ),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE surface_bindings
+                        SET display_name = ?, updated_at = ?
+                        WHERE binding_id = ?
+                        """,
+                        (name, timestamp, existing.surface_binding_id),
+                    )
+                    existing_row = self.connection.execute(
+                        "SELECT * FROM forum_subjects WHERE subject_id = ?",
+                        (existing.subject_id,),
+                    ).fetchone()
+                    existing = self._forum_subject_from_row(existing_row)
+                self.connection.execute("COMMIT")
+                return existing, False
+
+            binding_row = self.connection.execute(
+                """
+                SELECT *
+                FROM surface_bindings
+                WHERE chat_id = ? AND message_thread_id = ?
+                """,
+                (forum_chat_id, thread_id),
+            ).fetchone()
+            if binding_row is None:
+                cursor = self.connection.execute(
+                    """
+                    INSERT INTO surface_bindings(
+                        chat_id, message_thread_id, surface_type, display_name,
+                        target_type, target_id, state, created_at, updated_at
+                    )
+                    VALUES (?, ?, 'task', ?, 'controller', 'control',
+                        'active', ?, ?)
+                    """,
+                    (forum_chat_id, thread_id, name, timestamp, timestamp),
+                )
+                binding_id = int(cursor.lastrowid)
+            else:
+                binding = self._surface_binding_from_row(binding_row)
+                if (
+                    binding.state != "active"
+                    or binding.target_type != "controller"
+                    or binding.target_id != "control"
+                    or binding.surface_type not in {"control", "task"}
+                ):
+                    raise StoreError(
+                        "This topic is already bound to a different target."
+                    )
+                binding_id = binding.binding_id
+
+            root = self._ensure_main_agent(timestamp)
+            collision = self.connection.execute(
+                """
+                SELECT agent_id
+                FROM agents
+                WHERE hierarchical_name = ?
+                    OR (parent_agent_id = ? AND slug = ?)
+                """,
+                (hierarchical_name, root.agent_id, agent_slug),
+            ).fetchone()
+            if collision is not None:
+                raise StoreError(
+                    "The forum subject's managed-agent identity is unavailable."
+                )
+
+            agent_id = f"agent_{secrets.token_urlsafe(12)}"
+            self.connection.execute(
+                """
+                INSERT INTO agents(
+                    agent_id, parent_agent_id, role, slug,
+                    hierarchical_name, provider, project_path,
+                    working_directory, git_repository_root,
+                    provider_session_id, surface_binding_id,
+                    lifecycle_state, provider_config_json,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, 'worker', ?, ?, ?, ?, ?, ?, NULL, ?,
+                    'registered', ?, ?, ?)
+                """,
+                (
+                    agent_id,
+                    root.agent_id,
+                    agent_slug,
+                    hierarchical_name,
+                    workspace.provider,
+                    workspace.project_path,
+                    workspace.working_directory,
+                    workspace.git_repository_root,
+                    binding_id,
+                    json.dumps(
+                        workspace.provider_config,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            updated = self.connection.execute(
+                """
+                UPDATE surface_bindings
+                SET surface_type = 'task', display_name = ?,
+                    target_type = 'agent', target_id = ?, updated_at = ?
+                WHERE binding_id = ? AND state = 'active'
+                    AND target_type = 'controller' AND target_id = 'control'
+                """,
+                (name, agent_id, timestamp, binding_id),
+            )
+            if updated.rowcount != 1:
+                raise StoreError(
+                    "The forum topic changed during subject provisioning."
+                )
+            self.connection.execute(
+                """
+                INSERT INTO forum_subjects(
+                    subject_id, forum_chat_id, message_thread_id,
+                    surface_binding_id, agent_id, display_name,
+                    purpose_text, memory_json, state, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'active', ?, ?)
+                """,
+                (
+                    subject_id,
+                    forum_chat_id,
+                    thread_id,
+                    binding_id,
+                    agent_id,
+                    name,
+                    purpose,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('forum_subject_created', 'forum_subject', ?, ?, ?)
+                """,
+                (
+                    subject_id,
+                    json.dumps(
+                        {
+                            "agent_id": agent_id,
+                            "forum_chat_id": forum_chat_id,
+                            "message_thread_id": thread_id,
+                            "surface_binding_id": binding_id,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                ),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM forum_subjects WHERE subject_id = ?",
+                (subject_id,),
+            ).fetchone()
+            subject = self._forum_subject_from_row(row)
+            self.connection.execute("COMMIT")
+            return subject, True
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
     def bind_forum_workspace(
         self,
         chat_id: int,
@@ -3194,6 +3586,14 @@ class DurableStore:
                 raise StoreError(
                     "Managed topic changed before its rename could be recorded."
                 )
+            self.connection.execute(
+                """
+                UPDATE forum_subjects
+                SET display_name = ?, updated_at = ?
+                WHERE surface_binding_id = ? AND state = 'active'
+                """,
+                (name, timestamp, int(binding_id)),
+            )
             self.connection.execute(
                 """
                 INSERT INTO events(
@@ -3770,6 +4170,7 @@ class DurableStore:
         authorized_user_id: int,
         receipt_text: str,
         receipt_parse_mode: Optional[str] = None,
+        replied_message_id: Optional[int] = None,
         now: Optional[float] = None,
     ) -> int:
         text = input_text.strip()
@@ -3781,18 +4182,12 @@ class DurableStore:
         thread_id = int(message_thread_id) if message_thread_id is not None else 0
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            binding = self.connection.execute(
-                """
-                SELECT 1
-                FROM surface_bindings
-                WHERE chat_id = ? AND message_thread_id = ?
-                    AND target_type = 'controller' AND target_id = 'control'
-                    AND state = 'active'
-                """,
-                (int(chat_id), thread_id),
-            ).fetchone()
-            if binding is None:
-                raise StoreError("Main router surface is no longer valid.")
+            self._validate_router_input_route(
+                chat_id=int(chat_id),
+                thread_id=thread_id,
+                replied_message_id=replied_message_id,
+                timestamp=timestamp,
+            )
             main_agent = self._ensure_main_agent(timestamp)
             self.connection.execute(
                 """
@@ -3876,29 +4271,64 @@ class DurableStore:
             self.connection.execute("ROLLBACK")
             raise
 
+    def _validate_router_input_route(
+        self,
+        chat_id: int,
+        thread_id: int,
+        replied_message_id: Optional[int],
+        timestamp: float,
+    ) -> None:
+        if replied_message_id is None:
+            valid = self.connection.execute(
+                """
+                SELECT 1
+                FROM surface_bindings
+                WHERE chat_id = ? AND message_thread_id = ?
+                    AND target_type = 'controller' AND target_id = 'control'
+                    AND state = 'active'
+                """,
+                (int(chat_id), int(thread_id)),
+            ).fetchone()
+        else:
+            valid = self.connection.execute(
+                """
+                SELECT 1
+                FROM telegram_message_routes
+                WHERE chat_id = ? AND message_thread_id = ?
+                    AND telegram_message_id = ?
+                    AND target_type = 'controller'
+                    AND target_id = 'control'
+                    AND state = 'active' AND expires_at > ?
+                """,
+                (
+                    int(chat_id),
+                    int(thread_id),
+                    int(replied_message_id),
+                    float(timestamp),
+                ),
+            ).fetchone()
+        if valid is None:
+            raise StoreError("Main router surface is no longer valid.")
+
     def enqueue_router_voice_receipt(
         self,
         source_inbox_job_id: int,
         chat_id: int,
         message_thread_id: Optional[int],
         authorized_user_id: int,
+        replied_message_id: Optional[int] = None,
         now: Optional[float] = None,
     ) -> int:
         timestamp = time.time() if now is None else float(now)
         thread_id = int(message_thread_id) if message_thread_id is not None else 0
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            binding = self.connection.execute(
-                """
-                SELECT 1 FROM surface_bindings
-                WHERE chat_id = ? AND message_thread_id = ?
-                    AND target_type = 'controller' AND target_id = 'control'
-                    AND state = 'active'
-                """,
-                (int(chat_id), thread_id),
-            ).fetchone()
-            if binding is None:
-                raise StoreError("Main router surface is no longer valid.")
+            self._validate_router_input_route(
+                chat_id=int(chat_id),
+                thread_id=thread_id,
+                replied_message_id=replied_message_id,
+                timestamp=timestamp,
+            )
             self._ensure_main_agent(timestamp)
             message_id = self.enqueue_api_call(
                 operation_id=f"router-input:{int(source_inbox_job_id)}:receipt",
@@ -4008,6 +4438,7 @@ class DurableStore:
         chat_id: int,
         message_thread_id: Optional[int],
         authorized_user_id: int,
+        replied_message_id: Optional[int] = None,
         now: Optional[float] = None,
     ) -> int:
         text = input_text.strip()
@@ -4017,17 +4448,12 @@ class DurableStore:
         thread_id = int(message_thread_id) if message_thread_id is not None else 0
         self.connection.execute("BEGIN IMMEDIATE")
         try:
-            binding = self.connection.execute(
-                """
-                SELECT 1 FROM surface_bindings
-                WHERE chat_id = ? AND message_thread_id = ?
-                    AND target_type = 'controller' AND target_id = 'control'
-                    AND state = 'active'
-                """,
-                (int(chat_id), thread_id),
-            ).fetchone()
-            if binding is None:
-                raise StoreError("Main router surface is no longer valid.")
+            self._validate_router_input_route(
+                chat_id=int(chat_id),
+                thread_id=thread_id,
+                replied_message_id=replied_message_id,
+                timestamp=timestamp,
+            )
             main_agent = self._ensure_main_agent(timestamp)
             self.connection.execute(
                 """
@@ -5875,7 +6301,7 @@ class DurableStore:
             raise
 
     def agent_speaker_header(self, agent_id: str) -> str:
-        """Project display name used to label agent-authored Control-chat turns."""
+        """Durable surface name used to label agent-authored Telegram turns."""
         row = self.connection.execute(
             """
             SELECT p.display_name
@@ -5888,6 +6314,16 @@ class DurableStore:
         ).fetchone()
         if row is not None:
             return str(row["display_name"])
+        subject = self.connection.execute(
+            """
+            SELECT display_name
+            FROM forum_subjects
+            WHERE agent_id = ? AND state = 'active'
+            """,
+            (agent_id,),
+        ).fetchone()
+        if subject is not None:
+            return str(subject["display_name"])
         fallback = self.connection.execute(
             "SELECT slug FROM agents WHERE agent_id = ?",
             (agent_id,),
@@ -8316,6 +8752,8 @@ class DurableStore:
             ("agent_mailbox", "agent_mailbox"),
             ("agent_consoles", "agent_consoles"),
             ("projects", "managed_projects"),
+            ("forum_workspaces", "forum_workspaces"),
+            ("forum_subjects", "forum_subjects"),
             ("router_mailbox", "router_mailbox"),
         ):
             if label == "updates":
