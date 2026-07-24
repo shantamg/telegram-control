@@ -865,7 +865,7 @@ to enrolled Git projects; repeated turns, restart resume, voice input, explicit
 tmux disposal/recreation, pause/resume, inspection, and guarded session
 replacement all operate through durable logical agent state.
 
-The Stage 4 router-contract and durable-routing slices pass 77 offline tests:
+The Stage 4 router-contract and durable-routing slices pass 79 offline tests:
 
 - router prompts contain only path-safe active catalog metadata;
 - normalized output is limited to exact `route`, `clarify`, and `reject`
@@ -904,8 +904,12 @@ The Stage 4 router-contract and durable-routing slices pass 77 offline tests:
   choice expires its siblings and queues a new router turn with the original
   request, question, and answer;
 - typed replies to controller-routed messages re-enter the router naturally;
-- unknown-path inspection and confirmation-backed creation remain staged
-  behind the same controller validation boundary.
+- project creation accepts an enrolled slug or a Git root explicitly present
+  in the user's request, revalidates it read-only, derives safe catalog/topic
+  metadata, and exposes only opaque authorized Confirm/Cancel buttons;
+- confirmation enrolls the project, creates its Telegram topic, and attaches
+  the managed agent; cancellation creates nothing;
+- unknown-path inspection remains staged behind the same validation boundary.
 
 ## References
 

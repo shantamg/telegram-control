@@ -304,6 +304,13 @@ durable router turn containing the original request, question, and answer.
 Typed replies to controller-routed messages also re-enter the main router
 instead of falling back to a transport-test acknowledgment.
 
+Conversational project creation accepts either an enrolled slug or a local Git
+repository path that appears explicitly in the user's request. The controller
+re-resolves and validates the repository root, derives a safe catalog entry,
+and shows the proposed provider and Telegram topic behind **Create project
+agent** and **Cancel** buttons. Only the authorized confirmation enrolls the
+project, creates its private-chat topic, and attaches the managed agent.
+
 The earlier strict `route`, `clarify`, or `reject` schema remains as a compact
 classification and evaluation primitive. It is not intended to become a
 user-facing command language.

@@ -582,6 +582,121 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "clarification-clear",
         )
         return
+    if action.action_type in {
+        "router_project_confirm",
+        "router_project_cancel",
+    }:
+        router_mailbox_id = int(action.payload.get("router_mailbox_id", 0))
+        with DurableStore(Path(database_path)) as store:
+            store.expire_router_project_actions(router_mailbox_id)
+        if action.action_type == "router_project_cancel":
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": "Cancelled.",
+                    },
+                    "callback-answer",
+                )
+            send_message("Cancelled. No project or agent was created.")
+            return
+
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Creating project agent…",
+                },
+                "callback-answer",
+            )
+        required = {
+            "slug",
+            "display_name",
+            "provider",
+            "project_path",
+            "topic_name",
+        }
+        if not required.issubset(action.payload):
+            raise StoreError("Stored project-creation plan is invalid.")
+        requested_path = Path(str(action.payload["project_path"])).resolve()
+        if not requested_path.is_dir():
+            raise StoreError("The confirmed project directory no longer exists.")
+        git_result = subprocess.run(
+            ["git", "-C", str(requested_path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if (
+            git_result.returncode != 0
+            or Path(git_result.stdout.strip()).resolve() != requested_path
+        ):
+            raise StoreError(
+                "The confirmed path is no longer the validated Git repository."
+            )
+        slug = str(action.payload["slug"])
+        display_name = str(action.payload["display_name"])
+        provider = str(action.payload["provider"])
+        topic_name = str(action.payload["topic_name"])
+        with DurableStore(Path(database_path)) as store:
+            store.enroll_project(
+                slug=slug,
+                display_name=display_name,
+                provider=provider,
+                project_path=str(requested_path),
+            )
+            existing_agent = store.resolve_project_agent(slug)
+            existing_surface = store.resolve_named_surface(
+                chat_id,
+                topic_name,
+                surface_type="project",
+            )
+        if existing_agent is not None:
+            send_message(
+                f"✅ {display_name} already has managed agent "
+                f"{existing_agent.hierarchical_name}."
+            )
+            return
+        if existing_surface is None:
+            topic = bridge.api_call(
+                bridge.read_token(),
+                "createForumTopic",
+                chat_id=chat_id,
+                name=topic_name,
+            )
+            try:
+                project_thread_id = int(topic["message_thread_id"])
+            except (KeyError, TypeError, ValueError):
+                raise StoreError(
+                    "Telegram returned an invalid project-topic result."
+                ) from None
+            with DurableStore(Path(database_path)) as store:
+                store.ensure_surface_binding(
+                    chat_id=chat_id,
+                    message_thread_id=project_thread_id,
+                    surface_type="project",
+                    display_name=topic_name,
+                    target_type="controller",
+                    target_id="control",
+                )
+        with DurableStore(Path(database_path)) as store:
+            agent, _ = store.attach_enrolled_project(
+                chat_id,
+                (
+                    existing_surface.message_thread_id
+                    if existing_surface is not None
+                    else project_thread_id
+                ),
+                slug,
+            )
+        send_message(
+            f"✅ Created {agent.hierarchical_name} in the "
+            f"{topic_name} project topic."
+        )
+        return
     if action.action_type in {"agent_pause", "agent_resume"}:
         agent_id = str(action.payload.get("agent_id", ""))
         try:
@@ -941,6 +1056,7 @@ def main() -> int:
         return 1
     except StoreError as exc:
         print(f"Durable handler error: {exc}", file=sys.stderr, flush=True)
+        send_message(f"❌ {exc}")
         return 1
 
 

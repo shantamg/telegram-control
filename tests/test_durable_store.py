@@ -1762,6 +1762,211 @@ class DurableIntegrationTests(unittest.TestCase):
                     follow_up.input_text,
                 )
 
+    def test_router_project_creation_requires_validated_confirmation(self):
+        class FakeRouterAdapter:
+            def __init__(self, project_path):
+                self.project_path = project_path
+
+            def run_turn(
+                self,
+                agent,
+                prompt,
+                mailbox_session_id,
+                on_session,
+                heartbeat,
+            ):
+                on_session("router-session-123")
+                heartbeat()
+                return provider_adapters.ProviderTurnResult(
+                    provider_session_id="router-session-123",
+                    final_text=json.dumps(
+                        {
+                            "tool": "create_project_agent",
+                            "arguments": {
+                                "project": self.project_path,
+                                "topic_name": "Sample Project",
+                            },
+                        }
+                    ),
+                    usage={},
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "sample-project"
+            root.mkdir()
+            initialized = telegram_control.subprocess.run(
+                ["git", "init", str(root)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0)
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ingest_update(
+                    message_update(text=f"Add my project at {root}"),
+                    now=100,
+                )
+                inbox = store.claim_job("inbox", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    inbox,
+                    "inbox",
+                )
+                receipt = store.claim_outbox("sender", now=10**12)
+                store.complete_outbox(
+                    receipt.message_id,
+                    "sender",
+                    {"message_id": 800, "chat": {"id": 123}},
+                    now=10**12,
+                )
+                router_job = store.claim_router_mailbox(
+                    "router",
+                    now=10**12,
+                )
+                with mock.patch.object(
+                    telegram_control.provider_adapters,
+                    "adapter_for",
+                    return_value=FakeRouterAdapter(str(root)),
+                ):
+                    telegram_control.process_router_mailbox_job(
+                        store,
+                        router_job,
+                        "router",
+                    )
+                proposal = store.claim_outbox("sender-2", now=10**12)
+                self.assertIn(
+                    "Nothing will be created until you confirm.",
+                    proposal.params["text"],
+                )
+                buttons = proposal.params["reply_markup"]["inline_keyboard"]
+                self.assertEqual(
+                    [row[0]["text"] for row in buttons],
+                    ["Create project agent", "Cancel"],
+                )
+                self.assertEqual(store.list_projects(), [])
+
+                store.ingest_update(
+                    callback_update(
+                        11,
+                        buttons[1][0]["callback_data"],
+                        message_id=800,
+                    ),
+                    now=102,
+                )
+                callback_job = store.claim_job("inbox-2", now=102)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    callback_job,
+                    "inbox-2",
+                )
+                self.assertEqual(store.list_projects(), [])
+                self.assertEqual(
+                    store.status_counts()["callbacks"],
+                    {"consumed": 1, "expired": 1},
+                )
+
+    def test_confirmed_router_project_creation_builds_topic_and_agent(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory) / "sample-project"
+            root.mkdir()
+            initialized = telegram_control.subprocess.run(
+                ["git", "init", str(root)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(initialized.returncode, 0)
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            with DurableStore(database_path) as store:
+                action = store.create_callback_action(
+                    operation_id="router:99:project:0",
+                    action_type="router_project_confirm",
+                    payload={
+                        "router_mailbox_id": 99,
+                        "label": "Create project agent",
+                        "slug": "sample-project",
+                        "display_name": "Sample Project",
+                        "provider": "codex",
+                        "project_path": str(root),
+                        "topic_name": "Sample Project",
+                    },
+                    chat_id=123,
+                    authorized_user_id=123,
+                )
+                update = callback_update(
+                    11,
+                    f"a:{action.token}",
+                    message_id=800,
+                )
+                store.ingest_update(update, now=100)
+                job_id = int(
+                    store.connection.execute(
+                        "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+                    ).fetchone()["job_id"]
+                )
+
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(job_id),
+                "TELEGRAM_CHAT_ID": "123",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_MESSAGE_ID": "800",
+                "TELEGRAM_MESSAGE_THREAD_ID": "",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    on_message.bridge,
+                    "read_token",
+                    return_value="test-token",
+                ):
+                    with mock.patch.object(
+                        on_message.bridge,
+                        "api_call",
+                        return_value={"message_thread_id": 77},
+                    ) as api_call:
+                        on_message.handle_callback(
+                            update,
+                            update["callback_query"],
+                        )
+
+            api_call.assert_called_once_with(
+                "test-token",
+                "createForumTopic",
+                chat_id=123,
+                name="Sample Project",
+            )
+            with DurableStore(database_path) as store:
+                project = store.resolve_project("sample-project")
+                self.assertEqual(project.project_path, str(root.resolve()))
+                agent = store.resolve_project_agent("sample-project")
+                self.assertEqual(
+                    agent.hierarchical_name,
+                    "tc--root--sample-project",
+                )
+                binding = store.resolve_surface_binding(123, 77)
+                self.assertEqual(binding.target_id, agent.agent_id)
+                queued_texts = [
+                    json.loads(row["params_json"]).get("text")
+                    for row in store.connection.execute(
+                        "SELECT params_json FROM outbox_messages "
+                        "ORDER BY message_id"
+                    ).fetchall()
+                ]
+                self.assertTrue(
+                    any(
+                        text
+                        and "Created tc--root--sample-project" in text
+                        for text in queued_texts
+                    )
+                )
+
     def test_button_callback_routes_once_through_existing_handler(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"

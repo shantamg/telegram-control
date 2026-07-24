@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import plistlib
+import re
 import signal
 import socket
 import sqlite3
@@ -376,6 +377,78 @@ def project_catalog_text(store: DurableStore) -> str:
     return "\n".join(lines)
 
 
+def project_creation_proposal(
+    store: DurableStore,
+    user_input: str,
+    arguments: dict[str, Any],
+) -> tuple[str, Optional[dict[str, str]]]:
+    project_reference = str(arguments["project"]).strip()
+    topic_name = arguments.get("topic_name")
+    enrolled = store.resolve_project(project_reference)
+    if enrolled is not None:
+        existing_agent = store.resolve_project_agent(enrolled.slug)
+        if existing_agent is not None:
+            return (
+                f"✅ {enrolled.display_name} already has a managed project agent.",
+                None,
+            )
+        project_path = enrolled.project_path
+        slug = enrolled.slug
+        display_name = enrolled.display_name
+        provider = enrolled.provider
+    else:
+        if project_reference not in user_input:
+            raise StoreError(
+                "The project path must appear explicitly in the user's request."
+            )
+        requested_path = Path(project_reference).expanduser().resolve()
+        if not requested_path.is_dir():
+            raise StoreError("The requested project directory does not exist.")
+        git_result = subprocess.run(
+            ["git", "-C", str(requested_path), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if git_result.returncode != 0:
+            raise StoreError("The requested project is not a Git repository.")
+        git_root = Path(git_result.stdout.strip()).resolve()
+        if git_root != requested_path:
+            raise StoreError(
+                "Specify the Git repository root before creating its agent."
+            )
+        project_path = str(git_root)
+        slug = re.sub(r"[^a-z0-9]+", "-", git_root.name.lower()).strip("-")
+        if not slug or len(slug) > 48 or slug == "root":
+            raise StoreError("A safe project slug could not be derived.")
+        collision = store.resolve_project(slug)
+        if collision is not None and collision.project_path != project_path:
+            raise StoreError("Another enrolled project already uses this slug.")
+        display_name = git_root.name.replace("-", " ").replace("_", " ").title()
+        provider = "codex"
+    resolved_topic = (
+        str(topic_name).strip()
+        if isinstance(topic_name, str) and topic_name.strip()
+        else display_name
+    )
+    plan = {
+        "slug": slug,
+        "display_name": display_name,
+        "provider": provider,
+        "project_path": project_path,
+        "topic_name": resolved_topic,
+    }
+    return (
+        f"Create a managed project agent for {display_name}?\n\n"
+        f"Provider: {provider}\n"
+        f"Telegram topic: {resolved_topic}\n\n"
+        "The controller validated the Git repository. Nothing will be "
+        "created until you confirm.",
+        plan,
+    )
+
+
 def process_router_mailbox_job(
     store: DurableStore,
     job: RouterMailboxJob,
@@ -418,6 +491,7 @@ def process_router_mailbox_job(
         dispatch_agent_id = None
         dispatch_message = None
         clarification_options = None
+        project_creation_plan = None
         if call.tool == "send_to_agent":
             target = store.resolve_project_agent(
                 str(call.arguments["project_slug"])
@@ -446,6 +520,12 @@ def process_router_mailbox_job(
         elif call.tool == "ask_user":
             response_text = str(call.arguments["question"])
             clarification_options = list(call.arguments["options"]) or None
+        elif call.tool == "create_project_agent":
+            response_text, project_creation_plan = project_creation_proposal(
+                store,
+                job.input_text,
+                call.arguments,
+            )
         else:
             response_text = router_preview_text(store, call)
         store.complete_router_mailbox(
@@ -460,6 +540,7 @@ def process_router_mailbox_job(
             dispatch_agent_id=dispatch_agent_id,
             dispatch_message=dispatch_message,
             clarification_options=clarification_options,
+            project_creation_plan=project_creation_plan,
         )
         log_event(
             "router_turn_succeeded",

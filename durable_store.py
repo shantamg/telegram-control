@@ -2152,7 +2152,7 @@ class DurableStore:
             WHERE operation_id LIKE ? AND state = 'active'
             ORDER BY action_id
             """,
-            (f"router:{int(mailbox_id)}:clarify:%",),
+            (f"router:{int(mailbox_id)}:%",),
         ).fetchall()
         if not rows:
             return None
@@ -2160,7 +2160,10 @@ class DurableStore:
             "inline_keyboard": [
                 [
                     {
-                        "text": str(json.loads(row["payload_json"])["choice"]),
+                        "text": str(
+                            json.loads(row["payload_json"]).get("choice")
+                            or json.loads(row["payload_json"]).get("label")
+                        ),
                         "callback_data": f"a:{str(row['token'])}",
                     }
                 ]
@@ -2231,6 +2234,7 @@ class DurableStore:
         dispatch_agent_id: Optional[str] = None,
         dispatch_message: Optional[str] = None,
         clarification_options: Optional[list[str]] = None,
+        project_creation_plan: Optional[dict[str, str]] = None,
         now: Optional[float] = None,
     ) -> None:
         if not preview_text or len(preview_text) > 3800:
@@ -2243,6 +2247,12 @@ class DurableStore:
             or len(clarification_options) > 4
         ):
             raise StoreError("Router clarification options are invalid.")
+        if project_creation_plan is not None and (
+            tool_name != "create_project_agent"
+            or set(project_creation_plan)
+            != {"slug", "display_name", "provider", "project_path", "topic_name"}
+        ):
+            raise StoreError("Router project-creation plan is invalid.")
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -2321,6 +2331,65 @@ class DurableStore:
                     if not inserted:
                         raise StoreError(
                             "Could not allocate a router clarification token."
+                        )
+            if project_creation_plan is not None:
+                if row["authorized_user_id"] is None:
+                    raise StoreError("Router project creation has no authorized user.")
+                for index, (action_type, label) in enumerate(
+                    (
+                        ("router_project_confirm", "Create project agent"),
+                        ("router_project_cancel", "Cancel"),
+                    )
+                ):
+                    inserted = False
+                    for _ in range(5):
+                        token = secrets.token_urlsafe(6)
+                        payload = dict(project_creation_plan)
+                        payload["label"] = label
+                        payload["router_mailbox_id"] = int(mailbox_id)
+                        try:
+                            self.connection.execute(
+                                """
+                                INSERT INTO callback_actions(
+                                    operation_id, token, action_type,
+                                    payload_json, chat_id, message_thread_id,
+                                    authorized_user_id, one_time, state,
+                                    expires_at, created_at, updated_at
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active',
+                                    ?, ?, ?)
+                                """,
+                                (
+                                    (
+                                        f"router:{int(mailbox_id)}:"
+                                        f"project:{index}"
+                                    ),
+                                    token,
+                                    action_type,
+                                    json.dumps(
+                                        payload,
+                                        separators=(",", ":"),
+                                        sort_keys=True,
+                                    ),
+                                    int(row["chat_id"]),
+                                    (
+                                        int(row["message_thread_id"])
+                                        if int(row["message_thread_id"]) != 0
+                                        else None
+                                    ),
+                                    int(row["authorized_user_id"]),
+                                    timestamp + 10 * 60,
+                                    timestamp,
+                                    timestamp,
+                                ),
+                            )
+                        except sqlite3.IntegrityError:
+                            continue
+                        inserted = True
+                        break
+                    if not inserted:
+                        raise StoreError(
+                            "Could not allocate a project-confirmation token."
                         )
             self.connection.execute(
                 """
@@ -2492,6 +2561,21 @@ class DurableStore:
             f"Original request: {str(row['input_text'])}\n"
             f"Question: {question}\n"
             f"User's answer: {choice}"
+        )
+
+    def expire_router_project_actions(
+        self,
+        mailbox_id: int,
+        now: Optional[float] = None,
+    ) -> None:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute(
+            """
+            UPDATE callback_actions
+            SET state = 'expired', updated_at = ?
+            WHERE operation_id LIKE ? AND state = 'active'
+            """,
+            (timestamp, f"router:{int(mailbox_id)}:project:%"),
         )
 
     def attach_enrolled_project(
