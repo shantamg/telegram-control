@@ -483,6 +483,7 @@ def enqueue_router_input(text: str) -> None:
             input_text=text,
             chat_id=chat_id,
             message_thread_id=thread_id,
+            authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
             receipt_text="🧭 <b>Routing…</b>",
             receipt_parse_mode="HTML",
         )
@@ -543,6 +544,42 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "✅ Durable button route verified.\n\n"
             "The opaque action was authorized, resolved from SQLite, and "
             "consumed exactly once."
+        )
+        return
+    if action.action_type == "router_clarification":
+        router_mailbox_id = int(action.payload.get("router_mailbox_id", 0))
+        choice = str(action.payload.get("choice", ""))
+        with DurableStore(Path(database_path)) as store:
+            clarified_input = store.resolve_router_clarification(
+                router_mailbox_id,
+                choice,
+            )
+            store.enqueue_router_message_with_receipt(
+                source_inbox_job_id=int(os.environ["TELEGRAM_CONTROL_JOB_ID"]),
+                input_text=clarified_input,
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=user_id,
+                receipt_text="🧭 <b>Routing…</b>",
+                receipt_parse_mode="HTML",
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": f"Selected: {choice}",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "clarification-clear",
         )
         return
     if action.action_type in {"agent_pause", "agent_resume"}:
@@ -870,10 +907,7 @@ def main() -> int:
                     and route.target_type == "controller"
                     and route.target_id == "control"
                 ):
-                    send_message(
-                        "✅ Durable reply route verified.\n\n"
-                        f"Received through the stored controller route: {text}"
-                    )
+                    enqueue_router_input(text)
                 elif route is not None and route.target_type == "agent":
                     enqueue_agent_input(route.target_id, text)
                 else:

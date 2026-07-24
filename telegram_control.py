@@ -417,6 +417,7 @@ def process_router_mailbox_job(
         )
         dispatch_agent_id = None
         dispatch_message = None
+        clarification_options = None
         if call.tool == "send_to_agent":
             target = store.resolve_project_agent(
                 str(call.arguments["project_slug"])
@@ -442,6 +443,9 @@ def process_router_mailbox_job(
             response_text = project_catalog_text(store)
         elif call.tool == "respond":
             response_text = str(call.arguments["message"])
+        elif call.tool == "ask_user":
+            response_text = str(call.arguments["question"])
+            clarification_options = list(call.arguments["options"]) or None
         else:
             response_text = router_preview_text(store, call)
         store.complete_router_mailbox(
@@ -455,6 +459,7 @@ def process_router_mailbox_job(
             result.usage,
             dispatch_agent_id=dispatch_agent_id,
             dispatch_message=dispatch_message,
+            clarification_options=clarification_options,
         )
         log_event(
             "router_turn_succeeded",

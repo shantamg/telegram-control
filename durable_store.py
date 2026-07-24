@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 
 class StoreError(RuntimeError):
@@ -474,6 +474,13 @@ MIGRATION_10 = (
     """,
 )
 
+MIGRATION_11 = (
+    """
+    ALTER TABLE router_mailbox
+    ADD COLUMN authorized_user_id INTEGER
+    """,
+)
+
 
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
@@ -569,6 +576,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 10
                 self.connection.execute("PRAGMA user_version = 10")
+            if current < 11:
+                for statement in MIGRATION_11:
+                    self.connection.execute(statement)
+                current = 11
+                self.connection.execute("PRAGMA user_version = 11")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -1866,6 +1878,7 @@ class DurableStore:
         input_text: str,
         chat_id: int,
         message_thread_id: Optional[int],
+        authorized_user_id: int,
         receipt_text: str,
         receipt_parse_mode: Optional[str] = None,
         now: Optional[float] = None,
@@ -1897,16 +1910,18 @@ class DurableStore:
                 """
                 INSERT INTO router_mailbox(
                     source_inbox_job_id, chat_id, message_thread_id,
-                    input_text, provider_session_id, state, attempts,
+                    authorized_user_id, input_text, provider_session_id,
+                    state, attempts,
                     available_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
                 ON CONFLICT(source_inbox_job_id) DO NOTHING
                 """,
                 (
                     int(source_inbox_job_id),
                     int(chat_id),
                     thread_id,
+                    int(authorized_user_id),
                     text,
                     main_agent.provider_session_id,
                     timestamp,
@@ -1916,7 +1931,8 @@ class DurableStore:
             )
             row = self.connection.execute(
                 """
-                SELECT mailbox_id, chat_id, message_thread_id, input_text
+                SELECT mailbox_id, chat_id, message_thread_id,
+                    authorized_user_id, input_text
                 FROM router_mailbox
                 WHERE source_inbox_job_id = ?
                 """,
@@ -1924,10 +1940,16 @@ class DurableStore:
             ).fetchone()
             if row is None:
                 raise StoreError("Could not enqueue the main-router message.")
-            expected = (int(chat_id), thread_id, text)
+            expected = (
+                int(chat_id),
+                thread_id,
+                int(authorized_user_id),
+                text,
+            )
             actual = (
                 int(row["chat_id"]),
                 int(row["message_thread_id"]),
+                int(row["authorized_user_id"]),
                 str(row["input_text"]),
             )
             if actual != expected:
@@ -2119,6 +2141,33 @@ class DurableStore:
                 f"Router mailbox lease for {mailbox_id} is no longer owned."
             )
 
+    def _router_reply_markup(
+        self,
+        mailbox_id: int,
+    ) -> Optional[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT token, payload_json
+            FROM callback_actions
+            WHERE operation_id LIKE ? AND state = 'active'
+            ORDER BY action_id
+            """,
+            (f"router:{int(mailbox_id)}:clarify:%",),
+        ).fetchall()
+        if not rows:
+            return None
+        return {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": str(json.loads(row["payload_json"])["choice"]),
+                        "callback_data": f"a:{str(row['token'])}",
+                    }
+                ]
+                for row in rows
+            ]
+        }
+
     def _enqueue_router_final_edit(
         self,
         mailbox_id: int,
@@ -2146,16 +2195,20 @@ class DurableStore:
             )
         except (KeyError, TypeError, ValueError):
             raise StoreError("Stored Telegram router receipt is invalid.") from None
+        params: dict[str, Any] = {
+            "chat_id": int(row["chat_id"]),
+            "message_id": telegram_message_id,
+            "text": preview_text,
+        }
+        reply_markup = self._router_reply_markup(mailbox_id)
+        if reply_markup is not None:
+            params["reply_markup"] = reply_markup
         self.enqueue_api_call(
             operation_id=(
                 f"router-mailbox:{int(mailbox_id)}:{operation_suffix}"
             ),
             method="editMessageText",
-            params={
-                "chat_id": int(row["chat_id"]),
-                "message_id": telegram_message_id,
-                "text": preview_text,
-            },
+            params=params,
             card={
                 "kind": "router_turn",
                 "mailbox_id": int(mailbox_id),
@@ -2177,18 +2230,26 @@ class DurableStore:
         usage: dict[str, Any],
         dispatch_agent_id: Optional[str] = None,
         dispatch_message: Optional[str] = None,
+        clarification_options: Optional[list[str]] = None,
         now: Optional[float] = None,
     ) -> None:
         if not preview_text or len(preview_text) > 3800:
             raise StoreError("Router preview text is invalid.")
         if (dispatch_agent_id is None) != (dispatch_message is None):
             raise StoreError("Router dispatch arguments are incomplete.")
+        if clarification_options is not None and (
+            tool_name != "ask_user"
+            or not clarification_options
+            or len(clarification_options) > 4
+        ):
+            raise StoreError("Router clarification options are invalid.")
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             row = self.connection.execute(
                 """
-                SELECT source_inbox_job_id
+                SELECT source_inbox_job_id, chat_id, message_thread_id,
+                    authorized_user_id
                 FROM router_mailbox
                 WHERE mailbox_id = ? AND state = 'leased' AND lease_owner = ?
                 """,
@@ -2208,6 +2269,59 @@ class DurableStore:
                     input_text=dispatch_message,
                     now=timestamp,
                 )
+            if clarification_options is not None:
+                if row["authorized_user_id"] is None:
+                    raise StoreError("Router clarification has no authorized user.")
+                for index, choice in enumerate(clarification_options):
+                    inserted = False
+                    for _ in range(5):
+                        token = secrets.token_urlsafe(6)
+                        try:
+                            self.connection.execute(
+                                """
+                                INSERT INTO callback_actions(
+                                    operation_id, token, action_type,
+                                    payload_json, chat_id, message_thread_id,
+                                    authorized_user_id, one_time, state,
+                                    expires_at, created_at, updated_at
+                                )
+                                VALUES (?, ?, 'router_clarification', ?, ?, ?,
+                                    ?, 1, 'active', ?, ?, ?)
+                                """,
+                                (
+                                    (
+                                        f"router:{int(mailbox_id)}:"
+                                        f"clarify:{index}"
+                                    ),
+                                    token,
+                                    json.dumps(
+                                        {
+                                            "router_mailbox_id": int(mailbox_id),
+                                            "choice": choice,
+                                        },
+                                        separators=(",", ":"),
+                                        sort_keys=True,
+                                    ),
+                                    int(row["chat_id"]),
+                                    (
+                                        int(row["message_thread_id"])
+                                        if int(row["message_thread_id"]) != 0
+                                        else None
+                                    ),
+                                    int(row["authorized_user_id"]),
+                                    timestamp + 24 * 60 * 60,
+                                    timestamp,
+                                    timestamp,
+                                ),
+                            )
+                        except sqlite3.IntegrityError:
+                            continue
+                        inserted = True
+                        break
+                    if not inserted:
+                        raise StoreError(
+                            "Could not allocate a router clarification token."
+                        )
             self.connection.execute(
                 """
                 UPDATE router_mailbox
@@ -2336,6 +2450,48 @@ class DurableStore:
                 "ttl_seconds": 30 * 24 * 60 * 60,
             },
             now=timestamp,
+        )
+
+    def resolve_router_clarification(
+        self,
+        mailbox_id: int,
+        choice: str,
+        now: Optional[float] = None,
+    ) -> str:
+        row = self.connection.execute(
+            """
+            SELECT input_text, arguments_json
+            FROM router_mailbox
+            WHERE mailbox_id = ? AND state = 'succeeded'
+                AND tool_name = 'ask_user'
+            """,
+            (int(mailbox_id),),
+        ).fetchone()
+        if row is None or row["arguments_json"] is None:
+            raise StoreError("Router clarification is no longer available.")
+        arguments = json.loads(row["arguments_json"])
+        options = arguments.get("options")
+        question = arguments.get("question")
+        if (
+            not isinstance(options, list)
+            or choice not in options
+            or not isinstance(question, str)
+        ):
+            raise StoreError("Router clarification choice is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute(
+            """
+            UPDATE callback_actions
+            SET state = 'expired', updated_at = ?
+            WHERE operation_id LIKE ? AND state = 'active'
+            """,
+            (timestamp, f"router:{int(mailbox_id)}:clarify:%"),
+        )
+        return (
+            "Continue the prior request using the user's clarification.\n\n"
+            f"Original request: {str(row['input_text'])}\n"
+            f"Question: {question}\n"
+            f"User's answer: {choice}"
         )
 
     def attach_enrolled_project(

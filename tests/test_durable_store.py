@@ -24,6 +24,7 @@ from durable_store import (
     MIGRATION_8,
     MIGRATION_9,
     MIGRATION_10,
+    MIGRATION_11,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -115,7 +116,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            10,
+            11,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -1050,7 +1051,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    10,
+                    11,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1074,7 +1075,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    10,
+                    11,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1099,7 +1100,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    10,
+                    11,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1123,7 +1124,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    10,
+                    11,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1149,7 +1150,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    10,
+                    11,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1180,7 +1181,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    10,
+                    11,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1212,7 +1213,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    10,
+                    11,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1245,7 +1246,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    10,
+                    11,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1279,7 +1280,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    10,
+                    11,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1288,6 +1289,41 @@ class SchemaCompatibilityTests(unittest.TestCase):
                     ).fetchone()[0],
                     1,
                 )
+
+    def test_schema_ten_database_migrates_to_current_schema(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-ten.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for statement in (
+                MIGRATION_1
+                + MIGRATION_2
+                + MIGRATION_3
+                + MIGRATION_4
+                + MIGRATION_5
+                + MIGRATION_6
+                + MIGRATION_7
+                + MIGRATION_8
+                + MIGRATION_9
+                + MIGRATION_10
+            ):
+                connection.execute(statement)
+            connection.execute("PRAGMA user_version = 10")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    11,
+                )
+                columns = {
+                    str(row["name"])
+                    for row in store.connection.execute(
+                        "PRAGMA table_info(router_mailbox)"
+                    ).fetchall()
+                }
+                self.assertIn("authorized_user_id", columns)
 
     def test_cli_fails_cleanly_for_non_database_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1622,6 +1658,110 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 self.assertNotIn("/secret/local/path", catalog)
 
+    def test_router_clarification_buttons_resume_with_selected_answer(self):
+        class FakeRouterAdapter:
+            def run_turn(
+                self,
+                agent,
+                prompt,
+                mailbox_session_id,
+                on_session,
+                heartbeat,
+            ):
+                on_session("router-session-123")
+                heartbeat()
+                return provider_adapters.ProviderTurnResult(
+                    provider_session_id="router-session-123",
+                    final_text=(
+                        '{"tool":"ask_user","arguments":{'
+                        '"question":"Which project should handle this?",'
+                        '"options":["Telegram Control","Another Project"]}}'
+                    ),
+                    usage={},
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ingest_update(
+                    message_update(text="Please handle this project task"),
+                    now=100,
+                )
+                inbox = store.claim_job("inbox", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    inbox,
+                    "inbox",
+                )
+                receipt = store.claim_outbox("sender", now=10**12)
+                store.complete_outbox(
+                    receipt.message_id,
+                    "sender",
+                    {"message_id": 700, "chat": {"id": 123}},
+                    now=10**12,
+                )
+                router_job = store.claim_router_mailbox("router", now=10**12)
+                with mock.patch.object(
+                    telegram_control.provider_adapters,
+                    "adapter_for",
+                    return_value=FakeRouterAdapter(),
+                ):
+                    telegram_control.process_router_mailbox_job(
+                        store,
+                        router_job,
+                        "router",
+                    )
+                question = store.claim_outbox("sender-2", now=10**12)
+                self.assertEqual(question.method, "editMessageText")
+                self.assertEqual(
+                    question.params["text"],
+                    "Which project should handle this?",
+                )
+                buttons = question.params["reply_markup"]["inline_keyboard"]
+                self.assertEqual(
+                    [row[0]["text"] for row in buttons],
+                    ["Telegram Control", "Another Project"],
+                )
+                callback_data = buttons[0][0]["callback_data"]
+
+                store.ingest_update(
+                    callback_update(11, callback_data, message_id=700),
+                    now=102,
+                )
+                callback_job = store.claim_job("inbox-2", now=102)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    callback_job,
+                    "inbox-2",
+                )
+
+                self.assertEqual(
+                    store.status_counts()["callbacks"],
+                    {"consumed": 1, "expired": 1},
+                )
+                self.assertEqual(
+                    store.status_counts()["router_mailbox"],
+                    {"queued": 1, "succeeded": 1},
+                )
+                follow_up = store.claim_router_mailbox(
+                    "router-2",
+                    now=10**12,
+                )
+                self.assertIn(
+                    "User's answer: Telegram Control",
+                    follow_up.input_text,
+                )
+                self.assertIn(
+                    "Original request: Please handle this project task",
+                    follow_up.input_text,
+                )
+
     def test_button_callback_routes_once_through_existing_handler(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"
@@ -1763,8 +1903,12 @@ class DurableIntegrationTests(unittest.TestCase):
                 queued = reopened.claim_outbox("sender", now=10**12 + 1)
                 self.assertEqual(
                     queued.params["text"],
-                    "✅ Durable reply route verified.\n\n"
-                    "Received through the stored controller route: follow up",
+                    "🧭 <b>Routing…</b>",
+                )
+                self.assertEqual(queued.params["parse_mode"], "HTML")
+                self.assertEqual(
+                    reopened.status_counts()["router_mailbox"],
+                    {"queued": 2},
                 )
 
     def test_status_card_binds_surface_and_refreshes_same_message_repeatedly(self):

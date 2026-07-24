@@ -298,6 +298,12 @@ agent, provider-session, console, branch, and working-tree state without
 exposing the enrolled filesystem path. Inspection of an unknown path remains a
 preview until the controller can prove that the path came from the user.
 
+The `ask_user` tool renders its bounded choices as authorized, one-time
+Telegram buttons. Selecting one expires the sibling choices and queues a new
+durable router turn containing the original request, question, and answer.
+Typed replies to controller-routed messages also re-enter the main router
+instead of falling back to a transport-test acknowledgment.
+
 The earlier strict `route`, `clarify`, or `reject` schema remains as a compact
 classification and evaluation primitive. It is not intended to become a
 user-facing command language.
