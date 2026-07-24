@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 
 class StoreError(RuntimeError):
@@ -481,6 +481,36 @@ MIGRATION_11 = (
     """,
 )
 
+MIGRATION_12 = (
+    """
+    CREATE TABLE project_aliases (
+        alias_key TEXT PRIMARY KEY,
+        alias TEXT NOT NULL,
+        project_id TEXT NOT NULL
+            REFERENCES managed_projects(project_id) ON DELETE RESTRICT,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX project_aliases_project
+    ON project_aliases(project_id, alias_key)
+    """,
+)
+
+
+def normalize_project_alias(alias: str) -> str:
+    value = " ".join(alias.strip().casefold().split())
+    if (
+        len(value) < 2
+        or len(value) > 64
+        or not re.fullmatch(r"[a-z0-9]+(?:[ -][a-z0-9]+)*", value)
+    ):
+        raise StoreError(
+            "Project alias must use 2 to 64 letters, digits, spaces, or hyphens."
+        )
+    return value
+
 
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
@@ -581,6 +611,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 11
                 self.connection.execute("PRAGMA user_version = 11")
+            if current < 12:
+                for statement in MIGRATION_12:
+                    self.connection.execute(statement)
+                current = 12
+                self.connection.execute("PRAGMA user_version = 12")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -1772,6 +1807,12 @@ class DurableStore:
                     )
                 self.connection.execute("COMMIT")
                 return project, False
+            alias_collision = self.connection.execute(
+                "SELECT project_id FROM project_aliases WHERE alias_key = ?",
+                (slug,),
+            ).fetchone()
+            if alias_collision is not None:
+                raise StoreError("Project slug is already used as a project alias.")
             project_id = f"project_{secrets.token_urlsafe(12)}"
             self.connection.execute(
                 """
@@ -1802,12 +1843,21 @@ class DurableStore:
             raise
 
     def resolve_project(self, slug: str) -> Optional[ManagedProject]:
+        try:
+            alias_key = normalize_project_alias(slug)
+        except StoreError:
+            alias_key = ""
         row = self.connection.execute(
             """
-            SELECT * FROM managed_projects
-            WHERE slug = ? AND state = 'active'
+            SELECT p.*
+            FROM managed_projects AS p
+            LEFT JOIN project_aliases AS a ON a.project_id = p.project_id
+            WHERE p.state = 'active'
+                AND (p.slug = ? OR p.slug = ? OR a.alias_key = ?)
+            ORDER BY CASE WHEN p.slug = ? THEN 0 ELSE 1 END
+            LIMIT 1
             """,
-            (slug,),
+            (slug, alias_key, alias_key, slug),
         ).fetchone()
         return self._managed_project_from_row(row) if row is not None else None
 
@@ -1820,6 +1870,119 @@ class DurableStore:
             """
         ).fetchall()
         return [self._managed_project_from_row(row) for row in rows]
+
+    def project_alias_map(self) -> dict[str, list[str]]:
+        rows = self.connection.execute(
+            """
+            SELECT p.slug, a.alias
+            FROM managed_projects AS p
+            JOIN project_aliases AS a ON a.project_id = p.project_id
+            WHERE p.state = 'active'
+            ORDER BY p.slug, a.alias_key
+            """
+        ).fetchall()
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            result.setdefault(str(row["slug"]), []).append(str(row["alias"]))
+        return result
+
+    def project_alias_resolution(self) -> dict[str, str]:
+        rows = self.connection.execute(
+            """
+            SELECT a.alias_key, p.slug
+            FROM project_aliases AS a
+            JOIN managed_projects AS p ON p.project_id = a.project_id
+            WHERE p.state = 'active'
+            """
+        ).fetchall()
+        return {
+            str(row["alias_key"]): str(row["slug"])
+            for row in rows
+        }
+
+    def add_project_alias(
+        self,
+        project_slug: str,
+        alias: str,
+        now: Optional[float] = None,
+    ) -> bool:
+        project = self.resolve_project(project_slug)
+        if project is None:
+            raise StoreError("Project alias target is not enrolled.")
+        alias_text = " ".join(alias.strip().split())
+        alias_key = normalize_project_alias(alias_text)
+        if alias_key == project.slug:
+            raise StoreError("That is already the project's canonical slug.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            slug_collision = self.connection.execute(
+                """
+                SELECT project_id FROM managed_projects
+                WHERE state = 'active' AND slug = ?
+                """,
+                (alias_key,),
+            ).fetchone()
+            if slug_collision is not None:
+                raise StoreError("That alias is already a canonical project slug.")
+            existing = self.connection.execute(
+                "SELECT project_id FROM project_aliases WHERE alias_key = ?",
+                (alias_key,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["project_id"]) != project.project_id:
+                    raise StoreError("That alias already belongs to another project.")
+                self.connection.execute("COMMIT")
+                return False
+            self.connection.execute(
+                """
+                INSERT INTO project_aliases(
+                    alias_key, alias, project_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    alias_key,
+                    alias_text,
+                    project.project_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.connection.execute("COMMIT")
+            return True
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def remove_project_alias(
+        self,
+        alias: str,
+    ) -> Optional[ManagedProject]:
+        alias_key = normalize_project_alias(alias)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT p.*
+                FROM project_aliases AS a
+                JOIN managed_projects AS p ON p.project_id = a.project_id
+                WHERE a.alias_key = ? AND p.state = 'active'
+                """,
+                (alias_key,),
+            ).fetchone()
+            if row is None:
+                self.connection.execute("COMMIT")
+                return None
+            self.connection.execute(
+                "DELETE FROM project_aliases WHERE alias_key = ?",
+                (alias_key,),
+            )
+            self.connection.execute("COMMIT")
+            return self._managed_project_from_row(row)
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
 
     def list_project_agent_states(self) -> list[dict[str, Any]]:
         rows = self.connection.execute(

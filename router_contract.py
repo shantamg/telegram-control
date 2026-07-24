@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 from durable_store import ManagedProject, StoreError
 
@@ -61,6 +61,18 @@ CONTROLLER_TOOLS = (
         "confirmation": True,
     },
     {
+        "name": "set_project_alias",
+        "description": "Add a durable conversational alias for an enrolled project.",
+        "arguments": {"project_slug": "string", "alias": "string"},
+        "confirmation": False,
+    },
+    {
+        "name": "remove_project_alias",
+        "description": "Remove an existing durable project alias.",
+        "arguments": {"alias": "string"},
+        "confirmation": False,
+    },
+    {
         "name": "ask_user",
         "description": "Ask one concise question with optional button choices.",
         "arguments": {"question": "string", "options": "string[]"},
@@ -79,19 +91,25 @@ def build_main_agent_prompt(
     user_input: str,
     projects: Iterable[ManagedProject],
     agent_states: Iterable[dict[str, Any]],
+    project_aliases: Optional[dict[str, list[str]]] = None,
 ) -> str:
     text = user_input.strip()
     if not text or len(text) > 8000:
         raise RouterContractError("Main-agent input is invalid.")
-    catalog = [
-        {
+    aliases = project_aliases or {}
+    catalog = []
+    for project in projects:
+        if project.state != "active":
+            continue
+        item = {
             "slug": project.slug,
             "name": project.display_name,
             "provider": project.provider,
         }
-        for project in projects
-        if project.state == "active"
-    ]
+        project_alias_values = aliases.get(project.slug, [])
+        if project_alias_values:
+            item["aliases"] = list(project_alias_values)
+        catalog.append(item)
     states = [
         {
             "project_slug": str(state["project_slug"]),
@@ -107,6 +125,8 @@ def build_main_agent_prompt(
         "questions before proposing mutations. The controller independently "
         "validates every argument and enforces confirmation for consequential "
         "tools. Never invent a tool, project, path, or completed result.\n\n"
+        "When a user names an alias, return the canonical project slug shown "
+        "in the catalog.\n\n"
         f"Tools:\n{json.dumps(CONTROLLER_TOOLS, separators=(',', ':'), sort_keys=True)}"
         f"\n\nProjects:\n{json.dumps(catalog, separators=(',', ':'), sort_keys=True)}"
         f"\n\nAgents:\n{json.dumps(states, separators=(',', ':'), sort_keys=True)}"
@@ -124,6 +144,7 @@ def _bounded_string(arguments: dict[str, Any], key: str, limit: int) -> str:
 def parse_router_tool_call(
     raw_text: str,
     allowed_project_slugs: set[str],
+    project_aliases: Optional[dict[str, str]] = None,
 ) -> RouterToolCall:
     try:
         value = json.loads(raw_text)
@@ -150,7 +171,9 @@ def parse_router_tool_call(
     elif tool == "send_to_agent":
         if set(arguments) != {"project_slug", "message"}:
             raise RouterContractError("send_to_agent arguments are invalid.")
-        project_slug = _bounded_string(arguments, "project_slug", 48)
+        project_slug = _bounded_string(arguments, "project_slug", 64)
+        alias_key = " ".join(project_slug.casefold().split())
+        project_slug = (project_aliases or {}).get(alias_key, project_slug)
         if project_slug not in allowed_project_slugs:
             raise RouterContractError("send_to_agent selected an unknown project.")
         normalized = {
@@ -173,6 +196,22 @@ def parse_router_tool_call(
             "project": _bounded_string(arguments, "project", 1000),
             "topic_name": topic_name.strip() if isinstance(topic_name, str) else None,
         }
+    elif tool == "set_project_alias":
+        if set(arguments) != {"project_slug", "alias"}:
+            raise RouterContractError("set_project_alias arguments are invalid.")
+        project_slug = _bounded_string(arguments, "project_slug", 64)
+        alias_key = " ".join(project_slug.casefold().split())
+        project_slug = (project_aliases or {}).get(alias_key, project_slug)
+        if project_slug not in allowed_project_slugs:
+            raise RouterContractError("set_project_alias selected an unknown project.")
+        normalized = {
+            "project_slug": project_slug,
+            "alias": _bounded_string(arguments, "alias", 64),
+        }
+    elif tool == "remove_project_alias":
+        if set(arguments) != {"alias"}:
+            raise RouterContractError("remove_project_alias arguments are invalid.")
+        normalized = {"alias": _bounded_string(arguments, "alias", 64)}
     elif tool == "ask_user":
         if set(arguments) != {"question", "options"}:
             raise RouterContractError("ask_user arguments are invalid.")

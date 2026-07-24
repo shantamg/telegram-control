@@ -400,14 +400,28 @@ def project_catalog_text(store: DurableStore) -> str:
     if not projects:
         return "No projects are enrolled yet."
     lines = ["Enrolled projects", ""]
+    aliases = store.project_alias_map()
     for project in projects:
         agent = store.resolve_project_agent(project.slug)
         state = agent.lifecycle_state if agent is not None else "not created"
-        lines.append(
+        line = (
             f"{project.slug} — {project.display_name} "
             f"({project.provider}) · {state}"
         )
+        project_aliases = aliases.get(project.slug, [])
+        if project_aliases:
+            line += "\n  Aliases: " + ", ".join(project_aliases)
+        lines.append(line)
     return "\n".join(lines)
+
+
+def alias_appears_in_input(alias: str, user_input: str) -> bool:
+    normalized_alias = " ".join(alias.casefold().split())
+    normalized_input = " ".join(user_input.casefold().split())
+    return re.search(
+        rf"(?<![a-z0-9]){re.escape(normalized_alias)}(?![a-z0-9])",
+        normalized_input,
+    ) is not None
 
 
 def project_creation_proposal(
@@ -537,6 +551,7 @@ def process_router_mailbox_job(
             job.input_text,
             projects,
             store.list_project_agent_states(),
+            store.project_alias_map(),
         )
         adapter = provider_adapters.adapter_for(runtime_agent)
         result = adapter.run_turn(
@@ -556,6 +571,7 @@ def process_router_mailbox_job(
         call = router_contract.parse_router_tool_call(
             result.final_text,
             {project.slug for project in projects},
+            store.project_alias_resolution(),
         )
         dispatch_agent_id = None
         dispatch_message = None
@@ -595,6 +611,33 @@ def process_router_mailbox_job(
                 store,
                 job.input_text,
                 call.arguments,
+            )
+        elif call.tool == "set_project_alias":
+            alias = str(call.arguments["alias"])
+            if not alias_appears_in_input(alias, job.input_text):
+                raise StoreError(
+                    "The project alias must appear explicitly in the user's request."
+                )
+            project = store.resolve_project(str(call.arguments["project_slug"]))
+            if project is None:
+                raise StoreError("The selected project is not enrolled.")
+            created = store.add_project_alias(project.slug, alias)
+            response_text = (
+                f"✅ {project.display_name} can now be called “{alias}”."
+                if created
+                else f"✅ “{alias}” is already an alias for {project.display_name}."
+            )
+        elif call.tool == "remove_project_alias":
+            alias = str(call.arguments["alias"])
+            if not alias_appears_in_input(alias, job.input_text):
+                raise StoreError(
+                    "The project alias must appear explicitly in the user's request."
+                )
+            project = store.remove_project_alias(alias)
+            response_text = (
+                f"Removed the alias “{alias}” from {project.display_name}."
+                if project is not None
+                else f"“{alias}” is not an active project alias."
             )
         else:
             response_text = router_preview_text(store, call)

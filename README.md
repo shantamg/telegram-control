@@ -312,6 +312,12 @@ and shows the proposed provider and Telegram topic behind **Create project
 agent** and **Cancel** buttons. Only the authorized confirmation enrolls the
 project, creates its private-chat topic, and attaches the managed agent.
 
+Enrolled projects can also have durable conversational aliases. Natural
+requests can add or remove an alias when the alias is stated explicitly in the
+current message. Aliases are globally unique, survive restarts and router
+rotation, appear in the path-safe router catalog, and always resolve back to a
+canonical project slug before work is dispatched.
+
 The main router rotates before the next fresh turn after either 12 completed
 turns or 180,000 cumulative input tokens reported by Codex. Rotation clears
 only the controller's active session pointer; the old Codex conversation is
@@ -327,7 +333,7 @@ escaped transcript display, main-router work, and the final routed response.
 The router session, validation, clarification, confirmation, and project-agent
 relay rules are identical for text and voice input.
 
-The router contract has a repeatable six-case quality gate covering every
+The router contract has a repeatable eight-case quality gate covering every
 controller tool. The offline run validates the fixtures and parser without
 calling a model:
 
@@ -344,7 +350,8 @@ without changing the bot's durable router session:
 
 Pass `--model MODEL` to compare a candidate model. A router or model change is
 ready only when all cases pass. The default model passed 6/6 on July 23, 2026,
-with individual cold-session decisions taking 6.1–8.1 seconds.
+then passed the expanded 8/8 gate after aliases were added, with individual
+cold-session decisions taking 5.2–10.0 seconds.
 
 The earlier strict `route`, `clarify`, or `reject` schema remains as a compact
 classification and evaluation primitive. It is not intended to become a

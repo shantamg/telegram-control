@@ -95,6 +95,17 @@ class RouterContractTests(unittest.TestCase):
         self.assertIn('"project_slug":"telegram-control"', prompt)
         self.assertNotIn("/secret/local/path", prompt)
 
+    def test_main_agent_prompt_exposes_alias_with_canonical_slug(self):
+        prompt = build_main_agent_prompt(
+            "inspect TC",
+            [self.project],
+            [],
+            {"telegram-control": ["TC"]},
+        )
+        self.assertIn('"aliases":["TC"]', prompt)
+        self.assertIn("canonical project slug", prompt)
+        self.assertNotIn("/secret/local/path", prompt)
+
     def test_tool_call_normalizes_safe_dispatch(self):
         call = parse_router_tool_call(
             '{"tool":"send_to_agent","arguments":{'
@@ -113,6 +124,29 @@ class RouterContractTests(unittest.TestCase):
         )
         self.assertTrue(call.requires_confirmation)
         self.assertEqual(call.arguments["project"], "~/Code/new-project")
+
+    def test_alias_tools_are_strict_and_alias_dispatch_is_canonicalized(self):
+        call = parse_router_tool_call(
+            '{"tool":"set_project_alias","arguments":{'
+            '"project_slug":"telegram-control","alias":"TC"}}',
+            {"telegram-control"},
+        )
+        self.assertEqual(call.arguments["alias"], "TC")
+        self.assertFalse(call.requires_confirmation)
+
+        dispatch = parse_router_tool_call(
+            '{"tool":"send_to_agent","arguments":{'
+            '"project_slug":"TC","message":"inspect it"}}',
+            {"telegram-control"},
+            {"tc": "telegram-control"},
+        )
+        self.assertEqual(dispatch.arguments["project_slug"], "telegram-control")
+
+        removal = parse_router_tool_call(
+            '{"tool":"remove_project_alias","arguments":{"alias":"TC"}}',
+            {"telegram-control"},
+        )
+        self.assertEqual(removal.arguments, {"alias": "TC"})
 
     def test_tool_call_rejects_unknown_tools_projects_and_fields(self):
         with self.assertRaisesRegex(RouterContractError, "unknown tool"):

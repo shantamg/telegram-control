@@ -128,7 +128,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            11,
+            12,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -733,6 +733,66 @@ class DurableStoreTests(unittest.TestCase):
             self.store.resolve_surface_binding(123, 62).target_id,
             agent.agent_id,
         )
+
+    def test_project_aliases_are_durable_unique_and_resolvable(self):
+        project, _ = self.store.enroll_project(
+            slug="telegram-control",
+            display_name="Telegram Control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        self.assertTrue(
+            self.store.add_project_alias("telegram-control", "TC", now=101)
+        )
+        self.assertFalse(
+            self.store.add_project_alias("telegram-control", "tc", now=102)
+        )
+        self.assertEqual(self.store.resolve_project("TC"), project)
+        self.assertEqual(
+            self.store.project_alias_map(),
+            {"telegram-control": ["TC"]},
+        )
+        self.assertEqual(
+            self.store.project_alias_resolution(),
+            {"tc": "telegram-control"},
+        )
+
+        other, _ = self.store.enroll_project(
+            slug="other-project",
+            display_name="Other Project",
+            provider="codex",
+            project_path="/tmp/other-project",
+            now=103,
+        )
+        self.assertNotEqual(other.project_id, project.project_id)
+        with self.assertRaisesRegex(StoreError, "another project"):
+            self.store.add_project_alias("other-project", "TC", now=104)
+        with self.assertRaisesRegex(StoreError, "canonical project slug"):
+            self.store.add_project_alias("other-project", "telegram-control", now=105)
+
+        removed = self.store.remove_project_alias("tc")
+        self.assertEqual(removed, project)
+        self.assertIsNone(self.store.resolve_project("TC"))
+        self.assertIsNone(self.store.remove_project_alias("TC"))
+
+    def test_project_slug_cannot_reuse_existing_alias(self):
+        self.store.enroll_project(
+            slug="telegram-control",
+            display_name="Telegram Control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        self.store.add_project_alias("telegram-control", "other-project", now=101)
+        with self.assertRaisesRegex(StoreError, "already used"):
+            self.store.enroll_project(
+                slug="other-project",
+                display_name="Other Project",
+                provider="codex",
+                project_path="/tmp/other-project",
+                now=102,
+            )
         with self.assertRaisesRegex(StoreError, "not enrolled"):
             self.store.attach_enrolled_project(123, 62, "missing")
 
@@ -1148,7 +1208,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    12,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1172,7 +1232,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    12,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1197,7 +1257,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    12,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1221,7 +1281,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    12,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1247,7 +1307,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    12,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1278,7 +1338,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    12,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1310,7 +1370,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    12,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1343,7 +1403,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    12,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1377,7 +1437,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    12,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1412,7 +1472,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    11,
+                    12,
                 )
                 columns = {
                     str(row["name"])
@@ -1421,6 +1481,13 @@ class SchemaCompatibilityTests(unittest.TestCase):
                     ).fetchall()
                 }
                 self.assertIn("authorized_user_id", columns)
+                alias_table = store.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'project_aliases'
+                    """
+                ).fetchone()[0]
+                self.assertEqual(alias_table, 1)
 
     def test_cli_fails_cleanly_for_non_database_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1782,6 +1849,142 @@ class DurableIntegrationTests(unittest.TestCase):
                         "Inspect a repository I did not identify",
                     )
                 )
+
+    def test_router_creates_and_resolves_durable_project_alias(self):
+        class FakeRouterAdapter:
+            def __init__(self):
+                self.prompts = []
+                self.outputs = [
+                    {
+                        "tool": "set_project_alias",
+                        "arguments": {
+                            "project_slug": "telegram-control",
+                            "alias": "TC",
+                        },
+                    },
+                    {
+                        "tool": "inspect_project",
+                        "arguments": {"project": "TC"},
+                    },
+                ]
+
+            def run_turn(
+                self,
+                agent,
+                prompt,
+                mailbox_session_id,
+                on_session,
+                heartbeat,
+            ):
+                self.prompts.append(prompt)
+                on_session("router-session-alias")
+                heartbeat()
+                return provider_adapters.ProviderTurnResult(
+                    provider_session_id="router-session-alias",
+                    final_text=json.dumps(self.outputs.pop(0)),
+                    usage={},
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            fake = FakeRouterAdapter()
+            with DurableStore(database_path) as store:
+                store.enroll_project(
+                    slug="telegram-control",
+                    display_name="Telegram Control",
+                    provider="codex",
+                    project_path="/secret/local/path",
+                    now=99,
+                )
+
+                store.ingest_update(
+                    message_update(text="Call Telegram Control TC from now on"),
+                    now=100,
+                )
+                inbox = store.claim_job("inbox-1", now=100)
+                telegram_control.process_inbox_job(
+                    store, config, inbox, "inbox-1"
+                )
+                receipt = store.claim_outbox("sender-1", now=10**12)
+                store.complete_outbox(
+                    receipt.message_id,
+                    "sender-1",
+                    {"message_id": 700, "chat": {"id": 123}},
+                    now=10**12,
+                )
+                router_job = store.claim_router_mailbox(
+                    "router-1", now=10**12
+                )
+                with mock.patch.object(
+                    telegram_control.provider_adapters,
+                    "adapter_for",
+                    return_value=fake,
+                ):
+                    telegram_control.process_router_mailbox_job(
+                        store, router_job, "router-1"
+                    )
+                confirmation = store.claim_outbox("sender-2", now=10**12)
+                self.assertIn("can now be called “TC”", confirmation.params["text"])
+                store.complete_outbox(
+                    confirmation.message_id,
+                    "sender-2",
+                    {"message_id": 700, "chat": {"id": 123}},
+                    now=10**12,
+                )
+                self.assertEqual(
+                    store.project_alias_map(),
+                    {"telegram-control": ["TC"]},
+                )
+
+                store.ingest_update(
+                    message_update(update_id=11, text="Inspect TC"),
+                    now=101,
+                )
+                inbox = store.claim_job("inbox-2", now=101)
+                telegram_control.process_inbox_job(
+                    store, config, inbox, "inbox-2"
+                )
+                receipt = store.claim_outbox("sender-3", now=10**12)
+                store.complete_outbox(
+                    receipt.message_id,
+                    "sender-3",
+                    {"message_id": 701, "chat": {"id": 123}},
+                    now=10**12,
+                )
+                router_job = store.claim_router_mailbox(
+                    "router-2", now=10**12
+                )
+                git_results = [
+                    telegram_control.subprocess.CompletedProcess(
+                        ["git", "branch"], 0, stdout="main\n", stderr=""
+                    ),
+                    telegram_control.subprocess.CompletedProcess(
+                        ["git", "status"], 0, stdout="", stderr=""
+                    ),
+                ]
+                with (
+                    mock.patch.object(
+                        telegram_control.provider_adapters,
+                        "adapter_for",
+                        return_value=fake,
+                    ),
+                    mock.patch.object(
+                        telegram_control.subprocess,
+                        "run",
+                        side_effect=git_results,
+                    ),
+                ):
+                    telegram_control.process_router_mailbox_job(
+                        store, router_job, "router-2"
+                    )
+                inspection = store.claim_outbox("sender-4", now=10**12)
+                self.assertIn("🔎 Telegram Control", inspection.params["text"])
+                self.assertIn('"aliases":["TC"]', fake.prompts[1])
+                self.assertNotIn("/secret/local/path", fake.prompts[1])
 
     def test_router_clarification_buttons_resume_with_selected_answer(self):
         class FakeRouterAdapter:

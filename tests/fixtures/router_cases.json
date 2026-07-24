@@ -44,6 +44,29 @@
     }
   },
   {
+    "name": "set_project_alias",
+    "input": "Call the telegram-control project TC from now on.",
+    "expected_tool": "set_project_alias",
+    "sample_output": {
+      "tool": "set_project_alias",
+      "arguments": {
+        "project_slug": "telegram-control",
+        "alias": "TC"
+      }
+    }
+  },
+  {
+    "name": "remove_project_alias",
+    "input": "Remove the TC alias.",
+    "expected_tool": "remove_project_alias",
+    "sample_output": {
+      "tool": "remove_project_alias",
+      "arguments": {
+        "alias": "TC"
+      }
+    }
+  },
+  {
     "name": "ask_user",
     "input": "Do not choose for me. Ask whether I want a status check or to send a task.",
     "expected_tool": "ask_user",
