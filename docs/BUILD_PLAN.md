@@ -661,6 +661,22 @@ and committed and delivered a new message on its first queue attempts.
 This completes the Stage 1 activation checkpoint. Stage 2 buttons, topics, and
 durable return routing are next.
 
+### Stage 2 callback checkpoint
+
+The first Stage 2 slice passed offline and live tests on July 23, 2026:
+
+- schema version 2 stores opaque callback actions;
+- action creation is idempotent across inbox retries;
+- callback data contains only a short random token;
+- consumption validates chat, topic, user, expiry, and lifecycle state;
+- retrying the same Telegram update may finish safely after a crash;
+- a new update replaying a one-time action is rejected;
+- the live **Inspect transport** button routed once and the second tap produced
+  only the replay notice.
+
+The next Stage 2 slice is outbound-message route recording and reply-to-message
+routing, followed by topic bindings.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)

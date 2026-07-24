@@ -85,6 +85,19 @@ post-boot network failure was retried automatically, and the first Telegram
 message after reboot was committed, handled, and delivered without a queue
 retry.
 
+## Stage 2 callback checkpoint
+
+Schema version 2 adds durable opaque callback actions. Text acknowledgments now
+include an **Inspect transport** button whose compact `a:<token>` callback data
+contains no command, path, prompt, or privileged payload. SQLite holds the
+actual action and validates its chat, topic, authorized user, expiry, and
+one-time state.
+
+The live button test passed on July 23, 2026. The first tap resolved and
+consumed the stored action and returned its routed response. A second tap
+created a separate durable callback update but returned only “This button was
+already used” without executing the action again.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

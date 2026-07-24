@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import secrets
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -12,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class StoreError(RuntimeError):
@@ -25,6 +27,15 @@ class IncompatibleSchemaError(StoreError):
 
 class LeaseLostError(StoreError):
     """Raised when a worker attempts to mutate a lease it no longer owns."""
+
+
+class CallbackActionError(StoreError):
+    """Raised when an opaque callback token cannot be safely executed."""
+
+    def __init__(self, code: str, user_message: str):
+        super().__init__(user_message)
+        self.code = code
+        self.user_message = user_message
 
 
 @dataclass(frozen=True)
@@ -43,6 +54,19 @@ class OutboxMessage:
     method: str
     params: dict[str, Any]
     attempts: int
+
+
+@dataclass(frozen=True)
+class CallbackAction:
+    action_id: int
+    token: str
+    action_type: str
+    payload: dict[str, Any]
+    chat_id: int
+    message_thread_id: Optional[int]
+    authorized_user_id: int
+    one_time: bool
+    expires_at: float
 
 
 MIGRATION_1 = (
@@ -119,6 +143,33 @@ MIGRATION_1 = (
     """,
 )
 
+MIGRATION_2 = (
+    """
+    CREATE TABLE callback_actions (
+        action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        operation_id TEXT NOT NULL UNIQUE,
+        token TEXT NOT NULL UNIQUE,
+        action_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        message_thread_id INTEGER,
+        authorized_user_id INTEGER NOT NULL,
+        one_time INTEGER NOT NULL CHECK (one_time IN (0, 1)),
+        state TEXT NOT NULL
+            CHECK (state IN ('active', 'consumed', 'expired', 'revoked')),
+        expires_at REAL NOT NULL,
+        consumed_at REAL,
+        consumed_by_update_id INTEGER,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX callback_actions_lookup
+    ON callback_actions(token, state, expires_at)
+    """,
+)
+
 
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
@@ -164,10 +215,16 @@ class DurableStore:
                     f"Database schema {current} is newer than supported schema "
                     f"{SCHEMA_VERSION}."
                 )
-            if current == 0:
+            if current < 1:
                 for statement in MIGRATION_1:
                     self.connection.execute(statement)
-                self.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                current = 1
+                self.connection.execute("PRAGMA user_version = 1")
+            if current < 2:
+                for statement in MIGRATION_2:
+                    self.connection.execute(statement)
+                current = 2
+                self.connection.execute("PRAGMA user_version = 2")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -436,6 +493,231 @@ class DurableStore:
             )
         return int(row["message_id"])
 
+    @staticmethod
+    def _callback_from_row(row: sqlite3.Row) -> CallbackAction:
+        return CallbackAction(
+            action_id=int(row["action_id"]),
+            token=str(row["token"]),
+            action_type=str(row["action_type"]),
+            payload=json.loads(row["payload_json"]),
+            chat_id=int(row["chat_id"]),
+            message_thread_id=(
+                int(row["message_thread_id"])
+                if row["message_thread_id"] is not None
+                else None
+            ),
+            authorized_user_id=int(row["authorized_user_id"]),
+            one_time=bool(row["one_time"]),
+            expires_at=float(row["expires_at"]),
+        )
+
+    def create_callback_action(
+        self,
+        operation_id: str,
+        action_type: str,
+        payload: dict[str, Any],
+        chat_id: int,
+        authorized_user_id: int,
+        message_thread_id: Optional[int] = None,
+        one_time: bool = True,
+        ttl_seconds: float = 24 * 60 * 60,
+        now: Optional[float] = None,
+    ) -> CallbackAction:
+        if not operation_id:
+            raise StoreError("Callback operation_id is required.")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{1,63}", action_type):
+            raise StoreError("Callback action_type is invalid.")
+        if ttl_seconds <= 0:
+            raise StoreError("Callback ttl_seconds must be positive.")
+        timestamp = time.time() if now is None else float(now)
+        payload_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+        expected = (
+            action_type,
+            payload_json,
+            int(chat_id),
+            int(message_thread_id) if message_thread_id is not None else None,
+            int(authorized_user_id),
+            int(bool(one_time)),
+        )
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.connection.execute(
+                "SELECT * FROM callback_actions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if existing is not None:
+                actual = (
+                    str(existing["action_type"]),
+                    str(existing["payload_json"]),
+                    int(existing["chat_id"]),
+                    (
+                        int(existing["message_thread_id"])
+                        if existing["message_thread_id"] is not None
+                        else None
+                    ),
+                    int(existing["authorized_user_id"]),
+                    int(existing["one_time"]),
+                )
+                if actual != expected:
+                    raise StoreError(
+                        f"Callback operation {operation_id!r} was reused "
+                        "with a different action."
+                    )
+                action = self._callback_from_row(existing)
+                self.connection.execute("COMMIT")
+                return action
+
+            action = None
+            for _ in range(5):
+                token = secrets.token_urlsafe(6)
+                try:
+                    cursor = self.connection.execute(
+                        """
+                        INSERT INTO callback_actions(
+                            operation_id, token, action_type, payload_json,
+                            chat_id, message_thread_id, authorized_user_id,
+                            one_time, state, expires_at, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                        """,
+                        (
+                            operation_id,
+                            token,
+                            action_type,
+                            payload_json,
+                            int(chat_id),
+                            (
+                                int(message_thread_id)
+                                if message_thread_id is not None
+                                else None
+                            ),
+                            int(authorized_user_id),
+                            int(bool(one_time)),
+                            timestamp + float(ttl_seconds),
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    continue
+                row = self.connection.execute(
+                    "SELECT * FROM callback_actions WHERE action_id = ?",
+                    (int(cursor.lastrowid),),
+                ).fetchone()
+                action = self._callback_from_row(row)
+                break
+            if action is None:
+                raise StoreError("Could not allocate a unique callback token.")
+            self.connection.execute("COMMIT")
+            return action
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def consume_callback_action(
+        self,
+        callback_data: str,
+        chat_id: int,
+        authorized_user_id: int,
+        update_id: int,
+        message_thread_id: Optional[int] = None,
+        now: Optional[float] = None,
+    ) -> CallbackAction:
+        match = re.fullmatch(r"a:([A-Za-z0-9_-]{6,32})", callback_data)
+        if not match:
+            raise CallbackActionError(
+                "invalid",
+                "This button is invalid.",
+            )
+        token = match.group(1)
+        timestamp = time.time() if now is None else float(now)
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM callback_actions WHERE token = ?",
+                (token,),
+            ).fetchone()
+            if row is None:
+                raise CallbackActionError(
+                    "unknown",
+                    "This button is no longer available.",
+                )
+            if (
+                int(row["chat_id"]) != int(chat_id)
+                or int(row["authorized_user_id"]) != int(authorized_user_id)
+                or (
+                    int(row["message_thread_id"])
+                    if row["message_thread_id"] is not None
+                    else None
+                )
+                != (
+                    int(message_thread_id)
+                    if message_thread_id is not None
+                    else None
+                )
+            ):
+                raise CallbackActionError(
+                    "unauthorized",
+                    "This button is not authorized here.",
+                )
+            if float(row["expires_at"]) <= timestamp:
+                if row["state"] == "active":
+                    self.connection.execute(
+                        """
+                        UPDATE callback_actions
+                        SET state = 'expired', updated_at = ?
+                        WHERE action_id = ? AND state = 'active'
+                        """,
+                        (timestamp, int(row["action_id"])),
+                    )
+                self.connection.execute("COMMIT")
+                raise CallbackActionError(
+                    "expired",
+                    "This button has expired.",
+                )
+            if row["state"] == "consumed":
+                if int(row["consumed_by_update_id"] or -1) == int(update_id):
+                    action = self._callback_from_row(row)
+                    self.connection.execute("COMMIT")
+                    return action
+                raise CallbackActionError(
+                    "consumed",
+                    "This button was already used.",
+                )
+            if row["state"] != "active":
+                raise CallbackActionError(
+                    str(row["state"]),
+                    "This button is no longer available.",
+                )
+
+            if bool(row["one_time"]):
+                self.connection.execute(
+                    """
+                    UPDATE callback_actions
+                    SET state = 'consumed', consumed_at = ?,
+                        consumed_by_update_id = ?, updated_at = ?
+                    WHERE action_id = ? AND state = 'active'
+                    """,
+                    (
+                        timestamp,
+                        int(update_id),
+                        timestamp,
+                        int(row["action_id"]),
+                    ),
+                )
+            action = self._callback_from_row(row)
+            self.connection.execute("COMMIT")
+            return action
+        except CallbackActionError:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
     def claim_outbox(
         self,
         worker_id: str,
@@ -602,6 +884,7 @@ class DurableStore:
             ("updates", "telegram_updates"),
             ("inbox", "inbox_jobs"),
             ("outbox", "outbox_messages"),
+            ("callbacks", "callback_actions"),
         ):
             state_column = "ingest_state" if label == "updates" else "state"
             rows = self.connection.execute(

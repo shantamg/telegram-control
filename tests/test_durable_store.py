@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import tempfile
@@ -11,6 +12,8 @@ from unittest import mock
 import on_message
 import telegram_control
 from durable_store import (
+    MIGRATION_1,
+    CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
     LeaseLostError,
@@ -30,13 +33,13 @@ def message_update(update_id=10, text="hello"):
     }
 
 
-def callback_update(update_id=11):
+def callback_update(update_id=11, data="r:opaque"):
     return {
         "update_id": update_id,
         "callback_query": {
             "id": "callback-1",
             "from": {"id": 123, "username": "tester"},
-            "data": "r:opaque",
+            "data": data,
             "message": {
                 "message_id": 100,
                 "chat": {"id": 123, "type": "private"},
@@ -59,7 +62,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            1,
+            2,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -110,6 +113,132 @@ class DurableStoreTests(unittest.TestCase):
         self.assertIsNotNone(job)
         self.assertEqual(job.kind, "callback_query")
         self.assertEqual(job.payload["callback_query"]["data"], "r:opaque")
+
+    def test_callback_action_is_idempotent_for_creation_and_job_retry(self):
+        action = self.store.create_callback_action(
+            "inbox:1:inspect",
+            "inspect_status",
+            {"view": "transport"},
+            chat_id=123,
+            message_thread_id=7,
+            authorized_user_id=123,
+            now=100,
+            ttl_seconds=60,
+        )
+        duplicate = self.store.create_callback_action(
+            "inbox:1:inspect",
+            "inspect_status",
+            {"view": "transport"},
+            chat_id=123,
+            message_thread_id=7,
+            authorized_user_id=123,
+            now=110,
+            ttl_seconds=60,
+        )
+        self.assertEqual(duplicate.token, action.token)
+        with self.assertRaises(StoreError):
+            self.store.create_callback_action(
+                "inbox:1:inspect",
+                "inspect_status",
+                {"view": "different"},
+                chat_id=123,
+                message_thread_id=7,
+                authorized_user_id=123,
+                now=110,
+            )
+
+        consumed = self.store.consume_callback_action(
+            f"a:{action.token}",
+            chat_id=123,
+            message_thread_id=7,
+            authorized_user_id=123,
+            update_id=50,
+            now=120,
+        )
+        retry = self.store.consume_callback_action(
+            f"a:{action.token}",
+            chat_id=123,
+            message_thread_id=7,
+            authorized_user_id=123,
+            update_id=50,
+            now=121,
+        )
+        self.assertEqual(consumed.action_id, retry.action_id)
+        with self.assertRaises(CallbackActionError) as raised:
+            self.store.consume_callback_action(
+                f"a:{action.token}",
+                chat_id=123,
+                message_thread_id=7,
+                authorized_user_id=123,
+                update_id=51,
+                now=122,
+            )
+        self.assertEqual(raised.exception.code, "consumed")
+
+    def test_callback_action_rejects_wrong_context_without_consuming(self):
+        action = self.store.create_callback_action(
+            "inbox:1:inspect",
+            "inspect_status",
+            {},
+            chat_id=123,
+            message_thread_id=7,
+            authorized_user_id=123,
+            now=100,
+        )
+        for context in (
+            {"chat_id": 999, "message_thread_id": 7, "authorized_user_id": 123},
+            {"chat_id": 123, "message_thread_id": 8, "authorized_user_id": 123},
+            {"chat_id": 123, "message_thread_id": 7, "authorized_user_id": 999},
+        ):
+            with self.assertRaises(CallbackActionError) as raised:
+                self.store.consume_callback_action(
+                    f"a:{action.token}",
+                    update_id=50,
+                    now=110,
+                    **context,
+                )
+            self.assertEqual(raised.exception.code, "unauthorized")
+
+        consumed = self.store.consume_callback_action(
+            f"a:{action.token}",
+            chat_id=123,
+            message_thread_id=7,
+            authorized_user_id=123,
+            update_id=51,
+            now=111,
+        )
+        self.assertEqual(consumed.action_id, action.action_id)
+
+    def test_callback_action_expires_and_invalid_data_is_rejected(self):
+        action = self.store.create_callback_action(
+            "inbox:1:inspect",
+            "inspect_status",
+            {},
+            chat_id=123,
+            authorized_user_id=123,
+            now=100,
+            ttl_seconds=10,
+        )
+        with self.assertRaises(CallbackActionError) as expired:
+            self.store.consume_callback_action(
+                f"a:{action.token}",
+                chat_id=123,
+                authorized_user_id=123,
+                update_id=50,
+                now=110,
+            )
+        self.assertEqual(expired.exception.code, "expired")
+        self.assertEqual(self.store.status_counts()["callbacks"], {"expired": 1})
+
+        with self.assertRaises(CallbackActionError) as invalid:
+            self.store.consume_callback_action(
+                "send:/bin/rm",
+                chat_id=123,
+                authorized_user_id=123,
+                update_id=51,
+                now=111,
+            )
+        self.assertEqual(invalid.exception.code, "invalid")
 
     def test_unsupported_update_is_recorded_without_a_job(self):
         self.assertTrue(
@@ -239,6 +368,30 @@ class DurableStoreTests(unittest.TestCase):
 
 
 class SchemaCompatibilityTests(unittest.TestCase):
+    def test_schema_one_database_migrates_to_schema_two(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-one.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for statement in MIGRATION_1:
+                connection.execute(statement)
+            connection.execute("PRAGMA user_version = 1")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    2,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'callback_actions'"
+                    ).fetchone()[0],
+                    1,
+                )
+
     def test_cli_fails_cleanly_for_non_database_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "corrupt.sqlite3"
@@ -329,6 +482,86 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     reply.params["text"],
                     "✅ Mac script ran and received: hello",
+                )
+                button = reply.params["reply_markup"]["inline_keyboard"][0][0]
+                self.assertEqual(button["text"], "Inspect transport")
+                self.assertRegex(button["callback_data"], r"^a:[A-Za-z0-9_-]{6,32}$")
+
+    def test_button_callback_routes_once_through_existing_handler(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ingest_update(message_update(), now=100)
+                first_job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    first_job,
+                    "worker",
+                )
+                action = store.connection.execute(
+                    "SELECT token FROM callback_actions"
+                ).fetchone()
+
+                store.ingest_update(
+                    callback_update(11, f"a:{action['token']}"),
+                    now=101,
+                )
+                callback_job = store.claim_job("worker", now=101)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    callback_job,
+                    "worker",
+                )
+
+                store.ingest_update(
+                    callback_update(12, f"a:{action['token']}"),
+                    now=102,
+                )
+                replay_job = store.claim_job("worker", now=102)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    replay_job,
+                    "worker",
+                )
+
+                rows = store.connection.execute(
+                    "SELECT method, params_json FROM outbox_messages "
+                    "ORDER BY message_id"
+                ).fetchall()
+                calls = [
+                    (str(row["method"]), json.loads(row["params_json"]))
+                    for row in rows
+                ]
+                self.assertEqual(store.status_counts()["inbox"], {"succeeded": 3})
+                self.assertEqual(
+                    store.status_counts()["callbacks"],
+                    {"consumed": 1},
+                )
+                self.assertEqual(
+                    [method for method, _ in calls],
+                    [
+                        "sendMessage",
+                        "answerCallbackQuery",
+                        "sendMessage",
+                        "answerCallbackQuery",
+                    ],
+                )
+                self.assertEqual(
+                    calls[2][1]["text"],
+                    "✅ Durable button route verified.\n\n"
+                    "The opaque action was authorized, resolved from SQLite, "
+                    "and consumed exactly once.",
+                )
+                self.assertEqual(
+                    calls[3][1]["text"],
+                    "This button was already used.",
                 )
 
     def test_handler_queues_reply_instead_of_calling_telegram(self):

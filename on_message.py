@@ -7,8 +7,10 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import telegram_bridge as bridge
+from durable_store import CallbackActionError, DurableStore, StoreError
 
 
 HANDY_BINARY = Path("/Applications/Handy.app/Contents/MacOS/handy")
@@ -25,8 +27,6 @@ def deliver_api_call(method: str, params: dict, operation_name: str) -> None:
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
     if database_path and job_id:
-        from durable_store import DurableStore
-
         with DurableStore(Path(database_path)) as store:
             store.enqueue_api_call(
                 f"inbox:{job_id}:{operation_name}",
@@ -39,7 +39,38 @@ def deliver_api_call(method: str, params: dict, operation_name: str) -> None:
     bridge.api_call(token, method, **params)
 
 
-def send_message(text: str) -> None:
+def inspect_keyboard() -> Optional[dict]:
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    user_id = os.environ.get("TELEGRAM_FROM_ID")
+    if not all((database_path, job_id, chat_id, user_id)):
+        return None
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    thread_id = int(thread_id_text) if thread_id_text else None
+    with DurableStore(Path(database_path)) as store:
+        action = store.create_callback_action(
+            operation_id=f"inbox:{job_id}:inspect",
+            action_type="inspect_status",
+            payload={"view": "transport"},
+            chat_id=int(chat_id),
+            message_thread_id=thread_id,
+            authorized_user_id=int(user_id),
+            one_time=True,
+        )
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Inspect transport",
+                    "callback_data": f"a:{action.token}",
+                }
+            ]
+        ]
+    }
+
+
+def send_message(text: str, include_inspect_button: bool = False) -> None:
     global OUTPUT_SEQUENCE
     chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
     if chat_id_text:
@@ -51,6 +82,7 @@ def send_message(text: str) -> None:
     remaining = text.strip()
     if not remaining:
         remaining = "[empty transcript]"
+    reply_markup = inspect_keyboard() if include_inspect_button else None
     while remaining:
         if len(remaining) <= TELEGRAM_TEXT_CHUNK:
             chunk, remaining = remaining, ""
@@ -63,15 +95,78 @@ def send_message(text: str) -> None:
             chunk = remaining[:split_at].rstrip()
             remaining = remaining[split_at:].lstrip()
         OUTPUT_SEQUENCE += 1
+        params = {
+            "chat_id": chat_id,
+            "message_thread_id": thread_id,
+            "text": chunk,
+        }
+        if not remaining and reply_markup is not None:
+            params["reply_markup"] = reply_markup
         deliver_api_call(
             "sendMessage",
-            {
-                "chat_id": chat_id,
-                "message_thread_id": thread_id,
-                "text": chunk,
-            },
+            params,
             f"message:{OUTPUT_SEQUENCE}",
         )
+
+
+def handle_callback(update: dict, callback_query: dict) -> None:
+    callback_query_id = str(callback_query.get("id", ""))
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    if not database_path:
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Durable buttons require Stage 2.",
+                },
+                "callback-answer",
+            )
+        return
+
+    chat_id = int(os.environ["TELEGRAM_CHAT_ID"])
+    user_id = int(os.environ["TELEGRAM_FROM_ID"])
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    thread_id = int(thread_id_text) if thread_id_text else None
+    try:
+        with DurableStore(Path(database_path)) as store:
+            action = store.consume_callback_action(
+                callback_data=str(callback_query.get("data", "")),
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=user_id,
+                update_id=int(update["update_id"]),
+            )
+    except CallbackActionError as exc:
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": exc.user_message,
+                    "show_alert": exc.code in {"unauthorized", "invalid"},
+                },
+                "callback-answer",
+            )
+        return
+
+    if callback_query_id:
+        deliver_api_call(
+            "answerCallbackQuery",
+            {
+                "callback_query_id": callback_query_id,
+                "text": "Durable route verified.",
+            },
+            "callback-answer",
+        )
+    if action.action_type == "inspect_status":
+        send_message(
+            "✅ Durable button route verified.\n\n"
+            "The opaque action was authorized, resolved from SQLite, and "
+            "consumed exactly once."
+        )
+        return
+    raise StoreError(f"Unsupported callback action: {action.action_type}")
 
 
 def convert_to_wav(source: Path, destination: Path) -> None:
@@ -163,24 +258,17 @@ def main() -> int:
         callback_query = update.get("callback_query")
         message = update.get("message")
         if callback_query:
-            callback_query_id = str(callback_query.get("id", ""))
-            if callback_query_id:
-                deliver_api_call(
-                    "answerCallbackQuery",
-                    {
-                        "callback_query_id": callback_query_id,
-                        "text": "This button is not active yet.",
-                    },
-                    "callback-answer",
-                )
-            send_message("Buttons are recorded durably; actions arrive in Stage 2.")
+            handle_callback(update, callback_query)
         elif message and "voice" in message:
             print(f"Received voice message from @{username}.", flush=True)
             handle_voice(message["voice"])
         elif message and "text" in message:
             text = str(message["text"])
             print(f"Received text message from @{username}: {text}", flush=True)
-            send_message(f"✅ Mac script ran and received: {text}")
+            send_message(
+                f"✅ Mac script ran and received: {text}",
+                include_inspect_button=True,
+            )
         else:
             send_message("Send me a text or Telegram voice message.")
         return 0
@@ -190,6 +278,9 @@ def main() -> int:
     except (bridge.BridgeError, KeyError, ValueError) as exc:
         print(f"Voice handler error: {exc}", file=sys.stderr, flush=True)
         send_message(f"❌ {exc}")
+        return 1
+    except StoreError as exc:
+        print(f"Durable handler error: {exc}", file=sys.stderr, flush=True)
         return 1
 
 
