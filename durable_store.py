@@ -650,6 +650,35 @@ MIGRATION_16 = (
     UPDATE agents SET git_repository_root = project_path
     WHERE project_path IS NOT NULL
     """,
+    # A v15 project-creation confirmation may already be consumed while its
+    # durable mutation saga is still resumable. v15 guaranteed project_path
+    # was an exact Git root, so normalize both copies of that legacy plan
+    # before the v16 handler begins requiring the explicit metadata field.
+    """
+    UPDATE callback_actions
+    SET payload_json = json_set(
+            payload_json,
+            '$.git_repository_root',
+            json_extract(payload_json, '$.project_path')
+        ),
+        updated_at = updated_at
+    WHERE action_type = 'router_project_confirm'
+        AND json_type(payload_json, '$.git_repository_root') IS NULL
+        AND json_type(payload_json, '$.project_path') = 'text'
+    """,
+    """
+    UPDATE telegram_mutations
+    SET plan_json = json_set(
+            plan_json,
+            '$.git_repository_root',
+            json_extract(plan_json, '$.project_path')
+        ),
+        updated_at = updated_at
+    WHERE mutation_type = 'project_create'
+        AND state != 'applied'
+        AND json_type(plan_json, '$.git_repository_root') IS NULL
+        AND json_type(plan_json, '$.project_path') = 'text'
+    """,
     # Creation confirmations from schema v15 do not record whether Git was
     # optional, so they cannot be revalidated under the workspace model.
     """

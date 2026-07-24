@@ -26,6 +26,8 @@ from durable_store import (
     MIGRATION_11,
     MIGRATION_12,
     MIGRATION_13,
+    MIGRATION_14,
+    MIGRATION_15,
     DurableStore,
     StoreError,
     validate_workspace_paths,
@@ -696,6 +698,94 @@ class ConversationalControlTests(unittest.TestCase):
 
 
 class SchemaFourteenMigrationTests(unittest.TestCase):
+    def test_v15_consumed_project_saga_remains_resumable(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-fifteen.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for migration in (
+                MIGRATION_1,
+                MIGRATION_2,
+                MIGRATION_3,
+                MIGRATION_4,
+                MIGRATION_5,
+                MIGRATION_6,
+                MIGRATION_7,
+                MIGRATION_8,
+                MIGRATION_9,
+                MIGRATION_10,
+                MIGRATION_11,
+                MIGRATION_12,
+                MIGRATION_13,
+                MIGRATION_14,
+                MIGRATION_15,
+            ):
+                for statement in migration:
+                    connection.execute(statement)
+            legacy_plan = {
+                "slug": "legacy",
+                "display_name": "Legacy",
+                "provider": "codex",
+                "project_path": "/tmp/legacy-repo",
+                "working_directory": "/tmp/legacy-repo",
+                "topic_name": "Legacy",
+                "provider_config": {},
+                "provenance": [],
+            }
+            serialized = json.dumps(legacy_plan, separators=(",", ":"))
+            connection.execute(
+                """
+                INSERT INTO callback_actions(
+                    operation_id, token, action_type, payload_json,
+                    chat_id, message_thread_id, authorized_user_id,
+                    one_time, state, expires_at, created_at, updated_at
+                )
+                VALUES ('router:15:project:0', 'legacytoken',
+                    'router_project_confirm', ?, 123, NULL, 123, 1,
+                    'consumed', 9e12, 100, 100)
+                """,
+                (serialized,),
+            )
+            connection.execute(
+                """
+                INSERT INTO telegram_mutations(
+                    operation_id, mutation_type, plan_json, state,
+                    external_result_json, attempts, created_at, updated_at
+                )
+                VALUES ('router:15:project:0', 'project_create', ?,
+                    'external_succeeded', '{"message_thread_id":77}',
+                    1, 100, 100)
+                """,
+                (serialized,),
+            )
+            connection.execute("PRAGMA user_version = 15")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                action_row = store.connection.execute(
+                    "SELECT payload_json, state FROM callback_actions "
+                    "WHERE operation_id = 'router:15:project:0'"
+                ).fetchone()
+                mutation_row = store.connection.execute(
+                    "SELECT plan_json, state FROM telegram_mutations "
+                    "WHERE operation_id = 'router:15:project:0'"
+                ).fetchone()
+                self.assertEqual(action_row["state"], "consumed")
+                self.assertEqual(mutation_row["state"], "external_succeeded")
+                self.assertEqual(
+                    json.loads(action_row["payload_json"])[
+                        "git_repository_root"
+                    ],
+                    "/tmp/legacy-repo",
+                )
+                self.assertEqual(
+                    json.loads(mutation_row["plan_json"])[
+                        "git_repository_root"
+                    ],
+                    "/tmp/legacy-repo",
+                )
+
     def test_v13_database_migrates_preserving_identity(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "schema-thirteen.sqlite3"
