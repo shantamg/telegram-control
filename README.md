@@ -152,6 +152,27 @@ the provisioning command returned the same binding without creating another
 topic. `/status` in the project topic created its own singleton card while
 preserving the separate main Control card.
 
+## Stage 3 agent registry checkpoint
+
+Schema version 6 adds a provider-neutral managed-agent registry. Logical
+identity uses random immutable `agent_id` values; display and tmux names use the
+validated hierarchy `tc--root--<slug>`. Register an existing managed project
+topic against a local Git repository with:
+
+```sh
+/Users/shantam/telegram-control/telegram_control.py \
+  register-agent "Project Topic" project-slug /absolute/project/path
+```
+
+Registration atomically creates the project agent and changes the topic binding
+from `controller/control` to `agent/<agent_id>`. Repeating the same registration
+returns the existing agent; mismatched registrations and invalid slugs fail
+closed. Send `/agent` inside the topic for a path-safe registry summary.
+
+The live registry test passed on July 23, 2026. **Stage 2 Test** is bound to
+`tc--root--telegram-control` using the Codex provider and reports `registered`
+with no provider session started.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

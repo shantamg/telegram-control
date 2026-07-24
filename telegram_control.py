@@ -479,6 +479,44 @@ def provision_topic_command(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+def register_agent_command(args: argparse.Namespace) -> None:
+    requested_path = Path(args.project_path).expanduser().resolve()
+    if not requested_path.is_dir():
+        raise StoreError(f"Project directory does not exist: {requested_path}")
+    git_result = subprocess.run(
+        ["git", "-C", str(requested_path), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if git_result.returncode != 0:
+        raise StoreError("Managed Codex projects must be Git repositories.")
+    project_path = str(Path(git_result.stdout.strip()).resolve())
+    config = bridge.load_config()
+    with open_store(args.db) as store:
+        agent, created = store.register_project_agent(
+            chat_id=int(config["chat_id"]),
+            surface_name=args.surface,
+            slug=args.slug,
+            provider=args.provider,
+            project_path=project_path,
+        )
+    print(
+        json.dumps(
+            {
+                "created": created,
+                "agent_id": agent.agent_id,
+                "name": agent.hierarchical_name,
+                "provider": agent.provider,
+                "project_path": agent.project_path,
+                "state": agent.lifecycle_state,
+                "surface_binding_id": agent.surface_binding_id,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
 def doctor_command(args: argparse.Namespace) -> None:
     problems = []
     try:
@@ -587,6 +625,20 @@ def build_parser() -> argparse.ArgumentParser:
     provision_parser.add_argument("--target-type", default="controller")
     provision_parser.add_argument("--target-id", default="control")
     provision_parser.set_defaults(function=provision_topic_command)
+
+    register_parser = subparsers.add_parser(
+        "register-agent",
+        help="Register a managed project agent on an existing topic surface.",
+    )
+    register_parser.add_argument("surface", help="Existing managed topic name.")
+    register_parser.add_argument("slug", help="Lowercase hierarchical agent slug.")
+    register_parser.add_argument("project_path", help="Local Git project directory.")
+    register_parser.add_argument(
+        "--provider",
+        choices=("codex", "claude"),
+        default="codex",
+    )
+    register_parser.set_defaults(function=register_agent_command)
 
     doctor_parser = subparsers.add_parser("doctor", help="Check Stage 1 prerequisites.")
     doctor_parser.set_defaults(function=doctor_command)

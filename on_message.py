@@ -279,6 +279,30 @@ def resolve_replied_message_route():
         )
 
 
+def send_agent_status() -> None:
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    if not database_path:
+        send_message("Managed agent status requires the durable controller.")
+        return
+    chat_id, thread_id = surface_coordinates()
+    with DurableStore(Path(database_path)) as store:
+        agent = store.resolve_agent_for_surface(chat_id, thread_id)
+    if agent is None:
+        send_message("This Telegram surface has no managed agent.")
+        return
+    project_name = Path(agent.project_path).name if agent.project_path else "controller"
+    session = "not started" if not agent.provider_session_id else "persisted"
+    send_message(
+        "Managed agent\n\n"
+        f"Name: {agent.hierarchical_name}\n"
+        f"Role: {agent.role}\n"
+        f"Provider: {agent.provider}\n"
+        f"Project: {project_name}\n"
+        f"State: {agent.lifecycle_state}\n"
+        f"Session: {session}"
+    )
+
+
 def handle_callback(update: dict, callback_query: dict) -> None:
     callback_query_id = str(callback_query.get("id", ""))
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
@@ -496,6 +520,8 @@ def main() -> int:
             replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
             if text.strip().lower() == "/status":
                 send_status_card(update)
+            elif text.strip().lower() in {"/agent", "/agent status"}:
+                send_agent_status()
             elif replied_message_id:
                 route = resolve_replied_message_route()
                 if (
@@ -517,10 +543,16 @@ def main() -> int:
                 if thread_id and binding is None:
                     send_message("This topic has no durable controller binding.")
                 elif thread_id and binding is not None:
-                    send_message(
-                        f"✅ {binding.display_name} route verified: {text}",
-                        include_inspect_button=True,
-                    )
+                    if binding.target_type == "agent":
+                        send_message(
+                            f"✅ Routed to registered agent {binding.display_name}.\n\n"
+                            "Codex execution is not enabled for this agent yet."
+                        )
+                    else:
+                        send_message(
+                            f"✅ {binding.display_name} route verified: {text}",
+                            include_inspect_button=True,
+                        )
                 else:
                     send_message(
                         f"✅ Mac script ran and received: {text}",

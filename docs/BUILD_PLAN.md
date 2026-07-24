@@ -728,6 +728,25 @@ This completes the Stage 2 buttons, topics, return-routing, and persistent-card
 checkpoint. Stage 3 can now introduce the first managed Codex project agent
 behind a project topic without changing the Telegram transport model.
 
+The first Stage 3 registry slice passed 45 offline tests and its live test on
+July 23, 2026:
+
+- schema version 6 stores immutable random agent IDs, parent relationships,
+  roles, provider, project path, provider session ID, surface binding, and
+  lifecycle state;
+- hierarchical names are controller-derived using the `tc--root--<slug>`
+  protocol and strict lowercase slug validation;
+- registration requires an existing managed project topic and local Git
+  repository, atomically rebinds that surface to the agent, and is idempotent;
+- **Stage 2 Test** is registered as `tc--root--telegram-control`;
+- live `/agent` inspection reported the project agent as registered with no
+  provider session started.
+
+The provider boundary will use structured event/session adapters for ordinary
+control. Codex begins with `codex exec --json` and persisted session IDs; Claude
+and other harnesses can implement the same contract. tmux remains a separate
+human console and explicit takeover/recovery surface, not the durable protocol.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)

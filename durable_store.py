@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class StoreError(RuntimeError):
@@ -103,6 +103,20 @@ class SurfaceCard:
     telegram_message_id: Optional[int]
     generation: int
     state: str
+
+
+@dataclass(frozen=True)
+class ManagedAgent:
+    agent_id: str
+    parent_agent_id: Optional[str]
+    role: str
+    slug: str
+    hierarchical_name: str
+    provider: str
+    project_path: Optional[str]
+    provider_session_id: Optional[str]
+    surface_binding_id: Optional[int]
+    lifecycle_state: str
 
 
 MIGRATION_1 = (
@@ -289,6 +303,33 @@ MIGRATION_5 = (
     """,
 )
 
+MIGRATION_6 = (
+    """
+    CREATE TABLE agents (
+        agent_id TEXT PRIMARY KEY,
+        parent_agent_id TEXT
+            REFERENCES agents(agent_id) ON DELETE RESTRICT,
+        role TEXT NOT NULL CHECK (role IN ('main', 'project', 'worker')),
+        slug TEXT NOT NULL,
+        hierarchical_name TEXT NOT NULL UNIQUE,
+        provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude')),
+        project_path TEXT,
+        provider_session_id TEXT,
+        surface_binding_id INTEGER UNIQUE
+            REFERENCES surface_bindings(binding_id) ON DELETE RESTRICT,
+        lifecycle_state TEXT NOT NULL
+            CHECK (lifecycle_state IN ('registered', 'running', 'stopped', 'failed')),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE(parent_agent_id, slug)
+    )
+    """,
+    """
+    CREATE INDEX agents_lifecycle
+    ON agents(role, lifecycle_state, hierarchical_name)
+    """,
+)
+
 
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
@@ -359,6 +400,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 5
                 self.connection.execute("PRAGMA user_version = 5")
+            if current < 6:
+                for statement in MIGRATION_6:
+                    self.connection.execute(statement)
+                current = 6
+                self.connection.execute("PRAGMA user_version = 6")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -1270,6 +1316,231 @@ class DurableStore:
         return self._surface_binding_from_row(row) if row is not None else None
 
     @staticmethod
+    def _managed_agent_from_row(row: sqlite3.Row) -> ManagedAgent:
+        return ManagedAgent(
+            agent_id=str(row["agent_id"]),
+            parent_agent_id=(
+                str(row["parent_agent_id"])
+                if row["parent_agent_id"] is not None
+                else None
+            ),
+            role=str(row["role"]),
+            slug=str(row["slug"]),
+            hierarchical_name=str(row["hierarchical_name"]),
+            provider=str(row["provider"]),
+            project_path=(
+                str(row["project_path"])
+                if row["project_path"] is not None
+                else None
+            ),
+            provider_session_id=(
+                str(row["provider_session_id"])
+                if row["provider_session_id"] is not None
+                else None
+            ),
+            surface_binding_id=(
+                int(row["surface_binding_id"])
+                if row["surface_binding_id"] is not None
+                else None
+            ),
+            lifecycle_state=str(row["lifecycle_state"]),
+        )
+
+    def resolve_agent(self, agent_id: str) -> Optional[ManagedAgent]:
+        row = self.connection.execute(
+            "SELECT * FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+        return self._managed_agent_from_row(row) if row is not None else None
+
+    def resolve_agent_for_surface(
+        self,
+        chat_id: int,
+        message_thread_id: Optional[int] = None,
+    ) -> Optional[ManagedAgent]:
+        thread_id = int(message_thread_id) if message_thread_id is not None else 0
+        row = self.connection.execute(
+            """
+            SELECT a.*
+            FROM surface_bindings AS b
+            JOIN agents AS a
+                ON b.target_type = 'agent' AND b.target_id = a.agent_id
+            WHERE b.chat_id = ? AND b.message_thread_id = ?
+                AND b.state = 'active'
+            """,
+            (int(chat_id), thread_id),
+        ).fetchone()
+        return self._managed_agent_from_row(row) if row is not None else None
+
+    def register_project_agent(
+        self,
+        chat_id: int,
+        surface_name: str,
+        slug: str,
+        provider: str,
+        project_path: str,
+        now: Optional[float] = None,
+    ) -> tuple[ManagedAgent, bool]:
+        if (
+            len(slug) > 48
+            or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug)
+            or "--" in slug
+            or slug == "root"
+        ):
+            raise StoreError(
+                "Agent slug must use lowercase letters, digits, and single hyphens."
+            )
+        if provider not in {"codex", "claude"}:
+            raise StoreError("Agent provider is invalid.")
+        if not project_path or not Path(project_path).is_absolute():
+            raise StoreError("Agent project path must be absolute.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            binding_row = self.connection.execute(
+                """
+                SELECT *
+                FROM surface_bindings
+                WHERE chat_id = ? AND display_name = ?
+                    AND surface_type = 'project' AND state = 'active'
+                ORDER BY binding_id
+                LIMIT 1
+                """,
+                (int(chat_id), surface_name),
+            ).fetchone()
+            if binding_row is None:
+                raise StoreError("Managed project surface was not found.")
+            binding = self._surface_binding_from_row(binding_row)
+            if binding.message_thread_id is None:
+                raise StoreError("A project agent requires a Telegram topic.")
+            if binding.target_type == "agent":
+                existing_row = self.connection.execute(
+                    "SELECT * FROM agents WHERE agent_id = ?",
+                    (binding.target_id,),
+                ).fetchone()
+                if existing_row is None:
+                    raise StoreError("Surface references a missing managed agent.")
+                existing = self._managed_agent_from_row(existing_row)
+                expected = (slug, provider, project_path, binding.binding_id)
+                actual = (
+                    existing.slug,
+                    existing.provider,
+                    existing.project_path,
+                    existing.surface_binding_id,
+                )
+                if actual != expected:
+                    raise StoreError(
+                        "Project surface is already registered to another agent."
+                    )
+                self.connection.execute("COMMIT")
+                return existing, False
+            if (binding.target_type, binding.target_id) != ("controller", "control"):
+                raise StoreError(
+                    "Project surface target is not eligible for agent registration."
+                )
+
+            root_row = self.connection.execute(
+                "SELECT * FROM agents WHERE hierarchical_name = 'tc--root'"
+            ).fetchone()
+            if root_row is None:
+                root_id = f"agent_{secrets.token_urlsafe(12)}"
+                self.connection.execute(
+                    """
+                    INSERT INTO agents(
+                        agent_id, parent_agent_id, role, slug,
+                        hierarchical_name, provider, project_path,
+                        provider_session_id, surface_binding_id,
+                        lifecycle_state, created_at, updated_at
+                    )
+                    VALUES (?, NULL, 'main', 'root', 'tc--root', 'codex',
+                        NULL, NULL, NULL, 'registered', ?, ?)
+                    """,
+                    (root_id, timestamp, timestamp),
+                )
+            else:
+                root_id = str(root_row["agent_id"])
+
+            hierarchical_name = f"tc--root--{slug}"
+            if len(hierarchical_name) > 128:
+                raise StoreError("Derived agent name is too long.")
+            sibling = self.connection.execute(
+                """
+                SELECT 1 FROM agents
+                WHERE parent_agent_id = ? AND slug = ?
+                """,
+                (root_id, slug),
+            ).fetchone()
+            if sibling is not None:
+                raise StoreError("An active sibling already uses this agent slug.")
+
+            agent_id = f"agent_{secrets.token_urlsafe(12)}"
+            self.connection.execute(
+                """
+                INSERT INTO agents(
+                    agent_id, parent_agent_id, role, slug,
+                    hierarchical_name, provider, project_path,
+                    provider_session_id, surface_binding_id,
+                    lifecycle_state, created_at, updated_at
+                )
+                VALUES (?, ?, 'project', ?, ?, ?, ?, NULL, ?,
+                    'registered', ?, ?)
+                """,
+                (
+                    agent_id,
+                    root_id,
+                    slug,
+                    hierarchical_name,
+                    provider,
+                    project_path,
+                    binding.binding_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            updated = self.connection.execute(
+                """
+                UPDATE surface_bindings
+                SET target_type = 'agent', target_id = ?, updated_at = ?
+                WHERE binding_id = ? AND target_type = 'controller'
+                    AND target_id = 'control' AND state = 'active'
+                """,
+                (agent_id, timestamp, binding.binding_id),
+            )
+            if updated.rowcount != 1:
+                raise StoreError("Project surface changed during registration.")
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('agent_registered', 'agent', ?, ?, ?)
+                """,
+                (
+                    agent_id,
+                    json.dumps(
+                        {
+                            "hierarchical_name": hierarchical_name,
+                            "provider": provider,
+                            "surface_binding_id": binding.binding_id,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                ),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            agent = self._managed_agent_from_row(row)
+            self.connection.execute("COMMIT")
+            return agent, True
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
     def _surface_card_from_row(row: sqlite3.Row) -> SurfaceCard:
         return SurfaceCard(
             card_id=int(row["card_id"]),
@@ -1478,8 +1749,14 @@ class DurableStore:
             ("routes", "telegram_message_routes"),
             ("surfaces", "surface_bindings"),
             ("cards", "surface_cards"),
+            ("agents", "agents"),
         ):
-            state_column = "ingest_state" if label == "updates" else "state"
+            if label == "updates":
+                state_column = "ingest_state"
+            elif label == "agents":
+                state_column = "lifecycle_state"
+            else:
+                state_column = "state"
             rows = self.connection.execute(
                 f"SELECT {state_column} AS state, COUNT(*) AS count "
                 f"FROM {table} GROUP BY {state_column}"

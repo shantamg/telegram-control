@@ -17,6 +17,7 @@ from durable_store import (
     MIGRATION_2,
     MIGRATION_3,
     MIGRATION_4,
+    MIGRATION_5,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -96,7 +97,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            5,
+            6,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -593,6 +594,63 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(replacement.state, "pending")
         self.assertIsNone(replacement.telegram_message_id)
 
+    def test_project_agent_registration_is_strict_and_idempotent(self):
+        surface = self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, created = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Stage 2 Test",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=101,
+        )
+
+        self.assertTrue(created)
+        self.assertRegex(agent.agent_id, r"^agent_[A-Za-z0-9_-]+$")
+        self.assertEqual(agent.hierarchical_name, "tc--root--telegram-control")
+        self.assertEqual(agent.role, "project")
+        self.assertEqual(agent.lifecycle_state, "registered")
+        self.assertEqual(agent.surface_binding_id, surface.binding_id)
+        self.assertEqual(
+            self.store.resolve_agent_for_surface(123, 62).agent_id,
+            agent.agent_id,
+        )
+        rebound = self.store.resolve_surface_binding(123, 62)
+        self.assertEqual(rebound.target_type, "agent")
+        self.assertEqual(rebound.target_id, agent.agent_id)
+
+        duplicate, duplicate_created = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Stage 2 Test",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=102,
+        )
+        self.assertFalse(duplicate_created)
+        self.assertEqual(duplicate.agent_id, agent.agent_id)
+        self.assertEqual(
+            self.store.status_counts()["agents"],
+            {"registered": 2},
+        )
+
+        with self.assertRaises(StoreError):
+            self.store.register_project_agent(
+                chat_id=123,
+                surface_name="Stage 2 Test",
+                slug="Bad--Slug",
+                provider="codex",
+                project_path="/tmp/telegram-control",
+            )
+
 
 class SchemaCompatibilityTests(unittest.TestCase):
     def test_schema_one_database_migrates_to_current_schema(self):
@@ -609,7 +667,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    5,
+                    6,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -633,7 +691,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    5,
+                    6,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -658,7 +716,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    5,
+                    6,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -682,12 +740,38 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    5,
+                    6,
                 )
                 self.assertEqual(
                     store.connection.execute(
                         "SELECT COUNT(*) FROM sqlite_master "
                         "WHERE type = 'table' AND name = 'surface_cards'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_schema_five_database_migrates_to_current_schema(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-five.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for statement in (
+                MIGRATION_1 + MIGRATION_2 + MIGRATION_3 + MIGRATION_4 + MIGRATION_5
+            ):
+                connection.execute(statement)
+            connection.execute("PRAGMA user_version = 5")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    6,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'agents'"
                     ).fetchone()[0],
                     1,
                 )
@@ -1269,6 +1353,46 @@ class DurableIntegrationTests(unittest.TestCase):
                     store.resolve_surface_card(binding.binding_id).state,
                     "pending",
                 )
+
+    def test_agent_status_command_reads_topic_registry(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Stage 2 Test",
+                    target_type="controller",
+                    target_id="control",
+                )
+                agent, _ = store.register_project_agent(
+                    chat_id=123,
+                    surface_name="Stage 2 Test",
+                    slug="telegram-control",
+                    provider="codex",
+                    project_path="/tmp/telegram-control",
+                )
+                store.ingest_update(topic_message_update(10, "/agent"), now=100)
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(store, config, job, "worker")
+                response = store.claim_outbox("sender", now=10**12)
+
+                self.assertEqual(response.params["message_thread_id"], 62)
+                self.assertIn(
+                    "Name: tc--root--telegram-control",
+                    response.params["text"],
+                )
+                self.assertIn("State: registered", response.params["text"])
+                route_json = store.connection.execute(
+                    "SELECT route_json FROM outbox_messages WHERE message_id = ?",
+                    (response.message_id,),
+                ).fetchone()["route_json"]
+                self.assertEqual(json.loads(route_json)["target_id"], agent.agent_id)
 
     def test_handler_queues_reply_instead_of_calling_telegram(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
