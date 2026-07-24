@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -52,6 +53,89 @@ def controller_reply_route() -> dict:
         "policy": "reply",
         "ttl_seconds": 30 * 24 * 60 * 60,
     }
+
+
+def surface_coordinates():
+    chat_id = int(os.environ["TELEGRAM_CHAT_ID"])
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    thread_id = int(thread_id_text) if thread_id_text else None
+    return chat_id, thread_id
+
+
+def refresh_keyboard(token: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Refresh",
+                    "callback_data": f"a:{token}",
+                }
+            ]
+        ]
+    }
+
+
+def status_card_text(store: DurableStore, binding, refresh_marker: str) -> str:
+    counts = store.status_counts()
+    accepted_updates = sum(counts["updates"].values())
+    active_routes = counts["routes"].get("active", 0)
+    active_callbacks = counts["callbacks"].get("active", 0)
+    surface = (
+        binding.display_name
+        if binding.message_thread_id is None
+        else f"{binding.display_name} · topic {binding.message_thread_id}"
+    )
+    return (
+        "Telegram Control\n\n"
+        f"Database: {store.quick_check()}\n"
+        f"Surface: {surface}\n"
+        f"Target: {binding.target_type}/{binding.target_id}\n"
+        f"Stored updates: {accepted_updates}\n"
+        f"Active return routes: {active_routes}\n"
+        f"Active buttons: {active_callbacks}\n"
+        f"Refresh: {refresh_marker}"
+    )
+
+
+def send_status_card(update: dict) -> None:
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    if not database_path or not job_id:
+        send_message("Durable status requires the Stage 2 controller.")
+        return
+    chat_id, thread_id = surface_coordinates()
+    user_id = int(os.environ["TELEGRAM_FROM_ID"])
+    with DurableStore(Path(database_path)) as store:
+        binding = store.ensure_surface_binding(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            surface_type="control",
+            display_name="Control",
+            target_type="controller",
+            target_id="control",
+        )
+        action = store.create_callback_action(
+            operation_id=f"inbox:{job_id}:refresh-status",
+            action_type="refresh_status",
+            payload={"binding_id": binding.binding_id},
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            authorized_user_id=user_id,
+            one_time=False,
+            ttl_seconds=30 * 24 * 60 * 60,
+        )
+        text = status_card_text(store, binding, f"created by update {update['update_id']}")
+    deliver_api_call(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "message_thread_id": thread_id,
+            "text": text,
+            "reply_markup": refresh_keyboard(action.token),
+        },
+        "status-card",
+        route=controller_reply_route(),
+    )
 
 
 def inspect_keyboard() -> Optional[dict]:
@@ -198,6 +282,36 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "consumed exactly once."
         )
         return
+    if action.action_type == "refresh_status":
+        chat_id, thread_id = surface_coordinates()
+        with DurableStore(Path(database_path)) as store:
+            binding = store.resolve_surface_binding(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+            )
+            if (
+                binding is None
+                or binding.binding_id != int(action.payload.get("binding_id", 0))
+                or binding.target_type != "controller"
+                or binding.target_id != "control"
+            ):
+                raise StoreError("Status card surface binding is no longer valid.")
+            text = status_card_text(
+                store,
+                binding,
+                f"update {update['update_id']} at {time.strftime('%H:%M:%S')}",
+            )
+        deliver_api_call(
+            "editMessageText",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "text": text,
+                "reply_markup": refresh_keyboard(action.token),
+            },
+            "status-edit",
+        )
+        return
     raise StoreError(f"Unsupported callback action: {action.action_type}")
 
 
@@ -298,7 +412,9 @@ def main() -> int:
             text = str(message["text"])
             print(f"Received text message from @{username}: {text}", flush=True)
             replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
-            if replied_message_id:
+            if text.strip().lower() == "/status":
+                send_status_card(update)
+            elif replied_message_id:
                 route = resolve_replied_message_route()
                 if (
                     route is not None

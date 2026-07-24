@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class StoreError(RuntimeError):
@@ -79,6 +79,18 @@ class MessageRoute:
     target_id: str
     policy: str
     expires_at: float
+
+
+@dataclass(frozen=True)
+class SurfaceBinding:
+    binding_id: int
+    chat_id: int
+    message_thread_id: Optional[int]
+    surface_type: str
+    display_name: str
+    target_type: str
+    target_id: str
+    state: str
 
 
 MIGRATION_1 = (
@@ -214,6 +226,29 @@ MIGRATION_3 = (
     """,
 )
 
+MIGRATION_4 = (
+    """
+    CREATE TABLE surface_bindings (
+        binding_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id INTEGER NOT NULL,
+        message_thread_id INTEGER NOT NULL,
+        surface_type TEXT NOT NULL
+            CHECK (surface_type IN ('control', 'project', 'task')),
+        display_name TEXT NOT NULL,
+        target_type TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE(chat_id, message_thread_id)
+    )
+    """,
+    """
+    CREATE INDEX surface_bindings_target
+    ON surface_bindings(target_type, target_id, state)
+    """,
+)
+
 
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
@@ -274,6 +309,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 3
                 self.connection.execute("PRAGMA user_version = 3")
+            if current < 4:
+                for statement in MIGRATION_4:
+                    self.connection.execute(statement)
+                current = 4
+                self.connection.execute("PRAGMA user_version = 4")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -995,6 +1035,117 @@ class DurableStore:
             self.connection.execute("ROLLBACK")
             raise
 
+    @staticmethod
+    def _surface_binding_from_row(row: sqlite3.Row) -> SurfaceBinding:
+        thread_id = int(row["message_thread_id"])
+        return SurfaceBinding(
+            binding_id=int(row["binding_id"]),
+            chat_id=int(row["chat_id"]),
+            message_thread_id=thread_id if thread_id != 0 else None,
+            surface_type=str(row["surface_type"]),
+            display_name=str(row["display_name"]),
+            target_type=str(row["target_type"]),
+            target_id=str(row["target_id"]),
+            state=str(row["state"]),
+        )
+
+    def ensure_surface_binding(
+        self,
+        chat_id: int,
+        surface_type: str,
+        display_name: str,
+        target_type: str,
+        target_id: str,
+        message_thread_id: Optional[int] = None,
+        now: Optional[float] = None,
+    ) -> SurfaceBinding:
+        if surface_type not in {"control", "project", "task"}:
+            raise StoreError("Surface type is invalid.")
+        if not display_name or len(display_name) > 128:
+            raise StoreError("Surface display name is invalid.")
+        if not re.fullmatch(r"[a-z][a-z0-9_]{1,63}", target_type):
+            raise StoreError("Surface target type is invalid.")
+        if not target_id or len(target_id) > 128:
+            raise StoreError("Surface target ID is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        thread_id = int(message_thread_id) if message_thread_id is not None else 0
+        expected = (
+            surface_type,
+            display_name,
+            target_type,
+            target_id,
+            "active",
+        )
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT *
+                FROM surface_bindings
+                WHERE chat_id = ? AND message_thread_id = ?
+                """,
+                (int(chat_id), thread_id),
+            ).fetchone()
+            if row is None:
+                cursor = self.connection.execute(
+                    """
+                    INSERT INTO surface_bindings(
+                        chat_id, message_thread_id, surface_type, display_name,
+                        target_type, target_id, state, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                    """,
+                    (
+                        int(chat_id),
+                        thread_id,
+                        surface_type,
+                        display_name,
+                        target_type,
+                        target_id,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                row = self.connection.execute(
+                    "SELECT * FROM surface_bindings WHERE binding_id = ?",
+                    (int(cursor.lastrowid),),
+                ).fetchone()
+            else:
+                actual = (
+                    str(row["surface_type"]),
+                    str(row["display_name"]),
+                    str(row["target_type"]),
+                    str(row["target_id"]),
+                    str(row["state"]),
+                )
+                if actual != expected:
+                    raise StoreError(
+                        "Telegram surface is already bound to a different target."
+                    )
+            binding = self._surface_binding_from_row(row)
+            self.connection.execute("COMMIT")
+            return binding
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def resolve_surface_binding(
+        self,
+        chat_id: int,
+        message_thread_id: Optional[int] = None,
+    ) -> Optional[SurfaceBinding]:
+        thread_id = int(message_thread_id) if message_thread_id is not None else 0
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM surface_bindings
+            WHERE chat_id = ? AND message_thread_id = ? AND state = 'active'
+            """,
+            (int(chat_id), thread_id),
+        ).fetchone()
+        return self._surface_binding_from_row(row) if row is not None else None
+
     def fail_outbox(
         self,
         message_id: int,
@@ -1083,6 +1234,7 @@ class DurableStore:
             ("outbox", "outbox_messages"),
             ("callbacks", "callback_actions"),
             ("routes", "telegram_message_routes"),
+            ("surfaces", "surface_bindings"),
         ):
             state_column = "ingest_state" if label == "updates" else "state"
             rows = self.connection.execute(

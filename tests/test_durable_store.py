@@ -14,6 +14,7 @@ import telegram_control
 from durable_store import (
     MIGRATION_1,
     MIGRATION_2,
+    MIGRATION_3,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -40,19 +41,29 @@ def message_update(update_id=10, text="hello", reply_to_message_id=None):
     return update
 
 
-def callback_update(update_id=11, data="r:opaque"):
-    return {
+def callback_update(
+    update_id=11,
+    data="r:opaque",
+    message_id=100,
+    message_thread_id=None,
+):
+    update = {
         "update_id": update_id,
         "callback_query": {
-            "id": "callback-1",
+            "id": f"callback-{update_id}",
             "from": {"id": 123, "username": "tester"},
             "data": data,
             "message": {
-                "message_id": 100,
+                "message_id": int(message_id),
                 "chat": {"id": 123, "type": "private"},
             },
         },
     }
+    if message_thread_id is not None:
+        update["callback_query"]["message"]["message_thread_id"] = int(
+            message_thread_id
+        )
+    return update
 
 
 class DurableStoreTests(unittest.TestCase):
@@ -69,7 +80,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            3,
+            4,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -454,6 +465,53 @@ class DurableStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.store.status_counts()["routes"], {"expired": 1})
 
+    def test_surface_binding_is_topic_specific_and_cannot_be_rebound(self):
+        control = self.store.ensure_surface_binding(
+            chat_id=123,
+            surface_type="control",
+            display_name="Control",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        duplicate = self.store.ensure_surface_binding(
+            chat_id=123,
+            surface_type="control",
+            display_name="Control",
+            target_type="controller",
+            target_id="control",
+            now=101,
+        )
+        project = self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=7,
+            surface_type="project",
+            display_name="Reservations",
+            target_type="controller",
+            target_id="reservations",
+            now=102,
+        )
+        self.assertEqual(duplicate.binding_id, control.binding_id)
+        self.assertNotEqual(project.binding_id, control.binding_id)
+        self.assertEqual(
+            self.store.resolve_surface_binding(123).target_id,
+            "control",
+        )
+        self.assertEqual(
+            self.store.resolve_surface_binding(123, 7).target_id,
+            "reservations",
+        )
+        self.assertIsNone(self.store.resolve_surface_binding(123, 8))
+        with self.assertRaises(StoreError):
+            self.store.ensure_surface_binding(
+                chat_id=123,
+                surface_type="project",
+                display_name="Different",
+                target_type="controller",
+                target_id="different",
+                now=103,
+            )
+
 
 class SchemaCompatibilityTests(unittest.TestCase):
     def test_schema_one_database_migrates_to_current_schema(self):
@@ -470,7 +528,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    3,
+                    4,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -480,7 +538,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
                     1,
                 )
 
-    def test_schema_two_database_migrates_to_schema_three(self):
+    def test_schema_two_database_migrates_to_current_schema(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "schema-two.sqlite3"
             connection = sqlite3.connect(str(path), isolation_level=None)
@@ -494,13 +552,37 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    3,
+                    4,
                 )
                 self.assertEqual(
                     store.connection.execute(
                         "SELECT COUNT(*) FROM sqlite_master "
                         "WHERE type = 'table' "
                         "AND name = 'telegram_message_routes'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_schema_three_database_migrates_to_schema_four(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-three.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for statement in MIGRATION_1 + MIGRATION_2 + MIGRATION_3:
+                connection.execute(statement)
+            connection.execute("PRAGMA user_version = 3")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    4,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'surface_bindings'"
                     ).fetchone()[0],
                     1,
                 )
@@ -727,6 +809,95 @@ class DurableIntegrationTests(unittest.TestCase):
                     "✅ Durable reply route verified.\n\n"
                     "Received through the stored controller route: follow up",
                 )
+
+    def test_status_card_binds_surface_and_refreshes_same_message_repeatedly(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ingest_update(message_update(10, "/status"), now=100)
+                status_job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    status_job,
+                    "worker",
+                )
+                initial = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(initial.method, "sendMessage")
+                self.assertIn("Surface: Control", initial.params["text"])
+                button = initial.params["reply_markup"]["inline_keyboard"][0][0]
+                self.assertEqual(button["text"], "Refresh")
+                callback_data = button["callback_data"]
+                store.complete_outbox(
+                    initial.message_id,
+                    "sender",
+                    {"message_id": 700, "chat": {"id": 123}},
+                    now=10**12,
+                )
+
+                for update_id in (11, 12):
+                    store.ingest_update(
+                        callback_update(
+                            update_id,
+                            callback_data,
+                            message_id=700,
+                        ),
+                        now=10**12 + update_id,
+                    )
+                    callback_job = store.claim_job(
+                        "worker",
+                        now=10**12 + update_id,
+                    )
+                    telegram_control.process_inbox_job(
+                        store,
+                        config,
+                        callback_job,
+                        "worker",
+                    )
+
+                rows = store.connection.execute(
+                    "SELECT method, params_json FROM outbox_messages "
+                    "ORDER BY message_id"
+                ).fetchall()
+                calls = [
+                    (str(row["method"]), json.loads(row["params_json"]))
+                    for row in rows
+                ]
+                self.assertEqual(
+                    [method for method, _ in calls],
+                    [
+                        "sendMessage",
+                        "answerCallbackQuery",
+                        "editMessageText",
+                        "answerCallbackQuery",
+                        "editMessageText",
+                    ],
+                )
+                for _, edit in (calls[2], calls[4]):
+                    self.assertEqual(edit["message_id"], 700)
+                    self.assertEqual(
+                        edit["reply_markup"]["inline_keyboard"][0][0][
+                            "callback_data"
+                        ],
+                        callback_data,
+                    )
+                self.assertIn("Refresh: update 11", calls[2][1]["text"])
+                self.assertIn("Refresh: update 12", calls[4][1]["text"])
+                self.assertEqual(
+                    store.status_counts()["callbacks"],
+                    {"active": 1},
+                )
+                self.assertEqual(
+                    store.status_counts()["surfaces"],
+                    {"active": 1},
+                )
+                binding = store.resolve_surface_binding(123)
+                self.assertEqual(binding.display_name, "Control")
+                self.assertEqual(binding.target_id, "control")
 
     def test_handler_queues_reply_instead_of_calling_telegram(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

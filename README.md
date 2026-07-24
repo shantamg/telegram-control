@@ -108,6 +108,14 @@ The live reply-routing test passed on July 23, 2026. The route was created,
 survived a forced LaunchAgent restart, and then routed a Telegram reply back to
 the controller. The routed response received its own return route.
 
+Schema version 4 adds durable surface bindings keyed by Telegram chat and
+optional topic. `/status` binds the current private chat to the Control target
+and sends an editable status card with a reusable opaque Refresh action.
+
+The live status-card test passed on July 23, 2026. Two consecutive Refresh taps
+edited the same Telegram message ID in place, kept the same active action and
+return route, and created no duplicate card.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

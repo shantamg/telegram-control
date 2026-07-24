@@ -686,7 +686,18 @@ tests on July 23, 2026:
   route;
 - the routed response received its own durable return route.
 
-Topic bindings and editable status/menu cards are the next Stage 2 slice.
+The surface-binding and editable status-card slice passed offline and live
+tests on July 23, 2026:
+
+- schema version 4 binds `(chat_id, message_thread_id)` to a named target;
+- an existing surface cannot be silently rebound to another target;
+- the same model supports the current private Control chat and future topics;
+- `/status` creates the Control binding and a reusable opaque Refresh action;
+- two live refreshes edited the same Telegram message ID in place;
+- no duplicate card or return route was created.
+
+Persistent singleton menu cards and live topic provisioning remain before the
+Stage 2 UI is complete.
 
 ## References
 
