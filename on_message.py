@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import router_contract
 import telegram_bridge as bridge
 import tmux_console
 from durable_store import CallbackActionError, DurableStore, StoreError
@@ -289,6 +290,40 @@ def resolve_replied_message_route():
             chat_id=int(chat_id),
             message_thread_id=thread_id,
             telegram_message_id=int(replied_message_id),
+        )
+
+
+def build_router_reply_input(update: dict, route, user_text: str) -> str:
+    reply = (update.get("message") or {}).get("reply_to_message") or {}
+    quoted = reply.get("text") or reply.get("caption") or ""
+    provenance_label = "a controller message"
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    if database_path and route is not None:
+        with DurableStore(Path(database_path)) as store:
+            provenance_label = store.route_provenance_label(route.route_id)
+    return router_contract.compose_reply_context_input(
+        user_text,
+        str(quoted),
+        provenance_label,
+    )
+
+
+def enqueue_agent_reply_input(route, text: str) -> None:
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    if not database_path or not job_id:
+        raise StoreError("Managed agent input requires the durable controller.")
+    chat_id, thread_id = surface_coordinates()
+    with DurableStore(Path(database_path)) as store:
+        store.enqueue_agent_reply_message_with_receipt(
+            agent_id=route.target_id,
+            source_inbox_job_id=int(job_id),
+            input_text=text,
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            replied_message_id=route.telegram_message_id,
+            receipt_text="⏳ <b>Working…</b>",
+            receipt_parse_mode="HTML",
         )
 
 
@@ -1032,7 +1067,7 @@ def transcribe_wav(wav_path: Path) -> str:
         raise bridge.BridgeError("Handy returned an unreadable transcription result.") from None
 
 
-def handle_voice(voice: dict) -> None:
+def handle_voice(update: dict, voice: dict) -> None:
     file_size = int(voice.get("file_size", 0))
     duration = int(voice.get("duration", 0))
     if file_size > MAX_VOICE_BYTES:
@@ -1045,7 +1080,46 @@ def handle_voice(voice: dict) -> None:
     routes_to_main_router = False
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
-    if (
+    reply_route = None
+    if os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID"):
+        reply_route = resolve_replied_message_route()
+    agent_reply_route = None
+    router_reply_route = None
+    if reply_route is not None and reply_route.target_type == "agent":
+        if not (
+            binding is not None
+            and binding.target_type == "agent"
+            and binding.target_id == reply_route.target_id
+        ):
+            # The voice note replies to an agent-routed message outside that
+            # agent's own topic; continue that agent on the reply surface.
+            agent_reply_route = reply_route
+    elif (
+        reply_route is not None
+        and reply_route.target_type == "controller"
+        and reply_route.target_id == "control"
+    ):
+        router_reply_route = reply_route
+    if agent_reply_route is not None and database_path and job_id:
+        chat_id, thread_id = surface_coordinates()
+        with DurableStore(Path(database_path)) as store:
+            managed_agent = store.resolve_agent(agent_reply_route.target_id)
+            if managed_agent is None or managed_agent.role not in {
+                "project",
+                "worker",
+            }:
+                raise StoreError("Managed agent route is no longer valid.")
+            store.enqueue_agent_reply_receipt(
+                agent_id=managed_agent.agent_id,
+                source_inbox_job_id=int(job_id),
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                replied_message_id=agent_reply_route.telegram_message_id,
+                receipt_text="🎙️ <b>Transcribing…</b>",
+                input_kind="voice",
+                parse_mode="HTML",
+            )
+    elif (
         binding is not None
         and binding.target_type == "agent"
         and database_path
@@ -1119,17 +1193,36 @@ def handle_voice(voice: dict) -> None:
             "The user's voice note contained no detectable speech. "
             "Briefly ask them to try recording it again."
         )
+        chat_id, thread_id = surface_coordinates()
         with DurableStore(Path(database_path)) as store:
-            store.enqueue_agent_voice_message(
-                agent_id=managed_agent.agent_id,
-                source_inbox_job_id=int(job_id),
-                input_text=agent_input,
-            )
+            if agent_reply_route is not None:
+                store.enqueue_agent_reply_voice_message(
+                    agent_id=managed_agent.agent_id,
+                    source_inbox_job_id=int(job_id),
+                    input_text=agent_input,
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    replied_message_id=(
+                        agent_reply_route.telegram_message_id
+                    ),
+                )
+            else:
+                store.enqueue_agent_voice_message(
+                    agent_id=managed_agent.agent_id,
+                    source_inbox_job_id=int(job_id),
+                    input_text=agent_input,
+                )
     elif routes_to_main_router:
         router_input = transcript or (
             "The user's voice note contained no detectable speech. "
             "Briefly ask them to try recording it again."
         )
+        if router_reply_route is not None and transcript:
+            router_input = build_router_reply_input(
+                update,
+                router_reply_route,
+                transcript,
+            )
         chat_id, thread_id = surface_coordinates()
         with DurableStore(Path(database_path)) as store:
             store.enqueue_router_voice_message(
@@ -1156,7 +1249,7 @@ def main() -> int:
             handle_callback(update, callback_query)
         elif message and "voice" in message:
             print(f"Received voice message from @{username}.", flush=True)
-            handle_voice(message["voice"])
+            handle_voice(update, message["voice"])
         elif message and "text" in message:
             text = str(message["text"])
             print(f"Received text message from @{username}: {text}", flush=True)
@@ -1180,9 +1273,19 @@ def main() -> int:
                     and route.target_type == "controller"
                     and route.target_id == "control"
                 ):
-                    enqueue_router_input(text)
+                    enqueue_router_input(
+                        build_router_reply_input(update, route, text)
+                    )
                 elif route is not None and route.target_type == "agent":
-                    enqueue_agent_input(route.target_id, text)
+                    binding = current_surface_binding()
+                    if (
+                        binding is not None
+                        and binding.target_type == "agent"
+                        and binding.target_id == route.target_id
+                    ):
+                        enqueue_agent_input(route.target_id, text)
+                    else:
+                        enqueue_agent_reply_input(route, text)
                 else:
                     send_message(
                         "That replied-to message has no active durable route."

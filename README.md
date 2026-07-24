@@ -406,6 +406,91 @@ queued item. Dead items are explicitly requeued with
 `telegram_control.py retry inbox`, `telegram_control.py retry router`, or the
 corresponding agent/outbox queue name.
 
+## Durable reply continuity
+
+When the main router dispatches a root Control request to a managed project
+agent, the agent's final response replaces the root `🧭 Routing…` receipt in
+place. That edited final message now also carries durable reply continuity:
+
+- Once Telegram acknowledges the final edit, the receipt's stored reply route
+  is retargeted, in the same completing transaction, from the main router to
+  the exact project agent that produced the response. Route ownership never
+  switches before the acknowledgment, the transition is idempotent and
+  crash-safe, and it is scoped to the exact `(chat, topic, message)`.
+- Replying to that edited final message therefore continues the same managed
+  agent conversation—using its persisted provider session—directly from the
+  root Control chat. The reply gets its own `⏳ Working…` receipt in the
+  Control chat, the response edits that receipt in place, and the new final
+  message routes back to the same agent, so follow-up replies chain
+  indefinitely.
+- The reply route is revalidated durably at enqueue time: a reply from the
+  wrong chat or topic, to the wrong message, after route expiry, or against a
+  different agent fails closed.
+- If Telegram permanently rejects the final edit, the existing fallback sends
+  the response as a new routed message and route ownership stays with the main
+  router, so nothing is lost and nothing switches without a visible edit.
+- Delivery order is enforced, not hoped for: every sender process wraps the
+  actual Telegram call in one exclusive, non-reentrant kernel advisory lock
+  (an owner-only flock file derived from the canonically resolved controller
+  database path, single-host by design), atomically revalidating and
+  renewing its lease — sized to outlive the API call's hard 180-second
+  whole-operation deadline, enforced by running every Telegram request in a
+  killable helper subprocess: killing the child bounds every phase of the
+  operation, including macOS DNS resolution, which no in-process signal or
+  socket teardown can reliably interrupt. The helper inherits the sender's
+  locked delivery descriptor (`pass_fds`), so the kernel keeps the flock
+  held until the helper itself exits — even if the sender is SIGKILLed
+  mid-call or the helper resumes from macOS sleep before any of its threads
+  are scheduled — which makes inherited lock ownership the ordering
+  guarantee; the helper's self-termination (wall-clock deadline or parent
+  death) is cleanup, not the proof. The bot token reaches the helper on
+  stdin, never in process arguments, reflected error descriptions are
+  token-redacted, and standard urllib proxy handling is retained — and
+  re-checking
+  supersession inside the critical section before calling Telegram, then
+  recording the durable outcome before releasing. A retried edit answered
+  with “message is not modified” (a lost acknowledgment) completes normally
+  so the retarget still runs, a stale `Waiting for the agent…` preview edit
+  is superseded durably once the agent-outcome edit exists, and edits of the
+  same routing receipt carry a typed serialization key so they are never
+  claimed concurrently. Two residual windows remain and both degrade to the
+  documented at-least-once duplicate-delivery semantics, never to
+  reordering: a sender process dying — and the deadline expiring — at an
+  instant when Telegram had accepted but not yet applied a request. Neither
+  can be fenced without server-side compare-and-swap.
+- When a receipt was already delivered, a multi-chunk response edits the first
+  chunk into the receipt and sends the remaining chunks as follow-up messages,
+  so no `⏳ Working…` receipt is left behind.
+- Voice replies follow the same durable routes as text replies. A voice note
+  recorded as a reply to a retargeted agent answer continues that exact agent
+  and persisted provider session: the reply surface gets the usual
+  `🎙️ Transcribing…` receipt, the local transcript becomes the agent input,
+  and the one Telegram message progresses to the agent's final response. The
+  stored route is revalidated durably before any mailbox work is created, so
+  foreign, stale, or mismatched voice replies fail closed exactly like text.
+
+Replies that legitimately remain with the main router (receipts, direct
+responses, relayed continuation chunks, fallback deliveries) now carry bounded
+reply context, for voice replies exactly as for text; voice status edits
+display only the user's transcript, never the composed context. The durable router input embeds up to 1,000 characters of the
+replied-to bot message between explicit delimiters, plus a provenance label
+derived from the durable outbox operation that produced the message—never from
+message content. Deictic follow-ups such as “why did that happen?” therefore
+reach the router with trustworthy context. Quoted text is explicitly marked as
+data, delimiter spoofing inside the quote is stripped, stored filesystem paths
+and secrets are never included, and controller validations that require a
+value to appear explicitly in the user's request ignore the quoted context
+entirely—including when a clarification button resumes the original request.
+
+Quoted context is additionally fenced by a deterministic dispatch guard: on a
+reply-context turn, `send_to_agent` executes directly only when the
+user-authored reply itself names the destination by canonical slug, display
+name, or durable alias. Otherwise the controller converts the model's
+selection into a one-time authorized confirmation question (`Yes, send it` /
+`No, cancel`) instead of dispatching, so instructions hidden in quoted bot
+text can never reach a project agent without an explicit user action.
+Consequential tools keep their existing controller-enforced confirmations.
+
 ## Prerequisites
 
 - macOS

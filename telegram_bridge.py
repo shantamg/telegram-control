@@ -12,6 +12,7 @@ import plistlib
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -96,38 +97,259 @@ def store_token(token: str) -> None:
         raise BridgeError("Could not save the Telegram bot token in macOS Keychain.")
 
 
-def api_call(token: str, method: str, **params: Any) -> Any:
+API_BASE_URL = "https://api.telegram.org"
+API_SOCKET_TIMEOUT_SECONDS = 70.0
+API_TOTAL_DEADLINE_SECONDS = 180.0
+API_MAX_RESPONSE_BYTES = 8_000_000
+
+
+def _read_capped(response: Any, max_bytes: Optional[int] = None) -> bytes:
+    if max_bytes is None:
+        max_bytes = API_MAX_RESPONSE_BYTES
+    chunks = []
+    received = 0
+    while True:
+        chunk = response.read(64 * 1024)
+        if not chunk:
+            break
+        received += len(chunk)
+        if received > max_bytes:
+            raise BridgeError("Telegram response exceeded the size limit.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def perform_api_call(
+    token: str,
+    method: str,
+    params: dict[str, Any],
+    base_url: str = API_BASE_URL,
+) -> Any:
+    """Execute one Telegram Bot API request in the current process.
+
+    Runs inside the killable `api-exec` helper child in production, so it
+    needs only per-socket timeouts; the parent enforces the hard total
+    deadline by killing the child. Standard urllib handling is retained, so
+    system HTTPS-proxy configuration keeps working.
+    """
     encoded_params: dict[str, str] = {}
     for key, value in params.items():
         if value is None:
             continue
         encoded_params[key] = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
-
     request = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/{method}",
+        f"{base_url}/bot{token}/{method}",
         data=urllib.parse.urlencode(encoded_params).encode("utf-8"),
         method="POST",
     )
+    error_status: Optional[int] = None
     try:
-        with urllib.request.urlopen(request, timeout=70) as response:
-            payload = json.load(response)
-    except urllib.error.HTTPError as exc:
         try:
-            error_payload = json.loads(exc.read().decode("utf-8"))
-            description = error_payload.get("description", "Telegram rejected the request.")
-        except (ValueError, UnicodeDecodeError):
-            description = "Telegram rejected the request."
-        raise BridgeError(description) from None
-    except (urllib.error.URLError, http.client.InvalidURL):
-        raise BridgeError("Could not reach Telegram. Check this Mac's internet connection.") from None
+            with urllib.request.urlopen(
+                request,
+                timeout=API_SOCKET_TIMEOUT_SECONDS,
+            ) as response:
+                raw_body = _read_capped(response)
+        except urllib.error.HTTPError as exc:
+            error_status = int(exc.code)
+            try:
+                raw_body = _read_capped(exc)
+            except BridgeError:
+                raw_body = b""
+            finally:
+                exc.close()
+    except BridgeError:
+        raise
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        OSError,
+    ):
+        raise BridgeError(
+            "Could not reach Telegram. Check this Mac's internet connection."
+        ) from None
 
-    if not payload.get("ok"):
-        raise BridgeError(payload.get("description", "Telegram API request failed."))
+    def _redacted(description: str) -> str:
+        # A remotely supplied description could reflect the request path;
+        # never let the token travel into logs or durable error records.
+        return description.replace(token, "[redacted]")
+
+    if error_status is not None:
+        description = "Telegram rejected the request."
+        try:
+            parsed: Any = json.loads(raw_body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("description"), str):
+            description = _redacted(parsed["description"])
+        raise BridgeError(description)
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        raise BridgeError("Telegram returned an unreadable response.") from None
+    if not isinstance(payload, dict) or "result" not in payload:
+        raise BridgeError("Telegram returned an unreadable response.")
+    if payload.get("ok") is not True:
+        description = payload.get("description")
+        raise BridgeError(
+            _redacted(description)
+            if isinstance(description, str) and description
+            else "Telegram API request failed."
+        )
     return payload["result"]
 
 
+def api_exec_command(_: argparse.Namespace) -> None:
+    """Helper-child entrypoint: one API request described on stdin.
+
+    The bot token arrives on stdin — never in process arguments — and the
+    outcome leaves as one JSON object on stdout. Telegram-level failures are
+    reported as `ok: false`; a non-zero exit means the helper itself broke.
+
+    The parent's kill-on-timeout is the primary bound; a daemon watchdog
+    thread additionally makes the helper self-terminating, exiting hard at
+    its own deadline (with a small margin) or as soon as its parent dies.
+    An orphaned helper therefore can never keep a request in flight after
+    the supervisor tears a worker down. The deadline uses wall-clock time
+    deliberately: monotonic time pauses across macOS sleep while durable
+    outbox leases do not, so a helper that slept through its deadline must
+    exit immediately on wake rather than resume a stale request.
+    """
+    payload = json.load(sys.stdin)
+    deadline_seconds = float(
+        payload.get("total_deadline_seconds") or API_TOTAL_DEADLINE_SECONDS
+    )
+    # The expected parent PID comes from the payload: sampling getppid()
+    # here would race a parent that already died, leaving the baseline at
+    # launchd and orphan detection blind.
+    parent_pid = int(payload.get("parent_pid") or os.getppid())
+
+    def _self_watchdog() -> None:
+        deadline_at = time.time() + deadline_seconds + 5.0
+        while True:
+            if time.time() >= deadline_at:
+                os._exit(70)
+            if os.getppid() != parent_pid:
+                os._exit(71)
+            time.sleep(0.5)
+
+    threading.Thread(target=_self_watchdog, daemon=True).start()
+    try:
+        result = perform_api_call(
+            str(payload["token"]),
+            str(payload["method"]),
+            dict(payload.get("params") or {}),
+            base_url=str(payload.get("base_url") or API_BASE_URL),
+        )
+        outcome: dict[str, Any] = {"ok": True, "result": result}
+    except BridgeError as exc:
+        outcome = {"ok": False, "error": str(exc)}
+    print(json.dumps(outcome, separators=(",", ":")))
+
+
+def api_call(
+    token: str,
+    method: str,
+    total_deadline_seconds: float = API_TOTAL_DEADLINE_SECONDS,
+    delivery_lock_fd: Optional[int] = None,
+    **params: Any,
+) -> Any:
+    """Call the Telegram Bot API with a hard total wall-clock deadline.
+
+    The request runs in a killable helper subprocess; on deadline expiry the
+    child is killed. Killing a process bounds every phase of the operation —
+    including macOS `getaddrinfo`, which no in-process signal or socket
+    teardown can reliably interrupt. An expiry after Telegram accepted the
+    request is an ambiguous outcome and follows the documented at-least-once
+    retry semantics.
+
+    When `delivery_lock_fd` is given (the outbox sender's already-locked
+    delivery-lock descriptor — a reserved parameter, never a Telegram
+    field), the helper inherits that exact open file description, so the
+    kernel keeps the BSD flock held until the helper itself exits even if
+    this parent process is SIGKILLed mid-call. Inherited lock ownership is
+    the delivery-ordering fence; the helper's self-termination is cleanup.
+    """
+    request_payload = json.dumps(
+        {
+            "token": token,
+            "method": method,
+            "params": {
+                key: value
+                for key, value in params.items()
+                if value is not None
+            },
+            "base_url": API_BASE_URL,
+            "total_deadline_seconds": float(total_deadline_seconds),
+            "parent_pid": os.getpid(),
+        },
+        separators=(",", ":"),
+    )
+    try:
+        child = subprocess.Popen(
+            [sys.executable, str(SCRIPT_PATH), "api-exec"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            pass_fds=(
+                (int(delivery_lock_fd),)
+                if delivery_lock_fd is not None
+                else ()
+            ),
+        )
+    except (OSError, ValueError):
+        raise BridgeError("Could not start the Telegram API helper.") from None
+    try:
+        stdout, _stderr = child.communicate(
+            input=request_payload,
+            timeout=float(total_deadline_seconds),
+        )
+    except subprocess.TimeoutExpired:
+        child.kill()
+        try:
+            child.communicate(timeout=30)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+        raise BridgeError("Telegram call exceeded the total deadline.") from None
+    except BaseException:
+        # KeyboardInterrupt or any other failure while the parent survives:
+        # never leave the helper or its pipes behind.
+        child.kill()
+        try:
+            child.communicate(timeout=30)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+        raise
+    if child.returncode != 0:
+        raise BridgeError("The Telegram API helper exited unexpectedly.")
+    try:
+        outcome = json.loads(stdout)
+    except ValueError:
+        raise BridgeError(
+            "The Telegram API helper returned an unreadable result."
+        ) from None
+    if not isinstance(outcome, dict):
+        raise BridgeError("The Telegram API helper returned an unreadable result.")
+    if outcome.get("ok") is not True:
+        error = outcome.get("error")
+        raise BridgeError(
+            error
+            if isinstance(error, str) and error
+            else "Telegram API request failed."
+        )
+    if "result" not in outcome:
+        raise BridgeError("The Telegram API helper returned an unreadable result.")
+    return outcome["result"]
+
+
 def download_telegram_file(file_id: str, destination: Path, max_bytes: int = 20_000_000) -> None:
-    """Download a Telegram file without exposing the bot token to child processes."""
+    """Download a Telegram file without the bot token in process arguments.
+
+    The `getFile` lookup goes through the deadline-bounded API helper, which
+    receives the token on stdin; the content download itself runs in this
+    process.
+    """
     token = read_token()
     file_info = api_call(token, "getFile", file_id=file_id)
     file_size = int(file_info.get("file_size", 0))
@@ -551,6 +773,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="Show bridge status without secrets.")
     status_parser.set_defaults(function=status_command)
+
+    api_exec_parser = subparsers.add_parser(
+        "api-exec",
+        help=argparse.SUPPRESS,
+    )
+    api_exec_parser.set_defaults(function=api_exec_command)
     return parser
 
 

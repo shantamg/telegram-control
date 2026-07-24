@@ -964,6 +964,97 @@ The first Stage 5 provider-adapter slice passes 94 offline tests:
   UUID, and the Codex router benchmark passed the expanded 9/9 gate after
   provider/model/effort selection was added.
 
+The durable reply-continuity and reply-context slice passes 145 offline tests
+and the 10/10 offline router evaluation:
+
+- schema version 13 records an optional reply surface per agent mailbox turn;
+- when a routed project-agent response replaces the root routing receipt, the
+  receipt's durable reply route is retargeted to that exact agent inside the
+  same transaction that records Telegram's final-edit acknowledgment—never
+  before the edit is acknowledged—scoped to the exact chat, topic, and message,
+  idempotently, with a durable `route_retargeted` audit event;
+- both receipt-first and provider-first races converge on the same retargeted
+  route, and a permanently rejected final edit keeps route ownership with the
+  main router while the existing fallback message delivers the response;
+- replying to the retargeted final message in the root Control chat continues
+  the same managed agent and persisted provider session: the reply is enqueued
+  only after in-transaction revalidation of the exact stored route, receives
+  its own self-editing receipt on the reply surface, and its final message
+  routes back to the same agent so follow-ups chain;
+- foreign-chat, wrong-topic, wrong-message, expired, and wrong-agent replies
+  fail closed without creating mailbox work;
+- replies that stay with the main router now embed a bounded (≤1,000
+  character), explicitly delimited quote of the replied-to bot message plus a
+  provenance label derived only from durable outbox operations; quoted text is
+  declared data-not-instructions, spoofed delimiters are stripped, no stored
+  paths or secrets are exposed, and explicit-mention validations (aliases,
+  models, paths, topic names) evaluate only the user-authored reply text,
+  including when a clarification button resumes the original request;
+- voice replies resolve the same durable reply routes as text: a voice reply
+  to a retargeted agent answer revalidates the exact stored route, continues
+  the same agent and persisted provider session with the reply-surface receipt
+  and status edits, and a controller-owned voice reply enters the router with
+  the same bounded quoted context while status edits display only the user's
+  transcript;
+- a deterministic reply-dispatch guard prevents quoted bot context from
+  authorizing `send_to_agent` by itself: on reply-context turns the dispatch
+  runs only when the user-authored reply names the destination by slug,
+  display name, or alias; otherwise the controller converts the selection into
+  an authorized one-time confirmation question and queues no agent work;
+- retried edits answered with Telegram's “message is not modified” complete
+  normally so lost acknowledgments still converge on the retargeted route;
+- a routing-preview edit can never overwrite the agent's final answer:
+  Telegram delivery runs inside an exclusive, non-reentrant kernel advisory
+  lock (an `O_NOFOLLOW`, owner-only flock file derived from the canonically
+  resolved controller database path) held from atomic lease revalidation and
+  renewal — the 600-second lease outlives the API call's hard 180-second
+  whole-operation deadline, enforced by running every Telegram request in a
+  killable helper subprocess: killing the child bounds every request phase
+  (DNS resolution, connect, TLS, header waits, drip-fed success and error
+  bodies, and chunked framing alike), including macOS `getaddrinfo`, which
+  no in-process signal can reliably interrupt; the helper inherits the
+  sender's locked delivery descriptor (`pass_fds`), so the kernel keeps the
+  flock held until the helper itself exits — even across a SIGKILLed sender
+  or a wake-from-sleep race where no helper thread has been scheduled —
+  making inherited lock ownership the delivery-ordering guarantee, proven
+  by a regression that SIGSTOPs the helper, SIGKILLs its parent, and shows
+  a competing acquirer stays blocked until the helper ends; the helper is
+  additionally self-terminating as cleanup — it hard-exits at its own
+  wall-clock deadline (so a Mac that slept through the deadline exits on
+  wake) or when its payload-identified parent dies; the bot token
+  reaches the helper on stdin, never in process arguments, reflected
+  descriptions are token-redacted, and standard urllib proxy handling is
+  retained — through the API call and its durable
+  completion/failure record, so all controller sender processes on this Mac
+  deliver strictly one at a time, a paused sender blocks newer edits until
+  it resumes, and a crashed sender's lock is released by the kernel; layered
+  on that, enqueuing the agent-outcome edit atomically supersedes a
+  still-queued preview, edits of the same routing receipt share a typed
+  durable `serialize_key` (backfilled for pre-v13 queued rows during
+  migration) so the outbox claim never reorders them while leaving all other
+  operations unaffected, and a requeued stale preview is completed without
+  delivery inside the same critical section — the residual windows are a
+  sender process dying, or the deadline expiring, at the exact instant
+  Telegram has accepted but not yet applied a request, neither of which any
+  client-side mechanism can fence without server-side compare-and-swap;
+  both degrade to the documented at-least-once semantics (an edit converges
+  through “message is not modified”; a send may rarely duplicate) and never
+  to reordering;
+- when a receipt was already delivered, multi-chunk responses edit the first
+  chunk into the receipt and send the rest as follow-ups; if the response
+  finished before the receipt was delivered, the receipt is later resolved
+  using the canonical chunking (real content for one normalized chunk, a
+  completion marker for several) instead of staying on `⏳ Working…`; a
+  permanently rejected first-chunk edit falls back to resending only that
+  first chunk;
+- an oversized voice-reply transcript keeps its reply-context wrapper (the
+  transcript tail is trimmed as a last resort) so the reply dispatch guard
+  can never be bypassed by input length.
+
+This slice was verified offline; no live reply-continuity smoke test has been
+run yet. Live steering of running Codex/Claude turns (interrupt and mid-turn
+input) is the next priority slice.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)

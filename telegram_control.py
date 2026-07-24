@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import plistlib
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
@@ -28,9 +30,11 @@ from durable_store import (
     AgentMailboxJob,
     DurableStore,
     InboxJob,
+    LeaseLostError,
     OutboxMessage,
     RouterMailboxJob,
     StoreError,
+    chunk_telegram_text,
     validate_provider_config,
 )
 
@@ -162,23 +166,6 @@ def work_command(args: argparse.Namespace) -> None:
             process_inbox_job(store, config, job, worker_id)
             if args.once:
                 return
-
-
-def chunk_telegram_text(text: str, limit: int = 3800) -> list[str]:
-    remaining = text.strip() or "[empty agent response]"
-    chunks = []
-    while remaining:
-        if len(remaining) <= limit:
-            chunks.append(remaining)
-            break
-        split_at = remaining.rfind("\n", 0, limit)
-        if split_at < limit // 2:
-            split_at = remaining.rfind(" ", 0, limit)
-        if split_at < limit // 2:
-            split_at = limit
-        chunks.append(remaining[:split_at].rstrip())
-        remaining = remaining[split_at:].lstrip()
-    return chunks
 
 
 def process_agent_mailbox_job(
@@ -565,6 +552,32 @@ def topic_rename_proposal(
     )
 
 
+def reply_dispatch_authorized(
+    store: DurableStore,
+    project,
+    user_request_text: str,
+) -> bool:
+    """Decide whether a reply-context turn may dispatch without confirmation.
+
+    Quoted bot text must never authorize a dispatch by itself, so the
+    user-authored reply has to name the destination explicitly by canonical
+    slug, display name, or durable alias.
+    """
+    if project is None:
+        return False
+    candidates = {
+        project.slug,
+        project.slug.replace("-", " "),
+        project.display_name,
+    }
+    candidates.update(store.project_alias_map().get(project.slug, []))
+    return any(
+        alias_appears_in_input(candidate, user_request_text)
+        for candidate in candidates
+        if candidate
+    )
+
+
 def router_rotation_reason(metrics: dict[str, Any]) -> Optional[str]:
     if int(metrics["input_tokens"]) >= ROUTER_MAX_INPUT_TOKENS:
         return (
@@ -649,6 +662,44 @@ def process_router_mailbox_job(
                 if topic.message_thread_id is not None
             },
         )
+        # Explicit-mention validations must only consider the user-authored
+        # part of the input, never quoted reply context.
+        user_request_text = router_contract.extract_user_request(job.input_text)
+        if call.tool == "send_to_agent" and router_contract.has_reply_context(
+            job.input_text
+        ):
+            guarded_project = store.resolve_project(
+                str(call.arguments["project_slug"])
+            )
+            if not reply_dispatch_authorized(
+                store,
+                guarded_project,
+                user_request_text,
+            ):
+                destination = (
+                    guarded_project.display_name
+                    if guarded_project is not None
+                    else str(call.arguments["project_slug"])
+                )
+                call = router_contract.RouterToolCall(
+                    tool="ask_user",
+                    arguments={
+                        "question": (
+                            f"Send this follow-up to {destination}?"
+                        ),
+                        "options": ["Yes, send it", "No, cancel"],
+                    },
+                    requires_confirmation=False,
+                )
+                log_event(
+                    "router_reply_dispatch_guarded",
+                    mailbox_id=job.mailbox_id,
+                    project_slug=str(
+                        guarded_project.slug
+                        if guarded_project is not None
+                        else "unknown"
+                    ),
+                )
         dispatch_agent_id = None
         dispatch_message = None
         clarification_options = None
@@ -669,7 +720,7 @@ def process_router_mailbox_job(
             inspection = project_inspection_text(
                 store,
                 str(call.arguments["project"]),
-                job.input_text,
+                user_request_text,
             )
             response_text = (
                 inspection
@@ -686,14 +737,14 @@ def process_router_mailbox_job(
         elif call.tool == "create_project_agent":
             response_text, project_creation_plan = project_creation_proposal(
                 store,
-                job.input_text,
+                user_request_text,
                 call.arguments,
             )
         elif call.tool == "rename_topic":
             response_text, topic_rename_plan = topic_rename_proposal(
                 store,
                 job.chat_id,
-                job.input_text,
+                user_request_text,
                 call.arguments,
             )
         elif call.tool == "configure_agent":
@@ -715,7 +766,7 @@ def process_router_mailbox_job(
             for label, value in updates.items():
                 if (
                     isinstance(value, str)
-                    and not alias_appears_in_input(value, job.input_text)
+                    and not alias_appears_in_input(value, user_request_text)
                 ):
                     raise StoreError(
                         f"The requested {label} must appear explicitly in "
@@ -735,7 +786,7 @@ def process_router_mailbox_job(
             )
         elif call.tool == "set_project_alias":
             alias = str(call.arguments["alias"])
-            if not alias_appears_in_input(alias, job.input_text):
+            if not alias_appears_in_input(alias, user_request_text):
                 raise StoreError(
                     "The project alias must appear explicitly in the user's request."
                 )
@@ -750,7 +801,7 @@ def process_router_mailbox_job(
             )
         elif call.tool == "remove_project_alias":
             alias = str(call.arguments["alias"])
-            if not alias_appears_in_input(alias, job.input_text):
+            if not alias_appears_in_input(alias, user_request_text):
                 raise StoreError(
                     "The project alias must appear explicitly in the user's request."
                 )
@@ -817,61 +868,225 @@ def work_router_command(args: argparse.Namespace) -> None:
                 return
 
 
+@contextmanager
+def outbox_delivery_lock(database_path: Path):
+    """Serialize the Telegram delivery critical section across processes.
+
+    Every sender for one controller database must hold this exclusive kernel
+    advisory lock from the pre-delivery lease revalidation through the
+    Telegram API call and the durable completion or failure record. A paused
+    sender keeps the lock, so no other sender can deliver a newer edit ahead
+    of an in-flight older one; a crashed sender's lock is released by the
+    kernel and normal idempotent retry semantics take over.
+
+    The lock file is derived only from the canonically resolved controller
+    database path, so every path spelling of the same database maps to one
+    lock. The guarantee is single-host (all sender processes for one database
+    run on this Mac), and the lock is intentionally non-reentrant: it is
+    acquired exactly once per delivery and never nested.
+
+    Yields the locked descriptor so the delivery path can pass it to the
+    Telegram API helper subprocess, which inherits the same open file
+    description: BSD flock then stays held until the helper itself exits,
+    even if this sender process is SIGKILLed mid-call, so a replacement
+    sender cannot deliver a newer edit while an old request is still in
+    flight anywhere.
+    """
+    lock_path = Path(str(Path(database_path).resolve()) + ".send-lock")
+    descriptor = os.open(
+        str(lock_path),
+        os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+        0o600,
+    )
+    if descriptor < 3:
+        # A standard-fd slot would be overwritten by the helper's stdio
+        # redirection, silently defeating pass_fds inheritance; move the
+        # same open file description to a safe number.
+        try:
+            duplicated = fcntl.fcntl(descriptor, fcntl.F_DUPFD, 3)
+        except OSError:
+            os.close(descriptor)
+            raise
+        os.close(descriptor)
+        descriptor = duplicated
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    try:
+        yield descriptor
+    finally:
+        # Release by closing, never by explicit LOCK_UN: an unlock would
+        # strip the lock from a still-running helper that shares this open
+        # file description (for example after a failed kill/reap), whereas
+        # closing only drops this process's reference — the kernel releases
+        # the lock exactly when the last holder exits.
+        os.close(descriptor)
+
+
 def send_outbox_message(
     store: DurableStore,
     token: str,
     message: OutboxMessage,
     worker_id: str,
 ) -> None:
-    try:
-        result = bridge.api_call(token, message.method, **message.params)
-        store.complete_outbox(message.message_id, worker_id, result)
+    with outbox_delivery_lock(store.path) as delivery_lock_fd:
+        # Revalidate ownership after possibly waiting for the lock — another
+        # sender may have recovered this lease and already delivered — and
+        # atomically renew the lease so it comfortably outlives the Telegram
+        # call's hard whole-operation deadline plus the durable outcome
+        # record.
+        if not store.revalidate_outbox_lease(message.message_id, worker_id):
+            log_event(
+                "outbox_lease_lost",
+                message_id=message.message_id,
+                operation_id=message.operation_id,
+                attempts=message.attempts,
+            )
+            return
+        if store.router_final_edit_superseded(message.operation_id):
+            # A newer agent-outcome edit for the same routing receipt exists,
+            # so delivering this stale preview edit would overwrite the final
+            # answer.
+            try:
+                store.complete_outbox(
+                    message.message_id,
+                    worker_id,
+                    {"skipped": "superseded"},
+                )
+            except LeaseLostError:
+                log_event(
+                    "outbox_lease_lost",
+                    message_id=message.message_id,
+                    operation_id=message.operation_id,
+                    attempts=message.attempts,
+                )
+                return
+            log_event(
+                "outbox_superseded",
+                message_id=message.message_id,
+                operation_id=message.operation_id,
+                attempts=message.attempts,
+            )
+            return
+        try:
+            result = bridge.api_call(
+                token,
+                message.method,
+                delivery_lock_fd=delivery_lock_fd,
+                **message.params,
+            )
+        except bridge.BridgeError as exc:
+            error = str(exc)
+            if (
+                message.method == "editMessageText"
+                and "message is not modified" in error.lower()
+            ):
+                # Telegram already shows exactly this content, typically
+                # because a previous attempt was applied but its
+                # acknowledgment was lost. Completing normally keeps retries
+                # convergent and lets durable post-acknowledgment effects
+                # (like route retargeting) run.
+                try:
+                    store.complete_outbox(
+                        message.message_id,
+                        worker_id,
+                        {"edited": "not_modified"},
+                    )
+                except LeaseLostError:
+                    log_event(
+                        "outbox_lease_lost",
+                        message_id=message.message_id,
+                        operation_id=message.operation_id,
+                        attempts=message.attempts,
+                    )
+                    return
+                log_event(
+                    "outbox_sent",
+                    message_id=message.message_id,
+                    operation_id=message.operation_id,
+                    attempts=message.attempts,
+                    not_modified=True,
+                )
+                return
+            handle_outbox_send_failure(store, message, worker_id, error)
+            return
+        try:
+            store.complete_outbox(message.message_id, worker_id, result)
+        except LeaseLostError:
+            # The lease expired during the Telegram call and another sender
+            # reclaimed the row; it will revalidate under this same lock
+            # before acting, so delivery order is preserved either way.
+            log_event(
+                "outbox_lease_lost",
+                message_id=message.message_id,
+                operation_id=message.operation_id,
+                attempts=message.attempts,
+                delivered=True,
+            )
+            return
         log_event(
             "outbox_sent",
             message_id=message.message_id,
             operation_id=message.operation_id,
             attempts=message.attempts,
         )
-    except bridge.BridgeError as exc:
-        error = str(exc)
-        permanent_card_edit_failure = (
-            message.method == "editMessageText"
-            and message.card is not None
-            and message.card.get("mode") in {"edit", "final_edit"}
-            and any(
-                marker in error.lower()
-                for marker in (
-                    "message to edit not found",
-                    "message can't be edited",
-                    "message_id_invalid",
-                )
+
+
+def handle_outbox_send_failure(
+    store: DurableStore,
+    message: OutboxMessage,
+    worker_id: str,
+    error: str,
+) -> None:
+    permanent_card_edit_failure = (
+        message.method == "editMessageText"
+        and message.card is not None
+        and message.card.get("mode") in {"edit", "final_edit"}
+        and any(
+            marker in error.lower()
+            for marker in (
+                "message to edit not found",
+                "message can't be edited",
+                "message_id_invalid",
             )
         )
+    )
+    try:
         state = store.fail_outbox(
             message.message_id,
             worker_id,
             error,
             max_attempts=message.attempts if permanent_card_edit_failure else 8,
         )
-        if permanent_card_edit_failure and state == "dead":
-            if message.card.get("kind") == "agent_turn":
-                store.enqueue_agent_response_fallback(
-                    int(message.card["mailbox_id"])
-                )
-            elif message.card.get("kind") == "router_turn":
-                store.enqueue_router_response_fallback(
-                    int(message.card["mailbox_id"])
-                )
-            else:
-                store.mark_surface_card_stale(int(message.card["card_id"]))
+    except LeaseLostError:
         log_event(
-            "outbox_failed",
+            "outbox_lease_lost",
             message_id=message.message_id,
             operation_id=message.operation_id,
             attempts=message.attempts,
-            state=state,
-            error=error,
         )
+        return
+    if permanent_card_edit_failure and state == "dead":
+        if message.card.get("kind") == "agent_turn":
+            store.enqueue_agent_response_fallback(
+                int(message.card["mailbox_id"])
+            )
+        elif message.card.get("kind") == "router_turn":
+            store.enqueue_router_response_fallback(
+                int(message.card["mailbox_id"])
+            )
+        else:
+            store.mark_surface_card_stale(int(message.card["card_id"]))
+    log_event(
+        "outbox_failed",
+        message_id=message.message_id,
+        operation_id=message.operation_id,
+        attempts=message.attempts,
+        state=state,
+        error=error,
+    )
 
 
 def send_outbox_command(args: argparse.Namespace) -> None:
