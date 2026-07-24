@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class StoreError(RuntimeError):
@@ -128,6 +128,13 @@ class AgentMailboxJob:
     input_text: str
     provider_session_id: Optional[str]
     attempts: int
+
+
+@dataclass(frozen=True)
+class AgentConsole:
+    agent_id: str
+    tmux_session_name: str
+    state: str
 
 
 MIGRATION_1 = (
@@ -378,6 +385,24 @@ MIGRATION_7 = (
     """,
 )
 
+MIGRATION_8 = (
+    """
+    CREATE TABLE agent_consoles (
+        agent_id TEXT PRIMARY KEY
+            REFERENCES agents(agent_id) ON DELETE RESTRICT,
+        tmux_session_name TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL
+            CHECK (state IN ('starting', 'running', 'stopped')),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX agent_consoles_state
+    ON agent_consoles(state, tmux_session_name)
+    """,
+)
+
 
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
@@ -458,6 +483,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 7
                 self.connection.execute("PRAGMA user_version = 7")
+            if current < 8:
+                for statement in MIGRATION_8:
+                    self.connection.execute(statement)
+                current = 8
+                self.connection.execute("PRAGMA user_version = 8")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -1407,6 +1437,119 @@ class DurableStore:
         ).fetchone()
         return self._managed_agent_from_row(row) if row is not None else None
 
+    def resolve_agent_by_name(self, hierarchical_name: str) -> Optional[ManagedAgent]:
+        row = self.connection.execute(
+            "SELECT * FROM agents WHERE hierarchical_name = ?",
+            (hierarchical_name,),
+        ).fetchone()
+        return self._managed_agent_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _agent_console_from_row(row: sqlite3.Row) -> AgentConsole:
+        return AgentConsole(
+            agent_id=str(row["agent_id"]),
+            tmux_session_name=str(row["tmux_session_name"]),
+            state=str(row["state"]),
+        )
+
+    def resolve_agent_console(self, agent_id: str) -> Optional[AgentConsole]:
+        row = self.connection.execute(
+            "SELECT * FROM agent_consoles WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+        return self._agent_console_from_row(row) if row is not None else None
+
+    def reserve_agent_console(
+        self,
+        agent_id: str,
+        tmux_session_name: str,
+        now: Optional[float] = None,
+    ) -> AgentConsole:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            agent = self.connection.execute(
+                """
+                SELECT provider_session_id
+                FROM agents
+                WHERE agent_id = ? AND role IN ('project', 'worker')
+                """,
+                (agent_id,),
+            ).fetchone()
+            if agent is None:
+                raise StoreError("Managed agent was not found.")
+            if not agent["provider_session_id"]:
+                raise StoreError(
+                    "Managed agent has no persisted provider session to resume."
+                )
+            busy = self.connection.execute(
+                """
+                SELECT 1
+                FROM agent_mailbox
+                WHERE agent_id = ? AND state IN ('queued', 'leased')
+                LIMIT 1
+                """,
+                (agent_id,),
+            ).fetchone()
+            if busy is not None:
+                raise StoreError(
+                    "Managed agent mailbox must be idle before opening a console."
+                )
+            existing = self.connection.execute(
+                "SELECT * FROM agent_consoles WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            if existing is not None and str(existing["state"]) != "stopped":
+                raise StoreError("Managed agent console is already reserved.")
+            self.connection.execute(
+                """
+                INSERT INTO agent_consoles(
+                    agent_id, tmux_session_name, state, created_at, updated_at
+                )
+                VALUES (?, ?, 'starting', ?, ?)
+                ON CONFLICT(agent_id) DO UPDATE SET
+                    tmux_session_name = excluded.tmux_session_name,
+                    state = 'starting',
+                    updated_at = excluded.updated_at
+                """,
+                (agent_id, tmux_session_name, timestamp, timestamp),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM agent_consoles WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self._agent_console_from_row(row)
+
+    def set_agent_console_state(
+        self,
+        agent_id: str,
+        expected_state: str,
+        state: str,
+        now: Optional[float] = None,
+    ) -> AgentConsole:
+        if state not in {"starting", "running", "stopped"}:
+            raise StoreError("Managed agent console state is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        cursor = self.connection.execute(
+            """
+            UPDATE agent_consoles
+            SET state = ?, updated_at = ?
+            WHERE agent_id = ? AND state = ?
+            """,
+            (state, timestamp, agent_id, expected_state),
+        )
+        if cursor.rowcount != 1:
+            raise StoreError("Managed agent console state changed unexpectedly.")
+        row = self.connection.execute(
+            "SELECT * FROM agent_consoles WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+        return self._agent_console_from_row(row)
+
     def resolve_agent_for_surface(
         self,
         chat_id: int,
@@ -1680,6 +1823,12 @@ class DurableStore:
                 SELECT m.*
                 FROM agent_mailbox AS m
                 WHERE m.state = 'queued' AND m.available_at <= ?
+                    AND NOT EXISTS (
+                        SELECT 1
+                        FROM agent_consoles AS console
+                        WHERE console.agent_id = m.agent_id
+                            AND console.state IN ('starting', 'running')
+                    )
                     AND NOT EXISTS (
                         SELECT 1
                         FROM agent_mailbox AS active
@@ -2197,6 +2346,7 @@ class DurableStore:
             ("cards", "surface_cards"),
             ("agents", "agents"),
             ("agent_mailbox", "agent_mailbox"),
+            ("agent_consoles", "agent_consoles"),
         ):
             if label == "updates":
                 state_column = "ingest_state"

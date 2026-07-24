@@ -20,6 +20,7 @@ from durable_store import (
     MIGRATION_4,
     MIGRATION_5,
     MIGRATION_6,
+    MIGRATION_7,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -99,7 +100,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            7,
+            8,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -726,6 +727,64 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(route["target_type"], "agent")
         self.assertEqual(route["target_id"], agent.agent_id)
 
+    def test_agent_console_reservation_pauses_mailbox_claims(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Stage 2 Test",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        self.store.connection.execute(
+            "UPDATE agents SET provider_session_id = ? WHERE agent_id = ?",
+            ("019f924b-bbbf-7080-b778-a52e3e1bf4cc", agent.agent_id),
+        )
+        console = self.store.reserve_agent_console(
+            agent.agent_id,
+            agent.hierarchical_name,
+            now=101,
+        )
+        self.assertEqual(console.state, "starting")
+        self.store.set_agent_console_state(
+            agent.agent_id,
+            "starting",
+            "running",
+            now=102,
+        )
+
+        self.store.ingest_update(topic_message_update(10, "queued"), now=103)
+        job = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+        ).fetchone()
+        self.store.enqueue_agent_message(
+            agent.agent_id,
+            int(job["job_id"]),
+            "queued",
+            now=103,
+        )
+        self.assertIsNone(self.store.claim_agent_mailbox("worker", now=104))
+
+        self.store.set_agent_console_state(
+            agent.agent_id,
+            "running",
+            "stopped",
+            now=105,
+        )
+        self.assertEqual(
+            self.store.claim_agent_mailbox("worker", now=106).input_text,
+            "queued",
+        )
+
 
 class SchemaCompatibilityTests(unittest.TestCase):
     def test_schema_one_database_migrates_to_current_schema(self):
@@ -742,7 +801,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    7,
+                    8,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -766,7 +825,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    7,
+                    8,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -791,7 +850,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    7,
+                    8,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -815,7 +874,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    7,
+                    8,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -841,7 +900,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    7,
+                    8,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -872,12 +931,44 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    7,
+                    8,
                 )
                 self.assertEqual(
                     store.connection.execute(
                         "SELECT COUNT(*) FROM sqlite_master "
                         "WHERE type = 'table' AND name = 'agent_mailbox'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_schema_seven_database_migrates_to_current_schema(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-seven.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for statement in (
+                MIGRATION_1
+                + MIGRATION_2
+                + MIGRATION_3
+                + MIGRATION_4
+                + MIGRATION_5
+                + MIGRATION_6
+                + MIGRATION_7
+            ):
+                connection.execute(statement)
+            connection.execute("PRAGMA user_version = 7")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    8,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'agent_consoles'"
                     ).fetchone()[0],
                     1,
                 )

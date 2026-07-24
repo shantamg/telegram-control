@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 import telegram_bridge as bridge
+import tmux_console
 from durable_store import CallbackActionError, DurableStore, StoreError
 
 
@@ -287,11 +288,17 @@ def send_agent_status() -> None:
     chat_id, thread_id = surface_coordinates()
     with DurableStore(Path(database_path)) as store:
         agent = store.resolve_agent_for_surface(chat_id, thread_id)
+        console = (
+            tmux_console.reconcile_agent_console(store, agent.agent_id)
+            if agent is not None
+            else None
+        )
     if agent is None:
         send_message("This Telegram surface has no managed agent.")
         return
     project_name = Path(agent.project_path).name if agent.project_path else "controller"
     session = "not started" if not agent.provider_session_id else "persisted"
+    console_state = console.state if console is not None else "stopped"
     send_message(
         "Managed agent\n\n"
         f"Name: {agent.hierarchical_name}\n"
@@ -299,7 +306,8 @@ def send_agent_status() -> None:
         f"Provider: {agent.provider}\n"
         f"Project: {project_name}\n"
         f"State: {agent.lifecycle_state}\n"
-        f"Session: {session}"
+        f"Session: {session}\n"
+        f"Console: {console_state}"
     )
 
 

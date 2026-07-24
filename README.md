@@ -191,6 +191,32 @@ controller was restarted between turns, both used the same persisted Codex
 session ID, and the second turn produced an immediate receipt followed by the
 final response.
 
+Schema version 8 adds an optional interactive tmux console. Structured adapter
+turns remain the normal control path; the console is an explicit takeover of an
+already-persisted session:
+
+```sh
+/Users/shantam/telegram-control/telegram_control.py \
+  console-open tc--root--telegram-control
+/Users/shantam/telegram-control/telegram_control.py \
+  console-status tc--root--telegram-control
+tmux attach-session -t '=tc--root--telegram-control'
+/Users/shantam/telegram-control/telegram_control.py \
+  console-close tc--root--telegram-control
+```
+
+Opening fails unless the agent has a persisted provider session and an idle
+mailbox. The reservation prevents the mailbox worker from controlling the same
+agent concurrently. New Telegram turns may still queue durably during takeover
+and are claimed after the console closes. Existing unmanaged tmux sessions are
+never adopted or killed, and Codex retains the configured sandbox rather than
+enabling unrestricted/yolo mode.
+
+The live console test passed on July 23, 2026. The real Codex TUI resumed the
+same conversation in tmux, `/agent` reported `Console: running`, and a Telegram
+turn remained queued until `console-close`. It then completed on its first
+mailbox attempt with the expected response.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

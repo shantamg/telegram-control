@@ -763,6 +763,25 @@ live test on July 23, 2026:
 - two live read-only turns succeeded on their first attempts, with a controller
   restart between them and the same persisted Codex session ID on both.
 
+The explicit tmux console slice passed 55 offline tests and its live test on
+July 23, 2026:
+
+- schema version 8 stores console reservations independently from agent
+  lifecycle and provider-session state;
+- only a persisted, idle agent session can be opened, and unmanaged tmux name
+  collisions fail closed;
+- `starting` and `running` reservations exclude that agent from mailbox claims,
+  preventing concurrent structured and interactive control;
+- Codex resumes inside tmux with the agent's configured sandbox, without
+  enabling unrestricted/yolo mode;
+- `/agent` reports the reconciled console state, and a vanished tmux session is
+  released durably;
+- the live Codex TUI displayed both earlier structured turns from the persisted
+  conversation;
+- a Telegram turn received its immediate acknowledgement but remained queued
+  while the console ran, then completed on its first attempt immediately after
+  `console-close`.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)

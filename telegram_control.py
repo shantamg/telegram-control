@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 import telegram_bridge as bridge
 import provider_adapters
+import tmux_console
 from durable_store import (
     SCHEMA_VERSION,
     AgentMailboxJob,
@@ -613,6 +614,49 @@ def register_agent_command(args: argparse.Namespace) -> None:
     )
 
 
+def resolve_cli_agent(store: DurableStore, name: str):
+    agent = store.resolve_agent_by_name(name)
+    if agent is None or agent.role not in {"project", "worker"}:
+        raise StoreError(f"Managed agent was not found: {name}")
+    return agent
+
+
+def console_open_command(args: argparse.Namespace) -> None:
+    with open_store(args.db) as store:
+        agent = resolve_cli_agent(store, args.agent)
+        console = tmux_console.open_agent_console(store, agent)
+    print(f"Managed console running: {console.tmux_session_name}")
+    print(f"Attach: tmux attach-session -t '={console.tmux_session_name}'")
+
+
+def console_close_command(args: argparse.Namespace) -> None:
+    with open_store(args.db) as store:
+        agent = resolve_cli_agent(store, args.agent)
+        console = tmux_console.close_agent_console(store, agent)
+    print(f"Managed console stopped: {console.tmux_session_name}")
+
+
+def console_status_command(args: argparse.Namespace) -> None:
+    with open_store(args.db) as store:
+        agent = resolve_cli_agent(store, args.agent)
+        console = tmux_console.reconcile_agent_console(store, agent.agent_id)
+    state = console.state if console is not None else "not created"
+    session_name = (
+        console.tmux_session_name if console is not None else agent.hierarchical_name
+    )
+    print(
+        json.dumps(
+            {
+                "agent": agent.hierarchical_name,
+                "console": state,
+                "tmux_session": session_name,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
 def doctor_command(args: argparse.Namespace) -> None:
     problems = []
     try:
@@ -742,6 +786,27 @@ def build_parser() -> argparse.ArgumentParser:
         default="codex",
     )
     register_parser.set_defaults(function=register_agent_command)
+
+    console_open_parser = subparsers.add_parser(
+        "console-open",
+        help="Open an explicit tmux takeover for a persisted agent session.",
+    )
+    console_open_parser.add_argument("agent", help="Hierarchical managed-agent name.")
+    console_open_parser.set_defaults(function=console_open_command)
+
+    console_close_parser = subparsers.add_parser(
+        "console-close",
+        help="Close a managed tmux console and resume mailbox processing.",
+    )
+    console_close_parser.add_argument("agent", help="Hierarchical managed-agent name.")
+    console_close_parser.set_defaults(function=console_close_command)
+
+    console_status_parser = subparsers.add_parser(
+        "console-status",
+        help="Show and reconcile a managed tmux console.",
+    )
+    console_status_parser.add_argument("agent", help="Hierarchical managed-agent name.")
+    console_status_parser.set_defaults(function=console_status_command)
 
     doctor_parser = subparsers.add_parser("doctor", help="Check Stage 1 prerequisites.")
     doctor_parser.set_defaults(function=doctor_command)
