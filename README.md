@@ -236,10 +236,11 @@ Model and effort are also conversational, durable agent settings. A creation
 request can name them directly, and an existing project agent can be updated
 with a request such as `Use gpt-5.6-sol with high effort for TC`. Omitted
 settings retain the provider default; explicit `null` resets a setting. The
-controller validates provider-specific effort levels, refuses invented model
-strings, carries the settings through structured and tmux turns, and displays
-them in `/agent`. Subjective requests such as “use the best model” are routed
-to clarification instead of silently choosing a potentially expensive model.
+controller validates provider-specific effort levels, requires model names to
+be explicit, lets the installed harness reject unavailable models, carries the
+settings through structured and tmux turns, and displays them in `/agent`.
+Subjective requests such as “use the best model” are routed to clarification
+instead of silently choosing a potentially expensive model.
 
 The live console test passed on July 23, 2026. The real Codex TUI resumed the
 same conversation in tmux, `/agent` reported `Console: running`, and a Telegram
