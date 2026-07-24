@@ -36,6 +36,8 @@ from durable_store import (
 
 DATABASE_PATH = bridge.CONFIG_DIR / "controller.sqlite3"
 SCRIPT_PATH = Path(__file__).resolve()
+ROUTER_MAX_COMPLETED_TURNS = 12
+ROUTER_MAX_INPUT_TOKENS = 180_000
 
 
 def log_event(kind: str, **details: Any) -> None:
@@ -449,12 +451,43 @@ def project_creation_proposal(
     )
 
 
+def router_rotation_reason(metrics: dict[str, Any]) -> Optional[str]:
+    if int(metrics["input_tokens"]) >= ROUTER_MAX_INPUT_TOKENS:
+        return (
+            f"input tokens reached {int(metrics['input_tokens']):,} "
+            f"(limit {ROUTER_MAX_INPUT_TOKENS:,})"
+        )
+    if int(metrics["completed_turns"]) >= ROUTER_MAX_COMPLETED_TURNS:
+        return (
+            f"completed turns reached {int(metrics['completed_turns'])} "
+            f"(limit {ROUTER_MAX_COMPLETED_TURNS})"
+        )
+    return None
+
+
 def process_router_mailbox_job(
     store: DurableStore,
     job: RouterMailboxJob,
     worker_id: str,
 ) -> None:
     try:
+        mailbox_session_id = job.provider_session_id
+        if mailbox_session_id is not None and job.attempts == 1:
+            metrics = store.router_session_metrics(mailbox_session_id)
+            rotation_reason = router_rotation_reason(metrics)
+            if rotation_reason is not None:
+                old_session_id = store.rotate_main_router_session(
+                    job.mailbox_id,
+                    worker_id,
+                    rotation_reason,
+                )
+                mailbox_session_id = None
+                log_event(
+                    "router_session_rotated",
+                    mailbox_id=job.mailbox_id,
+                    old_provider_session_id=old_session_id,
+                    reason=rotation_reason,
+                )
         main_agent = store.resolve_main_agent()
         if main_agent is None:
             raise StoreError("Main router agent no longer exists.")
@@ -473,7 +506,7 @@ def process_router_mailbox_job(
         result = adapter.run_turn(
             runtime_agent,
             prompt,
-            job.provider_session_id,
+            mailbox_session_id,
             on_session=lambda session_id: store.attach_router_mailbox_session(
                 job.mailbox_id,
                 worker_id,
@@ -836,6 +869,7 @@ def status_command(args: argparse.Namespace) -> None:
         check=False,
     )
     with open_store(args.db) as store:
+        router_metrics = store.router_session_metrics()
         status = {
             "database": str(store.path),
             "quick_check": store.quick_check(),
@@ -843,6 +877,14 @@ def status_command(args: argparse.Namespace) -> None:
             "launch_agent": {
                 "configured_mode": configured_launch_agent_mode(),
                 "loaded": launch_result.returncode == 0,
+            },
+            "router_session": {
+                "persisted": router_metrics["provider_session_id"] is not None,
+                "completed_turns": router_metrics["completed_turns"],
+                "input_tokens": router_metrics["input_tokens"],
+                "turn_limit": ROUTER_MAX_COMPLETED_TURNS,
+                "input_token_limit": ROUTER_MAX_INPUT_TOKENS,
+                "rotations": store.router_rotation_count(),
             },
             "queues": store.status_counts(),
         }

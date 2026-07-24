@@ -110,6 +110,7 @@ def refresh_keyboard(token: str) -> dict:
 
 def status_card_text(store: DurableStore, binding, refresh_marker: str) -> str:
     counts = store.status_counts()
+    router = store.router_session_metrics()
     accepted_updates = sum(counts["updates"].values())
     active_routes = counts["routes"].get("active", 0)
     active_callbacks = counts["callbacks"].get("active", 0)
@@ -126,6 +127,11 @@ def status_card_text(store: DurableStore, binding, refresh_marker: str) -> str:
         f"Stored updates: {accepted_updates}\n"
         f"Active return routes: {active_routes}\n"
         f"Active buttons: {active_callbacks}\n"
+        f"Router session: "
+        f"{'persisted' if router['provider_session_id'] else 'not started'}\n"
+        f"Router context: {router['completed_turns']} turns · "
+        f"{router['input_tokens']:,} input tokens · "
+        f"{store.router_rotation_count()} rotations\n"
         f"Refresh: {refresh_marker}"
     )
 

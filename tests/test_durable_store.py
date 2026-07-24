@@ -1035,6 +1035,91 @@ class DurableStoreTests(unittest.TestCase):
         self.assertIsNone(reset.provider_session_id)
         self.assertEqual(reset.lifecycle_state, "registered")
 
+    def test_main_router_session_rotates_from_durable_usage(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            surface_type="control",
+            display_name="Control",
+            target_type="controller",
+            target_id="control",
+            now=99,
+        )
+        self.store.ingest_update(message_update(10, "first"), now=100)
+        first_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+            ).fetchone()["job_id"]
+        )
+        self.store.enqueue_router_message_with_receipt(
+            source_inbox_job_id=first_job_id,
+            input_text="first",
+            chat_id=123,
+            message_thread_id=None,
+            authorized_user_id=123,
+            receipt_text="routing",
+            now=100,
+        )
+        first = self.store.claim_router_mailbox("router-1", now=100)
+        self.store.attach_router_mailbox_session(
+            first.mailbox_id,
+            "router-1",
+            "router-session-old",
+            now=100,
+        )
+        self.store.complete_router_mailbox(
+            first.mailbox_id,
+            "router-1",
+            "router-session-old",
+            '{"tool":"respond","arguments":{"message":"done"}}',
+            "respond",
+            {"message": "done"},
+            "done",
+            {
+                "input_tokens": 180000,
+                "cached_input_tokens": 160000,
+                "output_tokens": 10,
+            },
+            now=101,
+        )
+        metrics = self.store.router_session_metrics("router-session-old")
+        self.assertEqual(metrics["completed_turns"], 1)
+        self.assertEqual(metrics["input_tokens"], 180000)
+        self.assertIsNotNone(
+            telegram_control.router_rotation_reason(metrics)
+        )
+
+        self.store.ingest_update(message_update(11, "second"), now=102)
+        second_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+            ).fetchone()["job_id"]
+        )
+        self.store.enqueue_router_message_with_receipt(
+            source_inbox_job_id=second_job_id,
+            input_text="second",
+            chat_id=123,
+            message_thread_id=None,
+            authorized_user_id=123,
+            receipt_text="routing",
+            now=102,
+        )
+        second = self.store.claim_router_mailbox("router-2", now=102)
+        self.assertEqual(second.provider_session_id, "router-session-old")
+        old = self.store.rotate_main_router_session(
+            second.mailbox_id,
+            "router-2",
+            "test threshold",
+            now=102,
+        )
+        self.assertEqual(old, "router-session-old")
+        self.assertIsNone(self.store.resolve_main_agent().provider_session_id)
+        mailbox_session = self.store.connection.execute(
+            "SELECT provider_session_id FROM router_mailbox WHERE mailbox_id = ?",
+            (second.mailbox_id,),
+        ).fetchone()["provider_session_id"]
+        self.assertIsNone(mailbox_session)
+        self.assertEqual(self.store.router_rotation_count(), 1)
+
 
 class SchemaCompatibilityTests(unittest.TestCase):
     def test_schema_one_database_migrates_to_current_schema(self):

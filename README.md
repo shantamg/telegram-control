@@ -311,6 +311,15 @@ and shows the proposed provider and Telegram topic behind **Create project
 agent** and **Cancel** buttons. Only the authorized confirmation enrolls the
 project, creates its private-chat topic, and attaches the managed agent.
 
+The main router rotates before the next fresh turn after either 12 completed
+turns or 180,000 cumulative input tokens reported by Codex. Rotation clears
+only the controller's active session pointer; the old Codex conversation is
+retained. The next ordinary turn starts a new read-only Codex session from the
+tool protocol, current catalog and agent state, and current request—there is no
+extra summarization turn. Crash-recovery attempts always resume their attached
+session instead of rotating mid-recovery. CLI and Telegram status expose the
+current counters and durable rotation count.
+
 The earlier strict `route`, `clarify`, or `reject` schema remains as a compact
 classification and evaluation primitive. It is not intended to become a
 user-facing command language.

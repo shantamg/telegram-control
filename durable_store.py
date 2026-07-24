@@ -1872,6 +1872,131 @@ class DurableStore:
         ).fetchone()
         return self._managed_agent_from_row(row) if row is not None else None
 
+    def router_session_metrics(
+        self,
+        provider_session_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        session_id = provider_session_id
+        if session_id is None:
+            main_agent = self.resolve_main_agent()
+            session_id = (
+                main_agent.provider_session_id
+                if main_agent is not None
+                else None
+            )
+        if session_id is None:
+            return {
+                "provider_session_id": None,
+                "completed_turns": 0,
+                "input_tokens": 0,
+                "cached_input_tokens": 0,
+                "output_tokens": 0,
+            }
+        rows = self.connection.execute(
+            """
+            SELECT usage_json
+            FROM router_mailbox
+            WHERE state = 'succeeded' AND provider_session_id = ?
+            ORDER BY mailbox_id
+            """,
+            (session_id,),
+        ).fetchall()
+        usage: dict[str, Any] = {}
+        if rows and rows[-1]["usage_json"] is not None:
+            candidate = json.loads(rows[-1]["usage_json"])
+            if isinstance(candidate, dict):
+                usage = candidate
+        return {
+            "provider_session_id": session_id,
+            "completed_turns": len(rows),
+            "input_tokens": int(usage.get("input_tokens", 0)),
+            "cached_input_tokens": int(usage.get("cached_input_tokens", 0)),
+            "output_tokens": int(usage.get("output_tokens", 0)),
+        }
+
+    def rotate_main_router_session(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        reason: str,
+        now: Optional[float] = None,
+    ) -> str:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT m.provider_session_id, a.agent_id
+                FROM router_mailbox AS m
+                JOIN agents AS a ON a.hierarchical_name = 'tc--root'
+                WHERE m.mailbox_id = ? AND m.state = 'leased'
+                    AND m.lease_owner = ?
+                    AND m.provider_session_id IS NOT NULL
+                    AND a.provider_session_id = m.provider_session_id
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    "Main-router session is no longer eligible for rotation."
+                )
+            old_session_id = str(row["provider_session_id"])
+            metrics = self.router_session_metrics(old_session_id)
+            self.connection.execute(
+                """
+                UPDATE router_mailbox
+                SET provider_session_id = NULL, updated_at = ?
+                WHERE mailbox_id = ?
+                """,
+                (timestamp, int(mailbox_id)),
+            )
+            self.connection.execute(
+                """
+                UPDATE agents
+                SET provider_session_id = NULL, updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (timestamp, str(row["agent_id"])),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('router_session_rotated', 'agent', ?, ?, ?)
+                """,
+                (
+                    str(row["agent_id"]),
+                    json.dumps(
+                        {
+                            "old_provider_session_id": old_session_id,
+                            "reason": reason,
+                            "completed_turns": metrics["completed_turns"],
+                            "input_tokens": metrics["input_tokens"],
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                ),
+            )
+            self.connection.execute("COMMIT")
+            return old_session_id
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def router_rotation_count(self) -> int:
+        return int(
+            self.connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM events
+                WHERE kind = 'router_session_rotated'
+                """
+            ).fetchone()[0]
+        )
+
     def enqueue_router_message_with_receipt(
         self,
         source_inbox_job_id: int,

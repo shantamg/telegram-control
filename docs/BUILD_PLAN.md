@@ -865,7 +865,7 @@ to enrolled Git projects; repeated turns, restart resume, voice input, explicit
 tmux disposal/recreation, pause/resume, inspection, and guarded session
 replacement all operate through durable logical agent state.
 
-The Stage 4 router-contract and durable-routing slices pass 79 offline tests:
+The Stage 4 router-contract and durable-routing slices pass 80 offline tests:
 
 - router prompts contain only path-safe active catalog metadata;
 - normalized output is limited to exact `route`, `clarify`, and `reject`
@@ -909,6 +909,14 @@ The Stage 4 router-contract and durable-routing slices pass 79 offline tests:
   metadata, and exposes only opaque authorized Confirm/Cancel buttons;
 - confirmation enrolls the project, creates its Telegram topic, and attaches
   the managed agent; cancellation creates nothing;
+- the main router rotates before a fresh turn once its current Codex session
+  reaches 180,000 cumulative input tokens or 12 completed turns, while
+  recovery retries remain attached to their original session;
+- rotation retains the old Codex conversation, records a durable event, and
+  starts the next session directly from reconstructed controller state without
+  a separate summarization call;
+- controller status reports current router turns, tokens, limits, and rotation
+  count;
 - unknown-path inspection remains staged behind the same validation boundary.
 
 ## References
