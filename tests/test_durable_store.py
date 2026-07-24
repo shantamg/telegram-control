@@ -641,6 +641,10 @@ class DurableStoreTests(unittest.TestCase):
             slug="telegram-control",
             provider="codex",
             project_path="/tmp/telegram-control",
+            provider_config={
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+            },
             now=101,
         )
 
@@ -650,6 +654,10 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(agent.role, "project")
         self.assertEqual(agent.lifecycle_state, "registered")
         self.assertEqual(agent.surface_binding_id, surface.binding_id)
+        self.assertEqual(
+            agent.provider_config,
+            {"model": "gpt-5.6-sol", "effort": "high"},
+        )
         self.assertEqual(
             self.store.resolve_agent_for_surface(123, 62).agent_id,
             agent.agent_id,
@@ -672,6 +680,21 @@ class DurableStoreTests(unittest.TestCase):
             self.store.status_counts()["agents"],
             {"registered": 2},
         )
+
+        configured = self.store.configure_agent_provider(
+            agent.agent_id,
+            {"effort": "max"},
+            now=103,
+        )
+        self.assertEqual(configured.provider_config["model"], "gpt-5.6-sol")
+        self.assertEqual(configured.provider_config["effort"], "max")
+        reset = self.store.configure_agent_provider(
+            agent.agent_id,
+            {"model": None},
+            now=104,
+        )
+        self.assertNotIn("model", reset.provider_config)
+        self.assertEqual(reset.provider_config["effort"], "max")
 
         with self.assertRaises(StoreError):
             self.store.register_project_agent(
@@ -1986,6 +2009,102 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertIn('"aliases":["TC"]', fake.prompts[1])
                 self.assertNotIn("/secret/local/path", fake.prompts[1])
 
+    def test_router_configures_existing_agent_model_and_effort(self):
+        class FakeRouterAdapter:
+            def run_turn(
+                self,
+                agent,
+                prompt,
+                mailbox_session_id,
+                on_session,
+                heartbeat,
+            ):
+                on_session("router-session-config")
+                heartbeat()
+                return provider_adapters.ProviderTurnResult(
+                    provider_session_id="router-session-config",
+                    final_text=json.dumps(
+                        {
+                            "tool": "configure_agent",
+                            "arguments": {
+                                "project_slug": "telegram-control",
+                                "model": "gpt-5.6-sol",
+                                "effort": "high",
+                            },
+                        }
+                    ),
+                    usage={},
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.enroll_project(
+                    slug="telegram-control",
+                    display_name="Telegram Control",
+                    provider="codex",
+                    project_path="/secret/local/path",
+                    now=99,
+                )
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Telegram Control",
+                    target_type="controller",
+                    target_id="control",
+                    now=99,
+                )
+                project_agent, _ = store.attach_enrolled_project(
+                    123,
+                    62,
+                    "telegram-control",
+                    now=99,
+                )
+                store.ingest_update(
+                    message_update(
+                        text=(
+                            "Use gpt-5.6-sol with high effort for "
+                            "telegram-control"
+                        )
+                    ),
+                    now=100,
+                )
+                inbox = store.claim_job("inbox", now=100)
+                telegram_control.process_inbox_job(
+                    store, config, inbox, "inbox"
+                )
+                receipt = store.claim_outbox("sender", now=10**12)
+                store.complete_outbox(
+                    receipt.message_id,
+                    "sender",
+                    {"message_id": 700, "chat": {"id": 123}},
+                    now=10**12,
+                )
+                router_job = store.claim_router_mailbox("router", now=10**12)
+                with mock.patch.object(
+                    telegram_control.provider_adapters,
+                    "adapter_for",
+                    return_value=FakeRouterAdapter(),
+                ):
+                    telegram_control.process_router_mailbox_job(
+                        store, router_job, "router"
+                    )
+
+                configured = store.resolve_agent(project_agent.agent_id)
+                self.assertEqual(
+                    configured.provider_config,
+                    {"model": "gpt-5.6-sol", "effort": "high"},
+                )
+                response = store.claim_outbox("sender-2", now=10**12)
+                self.assertIn("Updated Telegram Control", response.params["text"])
+                self.assertIn("Model: gpt-5.6-sol", response.params["text"])
+                self.assertIn("Effort: high", response.params["text"])
+
     def test_router_clarification_buttons_resume_with_selected_answer(self):
         class FakeRouterAdapter:
             def run_turn(
@@ -2226,6 +2345,10 @@ class DurableIntegrationTests(unittest.TestCase):
                         "provider": "codex",
                         "project_path": str(root),
                         "topic_name": "Sample Project",
+                        "provider_config": {
+                            "model": "gpt-5.6-sol",
+                            "effort": "high",
+                        },
                     },
                     chat_id=123,
                     authorized_user_id=123,
@@ -2279,6 +2402,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     agent.hierarchical_name,
                     "tc--root--sample-project",
+                )
+                self.assertEqual(
+                    agent.provider_config,
+                    {"model": "gpt-5.6-sol", "effort": "high"},
                 )
                 binding = store.resolve_surface_binding(123, 77)
                 self.assertEqual(binding.target_id, agent.agent_id)

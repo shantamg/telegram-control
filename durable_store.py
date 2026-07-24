@@ -512,6 +512,61 @@ def normalize_project_alias(alias: str) -> str:
     return value
 
 
+def validate_provider_config(
+    provider: str,
+    config: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    if provider not in {"codex", "claude"}:
+        raise StoreError("Agent provider is invalid.")
+    value = dict(config or {})
+    allowed = (
+        {"model", "effort", "sandbox"}
+        if provider == "codex"
+        else {"model", "effort", "permission_mode"}
+    )
+    if not set(value).issubset(allowed):
+        raise StoreError("Agent provider configuration has unknown fields.")
+    model = value.get("model")
+    if model is not None and (
+        not isinstance(model, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,99}", model)
+    ):
+        raise StoreError("Agent model is invalid.")
+    effort = value.get("effort")
+    efforts = (
+        {"low", "medium", "high", "xhigh", "max", "ultra"}
+        if provider == "codex"
+        else {"low", "medium", "high", "xhigh", "max"}
+    )
+    if effort is not None and (
+        not isinstance(effort, str) or effort not in efforts
+    ):
+        raise StoreError(f"Agent effort is invalid for {provider}.")
+    if provider == "codex":
+        sandbox = value.get("sandbox")
+        if sandbox is not None and (
+            not isinstance(sandbox, str)
+            or sandbox
+            not in {"read-only", "workspace-write", "danger-full-access"}
+        ):
+            raise StoreError("Codex sandbox is invalid.")
+    else:
+        permission_mode = value.get("permission_mode")
+        if permission_mode is not None and (
+            not isinstance(permission_mode, str)
+            or permission_mode
+            not in {
+                "acceptEdits",
+                "auto",
+                "bypassPermissions",
+                "dontAsk",
+                "plan",
+            }
+        ):
+            raise StoreError("Claude permission mode is invalid.")
+    return value
+
+
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
 
@@ -2751,7 +2806,7 @@ class DurableStore:
         dispatch_agent_id: Optional[str] = None,
         dispatch_message: Optional[str] = None,
         clarification_options: Optional[list[str]] = None,
-        project_creation_plan: Optional[dict[str, str]] = None,
+        project_creation_plan: Optional[dict[str, Any]] = None,
         now: Optional[float] = None,
     ) -> None:
         if not preview_text or len(preview_text) > 3800:
@@ -2767,7 +2822,14 @@ class DurableStore:
         if project_creation_plan is not None and (
             tool_name != "create_project_agent"
             or set(project_creation_plan)
-            != {"slug", "display_name", "provider", "project_path", "topic_name"}
+            != {
+                "slug",
+                "display_name",
+                "provider",
+                "project_path",
+                "topic_name",
+                "provider_config",
+            }
         ):
             raise StoreError("Router project-creation plan is invalid.")
         timestamp = time.time() if now is None else float(now)
@@ -3100,6 +3162,7 @@ class DurableStore:
         chat_id: int,
         message_thread_id: Optional[int],
         project_slug: str,
+        provider_config: Optional[dict[str, Any]] = None,
         now: Optional[float] = None,
     ) -> tuple[ManagedAgent, bool]:
         project = self.resolve_project(project_slug)
@@ -3126,6 +3189,14 @@ class DurableStore:
             )
             if actual != expected:
                 raise StoreError("This topic is attached to a different project.")
+            if (
+                provider_config is not None
+                and agent.provider_config
+                != validate_provider_config(agent.provider, provider_config)
+            ):
+                raise StoreError(
+                    "This project agent already uses different model settings."
+                )
             return agent, False
         if (binding.target_type, binding.target_id) != ("controller", "control"):
             raise StoreError("Project topic is not eligible for agent creation.")
@@ -3135,6 +3206,7 @@ class DurableStore:
             slug=project.slug,
             provider=project.provider,
             project_path=project.project_path,
+            provider_config=provider_config,
             now=now,
         )
 
@@ -3403,6 +3475,7 @@ class DurableStore:
         slug: str,
         provider: str,
         project_path: str,
+        provider_config: Optional[dict[str, Any]] = None,
         now: Optional[float] = None,
     ) -> tuple[ManagedAgent, bool]:
         if (
@@ -3418,6 +3491,7 @@ class DurableStore:
             raise StoreError("Agent provider is invalid.")
         if not project_path or not Path(project_path).is_absolute():
             raise StoreError("Agent project path must be absolute.")
+        normalized_config = validate_provider_config(provider, provider_config)
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -3455,6 +3529,13 @@ class DurableStore:
                 if actual != expected:
                     raise StoreError(
                         "Project surface is already registered to another agent."
+                    )
+                if (
+                    provider_config is not None
+                    and existing.provider_config != normalized_config
+                ):
+                    raise StoreError(
+                        "Project agent already uses different model settings."
                     )
                 self.connection.execute("COMMIT")
                 return existing, False
@@ -3504,10 +3585,10 @@ class DurableStore:
                     agent_id, parent_agent_id, role, slug,
                     hierarchical_name, provider, project_path,
                     provider_session_id, surface_binding_id,
-                    lifecycle_state, created_at, updated_at
+                    lifecycle_state, provider_config_json, created_at, updated_at
                 )
                 VALUES (?, ?, 'project', ?, ?, ?, ?, NULL, ?,
-                    'registered', ?, ?)
+                    'registered', ?, ?, ?)
                 """,
                 (
                     agent_id,
@@ -3517,6 +3598,11 @@ class DurableStore:
                     provider,
                     project_path,
                     binding.binding_id,
+                    json.dumps(
+                        normalized_config,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
                     timestamp,
                     timestamp,
                 ),
@@ -3560,6 +3646,68 @@ class DurableStore:
             agent = self._managed_agent_from_row(row)
             self.connection.execute("COMMIT")
             return agent, True
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def configure_agent_provider(
+        self,
+        agent_id: str,
+        updates: dict[str, Optional[str]],
+        now: Optional[float] = None,
+    ) -> ManagedAgent:
+        if not updates or not set(updates).issubset({"model", "effort"}):
+            raise StoreError("Agent model configuration update is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            if row is None or str(row["role"]) not in {"project", "worker"}:
+                raise StoreError("Managed project or worker agent was not found.")
+            agent = self._managed_agent_from_row(row)
+            busy = self.connection.execute(
+                """
+                SELECT 1 FROM agent_mailbox
+                WHERE agent_id = ? AND state = 'leased'
+                UNION ALL
+                SELECT 1 FROM agent_consoles
+                WHERE agent_id = ? AND state IN ('starting', 'running')
+                LIMIT 1
+                """,
+                (agent_id, agent_id),
+            ).fetchone()
+            if busy is not None:
+                raise StoreError(
+                    "Wait for the active agent turn or console before reconfiguring it."
+                )
+            config = dict(agent.provider_config)
+            for key, value in updates.items():
+                if value is None:
+                    config.pop(key, None)
+                else:
+                    config[key] = value
+            config = validate_provider_config(agent.provider, config)
+            self.connection.execute(
+                """
+                UPDATE agents
+                SET provider_config_json = ?, updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (
+                    json.dumps(config, separators=(",", ":"), sort_keys=True),
+                    timestamp,
+                    agent_id,
+                ),
+            )
+            updated = self.connection.execute(
+                "SELECT * FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+            return self._managed_agent_from_row(updated)
         except BaseException:
             self.connection.execute("ROLLBACK")
             raise

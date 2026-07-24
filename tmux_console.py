@@ -111,6 +111,11 @@ def open_agent_console(
         model = agent.provider_config.get("model")
         if model:
             command.extend(["--model", str(model)])
+        effort = agent.provider_config.get("effort")
+        if effort:
+            command.extend(
+                ["--config", f'model_reasoning_effort="{effort}"']
+            )
         command.append(agent.provider_session_id)
     else:
         permission_mode = str(
@@ -134,6 +139,9 @@ def open_agent_console(
         model = agent.provider_config.get("model")
         if model:
             command.extend(["--model", str(model)])
+        effort = agent.provider_config.get("effort")
+        if effort:
+            command.extend(["--effort", str(effort)])
     try:
         result = subprocess.run(
             [

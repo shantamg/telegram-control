@@ -232,6 +232,15 @@ controller validates that provider and shows it in the existing confirmation
 card before enrolling the repository, creating its topic, or attaching its
 agent.
 
+Model and effort are also conversational, durable agent settings. A creation
+request can name them directly, and an existing project agent can be updated
+with a request such as `Use gpt-5.6-sol with high effort for TC`. Omitted
+settings retain the provider default; explicit `null` resets a setting. The
+controller validates provider-specific effort levels, refuses invented model
+strings, carries the settings through structured and tmux turns, and displays
+them in `/agent`. Subjective requests such as “use the best model” are routed
+to clarification instead of silently choosing a potentially expensive model.
+
 The live console test passed on July 23, 2026. The real Codex TUI resumed the
 same conversation in tmux, `/agent` reported `Console: running`, and a Telegram
 turn remained queued until `console-close`. It then completed on its first
@@ -349,7 +358,7 @@ escaped transcript display, main-router work, and the final routed response.
 The router session, validation, clarification, confirmation, and project-agent
 relay rules are identical for text and voice input.
 
-The router contract has a repeatable eight-case quality gate covering every
+The router contract has a repeatable nine-case quality gate covering every
 controller tool. The offline run validates the fixtures and parser without
 calling a model:
 
@@ -366,8 +375,7 @@ without changing the bot's durable router session:
 
 Pass `--model MODEL` to compare a candidate model. A router or model change is
 ready only when all cases pass. The default model passed 6/6 on July 23, 2026,
-then passed the expanded 8/8 gate after aliases were added, with individual
-cold-session decisions taking 5.2–10.0 seconds.
+then 8/8 after aliases and 9/9 after model/effort configuration was added.
 
 The earlier strict `route`, `clarify`, or `reject` schema remains as a compact
 classification and evaluation primitive. It is not intended to become a

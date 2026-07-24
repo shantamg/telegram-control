@@ -31,6 +31,7 @@ from durable_store import (
     OutboxMessage,
     RouterMailboxJob,
     StoreError,
+    validate_provider_config,
 )
 
 
@@ -428,10 +429,17 @@ def project_creation_proposal(
     store: DurableStore,
     user_input: str,
     arguments: dict[str, Any],
-) -> tuple[str, Optional[dict[str, str]]]:
+) -> tuple[str, Optional[dict[str, Any]]]:
     project_reference = str(arguments["project"]).strip()
     topic_name = arguments.get("topic_name")
     requested_provider = arguments.get("provider")
+    model = arguments.get("model")
+    effort = arguments.get("effort")
+    for label, value in (("model", model), ("effort", effort)):
+        if isinstance(value, str) and not alias_appears_in_input(value, user_input):
+            raise StoreError(
+                f"The requested {label} must appear explicitly in the user's request."
+            )
     enrolled = store.resolve_project(project_reference)
     if enrolled is not None:
         if requested_provider is not None and requested_provider != enrolled.provider:
@@ -489,16 +497,27 @@ def project_creation_proposal(
         if isinstance(topic_name, str) and topic_name.strip()
         else display_name
     )
+    provider_config = {
+        key: value
+        for key, value in (("model", model), ("effort", effort))
+        if isinstance(value, str)
+    }
+    provider_config = validate_provider_config(provider, provider_config)
     plan = {
         "slug": slug,
         "display_name": display_name,
         "provider": provider,
         "project_path": project_path,
         "topic_name": resolved_topic,
+        "provider_config": provider_config,
     }
+    model_text = str(provider_config.get("model", "provider default"))
+    effort_text = str(provider_config.get("effort", "provider default"))
     return (
         f"Create a managed project agent for {display_name}?\n\n"
         f"Provider: {provider}\n"
+        f"Model: {model_text}\n"
+        f"Effort: {effort_text}\n"
         f"Telegram topic: {resolved_topic}\n\n"
         "The controller validated the Git repository. Nothing will be "
         "created until you confirm.",
@@ -621,6 +640,43 @@ def process_router_mailbox_job(
                 store,
                 job.input_text,
                 call.arguments,
+            )
+        elif call.tool == "configure_agent":
+            project = store.resolve_project(
+                str(call.arguments["project_slug"])
+            )
+            if project is None:
+                raise StoreError("The selected project is not enrolled.")
+            target = store.resolve_project_agent(project.slug)
+            if target is None:
+                raise StoreError(
+                    "The selected project has no active managed agent."
+                )
+            updates = {
+                key: call.arguments[key]
+                for key in ("model", "effort")
+                if key in call.arguments
+            }
+            for label, value in updates.items():
+                if (
+                    isinstance(value, str)
+                    and not alias_appears_in_input(value, job.input_text)
+                ):
+                    raise StoreError(
+                        f"The requested {label} must appear explicitly in "
+                        "the user's request."
+                    )
+            configured = store.configure_agent_provider(
+                target.agent_id,
+                updates,
+            )
+            response_text = (
+                f"✅ Updated {project.display_name}\n\n"
+                f"Provider: {configured.provider}\n"
+                f"Model: "
+                f"{configured.provider_config.get('model', 'provider default')}\n"
+                f"Effort: "
+                f"{configured.provider_config.get('effort', 'provider default')}"
             )
         elif call.tool == "set_project_alias":
             alias = str(call.arguments["alias"])

@@ -33,14 +33,29 @@
   },
   {
     "name": "create_project_agent",
-    "input": "Add the Git project at /tmp/example-project with a Claude agent.",
+    "input": "Add /tmp/example-project with Claude Sonnet at high effort.",
     "expected_tool": "create_project_agent",
     "sample_output": {
       "tool": "create_project_agent",
       "arguments": {
         "project": "/tmp/example-project",
         "topic_name": "Example Project",
-        "provider": "claude"
+        "provider": "claude",
+        "model": "sonnet",
+        "effort": "high"
+      }
+    }
+  },
+  {
+    "name": "configure_agent",
+    "input": "Use gpt-5.6-sol with high effort for telegram-control.",
+    "expected_tool": "configure_agent",
+    "sample_output": {
+      "tool": "configure_agent",
+      "arguments": {
+        "project_slug": "telegram-control",
+        "model": "gpt-5.6-sol",
+        "effort": "high"
       }
     }
   },

@@ -125,14 +125,18 @@ class RouterContractTests(unittest.TestCase):
         self.assertTrue(call.requires_confirmation)
         self.assertEqual(call.arguments["project"], "~/Code/new-project")
         self.assertIsNone(call.arguments["provider"])
+        self.assertIsNone(call.arguments["model"])
+        self.assertIsNone(call.arguments["effort"])
 
         claude = parse_router_tool_call(
             '{"tool":"create_project_agent","arguments":{'
             '"project":"/tmp/new-project","topic_name":"New Project",'
-            '"provider":"claude"}}',
+            '"provider":"claude","model":"sonnet","effort":"high"}}',
             {"telegram-control"},
         )
         self.assertEqual(claude.arguments["provider"], "claude")
+        self.assertEqual(claude.arguments["model"], "sonnet")
+        self.assertEqual(claude.arguments["effort"], "high")
         with self.assertRaisesRegex(RouterContractError, "provider"):
             parse_router_tool_call(
                 '{"tool":"create_project_agent","arguments":{'
@@ -140,6 +144,27 @@ class RouterContractTests(unittest.TestCase):
                 '"provider":"invented"}}',
                 {"telegram-control"},
             )
+
+    def test_configure_agent_tool_supports_patch_and_reset(self):
+        configured = parse_router_tool_call(
+            '{"tool":"configure_agent","arguments":{'
+            '"project_slug":"telegram-control","model":"gpt-5.6-sol",'
+            '"effort":"high"}}',
+            {"telegram-control"},
+        )
+        self.assertEqual(configured.arguments["model"], "gpt-5.6-sol")
+        self.assertEqual(configured.arguments["effort"], "high")
+        self.assertFalse(configured.requires_confirmation)
+
+        reset = parse_router_tool_call(
+            '{"tool":"configure_agent","arguments":{'
+            '"project_slug":"telegram-control","effort":null}}',
+            {"telegram-control"},
+        )
+        self.assertEqual(
+            reset.arguments,
+            {"project_slug": "telegram-control", "effort": None},
+        )
 
     def test_alias_tools_are_strict_and_alias_dispatch_is_canonicalized(self):
         call = parse_router_tool_call(

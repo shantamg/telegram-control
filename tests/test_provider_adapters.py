@@ -153,15 +153,17 @@ class ClaudeEventTests(unittest.TestCase):
                 **self.agent.__dict__,
                 "provider_config": {
                     "model": "sonnet",
+                    "effort": "high",
                     "permission_mode": "acceptEdits",
                 },
             }
         )
         resumed = adapter.command(configured, "session-123")
-        self.assertEqual(
-            resumed[-4:],
-            ["--model", "sonnet", "--resume", "session-123"],
-        )
+        self.assertIn("--model", resumed)
+        self.assertIn("sonnet", resumed)
+        self.assertIn("--effort", resumed)
+        self.assertIn("high", resumed)
+        self.assertEqual(resumed[-2:], ["--resume", "session-123"])
         self.assertIn("acceptEdits", resumed)
 
         invalid = ManagedAgent(

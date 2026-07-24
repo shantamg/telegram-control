@@ -197,6 +197,7 @@ class CodexExecAdapter:
         if not agent.project_path:
             raise ProviderAdapterError("Codex agent has no project path.")
         model = agent.provider_config.get("model")
+        effort = agent.provider_config.get("effort")
         sandbox = str(agent.provider_config.get("sandbox", "workspace-write"))
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
@@ -211,6 +212,10 @@ class CodexExecAdapter:
             ]
             if model:
                 command.extend(["--model", str(model)])
+            if effort:
+                command.extend(
+                    ["--config", f'model_reasoning_effort="{effort}"']
+                )
             command.extend([persisted_session, "-"])
         else:
             command = [
@@ -226,6 +231,10 @@ class CodexExecAdapter:
             ]
             if model:
                 command.extend(["--model", str(model)])
+            if effort:
+                command.extend(
+                    ["--config", f'model_reasoning_effort="{effort}"']
+                )
             command.append("-")
         effective_prompt = prompt
         if recovery:
@@ -356,6 +365,9 @@ class ClaudePrintAdapter:
         model = agent.provider_config.get("model")
         if model:
             command.extend(["--model", str(model)])
+        effort = agent.provider_config.get("effort")
+        if effort:
+            command.extend(["--effort", str(effort)])
         if persisted_session:
             command.extend(["--resume", persisted_session])
         return command

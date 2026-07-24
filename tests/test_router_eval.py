@@ -13,6 +13,7 @@ class RouterEvaluationTests(unittest.TestCase):
                 "inspect_project",
                 "send_to_agent",
                 "create_project_agent",
+                "configure_agent",
                 "set_project_alias",
                 "remove_project_alias",
                 "ask_user",

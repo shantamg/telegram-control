@@ -367,7 +367,12 @@ def send_agent_status() -> None:
     usage_line = ""
     if usage is not None:
         input_tokens = int(usage.get("input_tokens", 0))
-        cached_tokens = int(usage.get("cached_input_tokens", 0))
+        cached_tokens = int(
+            usage.get(
+                "cached_input_tokens",
+                usage.get("cache_read_input_tokens", 0),
+            )
+        )
         output_tokens = int(usage.get("output_tokens", 0))
         usage_line = (
             "\nLast turn: "
@@ -379,6 +384,8 @@ def send_agent_status() -> None:
         f"Name: {agent.hierarchical_name}\n"
         f"Role: {agent.role}\n"
         f"Provider: {agent.provider}\n"
+        f"Model: {agent.provider_config.get('model', 'provider default')}\n"
+        f"Effort: {agent.provider_config.get('effort', 'provider default')}\n"
         f"Project: {project_name}\n"
         f"State: {agent.lifecycle_state}\n"
         f"Session: {session}\n"
@@ -623,6 +630,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "provider",
             "project_path",
             "topic_name",
+            "provider_config",
         }
         if not required.issubset(action.payload):
             raise StoreError("Stored project-creation plan is invalid.")
@@ -646,6 +654,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         slug = str(action.payload["slug"])
         display_name = str(action.payload["display_name"])
         provider = str(action.payload["provider"])
+        provider_config = action.payload["provider_config"]
+        if not isinstance(provider_config, dict):
+            raise StoreError("Stored provider configuration is invalid.")
         topic_name = str(action.payload["topic_name"])
         with DurableStore(Path(database_path)) as store:
             store.enroll_project(
@@ -697,6 +708,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     else project_thread_id
                 ),
                 slug,
+                provider_config=provider_config,
             )
         send_message(
             f"✅ Created {agent.hierarchical_name} in the "

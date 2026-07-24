@@ -61,8 +61,22 @@ CONTROLLER_TOOLS = (
             "project": "string",
             "topic_name": "string|null",
             "provider": "codex|claude|null",
+            "model": "string|null",
+            "effort": "low|medium|high|xhigh|max|ultra|null",
         },
         "confirmation": True,
+    },
+    {
+        "name": "configure_agent",
+        "description": (
+            "Set or clear the model or effort for an existing project agent."
+        ),
+        "arguments": {
+            "project_slug": "string",
+            "model": "string|null (optional)",
+            "effort": "string|null (optional)",
+        },
+        "confirmation": False,
     },
     {
         "name": "set_project_alias",
@@ -130,7 +144,9 @@ def build_main_agent_prompt(
         "validates every argument and enforces confirmation for consequential "
         "tools. Never invent a tool, project, path, or completed result.\n\n"
         "When a user names an alias, return the canonical project slug shown "
-        "in the catalog.\n\n"
+        "in the catalog. Preserve explicit provider, model, and effort choices. "
+        "If the user asks for a subjective choice such as best, fastest, or "
+        "cheapest without naming a model, use ask_user rather than guessing.\n\n"
         f"Tools:\n{json.dumps(CONTROLLER_TOOLS, separators=(',', ':'), sort_keys=True)}"
         f"\n\nProjects:\n{json.dumps(catalog, separators=(',', ':'), sort_keys=True)}"
         f"\n\nAgents:\n{json.dumps(states, separators=(',', ':'), sort_keys=True)}"
@@ -185,9 +201,10 @@ def parse_router_tool_call(
             "message": _bounded_string(arguments, "message", 8000),
         }
     elif tool == "create_project_agent":
-        if set(arguments) not in (
-            {"project", "topic_name"},
-            {"project", "topic_name", "provider"},
+        required = {"project", "topic_name"}
+        optional = {"provider", "model", "effort"}
+        if not required.issubset(arguments) or not set(arguments).issubset(
+            required | optional
         ):
             raise RouterContractError(
                 "create_project_agent arguments are invalid."
@@ -202,11 +219,66 @@ def parse_router_tool_call(
         provider = arguments.get("provider")
         if provider is not None and provider not in {"codex", "claude"}:
             raise RouterContractError("Tool argument 'provider' is invalid.")
+        model = arguments.get("model")
+        if model is not None and (
+            not isinstance(model, str)
+            or not model.strip()
+            or len(model) > 100
+        ):
+            raise RouterContractError("Tool argument 'model' is invalid.")
+        effort = arguments.get("effort")
+        if effort is not None and effort not in {
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+        }:
+            raise RouterContractError("Tool argument 'effort' is invalid.")
         normalized = {
             "project": _bounded_string(arguments, "project", 1000),
             "topic_name": topic_name.strip() if isinstance(topic_name, str) else None,
             "provider": provider,
+            "model": model.strip() if isinstance(model, str) else None,
+            "effort": effort,
         }
+    elif tool == "configure_agent":
+        if (
+            "project_slug" not in arguments
+            or not ({"model", "effort"} & set(arguments))
+            or not set(arguments).issubset({"project_slug", "model", "effort"})
+        ):
+            raise RouterContractError("configure_agent arguments are invalid.")
+        project_slug = _bounded_string(arguments, "project_slug", 64)
+        alias_key = " ".join(project_slug.casefold().split())
+        project_slug = (project_aliases or {}).get(alias_key, project_slug)
+        if project_slug not in allowed_project_slugs:
+            raise RouterContractError("configure_agent selected an unknown project.")
+        normalized = {"project_slug": project_slug}
+        if "model" in arguments:
+            model = arguments.get("model")
+            if model is not None and (
+                not isinstance(model, str)
+                or not model.strip()
+                or len(model) > 100
+            ):
+                raise RouterContractError("Tool argument 'model' is invalid.")
+            normalized["model"] = (
+                model.strip() if isinstance(model, str) else None
+            )
+        if "effort" in arguments:
+            effort = arguments.get("effort")
+            if effort is not None and effort not in {
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+                "ultra",
+            }:
+                raise RouterContractError("Tool argument 'effort' is invalid.")
+            normalized["effort"] = effort
     elif tool == "set_project_alias":
         if set(arguments) != {"project_slug", "alias"}:
             raise RouterContractError("set_project_alias arguments are invalid.")

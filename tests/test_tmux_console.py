@@ -102,6 +102,7 @@ class TmuxConsoleTests(unittest.TestCase):
             provider="claude",
             provider_config={
                 "model": "sonnet",
+                "effort": "high",
                 "permission_mode": "acceptEdits",
             },
         )
@@ -117,6 +118,8 @@ class TmuxConsoleTests(unittest.TestCase):
         self.assertIn("acceptEdits", command)
         self.assertIn("--model", command)
         self.assertIn("sonnet", command)
+        self.assertIn("--effort", command)
+        self.assertIn("high", command)
 
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=True)
     def test_unmanaged_name_collision_fails_closed(self, _has_session):

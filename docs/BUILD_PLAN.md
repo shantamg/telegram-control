@@ -927,14 +927,15 @@ The Stage 4 router-contract and durable-routing slices pass 88 offline tests:
   conversational alias changes require the alias to appear explicitly in the
   current user message, and dispatch always resolves aliases to canonical
   project slugs;
-- a versioned eight-case router fixture suite covers every controller tool and
+- a versioned eight-case router fixture suite covers every Stage 4 controller
+  tool and
   can run either fully offline or through isolated live Codex sessions without
   mutating the durable router conversation;
 - the default Codex model passed the initial live benchmark 6/6 and the
   alias-expanded benchmark 8/8 on July 23, 2026, with the expanded cold-session
   decisions taking 5.2–10.0 seconds each.
 
-The first Stage 5 provider-adapter slice passes 92 offline tests:
+The first Stage 5 provider-adapter slice passes 94 offline tests:
 
 - Claude Code implements the same provider-neutral structured turn contract as
   Codex, using stream-JSON output and durable session UUIDs;
@@ -948,9 +949,14 @@ The first Stage 5 provider-adapter slice passes 92 offline tests:
   logical agent reservation and persisted provider session;
 - conversational project creation can explicitly select `codex` or `claude`,
   and still requires the existing validated confirmation;
+- model and effort are durable per-agent configuration, can be supplied during
+  conversational creation or changed later through `configure_agent`, flow
+  through structured and tmux sessions, and appear in `/agent`;
+- exact model and effort values must be explicit in the current request;
+  subjective choices cause clarification instead of controller invention;
 - a live adapter-level Claude probe completed two turns using the same session
-  UUID, and the Codex router benchmark still passed 8/8 after provider
-  selection was added.
+  UUID, and the Codex router benchmark passed the expanded 9/9 gate after
+  provider/model/effort selection was added.
 
 ## References
 
