@@ -1,0 +1,533 @@
+#!/usr/bin/python3
+"""A small, dependency-free Telegram bridge for macOS."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import http.client
+import json
+import os
+import plistlib
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Optional
+
+
+APP_NAME = "telegram-bridge"
+KEYCHAIN_TOKEN_SERVICE = "telegram-bridge-bot-token"
+LAUNCH_AGENT_LABEL = "local.telegram-bridge"
+CONFIG_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
+CONFIG_PATH = CONFIG_DIR / "config.json"
+STATE_PATH = CONFIG_DIR / "offset"
+LOG_DIR = Path.home() / "Library" / "Logs"
+PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+SCRIPT_PATH = Path(__file__).resolve()
+DEFAULT_HANDLER_PATH = SCRIPT_PATH.with_name("on_message.py")
+
+
+class BridgeError(RuntimeError):
+    pass
+
+
+def clean_and_validate_token(raw_token: str) -> str:
+    # Some terminals can include bracketed-paste or keyboard escape sequences
+    # in hidden input. Remove complete ANSI escape sequences before validating.
+    token = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|.)", "", raw_token).strip()
+    if not re.fullmatch(r"\d{6,15}:[A-Za-z0-9_-]{30,100}", token):
+        raise BridgeError(
+            "The pasted value is not a valid Telegram bot token. "
+            "Copy the replacement token directly from BotFather and try again."
+        )
+    return token
+
+
+def keychain_account() -> str:
+    return getpass.getuser()
+
+
+def read_token() -> str:
+    result = subprocess.run(
+        [
+            "/usr/bin/security",
+            "find-generic-password",
+            "-a",
+            keychain_account(),
+            "-s",
+            KEYCHAIN_TOKEN_SERVICE,
+            "-w",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise BridgeError("Telegram bot token is not in Keychain. Run the setup command first.")
+    token = result.stdout.strip()
+    if not token:
+        raise BridgeError("The Telegram bot token stored in Keychain is empty.")
+    return token
+
+
+def store_token(token: str) -> None:
+    # The token is never written to disk or printed. macOS's security tool requires
+    # the secret as an argument when updating a generic-password item.
+    result = subprocess.run(
+        [
+            "/usr/bin/security",
+            "add-generic-password",
+            "-U",
+            "-a",
+            keychain_account(),
+            "-s",
+            KEYCHAIN_TOKEN_SERVICE,
+            "-w",
+            token,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise BridgeError("Could not save the Telegram bot token in macOS Keychain.")
+
+
+def api_call(token: str, method: str, **params: Any) -> Any:
+    encoded_params: dict[str, str] = {}
+    for key, value in params.items():
+        if value is None:
+            continue
+        encoded_params[key] = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
+
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/{method}",
+        data=urllib.parse.urlencode(encoded_params).encode("utf-8"),
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=70) as response:
+            payload = json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            error_payload = json.loads(exc.read().decode("utf-8"))
+            description = error_payload.get("description", "Telegram rejected the request.")
+        except (ValueError, UnicodeDecodeError):
+            description = "Telegram rejected the request."
+        raise BridgeError(description) from None
+    except (urllib.error.URLError, http.client.InvalidURL):
+        raise BridgeError("Could not reach Telegram. Check this Mac's internet connection.") from None
+
+    if not payload.get("ok"):
+        raise BridgeError(payload.get("description", "Telegram API request failed."))
+    return payload["result"]
+
+
+def download_telegram_file(file_id: str, destination: Path, max_bytes: int = 20_000_000) -> None:
+    """Download a Telegram file without exposing the bot token to child processes."""
+    token = read_token()
+    file_info = api_call(token, "getFile", file_id=file_id)
+    file_size = int(file_info.get("file_size", 0))
+    if file_size > max_bytes:
+        raise BridgeError(
+            f"Telegram file is {file_size / 1_000_000:.1f} MB; "
+            f"the configured limit is {max_bytes / 1_000_000:.0f} MB."
+        )
+
+    file_path = file_info.get("file_path")
+    if not file_path:
+        raise BridgeError("Telegram did not provide a download path for this file.")
+    quoted_path = urllib.parse.quote(str(file_path), safe="/")
+    request = urllib.request.Request(
+        f"https://api.telegram.org/file/bot{token}/{quoted_path}",
+        method="GET",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=70) as response:
+            content_length = int(response.headers.get("Content-Length", 0))
+            if content_length > max_bytes:
+                raise BridgeError(
+                    f"Telegram file is {content_length / 1_000_000:.1f} MB; "
+                    f"the configured limit is {max_bytes / 1_000_000:.0f} MB."
+                )
+            downloaded = 0
+            with destination.open("wb") as output_file:
+                while True:
+                    chunk = response.read(64 * 1024)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        raise BridgeError("Telegram file exceeded the configured download limit.")
+                    output_file.write(chunk)
+    except BridgeError:
+        raise
+    except urllib.error.HTTPError:
+        raise BridgeError("Telegram rejected the file download request.") from None
+    except (urllib.error.URLError, http.client.InvalidURL):
+        raise BridgeError("Could not download the Telegram file.") from None
+    except OSError:
+        raise BridgeError("Could not save the Telegram file temporarily.") from None
+
+
+def ensure_private_file(path: Path) -> None:
+    path.chmod(0o600)
+
+
+def load_config() -> dict[str, Any]:
+    try:
+        with CONFIG_PATH.open(encoding="utf-8") as config_file:
+            return json.load(config_file)
+    except FileNotFoundError:
+        raise BridgeError("Telegram bridge is not paired. Run the setup command first.") from None
+    except (OSError, ValueError):
+        raise BridgeError(f"Could not read configuration at {CONFIG_PATH}.") from None
+
+
+def save_config(config: dict[str, Any]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    temporary_path = CONFIG_PATH.with_suffix(".tmp")
+    with temporary_path.open("w", encoding="utf-8") as config_file:
+        json.dump(config, config_file, indent=2)
+        config_file.write("\n")
+    ensure_private_file(temporary_path)
+    temporary_path.replace(CONFIG_PATH)
+    ensure_private_file(CONFIG_PATH)
+
+
+def read_offset() -> Optional[int]:
+    try:
+        return int(STATE_PATH.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+
+
+def save_offset(offset: int) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    temporary_path = STATE_PATH.with_suffix(".tmp")
+    temporary_path.write_text(f"{offset}\n", encoding="utf-8")
+    ensure_private_file(temporary_path)
+    temporary_path.replace(STATE_PATH)
+    ensure_private_file(STATE_PATH)
+
+
+def describe_message(message: dict[str, Any]) -> str:
+    sender = message.get("from", {})
+    name = " ".join(
+        part for part in (sender.get("first_name", ""), sender.get("last_name", "")) if part
+    )
+    username = sender.get("username")
+    identity = name or "Unknown user"
+    if username:
+        identity += f" (@{username})"
+    return f"{identity}, chat ID {message.get('chat', {}).get('id')}"
+
+
+def setup_command(_: argparse.Namespace) -> None:
+    print("Create a bot in Telegram first:")
+    print("  1. Open https://t.me/BotFather")
+    print("  2. Send /newbot and follow the prompts")
+    print("  3. Copy the token BotFather gives you")
+    print()
+
+    token = clean_and_validate_token(
+        getpass.getpass("Paste the replacement bot token (input is hidden): ")
+    )
+    if not token:
+        raise BridgeError("No token entered.")
+
+    bot = api_call(token, "getMe")
+    bot_username = bot.get("username", "")
+    print(f"Token verified for @{bot_username}.")
+    store_token(token)
+
+    # Long polling and webhooks are mutually exclusive.
+    api_call(token, "deleteWebhook", drop_pending_updates=False)
+    print(f"Open https://t.me/{bot_username}, tap Start, and send the bot: pair")
+    input("Press Return here after sending it... ")
+
+    print("Waiting for your private message...")
+    deadline = time.monotonic() + 120
+    detected: list[dict[str, Any]] = []
+    highest_update_id: Optional[int] = None
+    while time.monotonic() < deadline and not detected:
+        updates = api_call(
+            token,
+            "getUpdates",
+            timeout=20,
+            allowed_updates=["message"],
+        )
+        for update in updates:
+            highest_update_id = max(highest_update_id or 0, int(update["update_id"]))
+            message = update.get("message")
+            if message and message.get("chat", {}).get("type") == "private":
+                detected.append(message)
+
+    if not detected:
+        raise BridgeError("No private message arrived within two minutes. Run setup again.")
+
+    unique_chats: dict[int, dict[str, Any]] = {}
+    for message in detected:
+        unique_chats[int(message["chat"]["id"])] = message
+    choices = list(unique_chats.values())
+
+    if len(choices) == 1:
+        selected = choices[0]
+        answer = input(f"Pair with {describe_message(selected)}? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            raise BridgeError("Pairing cancelled.")
+    else:
+        print("Choose the private chat to authorize:")
+        for index, message in enumerate(choices, start=1):
+            print(f"  {index}. {describe_message(message)}")
+        try:
+            selected = choices[int(input("Number: ").strip()) - 1]
+        except (ValueError, IndexError):
+            raise BridgeError("Invalid selection; pairing cancelled.") from None
+
+    config = {
+        "chat_id": int(selected["chat"]["id"]),
+        "bot_username": bot_username,
+        "handler_path": str(DEFAULT_HANDLER_PATH),
+    }
+    save_config(config)
+    if highest_update_id is not None:
+        save_offset(highest_update_id + 1)
+
+    print("Paired successfully.")
+    print(f"Test computer → phone: {SCRIPT_PATH} send 'Hello from my Mac'")
+    print(f"Test phone → computer: {SCRIPT_PATH} listen")
+    print(f"Install background listener: {SCRIPT_PATH} install")
+
+
+def send_command(args: argparse.Namespace) -> None:
+    config = load_config()
+    token = read_token()
+    if args.text:
+        text = " ".join(args.text)
+    elif not sys.stdin.isatty():
+        text = sys.stdin.read()
+    else:
+        raise BridgeError("Provide message text as arguments or pipe it on standard input.")
+    text = text.strip()
+    if not text:
+        raise BridgeError("Message text is empty.")
+    api_call(token, "sendMessage", chat_id=config["chat_id"], text=text)
+    print("Message sent.")
+
+
+def handler_command(handler_path: Path) -> list[str]:
+    if handler_path.suffix == ".py":
+        return [sys.executable, str(handler_path)]
+    if not os.access(handler_path, os.X_OK):
+        raise BridgeError(f"Handler is not executable: {handler_path}")
+    return [str(handler_path)]
+
+
+def process_update(config: dict[str, Any], update: dict[str, Any]) -> None:
+    message = update.get("message")
+    if not message:
+        return
+
+    chat = message.get("chat", {})
+    if chat.get("type") != "private" or int(chat.get("id", 0)) != int(config["chat_id"]):
+        print(f"Ignored an unauthorized chat (update {update['update_id']}).", flush=True)
+        return
+
+    handler_path = Path(config["handler_path"]).expanduser().resolve()
+    if not handler_path.is_file():
+        raise BridgeError(f"Handler does not exist: {handler_path}")
+
+    sender = message.get("from", {})
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "TELEGRAM_CHAT_ID": str(chat["id"]),
+            "TELEGRAM_MESSAGE_ID": str(message.get("message_id", "")),
+            "TELEGRAM_TEXT": str(message.get("text", "")),
+            "TELEGRAM_FROM_ID": str(sender.get("id", "")),
+            "TELEGRAM_FROM_USERNAME": str(sender.get("username", "")),
+        }
+    )
+    result = subprocess.run(
+        handler_command(handler_path),
+        input=json.dumps(update),
+        text=True,
+        env=environment,
+    )
+    if result.returncode != 0:
+        raise BridgeError(f"Handler exited with status {result.returncode}.")
+
+
+def listen_command(_: argparse.Namespace) -> None:
+    config = load_config()
+    token = read_token()
+    offset = read_offset()
+    print(
+        f"Listening as @{config.get('bot_username', 'unknown')} "
+        f"for paired chat {config['chat_id']}.",
+        flush=True,
+    )
+
+    while True:
+        try:
+            updates = api_call(
+                token,
+                "getUpdates",
+                offset=offset,
+                timeout=50,
+                allowed_updates=["message"],
+            )
+            for update in updates:
+                next_offset = int(update["update_id"]) + 1
+                try:
+                    process_update(config, update)
+                except BridgeError as exc:
+                    print(f"Update {update['update_id']}: {exc}", file=sys.stderr, flush=True)
+                finally:
+                    offset = next_offset
+                    save_offset(offset)
+        except BridgeError as exc:
+            print(f"{exc} Retrying in 5 seconds.", file=sys.stderr, flush=True)
+            time.sleep(5)
+
+
+def launchctl(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/bin/launchctl", *arguments],
+        capture_output=True,
+        text=True,
+        check=check,
+    )
+
+
+def install_command(args: argparse.Namespace) -> None:
+    config = load_config()
+    read_token()
+
+    if args.handler:
+        handler_path = Path(args.handler).expanduser().resolve()
+        if not handler_path.is_file():
+            raise BridgeError(f"Handler does not exist: {handler_path}")
+        handler_command(handler_path)
+        config["handler_path"] = str(handler_path)
+        save_config(config)
+
+    handler_path = Path(config["handler_path"]).expanduser().resolve()
+    if not handler_path.is_file():
+        raise BridgeError(f"Handler does not exist: {handler_path}")
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    plist = {
+        "Label": LAUNCH_AGENT_LABEL,
+        "ProgramArguments": [sys.executable, str(SCRIPT_PATH), "listen"],
+        "WorkingDirectory": str(SCRIPT_PATH.parent),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ProcessType": "Background",
+        "StandardOutPath": str(LOG_DIR / f"{APP_NAME}.log"),
+        "StandardErrorPath": str(LOG_DIR / f"{APP_NAME}.error.log"),
+    }
+    with PLIST_PATH.open("wb") as plist_file:
+        plistlib.dump(plist, plist_file)
+    ensure_private_file(PLIST_PATH)
+
+    domain = f"gui/{os.getuid()}"
+    launchctl("bootout", domain, str(PLIST_PATH), check=False)
+    result = launchctl("bootstrap", domain, str(PLIST_PATH), check=False)
+    if result.returncode != 0:
+        raise BridgeError(result.stderr.strip() or "launchctl could not install the listener.")
+    launchctl("kickstart", "-k", f"{domain}/{LAUNCH_AGENT_LABEL}", check=False)
+    print("Background listener installed and started.")
+    print(f"Handler: {config['handler_path']}")
+    print(f"Logs: {LOG_DIR / f'{APP_NAME}.log'}")
+    print(f"Errors: {LOG_DIR / f'{APP_NAME}.error.log'}")
+
+
+def uninstall_command(_: argparse.Namespace) -> None:
+    domain = f"gui/{os.getuid()}"
+    launchctl("bootout", domain, str(PLIST_PATH), check=False)
+    if PLIST_PATH.exists():
+        PLIST_PATH.unlink()
+    print("Background listener removed. Pairing and the Keychain token were kept.")
+
+
+def status_command(_: argparse.Namespace) -> None:
+    try:
+        config = load_config()
+        paired = f"yes (chat {config['chat_id']}, @{config.get('bot_username', 'unknown')})"
+        handler = config.get("handler_path", "not configured")
+    except BridgeError:
+        paired = "no"
+        handler = "not configured"
+    try:
+        read_token()
+        token_present = "yes"
+    except BridgeError:
+        token_present = "no"
+
+    domain = f"gui/{os.getuid()}"
+    result = launchctl("print", f"{domain}/{LAUNCH_AGENT_LABEL}", check=False)
+    listener = "running/loaded" if result.returncode == 0 else "not loaded"
+    print(f"Paired: {paired}")
+    print(f"Token in Keychain: {token_present}")
+    print(f"Listener: {listener}")
+    print(f"Handler: {handler}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Send and receive Telegram messages from this Mac."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    setup_parser = subparsers.add_parser("setup", help="Store the bot token and pair your chat.")
+    setup_parser.set_defaults(function=setup_command)
+
+    send_parser = subparsers.add_parser("send", help="Send a Telegram message to your phone.")
+    send_parser.add_argument("text", nargs="*", help="Text to send; stdin is used when omitted.")
+    send_parser.set_defaults(function=send_command)
+
+    listen_parser = subparsers.add_parser("listen", help="Listen in the foreground.")
+    listen_parser.set_defaults(function=listen_command)
+
+    install_parser = subparsers.add_parser(
+        "install", help="Install and start the macOS background listener."
+    )
+    install_parser.add_argument(
+        "--handler",
+        help="Executable or Python script to run for each authorized incoming message.",
+    )
+    install_parser.set_defaults(function=install_command)
+
+    uninstall_parser = subparsers.add_parser(
+        "uninstall", help="Remove the macOS background listener."
+    )
+    uninstall_parser.set_defaults(function=uninstall_command)
+
+    status_parser = subparsers.add_parser("status", help="Show bridge status without secrets.")
+    status_parser.set_defaults(function=status_command)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        args.function(args)
+        return 0
+    except KeyboardInterrupt:
+        print("\nStopped.", file=sys.stderr)
+        return 130
+    except BridgeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

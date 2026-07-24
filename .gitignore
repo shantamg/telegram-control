@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Local environments
+.venv/
+venv/
+
+# Editors and macOS
+.DS_Store
+*.swp
+
+# Credentials and local runtime state
+.env
+.env.*
+!.env.example
+*.token
+*.secret
+config.json
+offset
+state/
+data/
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# Audio and generated output
+*.ogg
+*.oga
+*.wav
+*.mp3
+*.m4a
+logs/
