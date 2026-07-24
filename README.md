@@ -79,6 +79,12 @@ The active installation was migrated to the durable controller on July 23,
 workers, preserved the polling offset and queue state, and successfully
 processed a new Telegram message after restart.
 
+A full reboot/login test also passed on July 23, 2026. launchd started the
+durable supervisor and all three workers automatically after login. A brief
+post-boot network failure was retried automatically, and the first Telegram
+message after reboot was committed, handled, and delivered without a queue
+retry.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

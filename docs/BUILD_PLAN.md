@@ -653,8 +653,13 @@ July 23, 2026. The supervisor recreated the collector, inbox worker, and outbox
 sender; the database and polling offset survived; and a post-restart Telegram
 message was committed and delivered on its first attempt.
 
-The remaining activation checkpoint is a full reboot/login reconciliation
-test.
+The full reboot/login reconciliation test passed on July 23, 2026. launchd
+started the supervisor and all three workers after login, retained the database
+and polling offset, recovered from one brief post-boot Telegram network error,
+and committed and delivered a new message on its first queue attempts.
+
+This completes the Stage 1 activation checkpoint. Stage 2 buttons, topics, and
+durable return routing are next.
 
 ## References
 
