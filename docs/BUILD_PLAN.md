@@ -1323,9 +1323,10 @@ context after a topic has become a subject.
 
 ### Lightweight execution and agent-update checkpoint
 
-The controller keeps one queue per persisted agent but now supervises three
+The controller keeps one queue per persisted agent but now supervises eight
 agent workers, allowing different topic agents to execute concurrently while
-preserving single-writer ordering within each conversation. Managed Codex
+preserving single-writer ordering within each conversation. The pool is
+configurable from 1 through 16. Managed Codex
 agents default to `danger-full-access` with approval policy `never`; managed
 Claude agents default to `bypassPermissions` with
 `--dangerously-skip-permissions`. The global router remains read-only.

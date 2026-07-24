@@ -43,7 +43,8 @@ from durable_store import (
 
 DATABASE_PATH = bridge.CONFIG_DIR / "controller.sqlite3"
 SCRIPT_PATH = Path(__file__).resolve()
-DEFAULT_AGENT_WORKERS = 3
+DEFAULT_AGENT_WORKERS = 8
+MAX_AGENT_WORKERS = 16
 ROUTER_MAX_COMPLETED_TURNS = 12
 ROUTER_MAX_INPUT_TOKENS = 180_000
 ROUTER_MAX_DISCOVERY_STEPS = 6
@@ -1950,8 +1951,10 @@ def supervisor_commands(
     agent_workers: int = DEFAULT_AGENT_WORKERS,
 ) -> list[list[str]]:
     count = int(agent_workers)
-    if count < 1 or count > 8:
-        raise StoreError("Agent worker count must be between 1 and 8.")
+    if count < 1 or count > MAX_AGENT_WORKERS:
+        raise StoreError(
+            f"Agent worker count must be between 1 and {MAX_AGENT_WORKERS}."
+        )
     base = [sys.executable, str(SCRIPT_PATH), "--db", str(database_path)]
     commands = [
         [*base, "collect"],
@@ -2439,7 +2442,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument(
         "--agent-workers",
         type=int,
-        choices=range(1, 9),
+        choices=range(1, MAX_AGENT_WORKERS + 1),
         default=DEFAULT_AGENT_WORKERS,
         help=(
             "Managed-agent turns to run concurrently across distinct agents "

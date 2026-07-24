@@ -4392,12 +4392,12 @@ class DurableIntegrationTests(unittest.TestCase):
         self.assertTrue(plist["RunAtLoad"])
         self.assertTrue(plist["KeepAlive"])
 
-    def test_supervisor_runs_three_distinct_agent_workers_by_default(self):
+    def test_supervisor_runs_eight_distinct_agent_workers_by_default(self):
         commands = telegram_control.supervisor_commands(
             telegram_control.DATABASE_PATH
         )
         roles = [command[-1] for command in commands]
-        self.assertEqual(roles.count("work-agents"), 3)
+        self.assertEqual(roles.count("work-agents"), 8)
         self.assertEqual(
             roles,
             [
@@ -4407,13 +4407,23 @@ class DurableIntegrationTests(unittest.TestCase):
                 "work-agents",
                 "work-agents",
                 "work-agents",
+                "work-agents",
+                "work-agents",
+                "work-agents",
+                "work-agents",
+                "work-agents",
                 "send-outbox",
             ],
         )
-        with self.assertRaisesRegex(StoreError, "between 1 and 8"):
+        with self.assertRaisesRegex(StoreError, "between 1 and 16"):
             telegram_control.supervisor_commands(
                 telegram_control.DATABASE_PATH,
                 0,
+            )
+        with self.assertRaisesRegex(StoreError, "between 1 and 16"):
+            telegram_control.supervisor_commands(
+                telegram_control.DATABASE_PATH,
+                17,
             )
 
     def test_control_message_enters_durable_router_mailbox(self):

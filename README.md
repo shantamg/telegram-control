@@ -194,10 +194,11 @@ to `acceptEdits`, `auto`, `dontAsk`, or `plan` for a more restrictive agent.
 The explicit tmux console can resume either a Codex or Claude session without
 changing its logical agent identity.
 
-Three supervised agent workers may lease different agents concurrently. The
+Eight supervised agent workers may lease different agents concurrently. The
 mailbox still serializes turns for each individual agent, so two topics can
 work at once without allowing two processes to mutate the same persisted
-conversation concurrently.
+conversation concurrently. The foreground `run --agent-workers` option accepts
+1 through 16 when a different local resource limit is appropriate.
 
 Each accepted agent turn immediately sends a compact `⏳ Working…` receipt.
 For normal
