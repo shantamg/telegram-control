@@ -283,6 +283,12 @@ delivery.
 - Add exponential network retry instead of a fixed tight loop.
 - Start the collector, worker, sender, and reconciler as supervised processes
   or one small supervisor with separately observable loops.
+- The deployed supervisor also runs a daily topic-maintenance reconciler.
+  Because the Bot API does not emit ordinary topic-deletion updates or expose
+  a read-only topic lookup, it sends and immediately deletes a silent invisible
+  probe. It retires local routes only after Telegram explicitly reports the
+  topic missing. Ambiguous failures fail closed, active work defers cleanup,
+  and ordinary Telegram deletion remains the primary user workflow.
 - Use atomic database transactions; never store critical state only in memory.
 - Add a startup self-check for Keychain, database integrity, free disk space,
   Handy, ffmpeg, Codex, Claude, and tmux.

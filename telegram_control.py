@@ -45,12 +45,20 @@ DATABASE_PATH = bridge.CONFIG_DIR / "controller.sqlite3"
 SCRIPT_PATH = Path(__file__).resolve()
 DEFAULT_AGENT_WORKERS = 8
 MAX_AGENT_WORKERS = 16
+TOPIC_PROBE_INTERVAL_SECONDS = 24 * 60 * 60
+TOPIC_PROBE_BATCH_SIZE = 100
+TOPIC_PROBE_TEXT = "\u2063"
 ROUTER_MAX_COMPLETED_TURNS = 12
 ROUTER_MAX_INPUT_TOKENS = 180_000
 ROUTER_MAX_DISCOVERY_STEPS = 6
 ROUTER_MAX_DISCOVERY_REFS = 40
 ROUTER_MAX_LOOP_SECONDS = 240.0
 CONTROL_SPEAKER = "🎛 Control"
+MISSING_TOPIC_ERROR_MARKERS = (
+    "message thread not found",
+    "topic_id_invalid",
+    "topic id invalid",
+)
 
 
 def control_message(text: str) -> str:
@@ -1946,6 +1954,151 @@ def send_outbox_command(args: argparse.Namespace) -> None:
                 return
 
 
+def telegram_reports_missing_topic(error: str) -> bool:
+    """Recognize only Telegram's definitive missing-topic responses."""
+    normalized = " ".join(str(error).casefold().split())
+    return any(marker in normalized for marker in MISSING_TOPIC_ERROR_MARKERS)
+
+
+def probe_due_topics_once(
+    store: DurableStore,
+    token: str,
+    *,
+    interval_seconds: float = TOPIC_PROBE_INTERVAL_SECONDS,
+    batch_size: int = TOPIC_PROBE_BATCH_SIZE,
+    now: Optional[float] = None,
+) -> dict[str, int]:
+    """Reconcile active local routes against Telegram topic existence.
+
+    Telegram's Bot API has no read-only topic lookup, and no-op topic edits
+    return success even for nonexistent IDs. A silent invisible message is
+    therefore sent to each due topic and deleted immediately. Only an
+    explicit missing-thread response retires local state. Permission, network,
+    closed-topic, malformed-result, and all other failures remain
+    inconclusive.
+    """
+    timestamp = time.time() if now is None else float(now)
+    counts = {"probed": 0, "alive": 0, "retired": 0, "deferred": 0}
+    candidates = store.list_due_topic_probes(
+        now=timestamp,
+        interval_seconds=interval_seconds,
+        limit=batch_size,
+    )
+    for candidate in candidates:
+        counts["probed"] += 1
+        try:
+            result = bridge.api_call(
+                token,
+                "sendMessage",
+                chat_id=candidate.chat_id,
+                message_thread_id=candidate.message_thread_id,
+                text=TOPIC_PROBE_TEXT,
+                disable_notification=True,
+                protect_content=True,
+            )
+        except bridge.BridgeError as exc:
+            error = str(exc)
+            if telegram_reports_missing_topic(error):
+                retired = store.retire_missing_topic(
+                    candidate.binding_id,
+                    reason=error,
+                    now=timestamp,
+                )
+                counts["retired" if retired else "deferred"] += 1
+                log_event(
+                    "topic_probe_missing",
+                    binding_id=candidate.binding_id,
+                    chat_id=candidate.chat_id,
+                    message_thread_id=candidate.message_thread_id,
+                    retired=retired,
+                )
+            else:
+                store.record_topic_probe(
+                    candidate.binding_id,
+                    error=error,
+                    now=timestamp,
+                )
+                counts["deferred"] += 1
+                log_event(
+                    "topic_probe_result",
+                    binding_id=candidate.binding_id,
+                    chat_id=candidate.chat_id,
+                    message_thread_id=candidate.message_thread_id,
+                    result="inconclusive",
+                )
+        else:
+            probe_message_id = (
+                int(result["message_id"])
+                if isinstance(result, dict)
+                and isinstance(result.get("message_id"), int)
+                else None
+            )
+            if probe_message_id is None:
+                error = "Telegram returned no message ID for the topic probe."
+                store.record_topic_probe(
+                    candidate.binding_id,
+                    error=error,
+                    now=timestamp,
+                )
+                counts["deferred"] += 1
+                log_event(
+                    "topic_probe_result",
+                    binding_id=candidate.binding_id,
+                    chat_id=candidate.chat_id,
+                    message_thread_id=candidate.message_thread_id,
+                    result="inconclusive",
+                )
+                continue
+            cleanup_error = None
+            try:
+                bridge.api_call(
+                    token,
+                    "deleteMessage",
+                    chat_id=candidate.chat_id,
+                    message_id=probe_message_id,
+                )
+            except bridge.BridgeError as exc:
+                # The successful send already proved that the topic exists.
+                # Record a possible orphaned invisible probe for diagnostics.
+                cleanup_error = (
+                    f"Topic exists, but its probe message could not be "
+                    f"deleted: {exc}"
+                )
+            store.record_topic_probe(
+                candidate.binding_id,
+                error=cleanup_error,
+                now=timestamp,
+            )
+            counts["alive"] += 1
+            log_event(
+                "topic_probe_result",
+                binding_id=candidate.binding_id,
+                chat_id=candidate.chat_id,
+                message_thread_id=candidate.message_thread_id,
+                result="alive",
+                probe_deleted=cleanup_error is None,
+            )
+    return counts
+
+
+def maintain_topics_command(args: argparse.Namespace) -> None:
+    """Periodically retire routes for topics deleted directly in Telegram."""
+    token = bridge.read_token()
+    with open_store(args.db) as store:
+        while True:
+            counts = probe_due_topics_once(
+                store,
+                token,
+                interval_seconds=args.interval_seconds,
+                batch_size=args.batch_size,
+            )
+            if counts["probed"]:
+                log_event("topic_maintenance_cycle", **counts)
+            if args.once:
+                return
+            time.sleep(args.idle_sleep)
+
+
 def supervisor_commands(
     database_path: Path,
     agent_workers: int = DEFAULT_AGENT_WORKERS,
@@ -1962,6 +2115,7 @@ def supervisor_commands(
         [*base, "work-router"],
     ]
     commands.extend([*base, "work-agents"] for _ in range(count))
+    commands.append([*base, "maintain-topics"])
     commands.append([*base, "send-outbox"])
     return commands
 
@@ -2435,6 +2589,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_loop_arguments(outbox_parser, lease_seconds=90)
     outbox_parser.set_defaults(function=send_outbox_command)
+
+    topic_maintenance_parser = subparsers.add_parser(
+        "maintain-topics",
+        help="Retire controller routes for topics deleted directly in Telegram.",
+    )
+    topic_maintenance_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Probe one due batch and exit.",
+    )
+    topic_maintenance_parser.add_argument(
+        "--interval-seconds",
+        type=float,
+        default=TOPIC_PROBE_INTERVAL_SECONDS,
+        help="Minimum seconds between existence checks for a topic.",
+    )
+    topic_maintenance_parser.add_argument(
+        "--batch-size",
+        type=int,
+        choices=range(1, 1001),
+        default=TOPIC_PROBE_BATCH_SIZE,
+        help="Maximum topics checked in one maintenance cycle.",
+    )
+    topic_maintenance_parser.add_argument(
+        "--idle-sleep",
+        type=float,
+        default=5 * 60,
+        help="Seconds between checks for newly due topics.",
+    )
+    topic_maintenance_parser.set_defaults(function=maintain_topics_command)
 
     run_parser = subparsers.add_parser(
         "run", help="Run collector, inbox worker, and outbox sender."

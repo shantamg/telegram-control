@@ -4428,6 +4428,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 "work-agents",
                 "work-agents",
                 "work-agents",
+                "maintain-topics",
                 "send-outbox",
             ],
         )

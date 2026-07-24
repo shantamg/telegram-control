@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 CONTROL_SPEAKER = "🎛 Control"
 
@@ -98,6 +98,14 @@ class SurfaceBinding:
     target_type: str
     target_id: str
     state: str
+
+
+@dataclass(frozen=True)
+class TopicProbe:
+    binding_id: int
+    chat_id: int
+    message_thread_id: int
+    display_name: str
 
 
 @dataclass(frozen=True)
@@ -891,6 +899,26 @@ MIGRATION_19 = (
     """,
 )
 
+MIGRATION_20 = (
+    # The Bot API does not emit ordinary topic-deletion updates. A supervised
+    # maintenance loop therefore sends and immediately deletes a silent,
+    # invisible probe periodically and records its schedule here. Only a
+    # definitive "thread not found" result retires local routing metadata;
+    # all other Telegram failures fail closed.
+    """
+    ALTER TABLE surface_bindings
+    ADD COLUMN last_probe_at REAL
+    """,
+    """
+    ALTER TABLE surface_bindings
+    ADD COLUMN last_probe_error TEXT
+    """,
+    """
+    CREATE INDEX surface_bindings_probe
+    ON surface_bindings(state, message_thread_id, last_probe_at, updated_at)
+    """,
+)
+
 
 ROUTER_INPUT_LIMIT = 8_000
 REPLY_QUOTE_LIMIT = 1_000
@@ -1275,6 +1303,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 19
                 self.connection.execute("PRAGMA user_version = 19")
+            if current < 20:
+                for statement in MIGRATION_20:
+                    self.connection.execute(statement)
+                current = 20
+                self.connection.execute("PRAGMA user_version = 20")
             # Referential integrity is audited before the commit so a failed
             # check rolls the whole migration back instead of stranding an
             # upgraded-but-broken database.
@@ -3096,6 +3129,223 @@ class DurableStore:
             (int(chat_id),),
         ).fetchall()
         return [self._surface_binding_from_row(row) for row in rows]
+
+    def list_due_topic_probes(
+        self,
+        *,
+        now: Optional[float] = None,
+        interval_seconds: float = 24 * 60 * 60,
+        limit: int = 100,
+    ) -> list[TopicProbe]:
+        """Return active Telegram topics whose quiet existence check is due."""
+        timestamp = time.time() if now is None else float(now)
+        interval = float(interval_seconds)
+        if interval <= 0:
+            raise StoreError("Topic probe interval must be positive.")
+        count = int(limit)
+        if count < 1 or count > 1000:
+            raise StoreError("Topic probe batch size must be between 1 and 1000.")
+        cutoff = timestamp - interval
+        rows = self.connection.execute(
+            """
+            SELECT binding_id, chat_id, message_thread_id, display_name
+            FROM surface_bindings
+            WHERE state = 'active' AND message_thread_id != 0
+                AND COALESCE(last_probe_at, updated_at) <= ?
+            ORDER BY COALESCE(last_probe_at, updated_at), binding_id
+            LIMIT ?
+            """,
+            (cutoff, count),
+        ).fetchall()
+        return [
+            TopicProbe(
+                binding_id=int(row["binding_id"]),
+                chat_id=int(row["chat_id"]),
+                message_thread_id=int(row["message_thread_id"]),
+                display_name=str(row["display_name"]),
+            )
+            for row in rows
+        ]
+
+    def record_topic_probe(
+        self,
+        binding_id: int,
+        *,
+        error: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Record one conclusive-live or inconclusive topic probe."""
+        timestamp = time.time() if now is None else float(now)
+        message = str(error)[:1000] if error else None
+        cursor = self.connection.execute(
+            """
+            UPDATE surface_bindings
+            SET last_probe_at = ?, last_probe_error = ?
+            WHERE binding_id = ? AND state = 'active'
+                AND message_thread_id != 0
+            """,
+            (timestamp, message, int(binding_id)),
+        )
+        return cursor.rowcount == 1
+
+    def retire_missing_topic(
+        self,
+        binding_id: int,
+        *,
+        reason: str,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Retire local routing after Telegram definitively reports deletion.
+
+        Historical transport rows remain as an audit trail, but the active
+        surface, callbacks, replies, status card, subject, and resumable
+        provider pointer are all revoked atomically. A queued/running turn or
+        console defers retirement rather than racing active work.
+        """
+        timestamp = time.time() if now is None else float(now)
+        explanation = str(reason).strip()[:1000]
+        if not explanation:
+            raise StoreError("Missing-topic retirement requires a reason.")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT b.*, a.agent_id
+                FROM surface_bindings AS b
+                LEFT JOIN agents AS a ON a.surface_binding_id = b.binding_id
+                WHERE b.binding_id = ?
+                """,
+                (int(binding_id),),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["state"]) != "active"
+                or int(row["message_thread_id"]) == 0
+            ):
+                self.connection.execute("COMMIT")
+                return False
+            agent_id = (
+                str(row["agent_id"])
+                if row["agent_id"] is not None
+                else None
+            )
+            if agent_id is not None:
+                busy = self.connection.execute(
+                    """
+                    SELECT 1
+                    FROM agent_mailbox
+                    WHERE agent_id = ? AND state IN ('queued', 'leased')
+                    UNION ALL
+                    SELECT 1
+                    FROM agent_consoles
+                    WHERE agent_id = ? AND state IN ('starting', 'running')
+                    LIMIT 1
+                    """,
+                    (agent_id, agent_id),
+                ).fetchone()
+                if busy is not None:
+                    self.connection.execute(
+                        """
+                        UPDATE surface_bindings
+                        SET last_probe_at = ?, last_probe_error = ?
+                        WHERE binding_id = ?
+                        """,
+                        (
+                            timestamp,
+                            "Telegram reports this topic missing; cleanup is "
+                            "waiting for active work to finish.",
+                            int(binding_id),
+                        ),
+                    )
+                    self.connection.execute("COMMIT")
+                    return False
+
+            chat_id = int(row["chat_id"])
+            thread_id = int(row["message_thread_id"])
+            self.connection.execute(
+                """
+                UPDATE callback_actions
+                SET state = 'expired', updated_at = ?
+                WHERE chat_id = ? AND message_thread_id = ?
+                    AND state = 'active'
+                """,
+                (timestamp, chat_id, thread_id),
+            )
+            self.connection.execute(
+                """
+                UPDATE telegram_message_routes
+                SET state = 'revoked', updated_at = ?
+                WHERE chat_id = ? AND message_thread_id = ?
+                    AND state = 'active'
+                """,
+                (timestamp, chat_id, thread_id),
+            )
+            self.connection.execute(
+                """
+                UPDATE surface_cards
+                SET state = 'stale', updated_at = ?
+                WHERE binding_id = ? AND state != 'stale'
+                """,
+                (timestamp, int(binding_id)),
+            )
+            self.connection.execute(
+                """
+                UPDATE forum_subjects
+                SET state = 'archived', updated_at = ?
+                WHERE surface_binding_id = ? AND state = 'active'
+                """,
+                (timestamp, int(binding_id)),
+            )
+            if agent_id is not None:
+                self.connection.execute(
+                    """
+                    UPDATE agents
+                    SET lifecycle_state = 'stopped',
+                        provider_session_id = NULL, updated_at = ?
+                    WHERE agent_id = ?
+                    """,
+                    (timestamp, agent_id),
+                )
+            self.connection.execute(
+                """
+                UPDATE surface_bindings
+                SET state = 'revoked', last_probe_at = ?,
+                    last_probe_error = ?, updated_at = ?
+                WHERE binding_id = ? AND state = 'active'
+                """,
+                (
+                    timestamp,
+                    explanation,
+                    timestamp,
+                    int(binding_id),
+                ),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('telegram_topic_retired', 'surface', ?, ?, ?)
+                """,
+                (
+                    str(int(binding_id)),
+                    json.dumps(
+                        {
+                            "chat_id": chat_id,
+                            "message_thread_id": thread_id,
+                            "reason": explanation,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                ),
+            )
+            self.connection.execute("COMMIT")
+            return True
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _forum_workspace_from_row(row: sqlite3.Row) -> ForumWorkspace:

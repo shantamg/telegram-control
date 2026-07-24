@@ -586,6 +586,27 @@ Live setup:
    subject; later requests continue the same Codex session. Send `/status` in
    that topic to inspect or control its managed agent.
 
+Topics may be deleted normally in Telegram; no controller-specific delete
+command is required. The durable supervisor includes a `maintain-topics` loop
+that checks each active topic at most once per day. The Bot API has no
+read-only topic lookup, so the check sends one silent invisible message and
+deletes it immediately. Telegram's explicit `message thread not found` (or
+equivalent invalid-topic response) atomically revokes the topic route,
+callbacks, reply routes, and status card, archives a forum subject, stops its
+managed agent, and forgets the controller's resumable provider-session
+pointer. Historical inbox/outbox and event rows remain as a compact audit
+trail. Network failures, permission errors, closed topics, and all ambiguous
+responses leave the binding active and retry on a later cycle; active agent
+work or a running console also defers cleanup. A crash in the narrow interval
+between the probe send and delete may leave an empty, silent message, which is
+recorded for diagnosis rather than risking deletion of a valid topic. The
+maintenance process starts and restarts with the same LaunchAgent-backed
+supervisor as the rest of Telegram Control. For a one-time diagnostic run:
+
+```sh
+/usr/bin/python3 telegram_control.py maintain-topics --once
+```
+
 Replies that legitimately remain with the main router (receipts, direct
 responses, relayed continuation chunks, fallback deliveries) now carry bounded
 reply context, for voice replies exactly as for text; voice status edits
