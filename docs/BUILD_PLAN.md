@@ -1234,20 +1234,25 @@ Remaining release work:
    adapter deadline, worker crashes recover through leases, transient failures
    replace the live card with a retry state, and terminal failures replace it
    with an actionable error; no separate watchdog actor is needed.
-3. Add adoption of discoverable existing Codex sessions, voice replies, and
+3. Add adoption of discoverable existing Codex and Claude sessions, voice replies, and
    status presentation polish. Session adoption is explicit and
    confirmation-gated: `/agent` can list a bounded set of recent persisted
-   Codex sessions whose recorded working directory exactly matches the topic
+   provider sessions whose recorded working directory exactly matches the topic
    agent. The controller revalidates the selection and requires an idle
    mailbox, a stopped managed console, and exclusive ownership before changing
    only that agent's provider-session pointer. Controller-created sessions and
    sessions already attached elsewhere are omitted. This resumes persisted
-   context; it deliberately does not claim that a concurrently active Codex
-   window can be seized or steered through a second app-server process.
-   Discovery and confirmation revalidation use capped date traversal, file
-   counts, metadata bytes, index bytes/lines, and wall time so accumulated
-   Codex history cannot monopolize the Telegram inbox worker. Dormant-session
-   adoption has passed a live context-continuity test. The first voice-output
+   context; it deliberately does not claim that a concurrently active Codex or
+   Claude window can be seized through a second provider process. Discovery
+   and confirmation revalidation use capped directory traversal, file counts,
+   metadata bytes, index bytes/lines, and wall time so accumulated provider
+   history cannot monopolize the Telegram inbox worker. `/agent` also supports
+   a confirmation-gated switch between Codex and Claude for an idle topic.
+   The old conversation remains persisted locally, while the new provider
+   starts fresh unless the user explicitly adopts one of its existing
+   sessions. Dormant Codex-session adoption has passed a live
+   context-continuity test; Claude parity is implemented and awaiting the same
+   live acceptance check. The first voice-output
    slice is implemented as on-demand **Listen** / **Replay** controls with
    durable `sendVoice`, text fallback, bounded private speech files, and
    cleanup; live playback and reply-route verification remain before choosing

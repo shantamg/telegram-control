@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import claude_sessions
 import codex_sessions
 import discovery
 import router_contract
@@ -431,17 +432,38 @@ def send_agent_status() -> None:
                 ttl_seconds=15 * 60,
             )
             resume_session_action = None
-            if agent.provider == "codex":
+            if agent.provider in {"codex", "claude"}:
                 resume_session_action = store.create_callback_action(
                     operation_id=f"inbox:{job_id}:agent-resume-session-picker",
                     action_type="agent_resume_session_picker",
-                    payload={"agent_id": agent.agent_id},
+                    payload={
+                        "agent_id": agent.agent_id,
+                        "provider": agent.provider,
+                    },
                     chat_id=chat_id,
                     message_thread_id=thread_id,
                     authorized_user_id=int(user_id),
                     one_time=True,
                     ttl_seconds=15 * 60,
                 )
+            other_provider = "claude" if agent.provider == "codex" else "codex"
+            other_provider_name = (
+                "Claude" if other_provider == "claude" else "Codex"
+            )
+            switch_provider_action = store.create_callback_action(
+                operation_id=f"inbox:{job_id}:agent-switch-provider-prompt",
+                action_type="agent_switch_provider_prompt",
+                payload={
+                    "agent_id": agent.agent_id,
+                    "expected_provider": agent.provider,
+                    "provider": other_provider,
+                },
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=int(user_id),
+                one_time=True,
+                ttl_seconds=15 * 60,
+            )
             keyboard = {
                 "inline_keyboard": [
                     [
@@ -468,6 +490,14 @@ def send_agent_status() -> None:
                         if resume_session_action is not None
                         else []
                     ),
+                    [
+                        {
+                            "text": f"Switch to {other_provider_name}…",
+                            "callback_data": (
+                                f"a:{switch_provider_action.token}"
+                            ),
+                        }
+                    ],
                 ]
             }
     if agent is None:
@@ -1885,6 +1915,121 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             )
         send_message(result_text + " Send /agent to inspect or change it.")
         return
+    if action.action_type == "agent_switch_provider_prompt":
+        agent_id = str(action.payload.get("agent_id", ""))
+        provider = str(action.payload.get("provider", ""))
+        expected_provider = str(action.payload.get("expected_provider", ""))
+        if (
+            provider not in {"codex", "claude"}
+            or expected_provider not in {"codex", "claude"}
+            or provider == expected_provider
+        ):
+            raise StoreError("Provider switch selection is invalid.")
+        try:
+            with DurableStore(Path(database_path)) as store:
+                bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+                if bound_agent is None or bound_agent.agent_id != agent_id:
+                    raise StoreError("Managed agent surface changed.")
+                if bound_agent.provider != expected_provider:
+                    raise StoreError("Managed agent provider changed.")
+                confirm = store.create_callback_action(
+                    operation_id=(
+                        f"callback:{update['update_id']}:"
+                        "agent-switch-provider-confirm"
+                    ),
+                    action_type="agent_switch_provider_confirm",
+                    payload={
+                        "agent_id": agent_id,
+                        "expected_provider": expected_provider,
+                        "provider": provider,
+                    },
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    authorized_user_id=user_id,
+                    one_time=True,
+                    ttl_seconds=5 * 60,
+                )
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        provider_name = "Claude" if provider == "claude" else "Codex"
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Confirmation required.",
+                },
+                "callback-answer",
+            )
+        send_message(
+            f"Switch this topic to {provider_name}?\n\n"
+            f"The existing {expected_provider.title()} conversation remains "
+            "persisted locally. The next message will start a fresh "
+            f"{provider_name} conversation; you can also choose one of its "
+            "existing sessions afterward.",
+            reply_markup={
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": f"Confirm switch to {provider_name}",
+                            "callback_data": f"a:{confirm.token}",
+                        }
+                    ]
+                ]
+            },
+        )
+        return
+    if action.action_type == "agent_switch_provider_confirm":
+        agent_id = str(action.payload.get("agent_id", ""))
+        provider = str(action.payload.get("provider", ""))
+        expected_provider = str(action.payload.get("expected_provider", ""))
+        try:
+            with DurableStore(Path(database_path)) as store:
+                bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+                if bound_agent is None or bound_agent.agent_id != agent_id:
+                    raise StoreError("Managed agent surface changed.")
+                switched = store.switch_agent_provider(
+                    agent_id,
+                    provider,
+                    expected_provider,
+                )
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        provider_name = "Claude" if switched.provider == "claude" else "Codex"
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": f"Switched to {provider_name}.",
+                },
+                "callback-answer",
+            )
+        send_message(
+            f"✅ This topic now uses {provider_name}. Its next message will "
+            "start a fresh conversation."
+        )
+        return
     if action.action_type == "agent_new_session_prompt":
         agent_id = str(action.payload.get("agent_id", ""))
         with DurableStore(Path(database_path)) as store:
@@ -1967,18 +2112,24 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         return
     if action.action_type == "agent_resume_session_picker":
         agent_id = str(action.payload.get("agent_id", ""))
+        provider = str(action.payload.get("provider", ""))
         with DurableStore(Path(database_path)) as store:
             bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
             if bound_agent is None or bound_agent.agent_id != agent_id:
                 raise StoreError("Managed agent surface changed.")
-            if bound_agent.provider != "codex":
-                raise StoreError("Only Codex sessions can be resumed here.")
+            if bound_agent.provider != provider or provider not in {"codex", "claude"}:
+                raise StoreError("Managed agent provider changed.")
+            provider_name = "Claude" if provider == "claude" else "Codex"
+            session_source = (
+                claude_sessions if provider == "claude" else codex_sessions
+            )
             working_directory = (
                 bound_agent.working_directory or bound_agent.project_path
             )
             if not working_directory:
                 raise StoreError("Managed agent has no working directory.")
             used_session_ids = store.registered_provider_session_ids(
+                provider=provider,
                 excluding_agent_id=agent_id
             )
             if bound_agent.provider_session_id:
@@ -1991,7 +2142,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 snapshot_operation_id
             )
             if snapshot is None:
-                discovered = codex_sessions.discover_sessions(
+                discovered = session_source.discover_sessions(
                     working_directory,
                     excluded_session_ids=used_session_ids,
                 )
@@ -2000,6 +2151,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     action_type="agent_resume_session_snapshot",
                     payload={
                         "agent_id": agent_id,
+                        "provider": provider,
                         "candidates": [
                             {
                                 "provider_session_id": candidate.session_id,
@@ -2018,7 +2170,10 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 snapshot_operation_id,
                 "agent_resume_session_snapshot",
             )
-            if snapshot.payload.get("agent_id") != agent_id:
+            if (
+                snapshot.payload.get("agent_id") != agent_id
+                or snapshot.payload.get("provider") != provider
+            ):
                 raise StoreError("Persisted session picker snapshot is invalid.")
             candidates = snapshot.payload.get("candidates")
             if not isinstance(candidates, list) or len(candidates) > 5:
@@ -2034,7 +2189,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 )
                 candidate_label = str(candidate.get("label", ""))
                 if (
-                    codex_sessions.SESSION_ID_PATTERN.fullmatch(
+                    session_source.SESSION_ID_PATTERN.fullmatch(
                         candidate_session_id
                     )
                     is None
@@ -2053,6 +2208,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     action_type="agent_resume_session_prompt",
                     payload={
                         "agent_id": agent_id,
+                        "provider": provider,
                         "provider_session_id": candidate_session_id,
                         "candidate_label": candidate_label,
                     },
@@ -2085,20 +2241,22 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             )
         if not candidates:
             send_message(
-                "No other persisted Codex sessions were found for this "
+                f"No other persisted {provider_name} sessions were found for this "
                 "topic’s working directory."
             )
             return
         send_message(
-            "Resume a persisted Codex session\n\n"
+            f"Resume a persisted {provider_name} session\n\n"
             "Choose a recent session from this exact working directory. "
             "This can resume a closed or dormant session; it cannot safely "
-            "take control of a turn that is still running in another Codex window.",
+            f"take control of a turn that is still running in another "
+            f"{provider_name} window.",
             reply_markup={"inline_keyboard": buttons},
         )
         return
     if action.action_type == "agent_resume_session_prompt":
         agent_id = str(action.payload.get("agent_id", ""))
+        provider = str(action.payload.get("provider", ""))
         provider_session_id = str(
             action.payload.get("provider_session_id", "")
         )
@@ -2110,6 +2268,15 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
                 if bound_agent is None or bound_agent.agent_id != agent_id:
                     raise StoreError("Managed agent surface changed.")
+                if (
+                    bound_agent.provider != provider
+                    or provider not in {"codex", "claude"}
+                ):
+                    raise StoreError("Managed agent provider changed.")
+                provider_name = "Claude" if provider == "claude" else "Codex"
+                session_source = (
+                    claude_sessions if provider == "claude" else codex_sessions
+                )
                 confirm_operation_id = (
                     f"callback:{update['update_id']}:"
                     "agent-resume-session-confirm"
@@ -2123,7 +2290,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                         or bound_agent.project_path
                     )
                     candidate = (
-                        codex_sessions.resolve_session(
+                        session_source.resolve_session(
                             provider_session_id,
                             working_directory,
                         )
@@ -2140,6 +2307,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                         action_type="agent_resume_session_confirm",
                         payload={
                             "agent_id": agent_id,
+                            "provider": provider,
                             "provider_session_id": candidate.session_id,
                             "candidate_label": candidate_label,
                             "expected_provider_session_id": (
@@ -2154,6 +2322,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     )
                 if (
                     confirm.payload.get("agent_id") != agent_id
+                    or confirm.payload.get("provider") != provider
                     or confirm.payload.get("provider_session_id")
                     != provider_session_id
                     or confirm.payload.get("candidate_label")
@@ -2184,7 +2353,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 "callback-answer",
             )
         send_message(
-            "Resume this Codex session?\n\n"
+            f"Resume this {provider_name} session?\n\n"
             f"{candidate_label}\n\n"
             "The topic’s current conversation remains stored, but future "
             "messages will continue the selected session. Close any active "
@@ -2203,6 +2372,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         return
     if action.action_type == "agent_resume_session_confirm":
         agent_id = str(action.payload.get("agent_id", ""))
+        provider = str(action.payload.get("provider", ""))
         provider_session_id = str(
             action.payload.get("provider_session_id", "")
         )
@@ -2216,11 +2386,20 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
                 if bound_agent is None or bound_agent.agent_id != agent_id:
                     raise StoreError("Managed agent surface changed.")
+                if (
+                    bound_agent.provider != provider
+                    or provider not in {"codex", "claude"}
+                ):
+                    raise StoreError("Managed agent provider changed.")
+                provider_name = "Claude" if provider == "claude" else "Codex"
+                session_source = (
+                    claude_sessions if provider == "claude" else codex_sessions
+                )
                 working_directory = (
                     bound_agent.working_directory or bound_agent.project_path
                 )
                 candidate = (
-                    codex_sessions.resolve_session(
+                    session_source.resolve_session(
                         provider_session_id,
                         working_directory,
                     )
@@ -2254,12 +2433,12 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 "answerCallbackQuery",
                 {
                     "callback_query_id": callback_query_id,
-                    "text": "Codex session resumed.",
+                    "text": f"{provider_name} session resumed.",
                 },
                 "callback-answer",
             )
         send_message(
-            "✅ This topic will continue the selected Codex session on its "
+            f"✅ This topic will continue the selected {provider_name} session on its "
             "next message."
         )
         return

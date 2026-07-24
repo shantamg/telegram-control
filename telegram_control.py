@@ -272,6 +272,7 @@ def process_agent_mailbox_job(
                     job.mailbox_id,
                     worker_id,
                     stage,
+                    detail=detail,
                 )
 
         def poll_control() -> Optional[provider_adapters.ProviderControl]:

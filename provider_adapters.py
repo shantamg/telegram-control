@@ -97,10 +97,64 @@ def _emit_progress(
     stage: str,
     detail: str,
 ) -> None:
-    """Emit only adapter-authored, path/prompt-free progress descriptions."""
+    """Emit a normalized provider progress event."""
 
     if callback is not None:
         callback(stage, detail)
+
+
+class _UserFacingProgress:
+    """Throttle and bound provider-authored text before status-card updates."""
+
+    MAX_CHARACTERS = 3400
+    MIN_INTERVAL_SECONDS = 0.75
+
+    def __init__(
+        self,
+        callback: Optional[Callable[[str, str], None]],
+    ) -> None:
+        self.callback = callback
+        self.last_text = ""
+        self.last_emitted_at = 0.0
+        self.has_output = False
+
+    def emit(self, stage: str, text: str, force: bool = False) -> None:
+        rendered = str(text).strip()
+        if not rendered:
+            return
+        if len(rendered) > self.MAX_CHARACTERS:
+            rendered = "…\n\n" + rendered[-(self.MAX_CHARACTERS - 3) :]
+        if rendered == self.last_text:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and self.last_emitted_at
+            and now - self.last_emitted_at < self.MIN_INTERVAL_SECONDS
+        ):
+            return
+        _emit_progress(self.callback, stage, rendered)
+        self.last_text = rendered
+        self.last_emitted_at = now
+        self.has_output = True
+
+
+def _combined_user_output(
+    completed_parts: list[str],
+    active_parts: Iterable[str] = (),
+) -> str:
+    parts = [
+        str(part).strip()
+        for part in [*completed_parts, *active_parts]
+        if str(part).strip()
+    ]
+    return "\n\n".join(parts)
+
+
+def _append_distinct_output(parts: list[str], text: str) -> None:
+    rendered = str(text).strip()
+    if rendered and (not parts or parts[-1] != rendered):
+        parts.append(rendered)
 
 
 def _emit_control(
@@ -624,6 +678,10 @@ class CodexExecAdapter:
                 final_text = ""
                 usage: dict[str, Any] = {}
                 completed = False
+                item_phases: dict[str, str] = {}
+                item_text: dict[str, str] = {}
+                commentary_parts: list[str] = []
+                visible_progress = _UserFacingProgress(on_progress)
                 pending: Optional[
                     tuple[int, ProviderControl, float]
                 ] = None
@@ -787,7 +845,11 @@ class CodexExecAdapter:
                                 "Guidance was accepted by the active Codex turn.",
                             )
                             _emit_progress(
-                                on_progress,
+                                (
+                                    on_progress
+                                    if not visible_progress.has_output
+                                    else None
+                                ),
                                 "working",
                                 "Codex is continuing with the new guidance.",
                             )
@@ -810,11 +872,26 @@ class CodexExecAdapter:
                             params.get("threadId") == thread_id
                             and params.get("turnId") == turn_id
                         ):
-                            _emit_progress(
-                                on_progress,
-                                "responding",
-                                "Codex is preparing its response.",
-                            )
+                            item_id = str(params.get("itemId", ""))
+                            delta = str(params.get("delta", ""))
+                            if item_id and delta:
+                                item_text[item_id] = (
+                                    item_text.get(item_id, "") + delta
+                                )
+                                phase = item_phases.get(item_id, "")
+                                if phase == "commentary":
+                                    visible_progress.emit(
+                                        "commentary",
+                                        _combined_user_output(
+                                            commentary_parts,
+                                            [item_text[item_id]],
+                                        ),
+                                    )
+                                else:
+                                    visible_progress.emit(
+                                        "response",
+                                        item_text[item_id],
+                                    )
                     elif method == "item/started":
                         if (
                             params.get("threadId") == thread_id
@@ -826,6 +903,28 @@ class CodexExecAdapter:
                                 if isinstance(item, dict)
                                 else "work"
                             )
+                            if item_type == "agentMessage" and isinstance(item, dict):
+                                item_id = str(item.get("id", ""))
+                                if item_id:
+                                    phase = str(item.get("phase") or "")
+                                    item_phases[item_id] = phase
+                                    initial_text = str(item.get("text") or "")
+                                    if initial_text:
+                                        item_text[item_id] = initial_text
+                                        if phase == "commentary":
+                                            visible_progress.emit(
+                                                "commentary",
+                                                _combined_user_output(
+                                                    commentary_parts,
+                                                    [initial_text],
+                                                ),
+                                            )
+                                        else:
+                                            visible_progress.emit(
+                                                "response",
+                                                initial_text,
+                                            )
+                                continue
                             safe_types = {
                                 "commandExecution": "Running a project operation.",
                                 "fileChange": "Preparing a project change.",
@@ -835,7 +934,11 @@ class CodexExecAdapter:
                                 "collabAgentToolCall": "Coordinating agent work.",
                             }
                             _emit_progress(
-                                on_progress,
+                                (
+                                    on_progress
+                                    if not visible_progress.has_output
+                                    else None
+                                ),
                                 "working",
                                 safe_types.get(item_type, "Codex is working."),
                             )
@@ -850,8 +953,31 @@ class CodexExecAdapter:
                                 and item.get("type") == "agentMessage"
                             ):
                                 text = str(item.get("text", "")).strip()
-                                if text:
+                                item_id = str(item.get("id", ""))
+                                phase = str(
+                                    item.get("phase")
+                                    or item_phases.get(item_id, "")
+                                )
+                                if phase == "commentary" and text:
+                                    _append_distinct_output(
+                                        commentary_parts,
+                                        text,
+                                    )
+                                    visible_progress.emit(
+                                        "commentary",
+                                        _combined_user_output(commentary_parts),
+                                        force=True,
+                                    )
+                                elif text:
                                     final_text = text
+                                    visible_progress.emit(
+                                        "response",
+                                        text,
+                                        force=True,
+                                    )
+                                if item_id:
+                                    item_text.pop(item_id, None)
+                                    item_phases.pop(item_id, None)
                     elif method == "thread/tokenUsage/updated":
                         if (
                             params.get("threadId") == thread_id
@@ -1000,6 +1126,7 @@ class ClaudePrintAdapter:
             "stream-json",
             "--replay-user-messages",
             "--verbose",
+            "--include-partial-messages",
             "--permission-mode",
             permission_mode,
         ]
@@ -1149,6 +1276,9 @@ class ClaudePrintAdapter:
                 _emit_progress(on_progress, "turn_started", turn_id)
 
                 notified_session = False
+                completed_text_parts: list[str] = []
+                active_text_blocks: dict[int, str] = {}
+                visible_progress = _UserFacingProgress(on_progress)
                 pending: Optional[
                     tuple[ProviderControl, str, float]
                 ] = None
@@ -1339,7 +1469,11 @@ class ClaudePrintAdapter:
                             "Guidance was accepted by the active Claude turn.",
                         )
                         _emit_progress(
-                            on_progress,
+                            (
+                                on_progress
+                                if not visible_progress.has_output
+                                else None
+                            ),
                             "working",
                             "Claude is continuing with the new guidance.",
                         )
@@ -1348,12 +1482,120 @@ class ClaudePrintAdapter:
                     events.append(event)
                     event_type = str(event.get("type", ""))
                     if event_type == "assistant":
-                        _emit_progress(
-                            on_progress,
-                            "responding",
-                            "Claude is preparing its response.",
+                        message = event.get("message")
+                        content = (
+                            message.get("content")
+                            if isinstance(message, dict)
+                            else None
                         )
-                    elif event_type in {"stream_event", "system"}:
+                        text_parts = (
+                            [
+                                str(item.get("text", "")).strip()
+                                for item in content
+                                if isinstance(item, dict)
+                                and item.get("type") == "text"
+                                and str(item.get("text", "")).strip()
+                            ]
+                            if isinstance(content, list)
+                            else []
+                        )
+                        assistant_text = "\n".join(text_parts).strip()
+                        if assistant_text:
+                            active_rendered = _combined_user_output(
+                                [],
+                                [
+                                    active_text_blocks[index]
+                                    for index in sorted(active_text_blocks)
+                                ],
+                            )
+                            if active_rendered != assistant_text:
+                                _append_distinct_output(
+                                    completed_text_parts,
+                                    assistant_text,
+                                )
+                            else:
+                                for index in sorted(active_text_blocks):
+                                    _append_distinct_output(
+                                        completed_text_parts,
+                                        active_text_blocks[index],
+                                    )
+                            active_text_blocks.clear()
+                            visible_progress.emit(
+                                "commentary",
+                                _combined_user_output(completed_text_parts),
+                                force=True,
+                            )
+                    elif event_type == "stream_event":
+                        stream_event = event.get("event")
+                        stream_type = (
+                            str(stream_event.get("type", ""))
+                            if isinstance(stream_event, dict)
+                            else ""
+                        )
+                        if stream_type == "message_start":
+                            active_text_blocks.clear()
+                        elif stream_type == "content_block_start":
+                            index = stream_event.get("index")
+                            block = stream_event.get("content_block")
+                            if (
+                                type(index) is int
+                                and isinstance(block, dict)
+                                and block.get("type") == "text"
+                            ):
+                                active_text_blocks[index] = str(
+                                    block.get("text", "")
+                                )
+                        elif stream_type == "content_block_delta":
+                            index = stream_event.get("index")
+                            delta = stream_event.get("delta")
+                            if (
+                                type(index) is int
+                                and isinstance(delta, dict)
+                                and delta.get("type") == "text_delta"
+                            ):
+                                active_text_blocks[index] = (
+                                    active_text_blocks.get(index, "")
+                                    + str(delta.get("text", ""))
+                                )
+                                visible_progress.emit(
+                                    "commentary",
+                                    _combined_user_output(
+                                        completed_text_parts,
+                                        [
+                                            active_text_blocks[key]
+                                            for key in sorted(
+                                                active_text_blocks
+                                            )
+                                        ],
+                                    ),
+                                )
+                        elif stream_type == "content_block_stop":
+                            index = stream_event.get("index")
+                            if type(index) is int:
+                                _append_distinct_output(
+                                    completed_text_parts,
+                                    active_text_blocks.pop(index, ""),
+                                )
+                                visible_progress.emit(
+                                    "commentary",
+                                    _combined_user_output(
+                                        completed_text_parts,
+                                        [
+                                            active_text_blocks[key]
+                                            for key in sorted(
+                                                active_text_blocks
+                                            )
+                                        ],
+                                    ),
+                                    force=True,
+                                )
+                        elif not visible_progress.has_output:
+                            _emit_progress(
+                                on_progress,
+                                "working",
+                                "Claude is working.",
+                            )
+                    elif event_type == "system" and not visible_progress.has_output:
                         _emit_progress(
                             on_progress,
                             "working",

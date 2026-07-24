@@ -5470,7 +5470,8 @@ class DurableStore:
         match = re.fullmatch(
             (
                 r"agent-mailbox:(\d+):"
-                r"(turn-started|stopping|retry-\d+|progress-[a-z]+|"
+                r"(turn-started|stopping|retry-\d+|"
+                r"progress-[a-z]+(?:-\d+)?|"
                 r"voice-(sending|working))"
             ),
             str(operation_id),
@@ -6397,6 +6398,7 @@ class DurableStore:
 
     def registered_provider_session_ids(
         self,
+        provider: Optional[str] = None,
         excluding_agent_id: Optional[str] = None,
     ) -> set[str]:
         rows = self.connection.execute(
@@ -6404,9 +6406,10 @@ class DurableStore:
             SELECT provider_session_id
             FROM agents
             WHERE provider_session_id IS NOT NULL
+                AND (? IS NULL OR provider = ?)
                 AND (? IS NULL OR agent_id != ?)
             """,
-            (excluding_agent_id, excluding_agent_id),
+            (provider, provider, excluding_agent_id, excluding_agent_id),
         ).fetchall()
         return {str(row["provider_session_id"]) for row in rows}
 
@@ -6417,7 +6420,7 @@ class DurableStore:
         expected_provider_session_id: Optional[str],
         now: Optional[float] = None,
     ) -> ManagedAgent:
-        """Point an idle Codex agent at an explicitly confirmed session."""
+        """Point an idle managed agent at an explicitly confirmed session."""
         if not provider_session_id or len(provider_session_id) > 256:
             raise StoreError("Persisted provider session ID is invalid.")
         timestamp = time.time() if now is None else float(now)
@@ -6428,12 +6431,13 @@ class DurableStore:
                 SELECT *
                 FROM agents
                 WHERE agent_id = ? AND role IN ('project', 'worker')
-                    AND provider = 'codex'
+                    AND provider IN ('codex', 'claude')
                 """,
                 (agent_id,),
             ).fetchone()
             if row is None:
-                raise StoreError("Managed Codex agent was not found.")
+                raise StoreError("Managed agent was not found.")
+            provider = str(row["provider"])
             current_session_id = (
                 str(row["provider_session_id"])
                 if row["provider_session_id"] is not None
@@ -6444,7 +6448,7 @@ class DurableStore:
                 return self._managed_agent_from_row(row)
             if current_session_id != expected_provider_session_id:
                 raise StoreError(
-                    "The topic's Codex session changed after this "
+                    f"The topic's {provider.title()} session changed after this "
                     "confirmation was created. Open /agent and choose again."
                 )
             busy = self.connection.execute(
@@ -6464,9 +6468,10 @@ class DurableStore:
             owner = self.connection.execute(
                 """
                 SELECT 1 FROM agents
-                WHERE agent_id != ? AND provider_session_id = ?
+                WHERE agent_id != ? AND provider = ?
+                    AND provider_session_id = ?
                 """,
-                (agent_id, provider_session_id),
+                (agent_id, provider, provider_session_id),
             ).fetchone()
             if busy is not None or console is not None:
                 raise StoreError(
@@ -6497,7 +6502,10 @@ class DurableStore:
                 (
                     agent_id,
                     json.dumps(
-                        {"provider_session_id": provider_session_id},
+                        {
+                            "provider": provider,
+                            "provider_session_id": provider_session_id,
+                        },
                         separators=(",", ":"),
                         sort_keys=True,
                     ),
@@ -6879,6 +6887,95 @@ class DurableStore:
                     json.dumps(config, separators=(",", ":"), sort_keys=True),
                     timestamp,
                     agent_id,
+                ),
+            )
+            updated = self.connection.execute(
+                "SELECT * FROM agents WHERE agent_id = ?",
+                (agent_id,),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+            return self._managed_agent_from_row(updated)
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def switch_agent_provider(
+        self,
+        agent_id: str,
+        provider: str,
+        expected_provider: str,
+        now: Optional[float] = None,
+    ) -> ManagedAgent:
+        """Switch an idle topic to a fresh conversation on another provider."""
+        if provider not in {"codex", "claude"}:
+            raise StoreError("Agent provider is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT * FROM agents
+                WHERE agent_id = ? AND role IN ('project', 'worker')
+                """,
+                (agent_id,),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Managed agent was not found.")
+            current_provider = str(row["provider"])
+            if current_provider == provider:
+                self.connection.execute("COMMIT")
+                return self._managed_agent_from_row(row)
+            if current_provider != expected_provider:
+                raise StoreError(
+                    "The topic's provider changed after this confirmation was "
+                    "created. Open /agent and choose again."
+                )
+            busy = self.connection.execute(
+                """
+                SELECT 1 FROM agent_mailbox
+                WHERE agent_id = ? AND state IN ('queued', 'leased')
+                UNION ALL
+                SELECT 1 FROM agent_consoles
+                WHERE agent_id = ? AND state IN ('starting', 'running')
+                LIMIT 1
+                """,
+                (agent_id, agent_id),
+            ).fetchone()
+            if busy is not None:
+                raise StoreError(
+                    "Agent must have an idle mailbox and stopped console before "
+                    "switching providers."
+                )
+            previous_session_id = row["provider_session_id"]
+            self.connection.execute(
+                """
+                UPDATE agents
+                SET provider = ?, provider_config_json = '{}',
+                    provider_session_id = NULL, lifecycle_state = 'registered',
+                    updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (provider, timestamp, agent_id),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('agent_provider_switched', 'agent', ?, ?, ?)
+                """,
+                (
+                    agent_id,
+                    json.dumps(
+                        {
+                            "from_provider": current_provider,
+                            "previous_provider_session_id": previous_session_id,
+                            "to_provider": provider,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
                 ),
             )
             updated = self.connection.execute(
@@ -7338,6 +7435,7 @@ class DurableStore:
         text: str,
         timestamp: float,
         terminal: bool = False,
+        coalesce: bool = False,
     ) -> bool:
         target = self._agent_receipt_target(mailbox_id)
         if target is None:
@@ -7355,6 +7453,50 @@ class DurableStore:
                 params["reply_markup"] = markup
             else:
                 params["reply_markup"] = {"inline_keyboard": []}
+        if coalesce:
+            prefix = (
+                f"agent-mailbox:{int(mailbox_id)}:{operation_suffix}-"
+            )
+            latest = self.connection.execute(
+                """
+                SELECT message_id, operation_id, state
+                FROM outbox_messages
+                WHERE operation_id GLOB ?
+                ORDER BY message_id DESC
+                LIMIT 1
+                """,
+                (f"{prefix}*",),
+            ).fetchone()
+            if latest is not None and str(latest["state"]) == "queued":
+                params_json = json.dumps(
+                    params,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                cursor = self.connection.execute(
+                    """
+                    UPDATE outbox_messages
+                    SET params_json = ?, updated_at = ?
+                    WHERE message_id = ? AND state = 'queued'
+                    """,
+                    (
+                        params_json,
+                        timestamp,
+                        int(latest["message_id"]),
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    return True
+            sequence = 1
+            if latest is not None:
+                try:
+                    sequence = (
+                        int(str(latest["operation_id"]).removeprefix(prefix))
+                        + 1
+                    )
+                except ValueError:
+                    sequence = int(latest["message_id"]) + 1
+            operation_suffix = f"{operation_suffix}-{sequence}"
         self.enqueue_api_call(
             operation_id=(
                 f"agent-mailbox:{int(mailbox_id)}:{operation_suffix}"
@@ -7439,25 +7581,28 @@ class DurableStore:
         worker_id: str,
         stage: str,
         now: Optional[float] = None,
+        detail: Optional[str] = None,
     ) -> None:
-        labels = {
-            "starting": "🚀 Starting Codex…",
-            "steering": "🧭 Applying new guidance…",
-            "working": "🧠 Codex is continuing…",
-            "responding": "✍️ Codex is preparing the response…",
-            "cancelling": "⏹ Stopping Codex…",
+        generic_stages = {
+            "starting",
+            "steering",
+            "working",
+            "responding",
+            "cancelling",
         }
-        if stage not in labels:
+        user_output_stages = {"commentary", "response"}
+        if stage not in generic_stages and stage not in user_output_stages:
             return
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             row = self.connection.execute(
                 """
-                SELECT agent_id
-                FROM agent_mailbox
-                WHERE mailbox_id = ? AND state = 'leased'
-                    AND lease_owner = ?
+                SELECT m.agent_id, a.provider
+                FROM agent_mailbox AS m
+                JOIN agents AS a ON a.agent_id = m.agent_id
+                WHERE m.mailbox_id = ? AND m.state = 'leased'
+                    AND m.lease_owner = ?
                 """,
                 (int(mailbox_id), worker_id),
             ).fetchone()
@@ -7466,6 +7611,39 @@ class DurableStore:
                     f"Agent mailbox lease for {mailbox_id} is no longer owned."
                 )
             speaker = self.agent_speaker_header(str(row["agent_id"]))
+            if stage in user_output_stages:
+                output = str(detail or "").strip()
+                if not output:
+                    self.connection.execute("COMMIT")
+                    return
+                available = max(1, 3800 - len(speaker) - 2)
+                if len(output) > available:
+                    output = (
+                        "…"[:available]
+                        if available <= 3
+                        else "…\n\n" + output[-(available - 3) :]
+                    )
+                self._enqueue_agent_status_edit(
+                    mailbox_id,
+                    "progress-output",
+                    f"{speaker}\n\n{output}",
+                    timestamp,
+                    coalesce=True,
+                )
+                self.connection.execute("COMMIT")
+                return
+            provider_name = (
+                "Claude" if str(row["provider"]) == "claude" else "Codex"
+            )
+            labels = {
+                "starting": f"🚀 Starting {provider_name}…",
+                "steering": "🧭 Applying new guidance…",
+                "working": f"🧠 {provider_name} is continuing…",
+                "responding": (
+                    f"✍️ {provider_name} is preparing the response…"
+                ),
+                "cancelling": f"⏹ Stopping {provider_name}…",
+            }
             self._enqueue_agent_status_edit(
                 mailbox_id,
                 f"progress-{stage}",

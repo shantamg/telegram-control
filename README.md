@@ -192,7 +192,11 @@ conversation on later mailbox turns. Managed Claude agents default to
 turns cannot answer permission prompts; set `provider_config.permission_mode`
 to `acceptEdits`, `auto`, `dontAsk`, or `plan` for a more restrictive agent.
 The explicit tmux console can resume either a Codex or Claude session without
-changing its logical agent identity.
+changing its logical agent identity. The `/agent` card also exposes the same
+provider-neutral lifecycle directly in Telegram: an idle topic can switch
+between Codex and Claude after confirmation, start a fresh conversation, or
+choose a recent dormant session from its exact working directory. Switching
+providers does not delete the previous local session.
 
 Eight supervised agent workers may lease different agents concurrently. The
 mailbox still serializes turns for each individual agent, so two topics can
@@ -261,6 +265,15 @@ delivered first and then replaced in place by the exact Codex response, with no
 second final message. One observed slow receipt was traced to an isolated
 8.9-second delay before the Telegram update reached the controller; the
 controller queued the receipt within 0.46 seconds of ingestion.
+
+While a managed Codex or Claude turn is running, that same receipt now shows
+the provider's user-facing commentary and response text as it streams. Codex
+`commentary` and `final_answer` agent-message phases and Claude text content
+blocks are accumulated incrementally; reasoning, tool inputs, and other
+non-user-facing events remain generic status updates. Rapid deltas are bounded
+and coalesced in the durable outbox so they do not create a Telegram edit
+backlog. The completed answer then cleanly replaces the intermediate text on
+the original receipt.
 
 Voice notes sent inside a managed agent topic use that same turn card. The
 `🎙️ Transcribing…` receipt is queued before local download, ffmpeg conversion,
@@ -512,7 +525,8 @@ Schema v17 persists the provider turn ID separately from the provider session
 ID and adds a durable control queue for active worker turns:
 
 - A turn card progresses from `📨 Queued` through bounded Codex-authored
-  statuses and exposes a one-time `⏹ Stop` button while work is active.
+  or Claude-authored user-facing updates and exposes a one-time `⏹ Stop`
+  button while work is active.
 - Replying to the exact active turn card queues guidance for that exact Codex
   turn through app-server `turn/steer`. Replying to any other agent message
   starts an ordinary follow-up turn instead.

@@ -1998,6 +1998,112 @@ class DurableStoreTests(unittest.TestCase):
             self.assertEqual(durable.target_type, "agent")
             self.assertEqual(durable.target_id, agent.agent_id)
 
+    def test_provider_output_coalesces_on_the_existing_turn_card(self):
+        _agent, _, router_mailbox_id = self._setup_routed_agent_turn()
+        receipt = self.store.claim_outbox("sender", now=104)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=105,
+        )
+        preview = self.store.claim_outbox("sender", now=106)
+        self.store.complete_outbox(
+            preview.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=107,
+        )
+        mailbox = self.store.claim_agent_mailbox("agent", now=108)
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            "agent",
+            "turn-visible-1",
+            now=109,
+        )
+        started = self.store.claim_outbox("sender", now=110)
+        self.store.complete_outbox(
+            started.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=111,
+        )
+
+        self.store.update_agent_mailbox_progress(
+            mailbox.mailbox_id,
+            "agent",
+            "commentary",
+            now=112,
+            detail="I’m inspecting the provider events.",
+        )
+        self.store.update_agent_mailbox_progress(
+            mailbox.mailbox_id,
+            "agent",
+            "commentary",
+            now=113,
+            detail=(
+                "I’m inspecting the provider events.\n\n"
+                "The durable edit path is connected."
+            ),
+        )
+
+        progress_rows = self.store.connection.execute(
+            """
+            SELECT operation_id, params_json, state
+            FROM outbox_messages
+            WHERE operation_id GLOB ?
+            ORDER BY message_id
+            """,
+            (
+                f"agent-mailbox:{mailbox.mailbox_id}:"
+                "progress-output-*",
+            ),
+        ).fetchall()
+        self.assertEqual(len(progress_rows), 1)
+        self.assertEqual(
+            str(progress_rows[0]["operation_id"]),
+            f"agent-mailbox:{mailbox.mailbox_id}:progress-output-1",
+        )
+        progress_params = json.loads(progress_rows[0]["params_json"])
+        self.assertEqual(progress_params["message_id"], 700)
+        self.assertEqual(
+            progress_params["text"],
+            (
+                "telegram-control\n\n"
+                "I’m inspecting the provider events.\n\n"
+                "The durable edit path is connected."
+            ),
+        )
+        self.assertNotIn("parse_mode", progress_params)
+
+        self.store.complete_agent_mailbox(
+            mailbox.mailbox_id,
+            "agent",
+            "project-session-1",
+            "Final answer.",
+            {},
+            now=114,
+        )
+        self.assertTrue(
+            self.store.agent_status_edit_superseded(
+                str(progress_rows[0]["operation_id"])
+            )
+        )
+        final_row = self.store.connection.execute(
+            """
+            SELECT params_json
+            FROM outbox_messages
+            WHERE operation_id = ?
+            """,
+            (f"router-mailbox:{router_mailbox_id}:agent-final-edit",),
+        ).fetchone()
+        final_params = json.loads(final_row["params_json"])
+        self.assertEqual(final_params["message_id"], 700)
+        self.assertEqual(
+            final_params["text"],
+            "telegram-control\n\nFinal answer.",
+        )
+
     def test_live_reply_steers_exact_active_provider_turn(self):
         agent, _, _ = self._setup_routed_agent_turn()
         receipt = self.store.claim_outbox("sender", now=104)
@@ -3571,6 +3677,127 @@ class DurableStoreTests(unittest.TestCase):
                 session_id,
                 None,
                 now=102,
+            )
+
+    def test_agent_session_adoption_supports_claude_and_scopes_owners_by_provider(
+        self,
+    ):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Codex",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        codex, _ = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Codex",
+            slug="codex-project",
+            provider="codex",
+            project_path="/tmp/codex-project",
+            now=100,
+        )
+        self.store.ensure_surface_binding(
+            chat_id=124,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Claude",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        claude, _ = self.store.register_project_agent(
+            chat_id=124,
+            surface_name="Claude",
+            slug="claude-project",
+            provider="claude",
+            project_path="/tmp/claude-project",
+            now=100,
+        )
+        shared_id = "019f94f0-6c2d-7871-9456-88008cca34da"
+
+        codex_adopted = self.store.adopt_agent_session(
+            codex.agent_id,
+            shared_id,
+            None,
+            now=101,
+        )
+        claude_adopted = self.store.adopt_agent_session(
+            claude.agent_id,
+            shared_id,
+            None,
+            now=102,
+        )
+
+        self.assertEqual(codex_adopted.provider_session_id, shared_id)
+        self.assertEqual(claude_adopted.provider_session_id, shared_id)
+        self.assertEqual(
+            self.store.registered_provider_session_ids(provider="codex"),
+            {shared_id},
+        )
+        self.assertEqual(
+            self.store.registered_provider_session_ids(provider="claude"),
+            {shared_id},
+        )
+
+    def test_agent_provider_switch_requires_idle_agent_and_resets_session(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Planning",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Planning",
+            slug="planning",
+            provider="codex",
+            project_path="/tmp/planning",
+            provider_config={
+                "model": "gpt-5.6-sol",
+                "sandbox": "danger-full-access",
+            },
+            now=100,
+        )
+        self.store.adopt_agent_session(
+            agent.agent_id,
+            "019f94f0-6c2d-7871-9456-88008cca34da",
+            None,
+            now=101,
+        )
+
+        switched = self.store.switch_agent_provider(
+            agent.agent_id,
+            "claude",
+            "codex",
+            now=102,
+        )
+
+        self.assertEqual(switched.provider, "claude")
+        self.assertEqual(switched.provider_config, {})
+        self.assertIsNone(switched.provider_session_id)
+        event = self.store.connection.execute(
+            """
+            SELECT details_json FROM events
+            WHERE kind = 'agent_provider_switched' AND subject_id = ?
+            """,
+            (agent.agent_id,),
+        ).fetchone()
+        self.assertEqual(
+            json.loads(event["details_json"])["from_provider"],
+            "codex",
+        )
+        with self.assertRaisesRegex(StoreError, "provider changed"):
+            self.store.switch_agent_provider(
+                agent.agent_id,
+                "codex",
+                "codex",
+                now=103,
             )
 
     def test_agent_session_adoption_is_idempotent_and_rejects_stale_choice(self):
@@ -7792,6 +8019,7 @@ class DurableIntegrationTests(unittest.TestCase):
                         "⏸ Pause",
                         "New session…",
                         "Resume another session…",
+                        "Switch to Claude…",
                     ],
                 )
                 route_json = store.connection.execute(
@@ -7799,6 +8027,136 @@ class DurableIntegrationTests(unittest.TestCase):
                     (response.message_id,),
                 ).fetchone()["route_json"]
                 self.assertEqual(json.loads(route_json)["target_id"], agent.agent_id)
+
+    def test_agent_can_confirm_switching_from_codex_to_claude(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Planning",
+                    target_type="controller",
+                    target_id="control",
+                )
+                agent, _ = store.register_project_agent(
+                    chat_id=123,
+                    surface_name="Planning",
+                    slug="planning",
+                    provider="codex",
+                    project_path="/tmp/planning",
+                )
+                store.ingest_update(topic_message_update(10, "/agent"), now=100)
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(store, config, job, "worker")
+                response = store.claim_outbox("sender", now=10**12)
+                switch_data = next(
+                    button["callback_data"]
+                    for row in response.params["reply_markup"]["inline_keyboard"]
+                    for button in row
+                    if button["text"] == "Switch to Claude…"
+                )
+
+            def environment(job_id: int) -> dict[str, str]:
+                return {
+                    "TELEGRAM_CONTROL_DB": str(database_path),
+                    "TELEGRAM_CONTROL_JOB_ID": str(job_id),
+                    "TELEGRAM_CHAT_ID": "123",
+                    "TELEGRAM_FROM_ID": "123",
+                    "TELEGRAM_MESSAGE_ID": "800",
+                    "TELEGRAM_MESSAGE_THREAD_ID": "62",
+                }
+
+            prompt_update = callback_update(
+                11,
+                switch_data,
+                message_id=800,
+                message_thread_id=62,
+            )
+            with DurableStore(database_path) as store:
+                store.ingest_update(prompt_update, now=101)
+                prompt_job_id = int(
+                    store.connection.execute(
+                        "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+                    ).fetchone()["job_id"]
+                )
+            with mock.patch.dict(
+                os.environ,
+                environment(prompt_job_id),
+                clear=False,
+            ):
+                on_message.handle_callback(
+                    prompt_update,
+                    prompt_update["callback_query"],
+                )
+
+            with DurableStore(database_path) as store:
+                prompt_rows = store.connection.execute(
+                    """
+                    SELECT params_json FROM outbox_messages
+                    WHERE operation_id LIKE ?
+                    ORDER BY message_id
+                    """,
+                    (f"inbox:{prompt_job_id}:%",),
+                ).fetchall()
+                prompt_params = next(
+                    params
+                    for params in (
+                        json.loads(row["params_json"]) for row in prompt_rows
+                    )
+                    if "Switch this topic to Claude?"
+                    in str(params.get("text", ""))
+                )
+                confirmation_data = prompt_params["reply_markup"][
+                    "inline_keyboard"
+                ][0][0]["callback_data"]
+
+            confirm_update = callback_update(
+                12,
+                confirmation_data,
+                message_id=801,
+                message_thread_id=62,
+            )
+            with DurableStore(database_path) as store:
+                store.ingest_update(confirm_update, now=102)
+                confirm_job_id = int(
+                    store.connection.execute(
+                        "SELECT job_id FROM inbox_jobs WHERE update_id = 12"
+                    ).fetchone()["job_id"]
+                )
+            with mock.patch.dict(
+                os.environ,
+                environment(confirm_job_id),
+                clear=False,
+            ):
+                on_message.handle_callback(
+                    confirm_update,
+                    confirm_update["callback_query"],
+                )
+
+            with DurableStore(database_path) as store:
+                switched = store.resolve_agent(agent.agent_id)
+                self.assertEqual(switched.provider, "claude")
+                self.assertIsNone(switched.provider_session_id)
+                successes = store.connection.execute(
+                    """
+                    SELECT params_json FROM outbox_messages
+                    WHERE operation_id LIKE ?
+                    """,
+                    (f"inbox:{confirm_job_id}:%",),
+                ).fetchall()
+                self.assertTrue(
+                    any(
+                        "topic now uses Claude"
+                        in str(json.loads(row["params_json"]).get("text", ""))
+                        for row in successes
+                    )
+                )
 
     def test_agent_can_confirm_resuming_discovered_codex_session(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -7838,7 +8196,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 picker = store.create_callback_action(
                     operation_id="test:session-picker",
                     action_type="agent_resume_session_picker",
-                    payload={"agent_id": agent.agent_id},
+                    payload={
+                        "agent_id": agent.agent_id,
+                        "provider": "codex",
+                    },
                     chat_id=123,
                     message_thread_id=62,
                     authorized_user_id=123,
@@ -8056,6 +8417,156 @@ class DurableIntegrationTests(unittest.TestCase):
                         in str(json.loads(row["params_json"]).get("text", ""))
                         for row in successes
                     )
+                )
+
+    def test_claude_topic_discovers_and_adopts_claude_session(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            workspace = Path(temporary_directory) / "workspace"
+            workspace.mkdir()
+            candidate = on_message.claude_sessions.ClaudeSession(
+                session_id="6054b13e-168d-4940-a58e-f60f5d34d9e7",
+                working_directory=str(workspace),
+                originator="Claude Code",
+                updated_at=200,
+                title="Existing Claude conversation",
+            )
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Planning",
+                    target_type="controller",
+                    target_id="control",
+                )
+                agent, _ = store.register_project_agent(
+                    chat_id=123,
+                    surface_name="Planning",
+                    slug="planning",
+                    provider="claude",
+                    project_path=str(workspace),
+                )
+                picker = store.create_callback_action(
+                    operation_id="test:claude-session-picker",
+                    action_type="agent_resume_session_picker",
+                    payload={
+                        "agent_id": agent.agent_id,
+                        "provider": "claude",
+                    },
+                    chat_id=123,
+                    message_thread_id=62,
+                    authorized_user_id=123,
+                    ttl_seconds=10**12,
+                    now=100,
+                )
+
+            def environment(job_id: int) -> dict[str, str]:
+                return {
+                    "TELEGRAM_CONTROL_DB": str(database_path),
+                    "TELEGRAM_CONTROL_JOB_ID": str(job_id),
+                    "TELEGRAM_CHAT_ID": "123",
+                    "TELEGRAM_FROM_ID": "123",
+                    "TELEGRAM_MESSAGE_ID": "800",
+                    "TELEGRAM_MESSAGE_THREAD_ID": "62",
+                }
+
+            picker_update = callback_update(
+                10,
+                f"a:{picker.token}",
+                message_id=800,
+                message_thread_id=62,
+            )
+            with DurableStore(database_path) as store:
+                store.ingest_update(picker_update, now=101)
+                picker_job_id = int(
+                    store.connection.execute(
+                        "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+                    ).fetchone()["job_id"]
+                )
+            with mock.patch.dict(
+                os.environ,
+                environment(picker_job_id),
+                clear=False,
+            ), mock.patch.object(
+                on_message.claude_sessions,
+                "discover_sessions",
+                return_value=[candidate],
+            ) as discover:
+                on_message.handle_callback(
+                    picker_update,
+                    picker_update["callback_query"],
+                )
+            discover.assert_called_once_with(
+                str(workspace),
+                excluded_session_ids=set(),
+            )
+
+            with DurableStore(database_path) as store:
+                picker_rows = store.connection.execute(
+                    """
+                    SELECT params_json FROM outbox_messages
+                    WHERE operation_id LIKE ?
+                    """,
+                    (f"inbox:{picker_job_id}:%",),
+                ).fetchall()
+                self.assertTrue(
+                    any(
+                        "Resume a persisted Claude session"
+                        in str(json.loads(row["params_json"]).get("text", ""))
+                        for row in picker_rows
+                    )
+                )
+                confirm = store.create_callback_action(
+                    operation_id="test:claude-session-confirm",
+                    action_type="agent_resume_session_confirm",
+                    payload={
+                        "agent_id": agent.agent_id,
+                        "provider": "claude",
+                        "provider_session_id": candidate.session_id,
+                        "expected_provider_session_id": None,
+                    },
+                    chat_id=123,
+                    message_thread_id=62,
+                    authorized_user_id=123,
+                    ttl_seconds=10**12,
+                    now=102,
+                )
+
+            confirm_update = callback_update(
+                11,
+                f"a:{confirm.token}",
+                message_id=801,
+                message_thread_id=62,
+            )
+            with DurableStore(database_path) as store:
+                store.ingest_update(confirm_update, now=103)
+                confirm_job_id = int(
+                    store.connection.execute(
+                        "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+                    ).fetchone()["job_id"]
+                )
+            with mock.patch.dict(
+                os.environ,
+                environment(confirm_job_id),
+                clear=False,
+            ), mock.patch.object(
+                on_message.claude_sessions,
+                "resolve_session",
+                return_value=candidate,
+            ) as resolve:
+                on_message.handle_callback(
+                    confirm_update,
+                    confirm_update["callback_query"],
+                )
+            resolve.assert_called_once_with(candidate.session_id, str(workspace))
+
+            with DurableStore(database_path) as store:
+                adopted = store.resolve_agent(agent.agent_id)
+                self.assertEqual(adopted.provider, "claude")
+                self.assertEqual(
+                    adopted.provider_session_id,
+                    candidate.session_id,
                 )
 
     def test_topic_message_runs_through_adapter_and_durable_mailbox(self):

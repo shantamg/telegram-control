@@ -292,6 +292,7 @@ class ClaudeEventTests(unittest.TestCase):
         adapter = provider_adapters.ClaudePrintAdapter(binary="/bin/claude")
         fresh = adapter.command(self.agent, None)
         self.assertIn("stream-json", fresh)
+        self.assertIn("--include-partial-messages", fresh)
         self.assertIn("bypassPermissions", fresh)
         self.assertIn("--dangerously-skip-permissions", fresh)
         self.assertNotIn("--resume", fresh)
@@ -546,6 +547,132 @@ class LiveControlContractTests(unittest.TestCase):
         self.assertNotIn("SECRET", rendered_progress)
         self.assertNotIn("/private/project", rendered_progress)
 
+    def test_codex_streams_commentary_and_final_answer_as_visible_progress(self):
+        process = FakeProcess(lambda payload: None)
+
+        def emit_agent_message(item_id, phase, chunks, text):
+            process.stdout.emit(
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": item_id,
+                            "type": "agentMessage",
+                            "text": "",
+                            "phase": phase,
+                        },
+                    },
+                }
+            )
+            for chunk in chunks:
+                process.stdout.emit(
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "itemId": item_id,
+                            "delta": chunk,
+                        },
+                    }
+                )
+            process.stdout.emit(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": item_id,
+                            "type": "agentMessage",
+                            "text": text,
+                            "phase": phase,
+                        },
+                    },
+                }
+            )
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "turn/start":
+                emit_agent_message(
+                    "commentary-1",
+                    "commentary",
+                    ["I’m checking ", "the event pipeline."],
+                    "I’m checking the event pipeline.",
+                )
+                process.stdout.emit(
+                    {
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "tool-1",
+                                "type": "commandExecution",
+                            },
+                        },
+                    }
+                )
+                emit_agent_message(
+                    "answer-1",
+                    "final_answer",
+                    ["Implemented ", "and verified."],
+                    "Implemented and verified.",
+                )
+                process.stdout.emit(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turn": {
+                                "id": "turn-1",
+                                "items": [],
+                                "status": "completed",
+                            },
+                        },
+                    }
+                )
+
+        process.on_payload = handle
+        progress = []
+        result = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex",
+            poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        ).run_turn(
+            codex_agent(),
+            "Inspect it.",
+            None,
+            lambda _session: None,
+            lambda: None,
+            lambda stage, detail: progress.append((stage, detail)),
+        )
+
+        visible = [
+            event
+            for event in progress
+            if event[0] in {"commentary", "response"}
+        ]
+        self.assertIn(
+            ("commentary", "I’m checking the event pipeline."),
+            visible,
+        )
+        self.assertEqual(
+            visible[-1],
+            ("response", "Implemented and verified."),
+        )
+        self.assertEqual(result.final_text, "Implemented and verified.")
+        commentary_index = progress.index(
+            ("commentary", "I’m checking the event pipeline.")
+        )
+        self.assertNotIn(
+            ("working", "Running a project operation."),
+            progress[commentary_index + 1 :],
+        )
+
     def test_codex_rejects_stale_and_provider_error_controls(self):
         process = FakeProcess(lambda payload: None)
         control_queue = [
@@ -753,6 +880,120 @@ class LiveControlContractTests(unittest.TestCase):
         self.assertEqual(result.final_text, "Claude final")
         self.assertNotIn("SECRET", repr(progress))
         self.assertNotIn("/private/project", repr(progress))
+
+    def test_claude_streams_visible_text_blocks_as_incremental_progress(self):
+        process = FakeProcess(lambda payload: None)
+
+        def emit_text_message(session_id, text, chunks):
+            process.stdout.emit(
+                {
+                    "type": "stream_event",
+                    "session_id": session_id,
+                    "event": {"type": "message_start"},
+                }
+            )
+            process.stdout.emit(
+                {
+                    "type": "stream_event",
+                    "session_id": session_id,
+                    "event": {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    },
+                }
+            )
+            for chunk in chunks:
+                process.stdout.emit(
+                    {
+                        "type": "stream_event",
+                        "session_id": session_id,
+                        "event": {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {
+                                "type": "text_delta",
+                                "text": chunk,
+                            },
+                        },
+                    }
+                )
+            process.stdout.emit(
+                {
+                    "type": "stream_event",
+                    "session_id": session_id,
+                    "event": {
+                        "type": "content_block_stop",
+                        "index": 0,
+                    },
+                }
+            )
+            process.stdout.emit(
+                {
+                    "type": "assistant",
+                    "session_id": session_id,
+                    "uuid": str(uuid.uuid4()),
+                    "message": {
+                        "content": [{"type": "text", "text": text}]
+                    },
+                }
+            )
+
+        def handle(payload):
+            self.claude_initialize(process, payload)
+            if payload.get("type") == "user":
+                session_id = payload["session_id"]
+                process.stdout.emit(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": session_id,
+                    }
+                )
+                emit_text_message(
+                    session_id,
+                    "I’m tracing the event stream.",
+                    ["I’m tracing ", "the event stream."],
+                )
+                emit_text_message(
+                    session_id,
+                    "The update is complete.",
+                    ["The update ", "is complete."],
+                )
+                process.stdout.emit(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "session_id": session_id,
+                        "uuid": str(uuid.uuid4()),
+                        "result": "The update is complete.",
+                        "usage": {"input_tokens": 8, "output_tokens": 2},
+                    }
+                )
+
+        process.on_payload = handle
+        progress = []
+        result = provider_adapters.ClaudePrintAdapter(
+            binary="/bin/claude",
+            poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        ).run_turn(
+            claude_agent(),
+            "Inspect it.",
+            None,
+            lambda _session: None,
+            lambda: None,
+            lambda stage, detail: progress.append((stage, detail)),
+        )
+
+        visible = [detail for stage, detail in progress if stage == "commentary"]
+        self.assertIn("I’m tracing the event stream.", visible)
+        self.assertEqual(
+            visible[-1],
+            "I’m tracing the event stream.\n\nThe update is complete.",
+        )
+        self.assertEqual(result.final_text, "The update is complete.")
 
     def test_claude_uses_sdk_interrupt_and_polls_during_silence(self):
         process = FakeProcess(lambda payload: None)
