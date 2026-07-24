@@ -1340,14 +1340,11 @@ Claude agents default to `bypassPermissions` with
 An active managed turn receives only its database path, agent ID, mailbox ID,
 and lease-owner ID as runtime context. The provider-neutral
 `agent_telegram.py` helper uses that context to verify the live lease and
-durably enqueue a concise text or voice update to the owning topic. It can also
-request the controller-owned session panel on the agent's own bound topic; the
-helper only creates authorized one-time actions and cannot change the session
-pointer. No bot token is passed through the helper. Three focused, implicitly
-triggered skills—`telegram-voice-message`, `telegram-text-update`, and
-`telegram-session-control`—are installed for Codex and Claude and retained
-canonically in this repository. Users can ask for a voice note, progress
-update, or session controls naturally without naming a skill. This
+durably enqueue a concise text or voice update to the owning topic. No bot
+token is passed through the helper. Two focused, implicitly triggered skills—
+`telegram-voice-message` and `telegram-text-update`—are installed for Codex
+and Claude and retained canonically in this repository. Users can ask for a
+voice note or progress update naturally without naming either skill. This
 deliberately avoids a second notification service or provider-specific
 Telegram integration.
 

@@ -493,31 +493,18 @@ continuity:
   delivery or terminal failure. Stale cleanup consults queued and leased
   outbox references before removing completed audio.
 
-Managed Codex and Claude turns can also interact with their owning topic
-through three implicitly triggered skills:
-
-- `telegram-voice-message` and `telegram-text-update` send requested progress,
-  blocker, or completion updates;
-- `telegram-session-control` renders the controller-owned `/agent` session
-  interface when the user asks naturally to manage the current topic.
-
-Natural requests such as “send me a voice message when you finish,” “keep me
-updated in Telegram,” or “show me the session controls” are sufficient; the
+Managed Codex and Claude turns can also send an update before their final
+answer through the implicitly triggered `telegram-voice-message` and
+`telegram-text-update` skills. Natural requests such as “send me a voice
+message when you finish” or “keep me updated in Telegram” are sufficient; the
 user does not need to name a skill. The provider-neutral `agent_telegram.py`
-helper verifies the caller's active mailbox lease, resolves that turn's owning
-Telegram topic, and writes only validated messages or one-time controller
-actions to the durable outbox. It does not receive the Telegram bot token.
-Session controls are allowed only on the managed agent's own bound topic and
-remain controller-validated and confirmation-gated; an agent cannot change
-its own session pointer. Stable caller-provided keys and a content hash make
-text and voice retries idempotent. Canonical skill definitions live under
-`skills/` and are installed in both the Codex and Claude user skill
-directories. Voice messages send their bounded text to Microsoft Edge TTS.
-An explicit request to show or open this topic's agent/session controls is
-also a narrow harness-level alias for `/agent`: it renders the panel directly
-without invoking the provider or adding anything to its conversation history.
-Domain-specific requests such as email-monitoring controls do not match this
-alias.
+helper accepts concise text or voice on standard input, verifies the caller's
+active mailbox lease, resolves that turn's owning Telegram topic, and writes
+to the durable outbox. It does not receive the Telegram bot token. Stable
+caller-provided keys and a content hash make retries idempotent. Canonical
+skill definitions live under `skills/` and are installed in both the Codex and
+Claude user skill directories. Voice messages send their bounded text to
+Microsoft Edge TTS.
 
 ## Live Codex worker control
 

@@ -1777,71 +1777,6 @@ class DurableStoreTests(unittest.TestCase):
             now=10**12,
         )
 
-        with mock.patch.dict(os.environ, environment, clear=True):
-            with mock.patch.object(
-                agent_telegram.sys,
-                "argv",
-                ["agent_telegram.py", "controls"],
-            ):
-                output = StringIO()
-                with redirect_stdout(output):
-                    self.assertEqual(agent_telegram.main(), 0)
-        self.assertIn("session controls queued", output.getvalue())
-        controls = self.store.connection.execute(
-            """
-            SELECT method, params_json, route_json
-            FROM outbox_messages
-            WHERE operation_id = ?
-            """,
-            (f"agent-mailbox:{mailbox_id}:session-controls",),
-        ).fetchone()
-        self.assertEqual(controls["method"], "sendMessage")
-        controls_params = json.loads(controls["params_json"])
-        self.assertEqual(controls_params["chat_id"], 123)
-        self.assertEqual(controls_params["message_thread_id"], 62)
-        self.assertIn("Provider: codex", controls_params["text"])
-        controls_buttons = controls_params["reply_markup"]["inline_keyboard"]
-        self.assertEqual(
-            [[button["text"] for button in row] for row in controls_buttons],
-            [
-                ["⏸ Pause", "New session…"],
-                ["Resume another session…"],
-            ],
-        )
-        action_types = {
-            row["action_type"]
-            for row in self.store.connection.execute(
-                """
-                SELECT action_type
-                FROM callback_actions
-                WHERE operation_id LIKE ?
-                """,
-                (f"agent-mailbox:{mailbox_id}:session-controls:%",),
-            )
-        }
-        self.assertEqual(
-            action_types,
-            {
-                "agent_pause",
-                "agent_new_session_prompt",
-                "agent_resume_session_picker",
-            },
-        )
-        self.assertEqual(
-            json.loads(controls["route_json"])["target_id"],
-            agent.agent_id,
-        )
-        with mock.patch.dict(os.environ, environment, clear=True):
-            with mock.patch.object(
-                agent_telegram.sys,
-                "argv",
-                ["agent_telegram.py", "controls"],
-            ):
-                duplicate_output = StringIO()
-                with redirect_stdout(duplicate_output):
-                    self.assertEqual(agent_telegram.main(), 0)
-        self.assertIn("already queued", duplicate_output.getvalue())
-
         with self.assertRaisesRegex(
             LeaseLostError,
             "active managed turn",
@@ -1854,64 +1789,6 @@ class DurableStoreTests(unittest.TestCase):
                 text="This must not send.",
                 now=105,
             )
-
-    def test_claude_session_controls_omit_external_session_picker(self):
-        self.store.ensure_surface_binding(
-            chat_id=123,
-            message_thread_id=62,
-            surface_type="project",
-            display_name="Claude Test",
-            target_type="controller",
-            target_id="control",
-            now=100,
-        )
-        agent, _ = self.store.register_project_agent(
-            chat_id=123,
-            surface_name="Claude Test",
-            slug="claude-test",
-            provider="claude",
-            project_path="/tmp/claude-test",
-            now=100,
-        )
-        self.store.ingest_update(topic_message_update(10, "controls"), now=100)
-        inbox = self.store.connection.execute(
-            "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
-        ).fetchone()
-        mailbox_id = self.store.enqueue_agent_message(
-            agent.agent_id,
-            int(inbox["job_id"]),
-            "controls",
-            now=101,
-        )
-        self.store.claim_agent_mailbox(
-            "claude-worker",
-            now=102,
-            lease_seconds=10**12,
-        )
-        message_id = self.store.enqueue_agent_session_controls(
-            operation_id=f"agent-mailbox:{mailbox_id}:session-controls",
-            agent_id=agent.agent_id,
-            mailbox_id=mailbox_id,
-            worker_id="claude-worker",
-            now=103,
-        )
-        row = self.store.connection.execute(
-            "SELECT params_json FROM outbox_messages WHERE message_id = ?",
-            (message_id,),
-        ).fetchone()
-        params = json.loads(row["params_json"])
-        self.assertIn("Provider: claude", params["text"])
-        self.assertEqual(
-            [
-                button["text"]
-                for button in params["reply_markup"]["inline_keyboard"][0]
-            ],
-            ["⏸ Pause", "New session…"],
-        )
-        self.assertEqual(
-            len(params["reply_markup"]["inline_keyboard"]),
-            1,
-        )
 
     def test_failed_agent_turn_edit_falls_back_to_routed_message(self):
         self.store.ensure_surface_binding(
@@ -7922,70 +7799,6 @@ class DurableIntegrationTests(unittest.TestCase):
                     (response.message_id,),
                 ).fetchone()["route_json"]
                 self.assertEqual(json.loads(route_json)["target_id"], agent.agent_id)
-
-                store.complete_outbox(
-                    response.message_id,
-                    "sender",
-                    {"message_id": 700, "chat": {"id": 123}},
-                    now=101,
-                )
-                store.ingest_update(
-                    topic_message_update(
-                        11,
-                        "Show me the session controls for this topic.",
-                    ),
-                    now=102,
-                )
-                natural_job = store.claim_job("worker", now=102)
-                telegram_control.process_inbox_job(
-                    store,
-                    config,
-                    natural_job,
-                    "worker",
-                )
-                natural_response = store.claim_outbox("sender", now=10**12)
-                self.assertIn(
-                    "Name: tc--root--telegram-control",
-                    natural_response.params["text"],
-                )
-                self.assertEqual(
-                    [
-                        button["text"]
-                        for row in natural_response.params["reply_markup"][
-                            "inline_keyboard"
-                        ]
-                        for button in row
-                    ],
-                    labels,
-                )
-                mailbox_count = store.connection.execute(
-                    "SELECT COUNT(*) AS count FROM agent_mailbox"
-                ).fetchone()["count"]
-                self.assertEqual(mailbox_count, 0)
-
-    def test_agent_control_natural_alias_is_narrow(self):
-        accepted = (
-            "Show me the session controls for this topic.",
-            "Could you open the agent controls?",
-            "Bring up /agent",
-            "Display the Telegram session controls.",
-        )
-        rejected = (
-            "What controls should an email monitoring session have?",
-            "Show me the controls for this email monitoring session.",
-            "Explain how agent session controls work.",
-            "Start monitoring my email in this topic.",
-        )
-        for text in accepted:
-            self.assertTrue(
-                on_message.requests_agent_control_panel(text),
-                text,
-            )
-        for text in rejected:
-            self.assertFalse(
-                on_message.requests_agent_control_panel(text),
-                text,
-            )
 
     def test_agent_can_confirm_resuming_discovered_codex_session(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
