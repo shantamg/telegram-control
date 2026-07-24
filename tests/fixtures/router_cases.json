@@ -47,6 +47,18 @@
     }
   },
   {
+    "name": "bind_forum_workspace",
+    "input": "Bind this Life forum to my workspace at /Users/tester/life using Codex.",
+    "expected_tool": "bind_forum_workspace",
+    "sample_output": {
+      "tool": "bind_forum_workspace",
+      "arguments": {
+        "workspace": "/Users/tester/life",
+        "provider": "codex"
+      }
+    }
+  },
+  {
     "name": "rename_topic",
     "input": "Rename the Stage 2 Test topic to Telegram Control.",
     "expected_tool": "rename_topic",

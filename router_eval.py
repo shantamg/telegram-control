@@ -110,6 +110,15 @@ def router_prompt(input_text: str) -> str:
             }
         ],
         topics=[fixture_topic()],
+        current_surface={
+            "kind": "private_forum_topic",
+            "message_thread_id": 62,
+            "forum_authorized": True,
+            "forum_name": "Life",
+            "workspace_bound": False,
+            "workspace_name": None,
+            "provider": None,
+        },
     )
 
 

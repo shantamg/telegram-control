@@ -9,13 +9,14 @@ import os
 import re
 import secrets
 import sqlite3
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 CONTROL_SPEAKER = "🎛 Control"
 
@@ -159,6 +160,7 @@ class RouterMailboxJob:
     mailbox_id: int
     source_inbox_job_id: int
     chat_id: int
+    message_thread_id: Optional[int]
     input_text: str
     provider_session_id: Optional[str]
     attempts: int
@@ -181,6 +183,24 @@ class ManagedProject:
     state: str
     working_directory: str = ""
     git_repository_root: Optional[str] = None
+
+    @property
+    def workspace_root(self) -> str:
+        """Application-facing name for the legacy project_path column."""
+        return self.project_path
+
+
+@dataclass(frozen=True)
+class ForumWorkspace:
+    chat_id: int
+    forum_binding_id: int
+    display_name: str
+    project_path: str
+    working_directory: str
+    git_repository_root: Optional[str]
+    provider: str
+    provider_config: dict[str, Any]
+    state: str
 
     @property
     def workspace_root(self) -> str:
@@ -789,6 +809,32 @@ MIGRATION_17 = (
     """,
 )
 
+MIGRATION_18 = (
+    # An authorized private forum has one durable workspace boundary. Topics
+    # will reuse this record when creating lightweight subject orchestrators;
+    # no bot token, process, or project enrollment is duplicated per forum.
+    """
+    CREATE TABLE forum_workspaces (
+        chat_id INTEGER PRIMARY KEY,
+        forum_binding_id INTEGER NOT NULL UNIQUE
+            REFERENCES surface_bindings(binding_id) ON DELETE RESTRICT,
+        display_name TEXT NOT NULL,
+        project_path TEXT NOT NULL,
+        working_directory TEXT NOT NULL,
+        git_repository_root TEXT,
+        provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude')),
+        provider_config_json TEXT NOT NULL DEFAULT '{}',
+        state TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX forum_workspaces_state
+    ON forum_workspaces(state, display_name)
+    """,
+)
+
 
 ROUTER_INPUT_LIMIT = 8_000
 REPLY_QUOTE_LIMIT = 1_000
@@ -926,6 +972,33 @@ def validate_workspace_paths(
             "The working directory must stay inside the workspace root."
         )
     return str(root_real), str(workdir_real)
+
+
+def validate_exact_git_root(path: str) -> str:
+    """Return a real path only when it is exactly a Git worktree root."""
+    real = str(Path(os.path.realpath(path)))
+    if not Path(real).is_dir():
+        raise StoreError("The Git repository root does not exist.")
+    try:
+        result = subprocess.run(
+            ["git", "-C", real, "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise StoreError("The Git repository root could not be verified.") from None
+    discovered = (
+        str(Path(os.path.realpath(result.stdout.strip())))
+        if result.returncode == 0 and result.stdout.strip()
+        else None
+    )
+    if discovered != real:
+        raise StoreError(
+            "Git metadata must identify the exact repository root."
+        )
+    return real
 
 
 def normalize_project_alias(alias: str) -> str:
@@ -1136,6 +1209,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 17
                 self.connection.execute("PRAGMA user_version = 17")
+            if current < 18:
+                for statement in MIGRATION_18:
+                    self.connection.execute(statement)
+                current = 18
+                self.connection.execute("PRAGMA user_version = 18")
             # Referential integrity is audited before the commit so a failed
             # check rolls the whole migration back instead of stranding an
             # upgraded-but-broken database.
@@ -2885,6 +2963,178 @@ class DurableStore:
         ).fetchall()
         return [self._surface_binding_from_row(row) for row in rows]
 
+    @staticmethod
+    def _forum_workspace_from_row(row: sqlite3.Row) -> ForumWorkspace:
+        return ForumWorkspace(
+            chat_id=int(row["chat_id"]),
+            forum_binding_id=int(row["forum_binding_id"]),
+            display_name=str(row["display_name"]),
+            project_path=str(row["project_path"]),
+            working_directory=str(row["working_directory"]),
+            git_repository_root=(
+                str(row["git_repository_root"])
+                if row["git_repository_root"] is not None
+                else None
+            ),
+            provider=str(row["provider"]),
+            provider_config=json.loads(row["provider_config_json"]),
+            state=str(row["state"]),
+        )
+
+    def resolve_forum_workspace(self, chat_id: int) -> Optional[ForumWorkspace]:
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM forum_workspaces
+            WHERE chat_id = ? AND state = 'active'
+            """,
+            (int(chat_id),),
+        ).fetchone()
+        return self._forum_workspace_from_row(row) if row is not None else None
+
+    def bind_forum_workspace(
+        self,
+        chat_id: int,
+        forum_binding_id: int,
+        project_path: str,
+        working_directory: Optional[str] = None,
+        git_repository_root: Optional[str] = None,
+        provider: str = "codex",
+        provider_config: Optional[dict[str, Any]] = None,
+        now: Optional[float] = None,
+    ) -> tuple[ForumWorkspace, bool]:
+        """Bind one authorized private forum to one validated workspace.
+
+        The root forum surface remains owned by Control. Topic subjects reuse
+        this record as their immutable filesystem boundary and provider
+        defaults. Repeating the exact operation is idempotent; rebinding a
+        live forum requires an explicit future revocation flow.
+        """
+        if int(chat_id) >= 0:
+            raise StoreError("A forum workspace requires a supergroup chat.")
+        workspace_root, workdir = validate_workspace_paths(
+            project_path,
+            working_directory,
+        )
+        if git_repository_root is not None:
+            git_root = validate_exact_git_root(git_repository_root)
+            if git_root != workspace_root:
+                raise StoreError(
+                    "Forum Git metadata must be the exact workspace root."
+                )
+        else:
+            git_root = None
+        normalized_config = validate_provider_config(provider, provider_config)
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            binding_row = self.connection.execute(
+                """
+                SELECT *
+                FROM surface_bindings
+                WHERE binding_id = ? AND chat_id = ?
+                    AND message_thread_id = 0
+                    AND surface_type = 'control'
+                    AND target_type = 'controller'
+                    AND target_id = 'control'
+                    AND state = 'active'
+                """,
+                (int(forum_binding_id), int(chat_id)),
+            ).fetchone()
+            if binding_row is None:
+                raise StoreError(
+                    "The private forum is no longer authorized for Control."
+                )
+            display_name = str(binding_row["display_name"])
+            existing = self.connection.execute(
+                "SELECT * FROM forum_workspaces WHERE chat_id = ?",
+                (int(chat_id),),
+            ).fetchone()
+            expected = (
+                int(forum_binding_id),
+                display_name,
+                workspace_root,
+                workdir,
+                git_root,
+                provider,
+                normalized_config,
+                "active",
+            )
+            if existing is not None:
+                current = self._forum_workspace_from_row(existing)
+                actual = (
+                    current.forum_binding_id,
+                    current.display_name,
+                    current.project_path,
+                    current.working_directory,
+                    current.git_repository_root,
+                    current.provider,
+                    current.provider_config,
+                    current.state,
+                )
+                if actual != expected:
+                    raise StoreError(
+                        "This forum is already bound to a different workspace."
+                    )
+                self.connection.execute("COMMIT")
+                return current, False
+            self.connection.execute(
+                """
+                INSERT INTO forum_workspaces(
+                    chat_id, forum_binding_id, display_name, project_path,
+                    working_directory, git_repository_root, provider,
+                    provider_config_json, state, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (
+                    int(chat_id),
+                    int(forum_binding_id),
+                    display_name,
+                    workspace_root,
+                    workdir,
+                    git_root,
+                    provider,
+                    json.dumps(
+                        normalized_config,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('forum_workspace_bound', 'forum', ?, ?, ?)
+                """,
+                (
+                    str(int(chat_id)),
+                    json.dumps(
+                        {
+                            "forum_binding_id": int(forum_binding_id),
+                            "git": git_root is not None,
+                            "provider": provider,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                ),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM forum_workspaces WHERE chat_id = ?",
+                (int(chat_id),),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+            return self._forum_workspace_from_row(row), True
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
     def resolve_surface_binding_by_id(
         self,
         binding_id: int,
@@ -3902,6 +4152,11 @@ class DurableStore:
             mailbox_id=mailbox_id,
             source_inbox_job_id=int(claimed["source_inbox_job_id"]),
             chat_id=int(claimed["chat_id"]),
+            message_thread_id=(
+                int(claimed["message_thread_id"])
+                if int(claimed["message_thread_id"]) != 0
+                else None
+            ),
             input_text=str(claimed["input_text"]),
             provider_session_id=(
                 str(claimed["provider_session_id"])
@@ -4348,6 +4603,7 @@ class DurableStore:
         dispatch_message: Optional[str] = None,
         clarification_options: Optional[list[str]] = None,
         project_creation_plan: Optional[dict[str, Any]] = None,
+        forum_workspace_plan: Optional[dict[str, Any]] = None,
         topic_rename_plan: Optional[dict[str, Any]] = None,
         agent_config_plan: Optional[dict[str, Any]] = None,
         now: Optional[float] = None,
@@ -4378,6 +4634,22 @@ class DurableStore:
             }
         ):
             raise StoreError("Router project-creation plan is invalid.")
+        if forum_workspace_plan is not None and (
+            tool_name != "bind_forum_workspace"
+            or set(forum_workspace_plan)
+            != {
+                "chat_id",
+                "forum_binding_id",
+                "display_name",
+                "project_path",
+                "working_directory",
+                "git_repository_root",
+                "provider",
+                "provider_config",
+                "provenance",
+            }
+        ):
+            raise StoreError("Router forum-workspace plan is invalid.")
         if agent_config_plan is not None and (
             tool_name != "configure_agent"
             or set(agent_config_plan) != {"project_slug", "updates"}
@@ -4556,6 +4828,79 @@ class DurableStore:
                     if not inserted:
                         raise StoreError(
                             "Could not allocate a project-confirmation token."
+                        )
+            if forum_workspace_plan is not None:
+                if row["authorized_user_id"] is None:
+                    raise StoreError(
+                        "Router forum workspace binding has no authorized user."
+                    )
+                if int(forum_workspace_plan["chat_id"]) != int(row["chat_id"]):
+                    raise StoreError(
+                        "Router forum workspace binding targets another chat."
+                    )
+                if int(row["chat_id"]) >= 0:
+                    raise StoreError(
+                        "Router forum workspace binding requires a supergroup."
+                    )
+                for index, (action_type, label) in enumerate(
+                    (
+                        (
+                            "router_forum_workspace_confirm",
+                            "Bind forum workspace",
+                        ),
+                        ("router_forum_workspace_cancel", "Cancel"),
+                    )
+                ):
+                    inserted = False
+                    for _ in range(5):
+                        token = secrets.token_urlsafe(6)
+                        payload = dict(forum_workspace_plan)
+                        payload["label"] = label
+                        payload["router_mailbox_id"] = int(mailbox_id)
+                        try:
+                            self.connection.execute(
+                                """
+                                INSERT INTO callback_actions(
+                                    operation_id, token, action_type,
+                                    payload_json, chat_id, message_thread_id,
+                                    authorized_user_id, one_time, state,
+                                    expires_at, created_at, updated_at
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active',
+                                    ?, ?, ?)
+                                """,
+                                (
+                                    (
+                                        f"router:{int(mailbox_id)}:"
+                                        f"forum-workspace:{index}"
+                                    ),
+                                    token,
+                                    action_type,
+                                    json.dumps(
+                                        payload,
+                                        separators=(",", ":"),
+                                        sort_keys=True,
+                                    ),
+                                    int(row["chat_id"]),
+                                    (
+                                        int(row["message_thread_id"])
+                                        if int(row["message_thread_id"]) != 0
+                                        else None
+                                    ),
+                                    int(row["authorized_user_id"]),
+                                    timestamp + 10 * 60,
+                                    timestamp,
+                                    timestamp,
+                                ),
+                            )
+                        except sqlite3.IntegrityError:
+                            continue
+                        inserted = True
+                        break
+                    if not inserted:
+                        raise StoreError(
+                            "Could not allocate a forum-workspace "
+                            "confirmation token."
                         )
             if agent_config_plan is not None:
                 if row["authorized_user_id"] is None:
@@ -4827,14 +5172,18 @@ class DurableStore:
             "policy": "reply",
             "ttl_seconds": 30 * 24 * 60 * 60,
         }
+        params: dict[str, Any] = {
+            "chat_id": int(row["chat_id"]),
+            "message_thread_id": thread_id if thread_id != 0 else None,
+            "text": str(row["preview_text"]),
+        }
+        reply_markup = self._router_reply_markup(mailbox_id)
+        if reply_markup is not None:
+            params["reply_markup"] = reply_markup
         return self.enqueue_api_call(
             operation_id=f"router-mailbox:{int(mailbox_id)}:final-fallback",
             method="sendMessage",
-            params={
-                "chat_id": int(row["chat_id"]),
-                "message_thread_id": thread_id if thread_id != 0 else None,
-                "text": str(row["preview_text"]),
-            },
+            params=params,
             route=route,
             now=timestamp,
         )
@@ -4894,6 +5243,21 @@ class DurableStore:
             WHERE operation_id LIKE ? AND state = 'active'
             """,
             (timestamp, f"router:{int(mailbox_id)}:project:%"),
+        )
+
+    def expire_router_forum_workspace_actions(
+        self,
+        mailbox_id: int,
+        now: Optional[float] = None,
+    ) -> None:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute(
+            """
+            UPDATE callback_actions
+            SET state = 'expired', updated_at = ?
+            WHERE operation_id LIKE ? AND state = 'active'
+            """,
+            (timestamp, f"router:{int(mailbox_id)}:forum-workspace:%"),
         )
 
     def expire_router_topic_rename_actions(

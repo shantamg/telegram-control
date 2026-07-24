@@ -136,6 +136,27 @@ class RouterContractTests(unittest.TestCase):
         self.assertIn('"name":"Stage 2 Test"', prompt)
         self.assertNotIn('"chat_id":123', prompt)
 
+    def test_main_agent_prompt_exposes_bounded_forum_surface_state(self):
+        prompt = build_main_agent_prompt(
+            "bind this forum to my Life workspace",
+            [self.project],
+            [],
+            current_surface={
+                "kind": "private_forum_topic",
+                "message_thread_id": 62,
+                "forum_authorized": True,
+                "forum_name": "Life",
+                "workspace_bound": False,
+                "workspace_name": None,
+                "provider": None,
+            },
+        )
+        self.assertIn('"name":"bind_forum_workspace"', prompt)
+        self.assertIn('"kind":"private_forum_topic"', prompt)
+        self.assertIn('"forum_name":"Life"', prompt)
+        self.assertIn('"workspace_bound":false', prompt)
+        self.assertNotIn("/secret/local/path", prompt)
+
     def test_tool_call_normalizes_safe_dispatch(self):
         call = parse_router_tool_call(
             '{"tool":"send_to_agent","arguments":{'
@@ -172,6 +193,31 @@ class RouterContractTests(unittest.TestCase):
                 '{"tool":"create_project_agent","arguments":{'
                 '"project":"/tmp/new-project","topic_name":null,'
                 '"provider":"invented"}}',
+                {"telegram-control"},
+            )
+
+    def test_bind_forum_workspace_is_codex_only_and_requires_confirmation(self):
+        call = parse_router_tool_call(
+            '{"tool":"bind_forum_workspace","arguments":{'
+            '"workspace":"loc_life","working_directory":null,'
+            '"provider":"codex","model":"gpt-5.6-sol","effort":"high"}}',
+            {"telegram-control"},
+        )
+        self.assertTrue(call.requires_confirmation)
+        self.assertEqual(call.arguments["workspace"], "loc_life")
+        self.assertEqual(call.arguments["provider"], "codex")
+        self.assertEqual(call.arguments["effort"], "high")
+
+        with self.assertRaisesRegex(RouterContractError, "provider"):
+            parse_router_tool_call(
+                '{"tool":"bind_forum_workspace","arguments":{'
+                '"workspace":"loc_life","provider":"claude"}}',
+                {"telegram-control"},
+            )
+        with self.assertRaisesRegex(RouterContractError, "arguments"):
+            parse_router_tool_call(
+                '{"tool":"bind_forum_workspace","arguments":{'
+                '"workspace":"loc_life","chat_id":-100777}}',
                 {"telegram-control"},
             )
 

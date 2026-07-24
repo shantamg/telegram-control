@@ -1117,6 +1117,105 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         )
         return
     if action.action_type in {
+        "router_forum_workspace_confirm",
+        "router_forum_workspace_cancel",
+    }:
+        router_mailbox_id = int(action.payload.get("router_mailbox_id", 0))
+        with DurableStore(Path(database_path)) as store:
+            store.expire_router_forum_workspace_actions(router_mailbox_id)
+        if action.action_type == "router_forum_workspace_cancel":
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": "Cancelled.",
+                    },
+                    "callback-answer",
+                )
+            send_message(
+                "🎛 Control\n\n"
+                "Cancelled. This forum was not bound to a workspace."
+            )
+            return
+
+        required = {
+            "chat_id",
+            "forum_binding_id",
+            "display_name",
+            "project_path",
+            "working_directory",
+            "git_repository_root",
+            "provider",
+            "provider_config",
+            "provenance",
+        }
+        if not required.issubset(action.payload):
+            raise StoreError("Stored forum-workspace plan is invalid.")
+        target_chat_id = int(action.payload["chat_id"])
+        if target_chat_id != chat_id or target_chat_id >= 0:
+            raise StoreError("Stored forum-workspace target is invalid.")
+        provider_config = action.payload["provider_config"]
+        if not isinstance(provider_config, dict):
+            raise StoreError("Stored forum provider configuration is invalid.")
+        workspace_root, working_directory, git_repository_root = (
+            discovery.validate_agent_workspace(
+                str(action.payload["project_path"]),
+                str(action.payload["working_directory"]),
+                (
+                    str(action.payload["git_repository_root"])
+                    if action.payload["git_repository_root"] is not None
+                    else None
+                ),
+            )
+        )
+        if workspace_root != str(action.payload["project_path"]) or (
+            working_directory != str(action.payload["working_directory"])
+        ) or git_repository_root != action.payload["git_repository_root"]:
+            raise StoreError(
+                "The confirmed forum workspace no longer resolves to the "
+                "validated locations."
+            )
+        with DurableStore(Path(database_path)) as store:
+            workspace, created = store.bind_forum_workspace(
+                chat_id=target_chat_id,
+                forum_binding_id=int(action.payload["forum_binding_id"]),
+                project_path=workspace_root,
+                working_directory=working_directory,
+                git_repository_root=git_repository_root,
+                provider=str(action.payload["provider"]),
+                provider_config=provider_config,
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": (
+                        "Forum workspace bound."
+                        if created
+                        else "Forum workspace already bound."
+                    ),
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "forum-workspace-clear",
+        )
+        send_message(
+            "🎛 Control\n\n"
+            f"✅ {workspace.display_name} is now bound to "
+            f"{workspace.workspace_root}.\n\n"
+            "New topics can now become workspace-scoped subjects."
+        )
+        return
+    if action.action_type in {
         "router_project_confirm",
         "router_project_cancel",
     }:

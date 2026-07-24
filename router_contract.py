@@ -125,6 +125,23 @@ CONTROLLER_TOOLS = (
         "confirmation": True,
     },
     {
+        "name": "bind_forum_workspace",
+        "description": (
+            "Propose binding the current authorized private forum to one "
+            "workspace. Use only when the current-surface data says this is "
+            "an unbound private forum. The workspace may be any existing "
+            "authorized directory; Git is optional."
+        ),
+        "arguments": {
+            "workspace": "string (project slug, ref ID, or user-stated path)",
+            "working_directory": "string|null (ref ID or path, optional)",
+            "provider": "codex|null",
+            "model": "string|null",
+            "effort": "low|medium|high|xhigh|max|ultra|null",
+        },
+        "confirmation": True,
+    },
+    {
         "name": "configure_agent",
         "description": (
             "Propose setting or clearing the model or effort for an existing "
@@ -170,6 +187,7 @@ def build_main_agent_prompt(
     agent_states: Iterable[dict[str, Any]],
     project_aliases: Optional[dict[str, list[str]]] = None,
     topics: Iterable[SurfaceBinding] = (),
+    current_surface: Optional[dict[str, Any]] = None,
 ) -> str:
     text = user_input.strip()
     if not text or len(text) > 8000:
@@ -234,8 +252,9 @@ def build_main_agent_prompt(
         "concrete candidates instead of guessing.\n\n"
         "After any needed investigation, end with exactly one terminal tool: respond, "
         "ask_user, send_to_agent, list_projects, inspect_project, or a "
-        "confirmation-gated mutation (create_project_agent, rename_topic, "
-        "configure_agent, set_project_alias, remove_project_alias). The "
+        "confirmation-gated mutation (create_project_agent, "
+        "bind_forum_workspace, rename_topic, configure_agent, "
+        "set_project_alias, remove_project_alias). The "
         "controller independently validates every argument and enforces "
         "confirmation for consequential tools. Never invent a tool, project, "
         "path, or completed result, and never claim an action happened "
@@ -254,6 +273,8 @@ def build_main_agent_prompt(
         f"\n\nProjects:\n{json.dumps(catalog, separators=(',', ':'), sort_keys=True)}"
         f"\n\nAgents:\n{json.dumps(states, separators=(',', ':'), sort_keys=True)}"
         f"\n\nTopics:\n{json.dumps(topic_catalog, separators=(',', ':'), sort_keys=True)}"
+        "\n\nCurrent surface:\n"
+        f"{json.dumps(current_surface or {}, separators=(',', ':'), sort_keys=True)}"
         f"\n\nUser input:\n{json.dumps(text)}"
     )
 
@@ -450,6 +471,57 @@ def parse_router_tool_call(
                 else None
             ),
             "topic_name": topic_name.strip() if isinstance(topic_name, str) else None,
+            "provider": provider,
+            "model": model.strip() if isinstance(model, str) else None,
+            "effort": effort,
+        }
+    elif tool == "bind_forum_workspace":
+        required = {"workspace"}
+        optional = {"working_directory", "provider", "model", "effort"}
+        if not required.issubset(arguments) or not set(arguments).issubset(
+            required | optional
+        ):
+            raise RouterContractError(
+                "bind_forum_workspace arguments are invalid."
+            )
+        working_directory = arguments.get("working_directory")
+        if working_directory is not None and (
+            not isinstance(working_directory, str)
+            or not working_directory.strip()
+            or len(working_directory) > 500
+        ):
+            raise RouterContractError(
+                "Tool argument 'working_directory' is invalid."
+            )
+        provider = arguments.get("provider")
+        if provider is not None and provider != "codex":
+            raise RouterContractError(
+                "Tool argument 'provider' is invalid."
+            )
+        model = arguments.get("model")
+        if model is not None and (
+            not isinstance(model, str)
+            or not model.strip()
+            or len(model) > 100
+        ):
+            raise RouterContractError("Tool argument 'model' is invalid.")
+        effort = arguments.get("effort")
+        if effort is not None and effort not in {
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+        }:
+            raise RouterContractError("Tool argument 'effort' is invalid.")
+        normalized = {
+            "workspace": _bounded_string(arguments, "workspace", 1000),
+            "working_directory": (
+                working_directory.strip()
+                if isinstance(working_directory, str)
+                else None
+            ),
             "provider": provider,
             "model": model.strip() if isinstance(model, str) else None,
             "effort": effort,

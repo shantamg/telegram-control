@@ -517,6 +517,15 @@ Control-bound surface under the authorized forum using the existing
 `(chat_id, message_thread_id)` key. Consequential workspace or agent creation
 remains separately confirmation-gated. Multiple bot tokens are not required.
 
+An authorized forum can then be bound conversationally to one existing local
+workspace, including a non-Git notes tree. Control resolves the user-stated
+path or an enrolled project, validates the workspace and optional working
+directory, and presents a one-time **Bind forum workspace** confirmation. The
+durable forum record stores the realpath-resolved boundary, optional exact Git
+root, and Codex model/effort defaults. Repeating the same confirmation is
+idempotent; silently rebinding an active forum to another directory is
+rejected. Topic-level subject state is the next layer built on this boundary.
+
 Live setup:
 
 1. Create a private Telegram group and enable Topics.

@@ -31,6 +31,7 @@ from durable_store import (
     MIGRATION_14,
     MIGRATION_15,
     MIGRATION_16,
+    MIGRATION_17,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -592,6 +593,90 @@ class DurableStoreTests(unittest.TestCase):
                 target_type="controller",
                 target_id="different",
                 now=103,
+            )
+
+    def test_private_forum_workspace_binding_is_strict_and_idempotent(self):
+        workspace = Path(self.temporary_directory.name) / "life"
+        workspace.mkdir()
+        notes = workspace / "notes"
+        notes.mkdir()
+        forum = self.store.ensure_surface_binding(
+            chat_id=-100777,
+            surface_type="control",
+            display_name="Life",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+
+        bound, created = self.store.bind_forum_workspace(
+            chat_id=-100777,
+            forum_binding_id=forum.binding_id,
+            project_path=str(workspace),
+            working_directory=str(notes),
+            provider="codex",
+            provider_config={"model": "gpt-5.6-sol", "effort": "high"},
+            now=101,
+        )
+        self.assertTrue(created)
+        self.assertEqual(bound.display_name, "Life")
+        self.assertEqual(bound.workspace_root, os.path.realpath(workspace))
+        self.assertEqual(bound.working_directory, os.path.realpath(notes))
+        self.assertIsNone(bound.git_repository_root)
+        self.assertEqual(
+            bound.provider_config,
+            {"model": "gpt-5.6-sol", "effort": "high"},
+        )
+        self.assertEqual(
+            self.store.resolve_forum_workspace(-100777),
+            bound,
+        )
+
+        duplicate, duplicate_created = self.store.bind_forum_workspace(
+            chat_id=-100777,
+            forum_binding_id=forum.binding_id,
+            project_path=str(workspace),
+            working_directory=str(notes),
+            provider="codex",
+            provider_config={"model": "gpt-5.6-sol", "effort": "high"},
+            now=102,
+        )
+        self.assertFalse(duplicate_created)
+        self.assertEqual(duplicate, bound)
+        event = self.store.connection.execute(
+            "SELECT * FROM events WHERE kind = 'forum_workspace_bound'"
+        ).fetchall()
+        self.assertEqual(len(event), 1)
+
+        another = Path(self.temporary_directory.name) / "other"
+        another.mkdir()
+        with self.assertRaisesRegex(StoreError, "different workspace"):
+            self.store.bind_forum_workspace(
+                chat_id=-100777,
+                forum_binding_id=forum.binding_id,
+                project_path=str(another),
+            )
+        with self.assertRaisesRegex(StoreError, "exact repository root"):
+            self.store.bind_forum_workspace(
+                chat_id=-100777,
+                forum_binding_id=forum.binding_id,
+                project_path=str(workspace),
+                working_directory=str(notes),
+                git_repository_root=str(workspace),
+                provider="codex",
+                provider_config={"model": "gpt-5.6-sol", "effort": "high"},
+            )
+        with self.assertRaisesRegex(StoreError, "supergroup"):
+            self.store.bind_forum_workspace(
+                chat_id=123,
+                forum_binding_id=forum.binding_id,
+                project_path=str(workspace),
+            )
+        with self.assertRaisesRegex(StoreError, "no longer authorized"):
+            self.store.bind_forum_workspace(
+                chat_id=-100888,
+                forum_binding_id=forum.binding_id,
+                project_path=str(workspace),
             )
 
     def test_topic_surface_rename_is_identity_checked_and_audited(self):
@@ -3271,6 +3356,68 @@ class SchemaCompatibilityTests(unittest.TestCase):
                 )
                 self.assertEqual(store.quick_check(), "ok")
 
+    def test_schema_seventeen_database_adds_forum_workspaces(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-seventeen.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for migration in (
+                MIGRATION_1,
+                MIGRATION_2,
+                MIGRATION_3,
+                MIGRATION_4,
+                MIGRATION_5,
+                MIGRATION_6,
+                MIGRATION_7,
+                MIGRATION_8,
+                MIGRATION_9,
+                MIGRATION_10,
+                MIGRATION_11,
+                MIGRATION_12,
+                MIGRATION_13,
+                MIGRATION_14,
+                MIGRATION_15,
+                MIGRATION_16,
+                MIGRATION_17,
+            ):
+                for statement in migration:
+                    connection.execute(statement)
+            connection.execute(
+                """
+                INSERT INTO surface_bindings(
+                    binding_id, chat_id, message_thread_id, surface_type,
+                    display_name, target_type, target_id, state,
+                    created_at, updated_at
+                )
+                VALUES (
+                    61, -100777, 0, 'control', 'Life', 'controller',
+                    'control', 'active', 100, 100
+                )
+                """
+            )
+            connection.execute("PRAGMA user_version = 17")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+                table_count = store.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'forum_workspaces'
+                    """
+                ).fetchone()[0]
+                self.assertEqual(table_count, 1)
+                preserved = store.resolve_surface_binding(-100777, None)
+                self.assertIsNotNone(preserved)
+                self.assertEqual(preserved.binding_id, 61)
+                self.assertEqual(preserved.display_name, "Life")
+                self.assertIsNone(store.resolve_forum_workspace(-100777))
+                self.assertEqual(store.quick_check(), "ok")
+
     def test_cli_fails_cleanly_for_non_database_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "corrupt.sqlite3"
@@ -4155,6 +4302,311 @@ class DurableIntegrationTests(unittest.TestCase):
                     store.status_counts()["callbacks"],
                     {"consumed": 1, "expired": 1},
                 )
+
+    def test_router_binds_private_forum_workspace_after_confirmation(self):
+        class FakeRouterAdapter:
+            def __init__(self, workspace):
+                self.workspace = workspace
+
+            def run_turn(
+                self,
+                agent,
+                prompt,
+                mailbox_session_id,
+                on_session,
+                heartbeat,
+            ):
+                self.prompt = prompt
+                on_session("router-session-forum")
+                heartbeat()
+                return provider_adapters.ProviderTurnResult(
+                    provider_session_id="router-session-forum",
+                    final_text=json.dumps(
+                        {
+                            "tool": "bind_forum_workspace",
+                            "arguments": {
+                                "workspace": self.workspace,
+                                "provider": "codex",
+                            },
+                        }
+                    ),
+                    usage={},
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            real_workspace = os.path.realpath(workspace)
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            update = topic_message_update(
+                10,
+                f"Bind this forum to my workspace at {real_workspace}",
+            )
+            update["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            update["message"]["reply_to_message"]["forum_topic_created"][
+                "name"
+            ] = "General"
+
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                store.ensure_surface_binding(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    surface_type="control",
+                    display_name="General",
+                    target_type="controller",
+                    target_id="control",
+                    now=91,
+                )
+                store.ingest_update(update, now=100)
+                inbox = store.claim_job("inbox", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    inbox,
+                    "inbox",
+                )
+                receipt = store.claim_outbox("sender", now=10**12)
+                store.complete_outbox(
+                    receipt.message_id,
+                    "sender",
+                    {"message_id": 800, "chat": {"id": -100777}},
+                    now=10**12,
+                )
+                router_job = store.claim_router_mailbox(
+                    "router",
+                    now=10**12,
+                )
+                adapter = FakeRouterAdapter(real_workspace)
+                with mock.patch.object(
+                    telegram_control.provider_adapters,
+                    "adapter_for",
+                    return_value=adapter,
+                ):
+                    telegram_control.process_router_mailbox_job(
+                        store,
+                        router_job,
+                        "router",
+                    )
+
+                self.assertIn('"forum_authorized":true', adapter.prompt)
+                self.assertIn('"workspace_bound":false', adapter.prompt)
+                proposal = store.claim_outbox("sender-2", now=10**12)
+                self.assertEqual(proposal.method, "editMessageText")
+                self.assertIn(
+                    "Bind the Life forum to this workspace?",
+                    proposal.params["text"],
+                )
+                self.assertIn(real_workspace, proposal.params["text"])
+                proposal_buttons = proposal.params["reply_markup"][
+                    "inline_keyboard"
+                ]
+                self.assertEqual(
+                    [row[0]["text"] for row in proposal_buttons],
+                    ["Bind forum workspace", "Cancel"],
+                )
+                self.assertIsNone(store.resolve_forum_workspace(-100777))
+
+                with mock.patch.object(
+                    telegram_control.bridge,
+                    "api_call",
+                    side_effect=telegram_control.bridge.BridgeError(
+                        "Bad Request: message to edit not found"
+                    ),
+                ):
+                    telegram_control.send_outbox_message(
+                        store,
+                        "test-token",
+                        proposal,
+                        "sender-2",
+                    )
+                fallback = store.claim_outbox("sender-3", now=10**12)
+                self.assertEqual(fallback.method, "sendMessage")
+                self.assertIn("final-fallback", fallback.operation_id)
+                buttons = fallback.params["reply_markup"]["inline_keyboard"]
+                self.assertEqual(buttons, proposal_buttons)
+                store.complete_outbox(
+                    fallback.message_id,
+                    "sender-3",
+                    {"message_id": 801, "chat": {"id": -100777}},
+                    now=10**12,
+                )
+                with self.assertRaises(CallbackActionError) as wrong_chat:
+                    store.consume_callback_action(
+                        buttons[0][0]["callback_data"],
+                        chat_id=-100888,
+                        authorized_user_id=123,
+                        update_id=99,
+                        message_thread_id=62,
+                        now=101,
+                    )
+                self.assertEqual(wrong_chat.exception.code, "unauthorized")
+
+                confirmation = callback_update(
+                    11,
+                    buttons[0][0]["callback_data"],
+                    message_id=801,
+                    message_thread_id=62,
+                )
+                confirmation["callback_query"]["message"]["chat"] = {
+                    "id": -100777,
+                    "type": "supergroup",
+                    "title": "Life",
+                    "is_forum": True,
+                }
+                store.ingest_update(confirmation, now=102)
+                callback_job = store.claim_job("inbox-2", now=102)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    callback_job,
+                    "inbox-2",
+                )
+
+                bound = store.resolve_forum_workspace(-100777)
+                self.assertIsNotNone(bound)
+                self.assertEqual(bound.forum_binding_id, forum.binding_id)
+                self.assertEqual(bound.workspace_root, real_workspace)
+                self.assertEqual(bound.working_directory, real_workspace)
+                self.assertEqual(bound.provider, "codex")
+                self.assertEqual(
+                    store.status_counts()["callbacks"],
+                    {"consumed": 1, "expired": 1},
+                )
+                with self.assertRaises(CallbackActionError) as replay:
+                    store.consume_callback_action(
+                        buttons[0][0]["callback_data"],
+                        chat_id=-100777,
+                        authorized_user_id=123,
+                        update_id=12,
+                        message_thread_id=62,
+                        now=103,
+                    )
+                self.assertEqual(replay.exception.code, "consumed")
+                callback_outbox = [
+                    json.loads(row["params_json"])
+                    for row in store.connection.execute(
+                        """
+                        SELECT params_json
+                        FROM outbox_messages
+                        WHERE state = 'queued'
+                        ORDER BY message_id
+                        """
+                    ).fetchall()
+                ]
+                self.assertTrue(
+                    any(
+                        params.get("method") is None
+                        and "Life is now bound" in str(params.get("text", ""))
+                        for params in callback_outbox
+                    )
+                )
+
+    def test_forum_workspace_confirmation_rejects_moved_path(self):
+        import shutil
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            outside = Path(temporary_directory) / "outside"
+            outside.mkdir()
+            real_workspace = os.path.realpath(workspace)
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                action = store.create_callback_action(
+                    operation_id="router:99:forum-workspace:0",
+                    action_type="router_forum_workspace_confirm",
+                    payload={
+                        "router_mailbox_id": 99,
+                        "label": "Bind forum workspace",
+                        "chat_id": -100777,
+                        "forum_binding_id": forum.binding_id,
+                        "display_name": "Life",
+                        "project_path": real_workspace,
+                        "working_directory": real_workspace,
+                        "git_repository_root": None,
+                        "provider": "codex",
+                        "provider_config": {},
+                        "provenance": [
+                            {
+                                "value": real_workspace,
+                                "source": "user_request",
+                                "derived_from": real_workspace,
+                            }
+                        ],
+                    },
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    authorized_user_id=123,
+                    ttl_seconds=10**12,
+                    now=100,
+                )
+                update = callback_update(
+                    11,
+                    f"a:{action.token}",
+                    message_id=800,
+                    message_thread_id=62,
+                )
+                update["callback_query"]["message"]["chat"] = {
+                    "id": -100777,
+                    "type": "supergroup",
+                    "title": "Life",
+                    "is_forum": True,
+                }
+                store.ingest_update(update, now=101)
+                job_id = int(
+                    store.connection.execute(
+                        "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+                    ).fetchone()["job_id"]
+                )
+
+            shutil.rmtree(workspace)
+            workspace.symlink_to(outside)
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(job_id),
+                "TELEGRAM_CHAT_ID": "-100777",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_MESSAGE_ID": "800",
+                "TELEGRAM_MESSAGE_THREAD_ID": "62",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with self.assertRaisesRegex(
+                    StoreError,
+                    "no longer resolves",
+                ):
+                    on_message.handle_callback(
+                        update,
+                        update["callback_query"],
+                    )
+
+            with DurableStore(database_path) as store:
+                self.assertIsNone(store.resolve_forum_workspace(-100777))
 
     def test_confirmed_router_project_creation_builds_topic_and_agent(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

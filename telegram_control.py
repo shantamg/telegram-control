@@ -884,6 +884,145 @@ def project_creation_proposal(
     )
 
 
+def forum_workspace_proposal(
+    store: DurableStore,
+    chat_id: int,
+    user_input: str,
+    arguments: dict[str, Any],
+    discovery_refs: Optional[dict[str, dict[str, Any]]] = None,
+) -> tuple[str, Optional[dict[str, Any]]]:
+    """Build a confirmation-gated workspace binding for this private forum."""
+    if int(chat_id) >= 0:
+        raise StoreError(
+            "Forum workspace binding is available only inside an authorized "
+            "private forum."
+        )
+    forum_binding = store.resolve_surface_binding(chat_id, None)
+    if (
+        forum_binding is None
+        or forum_binding.surface_type != "control"
+        or forum_binding.target_type != "controller"
+        or forum_binding.target_id != "control"
+    ):
+        raise StoreError("This private forum is not authorized for Control.")
+    existing = store.resolve_forum_workspace(chat_id)
+    if existing is not None:
+        return (
+            control_message(
+                f"{existing.display_name} is already bound to its workspace."
+            ),
+            None,
+        )
+
+    refs = discovery_refs or {}
+    workspace_reference = str(arguments["workspace"]).strip()
+    workdir_reference = arguments.get("working_directory")
+    requested_provider = arguments.get("provider")
+    model = arguments.get("model")
+    effort = arguments.get("effort")
+    for label, value in (("model", model), ("effort", effort)):
+        if isinstance(value, str) and not alias_appears_in_input(value, user_input):
+            raise StoreError(
+                f"The requested {label} must appear explicitly in the user's request."
+            )
+
+    enrolled = store.resolve_project(workspace_reference)
+    provenance: list[dict[str, Any]] = []
+    if enrolled is not None:
+        if workdir_reference is not None:
+            raise StoreError(
+                f"{enrolled.display_name} is already enrolled; its working "
+                "directory cannot be changed while binding this forum."
+            )
+        if enrolled.provider != "codex":
+            raise StoreError(
+                "This release binds forum subjects to Codex workspaces only."
+            )
+        workspace_root = enrolled.project_path
+        working_directory = enrolled.working_directory
+        git_repository_root = enrolled.git_repository_root
+        provenance.append(
+            {
+                "value": workspace_root,
+                "source": "enrolled_project",
+                "derived_from": enrolled.slug,
+            }
+        )
+    else:
+        root_reference, root_provenance = resolve_path_reference(
+            workspace_reference,
+            user_input,
+            refs,
+            "forum workspace root",
+        )
+        workdir_text: Optional[str] = None
+        if workdir_reference is not None:
+            workdir_text, workdir_provenance = resolve_path_reference(
+                str(workdir_reference).strip(),
+                user_input,
+                refs,
+                "forum working directory",
+            )
+        workspace_root, working_directory, _ = (
+            discovery.validate_agent_workspace(
+                str(Path(root_reference).expanduser()),
+                (
+                    str(Path(workdir_text).expanduser())
+                    if workdir_text is not None
+                    else None
+                ),
+            )
+        )
+        git_repository_root = discovery.exact_git_root(workspace_root)
+        provenance.append(root_provenance)
+        if workdir_reference is not None:
+            provenance.append(workdir_provenance)
+
+    provider = str(requested_provider or "codex")
+    if provider != "codex":
+        raise StoreError("This release binds forum subjects to Codex only.")
+    provider_config = validate_provider_config(
+        provider,
+        {
+            key: value
+            for key, value in (("model", model), ("effort", effort))
+            if isinstance(value, str)
+        },
+    )
+    plan = {
+        "chat_id": int(chat_id),
+        "forum_binding_id": forum_binding.binding_id,
+        "display_name": forum_binding.display_name,
+        "project_path": workspace_root,
+        "working_directory": working_directory,
+        "git_repository_root": git_repository_root,
+        "provider": provider,
+        "provider_config": provider_config,
+        "provenance": provenance,
+    }
+    workdir_line = (
+        f"Working directory: {working_directory}\n"
+        if working_directory != workspace_root
+        else ""
+    )
+    model_text = str(provider_config.get("model", "provider default"))
+    effort_text = str(provider_config.get("effort", "provider default"))
+    return (
+        control_message(
+            f"Bind the {forum_binding.display_name} forum to this workspace?\n\n"
+            f"Workspace: {workspace_root}\n"
+            f"{workdir_line}"
+            f"Git: {'repository detected' if git_repository_root else 'not required'}\n"
+            f"Provider: {provider}\n"
+            f"Model: {model_text}\n"
+            f"Effort: {effort_text}\n\n"
+            "Every topic in this forum will stay inside this workspace "
+            "boundary. Nothing changes until you confirm."
+        ),
+        plan,
+    )
+
+
 def topic_rename_proposal(
     store: DurableStore,
     chat_id: int,
@@ -1071,12 +1210,53 @@ def process_router_mailbox_job(
         )
         projects = store.list_projects()
         topics = store.list_topic_surfaces(job.chat_id)
+        forum_workspace = (
+            store.resolve_forum_workspace(job.chat_id)
+            if job.chat_id < 0
+            else None
+        )
+        forum_binding = (
+            store.resolve_surface_binding(job.chat_id, None)
+            if job.chat_id < 0
+            else None
+        )
+        current_surface = {
+            "kind": (
+                "private_forum_topic"
+                if job.chat_id < 0 and forum_binding is not None
+                else "private_control"
+            ),
+            "message_thread_id": job.message_thread_id,
+            "forum_authorized": bool(
+                job.chat_id < 0
+                and forum_binding is not None
+                and forum_binding.target_type == "controller"
+                and forum_binding.target_id == "control"
+            ),
+            "forum_name": (
+                forum_binding.display_name
+                if forum_binding is not None
+                else None
+            ),
+            "workspace_bound": forum_workspace is not None,
+            "workspace_name": (
+                forum_workspace.display_name
+                if forum_workspace is not None
+                else None
+            ),
+            "provider": (
+                forum_workspace.provider
+                if forum_workspace is not None
+                else None
+            ),
+        }
         prompt = router_contract.build_main_agent_prompt(
             job.input_text,
             projects,
             store.list_project_agent_states(),
             store.project_alias_map(),
             topics,
+            current_surface,
         )
         # Bounded multi-step loop: read-only discovery calls repeat until the
         # model returns one terminal tool. Completed steps are persisted, so
@@ -1291,6 +1471,7 @@ def process_router_mailbox_job(
         dispatch_message = None
         clarification_options = None
         project_creation_plan = None
+        forum_workspace_plan = None
         topic_rename_plan = None
         agent_config_plan = None
         if call.tool == "send_to_agent":
@@ -1332,6 +1513,14 @@ def process_router_mailbox_job(
         elif call.tool == "create_project_agent":
             response_text, project_creation_plan = project_creation_proposal(
                 store,
+                user_request_text,
+                call.arguments,
+                discovery_state["refs"],
+            )
+        elif call.tool == "bind_forum_workspace":
+            response_text, forum_workspace_plan = forum_workspace_proposal(
+                store,
+                job.chat_id,
                 user_request_text,
                 call.arguments,
                 discovery_state["refs"],
@@ -1426,6 +1615,7 @@ def process_router_mailbox_job(
             dispatch_message=dispatch_message,
             clarification_options=clarification_options,
             project_creation_plan=project_creation_plan,
+            forum_workspace_plan=forum_workspace_plan,
             topic_rename_plan=topic_rename_plan,
             agent_config_plan=agent_config_plan,
         )

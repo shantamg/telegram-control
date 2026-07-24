@@ -1240,6 +1240,27 @@ administrator in each private forum before ordinary topic text and voice can
 reach the controller. This is an explicit live-setup requirement, not
 something the local tests can simulate.
 
+### Forum-workspace binding checkpoint
+
+Schema v18 adds one durable workspace boundary per authorized private forum.
+The conversational Control agent receives bounded current-surface state and
+may propose `bind_forum_workspace` only for the forum containing the request.
+The proposal accepts an enrolled workspace, an explicit user path, or an
+opaque result from read-only discovery; Git remains optional and Claude is not
+enabled for this release. Model and effort overrides must appear explicitly in
+the user's request.
+
+The controller revalidates the forum authorization and every realpath at
+confirmation time, then persists the binding only after the owner presses the
+one-time **Bind forum workspace** button. Exact retries are idempotent, while
+cross-chat confirmation, model-invented paths or discovery refs, symlink
+movement, false Git metadata, callback replay, and silent rebinding fail
+closed. Schema-17 migration and end-to-end request/proposal/confirmation
+fixtures cover those boundaries before live deployment. The permanent-edit
+fallback also preserves the active confirmation keyboard if Telegram can no
+longer edit the original routing receipt. Topic subjects remain the next chunk
+and do not yet inherit an agent merely because the forum workspace is bound.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)
