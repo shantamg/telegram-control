@@ -6788,10 +6788,14 @@ class DurableStore:
                 method=method,
                 params=params,
                 route=route,
-                card={
-                    "kind": "agent_notification",
-                    "mailbox_id": int(mailbox_id),
-                },
+                card=(
+                    {
+                        "kind": "agent_voice",
+                        "mailbox_id": int(mailbox_id),
+                    }
+                    if voice_file_path is not None
+                    else None
+                ),
                 serialize_key=f"agent-notification:{int(mailbox_id)}",
                 now=timestamp,
             )

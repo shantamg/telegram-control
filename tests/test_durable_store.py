@@ -1716,6 +1716,15 @@ class DurableStoreTests(unittest.TestCase):
             agent.agent_id,
         )
         self.assertEqual(self.store.outbox_operation_state(operation_id), "queued")
+        outbound = self.store.claim_outbox("sender", now=105)
+        self.assertEqual(outbound.message_id, message_id)
+        self.store.complete_outbox(
+            outbound.message_id,
+            "sender",
+            {"message_id": 701, "chat": {"id": 123}},
+            now=106,
+        )
+        self.assertEqual(self.store.outbox_operation_state(operation_id), "sent")
 
         environment = {
             "TELEGRAM_CONTROL_DB": str(self.database_path),
@@ -1759,6 +1768,13 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(
             json.loads(voice_row["params_json"])["__voice_file_path"],
             str(voice_path),
+        )
+        voice_outbound = self.store.claim_outbox("sender", now=10**12)
+        self.store.complete_outbox(
+            voice_outbound.message_id,
+            "sender",
+            {"message_id": 702, "chat": {"id": 123}},
+            now=10**12,
         )
 
         with self.assertRaisesRegex(
