@@ -265,10 +265,12 @@ def router_preview_text(
         destination = project.display_name if project is not None else str(
             arguments["project_slug"]
         )
-        body = (
-            f"Would send this to {destination}:\n\n"
-            f"{arguments['message']}"
+        result = (
+            f"📨 Sent to {destination}\n\n"
+            f"{arguments['message']}\n\n"
+            "Waiting for the agent…"
         )
+        return result[:3800]
     elif call.tool == "list_projects":
         body = "Would list the enrolled projects and their active agents."
     elif call.tool == "inspect_project":
@@ -340,6 +342,18 @@ def process_router_mailbox_job(
             {project.slug for project in projects},
         )
         preview = router_preview_text(store, call)
+        dispatch_agent_id = None
+        dispatch_message = None
+        if call.tool == "send_to_agent":
+            target = store.resolve_project_agent(
+                str(call.arguments["project_slug"])
+            )
+            if target is None:
+                raise StoreError(
+                    "The selected project has no active managed agent."
+                )
+            dispatch_agent_id = target.agent_id
+            dispatch_message = str(call.arguments["message"])
         store.complete_router_mailbox(
             job.mailbox_id,
             worker_id,
@@ -349,6 +363,8 @@ def process_router_mailbox_job(
             call.arguments,
             preview,
             result.usage,
+            dispatch_agent_id=dispatch_agent_id,
+            dispatch_message=dispatch_message,
         )
         log_event(
             "router_turn_succeeded",

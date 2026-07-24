@@ -286,9 +286,11 @@ requires controller-enforced confirmation.
 Ordinary messages in the root Control chat now enter a dedicated durable
 router mailbox. A supervised worker invokes the main Codex agent with the
 path-safe catalog, persists its provider session, validates the selected tool,
-and replaces a `🧭 Routing…` receipt with a preview. This checkpoint does not
-execute the tool, so routing judgment can be tested independently from side
-effects.
+and replaces a `🧭 Routing…` receipt with the selected action. A validated
+`send_to_agent` call is atomically appended to the project agent's durable
+mailbox. The root receipt briefly reports the destination, then is replaced by
+the project agent's eventual response. Project-agent creation remains
+confirmation-gated.
 
 The earlier strict `route`, `clarify`, or `reject` schema remains as a compact
 classification and evaluation primitive. It is not intended to become a

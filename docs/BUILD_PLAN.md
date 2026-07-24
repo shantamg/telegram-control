@@ -890,8 +890,13 @@ The Stage 4 router-contract and durable-preview slices pass 74 offline tests:
   call, and replaces the receipt with a human-readable preview;
 - receipt/result races and failed edits have durable completion and fallback
   paths;
-- the preview executes no tool; live evaluation comes before enabling
-  read-only tools, clarification buttons, confirmations, or real dispatch.
+- the first live preview correctly selected `send_to_agent` for a natural
+  request and executed nothing;
+- validated `send_to_agent` calls are now atomically appended to the selected
+  project agent mailbox, and the project response replaces the root routing
+  receipt rather than leaking into the project topic;
+- read-only tools, clarification buttons, and confirmation-backed creation
+  remain staged behind the same controller validation boundary.
 
 ## References
 

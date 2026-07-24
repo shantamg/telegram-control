@@ -1386,7 +1386,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     {"queued": 1},
                 )
 
-    def test_router_worker_builds_path_safe_prompt_and_edits_preview(self):
+    def test_router_dispatches_atomically_and_relays_agent_response(self):
         class FakeRouterAdapter:
             def run_turn(
                 self,
@@ -1411,6 +1411,24 @@ class DurableIntegrationTests(unittest.TestCase):
                     usage={"input_tokens": 25, "output_tokens": 8},
                 )
 
+        class FakeProjectAdapter:
+            def run_turn(
+                self,
+                agent,
+                prompt,
+                mailbox_session_id,
+                on_session,
+                heartbeat,
+            ):
+                self.prompt = prompt
+                on_session("project-session-123")
+                heartbeat()
+                return provider_adapters.ProviderTurnResult(
+                    provider_session_id="project-session-123",
+                    final_text="Stage 4 is progressing normally.",
+                    usage={"input_tokens": 40, "output_tokens": 6},
+                )
+
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"
             config = {
@@ -1424,6 +1442,21 @@ class DurableIntegrationTests(unittest.TestCase):
                     display_name="Telegram Control",
                     provider="codex",
                     project_path="/secret/local/path",
+                    now=99,
+                )
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Telegram Control",
+                    target_type="controller",
+                    target_id="control",
+                    now=99,
+                )
+                project_agent, _ = store.attach_enrolled_project(
+                    123,
+                    62,
+                    "telegram-control",
                     now=99,
                 )
                 store.ingest_update(
@@ -1474,6 +1507,10 @@ class DurableIntegrationTests(unittest.TestCase):
                     {"succeeded": 1},
                 )
                 self.assertEqual(
+                    store.status_counts()["agent_mailbox"],
+                    {"queued": 1},
+                )
+                self.assertEqual(
                     store.resolve_main_agent().provider_session_id,
                     "router-session-123",
                 )
@@ -1481,10 +1518,46 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(preview.method, "editMessageText")
                 self.assertEqual(preview.params["message_id"], 700)
                 self.assertIn(
-                    "Would send this to Telegram Control",
+                    "📨 Sent to Telegram Control",
                     preview.params["text"],
                 )
-                self.assertIn("No action was executed.", preview.params["text"])
+                self.assertIn("Waiting for the agent", preview.params["text"])
+                store.complete_outbox(
+                    preview.message_id,
+                    "sender-2",
+                    {"message_id": 700, "chat": {"id": 123}},
+                    now=10**12,
+                )
+
+                agent_job = store.claim_agent_mailbox(
+                    "agent-worker",
+                    now=10**12,
+                )
+                project_fake = FakeProjectAdapter()
+                with mock.patch.object(
+                    telegram_control.provider_adapters,
+                    "adapter_for",
+                    return_value=project_fake,
+                ):
+                    telegram_control.process_agent_mailbox_job(
+                        store,
+                        agent_job,
+                        "agent-worker",
+                    )
+                self.assertEqual(project_fake.prompt, "Summarize Stage 4")
+                self.assertEqual(
+                    store.resolve_agent(
+                        project_agent.agent_id
+                    ).provider_session_id,
+                    "project-session-123",
+                )
+                final = store.claim_outbox("sender-3", now=10**12)
+                self.assertEqual(final.method, "editMessageText")
+                self.assertEqual(final.params["message_id"], 700)
+                self.assertEqual(
+                    final.params["text"],
+                    "Stage 4 is progressing normally.",
+                )
 
     def test_button_callback_routes_once_through_existing_handler(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

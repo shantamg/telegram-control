@@ -1813,6 +1813,22 @@ class DurableStore:
             for row in rows
         ]
 
+    def resolve_project_agent(self, project_slug: str) -> Optional[ManagedAgent]:
+        row = self.connection.execute(
+            """
+            SELECT a.*
+            FROM agents AS a
+            JOIN managed_projects AS p
+                ON p.slug = a.slug
+                AND p.project_path = a.project_path
+            WHERE p.slug = ? AND p.state = 'active' AND a.role = 'project'
+            ORDER BY a.created_at
+            LIMIT 1
+            """,
+            (project_slug,),
+        ).fetchone()
+        return self._managed_agent_from_row(row) if row is not None else None
+
     def _ensure_main_agent(self, timestamp: float) -> ManagedAgent:
         row = self.connection.execute(
             "SELECT * FROM agents WHERE hierarchical_name = 'tc--root'"
@@ -2108,6 +2124,7 @@ class DurableStore:
         mailbox_id: int,
         preview_text: str,
         timestamp: float,
+        operation_suffix: str = "final-edit",
     ) -> bool:
         row = self.connection.execute(
             """
@@ -2130,7 +2147,9 @@ class DurableStore:
         except (KeyError, TypeError, ValueError):
             raise StoreError("Stored Telegram router receipt is invalid.") from None
         self.enqueue_api_call(
-            operation_id=f"router-mailbox:{int(mailbox_id)}:final-edit",
+            operation_id=(
+                f"router-mailbox:{int(mailbox_id)}:{operation_suffix}"
+            ),
             method="editMessageText",
             params={
                 "chat_id": int(row["chat_id"]),
@@ -2156,16 +2175,20 @@ class DurableStore:
         arguments: dict[str, Any],
         preview_text: str,
         usage: dict[str, Any],
+        dispatch_agent_id: Optional[str] = None,
+        dispatch_message: Optional[str] = None,
         now: Optional[float] = None,
     ) -> None:
         if not preview_text or len(preview_text) > 3800:
             raise StoreError("Router preview text is invalid.")
+        if (dispatch_agent_id is None) != (dispatch_message is None):
+            raise StoreError("Router dispatch arguments are incomplete.")
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             row = self.connection.execute(
                 """
-                SELECT 1
+                SELECT source_inbox_job_id
                 FROM router_mailbox
                 WHERE mailbox_id = ? AND state = 'leased' AND lease_owner = ?
                 """,
@@ -2174,6 +2197,16 @@ class DurableStore:
             if row is None:
                 raise LeaseLostError(
                     f"Router mailbox lease for {mailbox_id} is no longer owned."
+                )
+            if dispatch_agent_id is not None and dispatch_message is not None:
+                agent = self.resolve_agent(dispatch_agent_id)
+                if agent is None or agent.role != "project":
+                    raise StoreError("Router dispatch target is not a project agent.")
+                self.enqueue_agent_message(
+                    agent_id=dispatch_agent_id,
+                    source_inbox_job_id=int(row["source_inbox_job_id"]),
+                    input_text=dispatch_message,
+                    now=timestamp,
                 )
             self.connection.execute(
                 """
@@ -3277,6 +3310,63 @@ class DurableStore:
                 (provider_session_id, timestamp, str(row["agent_id"])),
             )
             thread_id = int(binding["message_thread_id"])
+            router_origin = self.connection.execute(
+                """
+                SELECT mailbox_id, chat_id, message_thread_id
+                FROM router_mailbox
+                WHERE source_inbox_job_id = ?
+                    AND state = 'succeeded'
+                    AND tool_name = 'send_to_agent'
+                """,
+                (int(row["source_inbox_job_id"]),),
+            ).fetchone()
+            if router_origin is not None:
+                router_mailbox_id = int(router_origin["mailbox_id"])
+                self.connection.execute(
+                    """
+                    UPDATE router_mailbox
+                    SET preview_text = ?, updated_at = ?
+                    WHERE mailbox_id = ?
+                    """,
+                    (
+                        response_chunks[0],
+                        timestamp,
+                        router_mailbox_id,
+                    ),
+                )
+                self._enqueue_router_final_edit(
+                    router_mailbox_id,
+                    response_chunks[0],
+                    timestamp,
+                    operation_suffix="agent-final-edit",
+                )
+                router_thread_id = int(router_origin["message_thread_id"])
+                for index, chunk in enumerate(response_chunks[1:], start=2):
+                    self.enqueue_api_call(
+                        operation_id=(
+                            f"router-mailbox:{router_mailbox_id}:"
+                            f"agent-response:{index}"
+                        ),
+                        method="sendMessage",
+                        params={
+                            "chat_id": int(router_origin["chat_id"]),
+                            "message_thread_id": (
+                                router_thread_id
+                                if router_thread_id != 0
+                                else None
+                            ),
+                            "text": chunk,
+                        },
+                        route={
+                            "target_type": "controller",
+                            "target_id": "control",
+                            "policy": "reply",
+                            "ttl_seconds": 30 * 24 * 60 * 60,
+                        },
+                        now=timestamp,
+                    )
+                self.connection.execute("COMMIT")
+                return
             receipt = self.connection.execute(
                 """
                 SELECT state, params_json, telegram_result_json
@@ -3359,7 +3449,7 @@ class DurableStore:
         try:
             row = self.connection.execute(
                 """
-                SELECT agent_id, attempts
+                SELECT agent_id, source_inbox_job_id, attempts
                 FROM agent_mailbox
                 WHERE mailbox_id = ? AND state = 'leased'
                     AND lease_owner = ?
@@ -3400,6 +3490,37 @@ class DurableStore:
                     str(row["agent_id"]),
                 ),
             )
+            if state == "dead":
+                router_origin = self.connection.execute(
+                    """
+                    SELECT mailbox_id
+                    FROM router_mailbox
+                    WHERE source_inbox_job_id = ?
+                        AND state = 'succeeded'
+                        AND tool_name = 'send_to_agent'
+                    """,
+                    (int(row["source_inbox_job_id"]),),
+                ).fetchone()
+                if router_origin is not None:
+                    router_mailbox_id = int(router_origin["mailbox_id"])
+                    failure_text = (
+                        "❌ The project agent could not complete this request. "
+                        "You can retry or rephrase it."
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE router_mailbox
+                        SET preview_text = ?, updated_at = ?
+                        WHERE mailbox_id = ?
+                        """,
+                        (failure_text, timestamp, router_mailbox_id),
+                    )
+                    self._enqueue_router_final_edit(
+                        router_mailbox_id,
+                        failure_text,
+                        timestamp,
+                        operation_suffix="agent-failed-edit",
+                    )
             self.connection.execute("COMMIT")
             return state
         except BaseException:
