@@ -196,6 +196,7 @@ class CodexExecAdapter:
     ) -> ProviderTurnResult:
         if not agent.project_path:
             raise ProviderAdapterError("Codex agent has no project path.")
+        launch_directory = agent.working_directory or agent.project_path
         model = agent.provider_config.get("model")
         effort = agent.provider_config.get("effort")
         sandbox = str(agent.provider_config.get("sandbox", "workspace-write"))
@@ -227,7 +228,7 @@ class CodexExecAdapter:
                 "--sandbox",
                 sandbox,
                 "--cd",
-                agent.project_path,
+                launch_directory,
             ]
             if model:
                 command.extend(["--model", str(model)])
@@ -251,7 +252,7 @@ class CodexExecAdapter:
         with tempfile.TemporaryFile(mode="w+t") as stderr_file:
             process = subprocess.Popen(
                 command,
-                cwd=agent.project_path,
+                cwd=launch_directory,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,
@@ -382,6 +383,7 @@ class ClaudePrintAdapter:
     ) -> ProviderTurnResult:
         if not agent.project_path:
             raise ProviderAdapterError("Claude agent has no project path.")
+        launch_directory = agent.working_directory or agent.project_path
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
         command = self.command(agent, persisted_session)
@@ -400,7 +402,7 @@ class ClaudePrintAdapter:
         with tempfile.TemporaryFile(mode="w+t") as stderr_file:
             process = subprocess.Popen(
                 command,
-                cwd=agent.project_path,
+                cwd=launch_directory,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,

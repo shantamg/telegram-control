@@ -119,5 +119,41 @@
         "message": "The controller is online."
       }
     }
+  },
+  {
+    "name": "find_directory_discovery",
+    "input": "Add the lovely repo from my software folder as a project.",
+    "expected_tool": "find_directory",
+    "sample_output": {
+      "tool": "find_directory",
+      "arguments": {
+        "query": "lovely"
+      }
+    }
+  },
+  {
+    "name": "inspect_directory_discovery",
+    "input": "What is inside the lovely repository you found?",
+    "expected_tool": "inspect_directory",
+    "sample_output": {
+      "tool": "inspect_directory",
+      "arguments": {
+        "path": "loc_1a2b3c4d"
+      }
+    }
+  },
+  {
+    "name": "create_project_agent_with_workdir",
+    "input": "Create a project called Lovely for the peter app subdirectory of the lovely repo.",
+    "expected_tool": "create_project_agent",
+    "sample_output": {
+      "tool": "create_project_agent",
+      "arguments": {
+        "project": "loc_1a2b3c4d",
+        "working_directory": "loc_5e6f7a8b",
+        "topic_name": "Lovely",
+        "name": "Lovely"
+      }
+    }
   }
 ]

@@ -14,6 +14,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -21,6 +22,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
+import discovery
 import telegram_bridge as bridge
 import provider_adapters
 import router_contract
@@ -34,7 +36,6 @@ from durable_store import (
     OutboxMessage,
     RouterMailboxJob,
     StoreError,
-    chunk_telegram_text,
     validate_provider_config,
 )
 
@@ -43,6 +44,20 @@ DATABASE_PATH = bridge.CONFIG_DIR / "controller.sqlite3"
 SCRIPT_PATH = Path(__file__).resolve()
 ROUTER_MAX_COMPLETED_TURNS = 12
 ROUTER_MAX_INPUT_TOKENS = 180_000
+ROUTER_MAX_DISCOVERY_STEPS = 6
+ROUTER_MAX_DISCOVERY_REFS = 40
+ROUTER_MAX_LOOP_SECONDS = 240.0
+CONTROL_SPEAKER = "🎛 Control"
+
+
+def control_message(text: str) -> str:
+    """Render a Control-authored Telegram message with its speaker label."""
+    return f"{CONTROL_SPEAKER}\n\n{text}"
+
+
+def handoff_message(project_name: str, text: str) -> str:
+    """Render a visible Control → project handoff."""
+    return f"{CONTROL_SPEAKER} → {project_name}\n\n{text}"
 
 
 def log_event(kind: str, **details: Any) -> None:
@@ -177,6 +192,21 @@ def process_agent_mailbox_job(
         agent = store.resolve_agent(job.agent_id)
         if agent is None:
             raise StoreError("Managed agent no longer exists.")
+        if agent.project_path:
+            # Launch-time revalidation: the stored paths must still resolve
+            # to themselves (no symlink swap) with the working directory
+            # contained in the repository root.
+            root_real, workdir_real = discovery.validate_repository_workspace(
+                agent.project_path,
+                agent.working_directory,
+            )
+            if root_real != agent.project_path or workdir_real != (
+                agent.working_directory or agent.project_path
+            ):
+                raise StoreError(
+                    "Managed agent workspace paths no longer resolve to "
+                    "their enrolled locations."
+                )
         store.enqueue_agent_voice_status(
             job.source_inbox_job_id,
             "working",
@@ -202,7 +232,6 @@ def process_agent_mailbox_job(
             worker_id,
             result.provider_session_id,
             result.final_text,
-            chunk_telegram_text(result.final_text),
             result.usage,
         )
         log_event(
@@ -246,62 +275,202 @@ def work_agents_command(args: argparse.Namespace) -> None:
                 return
 
 
-def router_preview_text(
+def dispatch_preview_text(
     store: DurableStore,
     call: router_contract.RouterToolCall,
 ) -> str:
+    """Precise, identity-labeled handoff text for send_to_agent."""
     arguments = call.arguments
-    if call.tool == "send_to_agent":
-        project = store.resolve_project(str(arguments["project_slug"]))
-        destination = project.display_name if project is not None else str(
-            arguments["project_slug"]
-        )
-        result = (
-            f"📨 Sent to {destination}\n\n"
-            f"{arguments['message']}\n\n"
-            "Waiting for the agent…"
-        )
-        return result[:3800]
-    elif call.tool == "list_projects":
-        body = "Would list the enrolled projects and their active agents."
-    elif call.tool == "inspect_project":
-        body = f"Would inspect {arguments['project']} read-only."
-    elif call.tool == "create_project_agent":
-        topic = arguments.get("topic_name")
-        body = f"Would propose creating a project agent for {arguments['project']}."
-        if topic:
-            body += f"\n\nSuggested topic: {topic}"
-    elif call.tool == "rename_topic":
-        body = (
-            f"Would rename topic {arguments['message_thread_id']} "
-            f"to {arguments['name']}."
-        )
-    elif call.tool == "ask_user":
-        body = f"Would ask:\n\n{arguments['question']}"
-        options = arguments["options"]
-        if options:
-            body += "\n\nChoices: " + " · ".join(options)
-    else:
-        body = f"Would reply:\n\n{arguments['message']}"
-    confirmation = (
-        "\n\nConfirmation would be required."
-        if call.requires_confirmation
-        else ""
+    project = store.resolve_project(str(arguments["project_slug"]))
+    destination = (
+        project.display_name
+        if project is not None
+        else str(arguments["project_slug"])
     )
-    preview = (
-        "🧭 Router preview\n\n"
-        f"{body}{confirmation}\n\n"
-        "No action was executed."
+    result = handoff_message(
+        destination,
+        f"Sending: {arguments['message']}\n\nWaiting for {destination}…",
     )
-    if len(preview) > 3800:
-        preview = preview[:3799].rstrip() + "…"
-    return preview
+    return result[:3800]
+
+
+def annotate_discovery_refs(
+    result: dict[str, Any],
+    existing_refs: dict[str, dict[str, Any]],
+    derived_from: str,
+    roots: list[Path],
+    ref_budget: int,
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """Attach controller-issued opaque ref IDs to every discovered path.
+
+    Refs are the only trusted provenance for discovered paths: the model may
+    reference a filesystem location in a mutation proposal only through a
+    ref the controller issued here (or through text the user wrote). A ref
+    is issued only for paths inside the authorized discovery roots — a
+    containing Git root that lies above the roots stays visible as plain
+    text but can never be used for enrollment — and issuance stops at the
+    per-turn ref budget.
+    """
+    path_to_ref = {
+        str(info.get("path")): ref for ref, info in existing_refs.items()
+    }
+    issued: dict[str, dict[str, Any]] = {}
+
+    def ref_for(path: str) -> Optional[str]:
+        if path in path_to_ref:
+            return path_to_ref[path]
+        if len(issued) >= ref_budget:
+            result["refs_truncated"] = True
+            return None
+        if not discovery.within_roots(path, roots):
+            return None
+        existing_ids = set(existing_refs) | set(issued)
+        ref = f"loc_{uuid.uuid4().hex[:8]}"
+        while ref in existing_ids:
+            ref = f"loc_{uuid.uuid4().hex[:8]}"
+        path_to_ref[path] = ref
+        issued[ref] = {
+            "path": path,
+            "source": "read_only_discovery",
+            "derived_from": derived_from[:200],
+        }
+        return ref
+
+    def annotate_entry(entry: dict[str, Any]) -> None:
+        path = entry.get("path")
+        if isinstance(path, str) and path:
+            ref = ref_for(path)
+            if ref is not None:
+                entry["ref"] = ref
+        git_root = entry.get("containing_git_root")
+        if isinstance(git_root, str) and git_root:
+            git_root_ref = ref_for(git_root)
+            if git_root_ref is not None:
+                entry["git_root_ref"] = git_root_ref
+
+    candidates = result.get("candidates")
+    if isinstance(candidates, list):
+        for entry in candidates:
+            if isinstance(entry, dict):
+                annotate_entry(entry)
+    if result.get("is_directory"):
+        annotate_entry(result)
+        parent = result.get("path")
+        names = result.get("subdirectories")
+        if isinstance(parent, str) and isinstance(names, list):
+            subdirectory_refs = {}
+            for name in names:
+                ref = ref_for(str(Path(parent) / str(name)))
+                if ref is not None:
+                    subdirectory_refs[str(name)] = ref
+            result["subdirectory_refs"] = subdirectory_refs
+    return result, issued
+
+
+def annotate_enrollment_metadata(
+    store: DurableStore,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    """Add bounded durable project/agent context to discovered paths."""
+    projects = store.list_projects()
+
+    def annotate(entry: dict[str, Any]) -> None:
+        path = entry.get("path")
+        git_root = entry.get("containing_git_root")
+        if not isinstance(path, str):
+            return
+        matches = []
+        for project in projects:
+            roles = []
+            if path == project.project_path:
+                roles.append("repository_root")
+            if path == project.working_directory:
+                roles.append("working_directory")
+            if git_root == project.project_path and not roles:
+                roles.append("inside_repository")
+            if not roles:
+                continue
+            agent = store.resolve_project_agent(project.slug)
+            matches.append(
+                {
+                    "project_slug": project.slug,
+                    "name": project.display_name,
+                    "provider": project.provider,
+                    "path_roles": roles,
+                    "agent_state": (
+                        agent.lifecycle_state
+                        if agent is not None
+                        else "not created"
+                    ),
+                }
+            )
+            if len(matches) >= 4:
+                break
+        if matches:
+            entry["enrolled_projects"] = matches
+
+    candidates = result.get("candidates")
+    if isinstance(candidates, list):
+        for entry in candidates:
+            if isinstance(entry, dict):
+                annotate(entry)
+    if result.get("is_directory"):
+        annotate(result)
+    return result
+
+
+def explicit_absolute_path_in_input(reference: str, user_input: str) -> bool:
+    """Require an exact user-authored absolute path, allowing prose punctuation."""
+    if not reference or len(reference) > 1000:
+        return False
+    candidate = Path(reference).expanduser()
+    if not candidate.is_absolute():
+        return False
+    # Path characters on either side indicate a prefix/subpath match. Safe
+    # prose delimiters such as quotes, backticks, parentheses, commas, and a
+    # sentence-ending period remain accepted.
+    start = 0
+    invalid_neighbor = set("_/~+@-")
+    while True:
+        index = user_input.find(reference, start)
+        if index < 0:
+            return False
+        before = user_input[index - 1] if index else ""
+        end = index + len(reference)
+        after = user_input[end] if end < len(user_input) else ""
+        before_ok = (
+            not before
+            or before.isspace()
+            or (
+                not before.isalnum()
+                and before not in (invalid_neighbor | {"."})
+            )
+        )
+        after_ok = (
+            not after
+            or after.isspace()
+            or after in "'\"`),;:!?]}“”‘’>"
+            or (
+                after == "."
+                and (
+                    end + 1 == len(user_input)
+                    or user_input[end + 1].isspace()
+                    or user_input[end + 1] in "'\"`)]}“”‘’>"
+                )
+            )
+        )
+        if before_ok and after_ok:
+            return True
+        start = index + 1
 
 
 def project_inspection_text(
     store: DurableStore,
     project_key: str,
     user_input: Optional[str] = None,
+    discovery_refs: Optional[dict[str, dict[str, Any]]] = None,
+    roots: Optional[list[Path]] = None,
+    deadline: Optional[float] = None,
 ) -> Optional[str]:
     project = store.resolve_project(project_key)
     if project is not None:
@@ -310,17 +479,36 @@ def project_inspection_text(
         provider = project.provider
         agent = store.resolve_project_agent(project.slug)
     else:
-        if user_input is None or project_key not in user_input:
+        ref = (discovery_refs or {}).get(project_key)
+        if ref is not None:
+            raw_path = str(ref.get("path", ""))
+        elif (
+            user_input is not None
+            and explicit_absolute_path_in_input(project_key, user_input)
+        ):
+            raw_path = project_key
+        else:
             return None
-        requested_path = Path(project_key).expanduser().resolve()
+        if roots is None:
+            roots = discovery.load_discovery_roots()
+        if not discovery.within_roots(raw_path, roots):
+            return None
+        requested_path = Path(os.path.realpath(Path(raw_path).expanduser()))
         if not requested_path.is_dir():
+            return None
+        remaining = (
+            5.0
+            if deadline is None
+            else min(5.0, deadline - time.monotonic())
+        )
+        if remaining <= 0:
             return None
         try:
             root_result = subprocess.run(
                 ["git", "-C", str(requested_path), "rev-parse", "--show-toplevel"],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=remaining,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -348,20 +536,34 @@ def project_inspection_text(
 
     git_status = "unavailable"
     try:
+        remaining = (
+            5.0
+            if deadline is None
+            else min(5.0, deadline - time.monotonic())
+        )
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired("git", 0)
         branch_result = subprocess.run(
             ["git", "branch", "--show-current"],
             cwd=project_path,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=remaining,
             check=False,
         )
+        remaining = (
+            5.0
+            if deadline is None
+            else min(5.0, deadline - time.monotonic())
+        )
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired("git", 0)
         changes_result = subprocess.run(
             ["git", "status", "--porcelain"],
             cwd=project_path,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=remaining,
             check=False,
         )
         if branch_result.returncode == 0 and changes_result.returncode == 0:
@@ -417,12 +619,56 @@ def alias_appears_in_input(alias: str, user_input: str) -> bool:
     ) is not None
 
 
+def resolve_path_reference(
+    reference: str,
+    user_input: str,
+    discovery_refs: dict[str, dict[str, Any]],
+    label: str,
+) -> tuple[str, dict[str, Any]]:
+    """Resolve a model-supplied path reference with trusted provenance.
+
+    A reference is accepted only as a controller-issued discovery ref ID or
+    as a path the user themselves wrote; a model-asserted path with neither
+    provenance fails closed.
+    """
+    if reference in discovery_refs:
+        info = discovery_refs[reference]
+        return str(info["path"]), {
+            "value": str(info["path"]),
+            "source": "read_only_discovery",
+            "derived_from": str(info.get("derived_from", "")),
+        }
+    if explicit_absolute_path_in_input(reference, user_input):
+        return reference, {
+            "value": reference,
+            "source": "user_request",
+            "derived_from": reference,
+        }
+    raise StoreError(
+        f"The {label} must be a discovery ref ID or text from the user's "
+        "own request."
+    )
+
+
 def project_creation_proposal(
     store: DurableStore,
     user_input: str,
     arguments: dict[str, Any],
+    discovery_refs: Optional[dict[str, dict[str, Any]]] = None,
 ) -> tuple[str, Optional[dict[str, Any]]]:
+    refs = discovery_refs or {}
     project_reference = str(arguments["project"]).strip()
+    workdir_reference = arguments.get("working_directory")
+    identity_name = arguments.get("name")
+    if isinstance(identity_name, str):
+        identity_name = identity_name.strip()
+        # The project identity is user-chosen; it must come from the user's
+        # own words, not model invention.
+        if not alias_appears_in_input(identity_name, user_input):
+            raise StoreError(
+                "The project name must appear explicitly in the user's "
+                "request."
+            )
     topic_name = arguments.get("topic_name")
     requested_provider = arguments.get("provider")
     model = arguments.get("model")
@@ -433,7 +679,13 @@ def project_creation_proposal(
                 f"The requested {label} must appear explicitly in the user's request."
             )
     enrolled = store.resolve_project(project_reference)
+    provenance: list[dict[str, Any]] = []
     if enrolled is not None:
+        if workdir_reference is not None:
+            raise StoreError(
+                f"{enrolled.display_name} is already enrolled; its working "
+                "directory cannot be changed through creation."
+            )
         if requested_provider is not None and requested_provider != enrolled.provider:
             raise StoreError(
                 f"{enrolled.display_name} is already enrolled for "
@@ -442,43 +694,75 @@ def project_creation_proposal(
         existing_agent = store.resolve_project_agent(enrolled.slug)
         if existing_agent is not None:
             return (
-                f"✅ {enrolled.display_name} already has a managed project agent.",
+                control_message(
+                    f"{enrolled.display_name} already has a managed project "
+                    "agent."
+                ),
                 None,
             )
-        project_path = enrolled.project_path
+        repository_root = enrolled.project_path
+        working_directory = enrolled.working_directory
         slug = enrolled.slug
         display_name = enrolled.display_name
         provider = enrolled.provider
-    else:
-        if project_reference not in user_input:
-            raise StoreError(
-                "The project path must appear explicitly in the user's request."
-            )
-        requested_path = Path(project_reference).expanduser().resolve()
-        if not requested_path.is_dir():
-            raise StoreError("The requested project directory does not exist.")
-        git_result = subprocess.run(
-            ["git", "-C", str(requested_path), "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+        provenance.append(
+            {
+                "value": repository_root,
+                "source": "enrolled_project",
+                "derived_from": enrolled.slug,
+            }
         )
-        if git_result.returncode != 0:
-            raise StoreError("The requested project is not a Git repository.")
-        git_root = Path(git_result.stdout.strip()).resolve()
-        if git_root != requested_path:
-            raise StoreError(
-                "Specify the Git repository root before creating its agent."
+    else:
+        root_reference, root_provenance = resolve_path_reference(
+            project_reference,
+            user_input,
+            refs,
+            "repository root",
+        )
+        workdir_text: Optional[str] = None
+        if workdir_reference is not None:
+            workdir_text, workdir_provenance = resolve_path_reference(
+                str(workdir_reference).strip(),
+                user_input,
+                refs,
+                "working directory",
             )
-        project_path = str(git_root)
-        slug = re.sub(r"[^a-z0-9]+", "-", git_root.name.lower()).strip("-")
+        # Full validation: real paths, Git root, and containment. The same
+        # check runs again at confirmation and at agent launch.
+        repository_root, working_directory = (
+            discovery.validate_repository_workspace(
+                str(Path(root_reference).expanduser()),
+                (
+                    str(Path(workdir_text).expanduser())
+                    if workdir_text is not None
+                    else None
+                ),
+            )
+        )
+        provenance.append(root_provenance)
+        if workdir_reference is not None:
+            provenance.append(workdir_provenance)
+        # The user's stated name is the project identity; the directory name
+        # is only a fallback when no name was given.
+        if isinstance(identity_name, str) and identity_name:
+            source_name = identity_name
+            display_name = identity_name
+        else:
+            source_name = (
+                Path(working_directory).name or Path(repository_root).name
+            )
+            display_name = (
+                source_name.replace("-", " ").replace("_", " ").title()
+            )
+        slug = re.sub(r"[^a-z0-9]+", "-", source_name.lower()).strip("-")
         if not slug or len(slug) > 48 or slug == "root":
             raise StoreError("A safe project slug could not be derived.")
         collision = store.resolve_project(slug)
-        if collision is not None and collision.project_path != project_path:
+        if collision is not None and (
+            collision.project_path != repository_root
+            or collision.working_directory != working_directory
+        ):
             raise StoreError("Another enrolled project already uses this slug.")
-        display_name = git_root.name.replace("-", " ").replace("_", " ").title()
         provider = (
             str(requested_provider)
             if requested_provider in {"codex", "claude"}
@@ -499,20 +783,30 @@ def project_creation_proposal(
         "slug": slug,
         "display_name": display_name,
         "provider": provider,
-        "project_path": project_path,
+        "project_path": repository_root,
+        "working_directory": working_directory,
         "topic_name": resolved_topic,
         "provider_config": provider_config,
+        "provenance": provenance,
     }
     model_text = str(provider_config.get("model", "provider default"))
     effort_text = str(provider_config.get("effort", "provider default"))
+    workdir_line = (
+        f"Working directory: {working_directory}\n"
+        if working_directory != repository_root
+        else ""
+    )
     return (
-        f"Create a managed project agent for {display_name}?\n\n"
-        f"Provider: {provider}\n"
-        f"Model: {model_text}\n"
-        f"Effort: {effort_text}\n"
-        f"Telegram topic: {resolved_topic}\n\n"
-        "The controller validated the Git repository. Nothing will be "
-        "created until you confirm.",
+        control_message(
+            f"I found the {display_name} repository at {repository_root}.\n"
+            f"{workdir_line}"
+            f"Provider: {provider}\n"
+            f"Model: {model_text}\n"
+            f"Effort: {effort_text}\n"
+            f"Telegram topic: {resolved_topic}\n\n"
+            "I validated the Git repository and working directory. Nothing "
+            "will be created until you confirm."
+        ),
         plan,
     )
 
@@ -533,7 +827,10 @@ def topic_rename_proposal(
     if binding is None or binding.message_thread_id is None:
         raise StoreError("The selected managed Telegram topic no longer exists.")
     if binding.display_name == new_name:
-        return (f"✅ The topic is already named “{new_name}”.", None)
+        return (
+            control_message(f"The topic is already named “{new_name}”."),
+            None,
+        )
     plan = {
         "binding_id": binding.binding_id,
         "chat_id": binding.chat_id,
@@ -542,12 +839,14 @@ def topic_rename_proposal(
         "new_name": new_name,
     }
     return (
-        "Rename this Telegram topic?\n\n"
-        f"Current name: {binding.display_name}\n"
-        f"New name: {new_name}\n"
-        f"Topic ID: {binding.message_thread_id}\n\n"
-        "Telegram and the durable controller binding will be updated only "
-        "after you confirm.",
+        control_message(
+            "Rename this Telegram topic?\n\n"
+            f"Current name: {binding.display_name}\n"
+            f"New name: {new_name}\n"
+            f"Topic ID: {binding.message_thread_id}\n\n"
+            "Telegram and the durable controller binding will be updated "
+            "only after you confirm."
+        ),
         plan,
     )
 
@@ -592,11 +891,80 @@ def router_rotation_reason(metrics: dict[str, Any]) -> Optional[str]:
     return None
 
 
+class RouterLeaseKeeper:
+    """Renew one router lease independently of provider output."""
+
+    def __init__(
+        self,
+        database_path: Path,
+        mailbox_id: int,
+        worker_id: str,
+        lease_seconds: float,
+    ):
+        self.database_path = Path(database_path)
+        self.mailbox_id = int(mailbox_id)
+        self.worker_id = worker_id
+        self.lease_seconds = max(0.25, float(lease_seconds))
+        self.interval = max(0.05, min(30.0, self.lease_seconds / 3.0))
+        self.stop_event = threading.Event()
+        self.lost_event = threading.Event()
+        self.error: Optional[BaseException] = None
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"router-lease-{self.mailbox_id}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _run(self) -> None:
+        try:
+            with DurableStore(self.database_path) as keeper_store:
+                while not self.stop_event.wait(self.interval):
+                    keeper_store.heartbeat_router_mailbox(
+                        self.mailbox_id,
+                        self.worker_id,
+                        lease_seconds=self.lease_seconds,
+                    )
+        except BaseException as exc:
+            self.error = exc
+            self.lost_event.set()
+
+    def assert_owned(self) -> None:
+        if self.lost_event.is_set():
+            detail = str(self.error) if self.error is not None else "unknown error"
+            raise LeaseLostError(
+                f"Router mailbox lease keeper stopped: {detail}"
+            )
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=max(1.0, self.interval * 2.0))
+        if self.thread.is_alive():
+            self.lost_event.set()
+            raise LeaseLostError("Router mailbox lease keeper did not stop.")
+
+
 def process_router_mailbox_job(
     store: DurableStore,
     job: RouterMailboxJob,
     worker_id: str,
+    lease_seconds: float = 10 * 60,
 ) -> None:
+    effective_lease_seconds = max(0.25, float(lease_seconds))
+    lease_keeper = RouterLeaseKeeper(
+        store.path,
+        job.mailbox_id,
+        worker_id,
+        effective_lease_seconds,
+    )
+    store.heartbeat_router_mailbox(
+        job.mailbox_id,
+        worker_id,
+        lease_seconds=effective_lease_seconds,
+    )
+    lease_keeper.start()
     try:
         mailbox_session_id = job.provider_session_id
         if mailbox_session_id is not None and job.attempts == 1:
@@ -637,31 +1005,177 @@ def process_router_mailbox_job(
             store.project_alias_map(),
             topics,
         )
+        # Bounded multi-step loop: read-only discovery calls repeat until the
+        # model returns one terminal tool. Completed steps are persisted, so
+        # a crash-recovery retry resumes from recorded history.
+        discovery_state = store.load_router_discovery(job.mailbox_id)
+        if job.attempts > 1 and discovery_state["steps"]:
+            prompt = (
+                prompt
+                + "\n\n"
+                + router_contract.build_discovery_recap(
+                    discovery_state["steps"]
+                )
+            )
         adapter = provider_adapters.adapter_for(runtime_agent)
-        result = adapter.run_turn(
-            runtime_agent,
-            prompt,
-            mailbox_session_id,
-            on_session=lambda session_id: store.attach_router_mailbox_session(
+        allowed_slugs = {project.slug for project in projects}
+        alias_resolution = store.project_alias_resolution()
+        allowed_topics = {
+            int(topic.message_thread_id)
+            for topic in topics
+            if topic.message_thread_id is not None
+        }
+        loop_started = time.monotonic()
+        loop_deadline = loop_started + ROUTER_MAX_LOOP_SECONDS
+        next_input = prompt
+        discovery_roots: Optional[list[Path]] = None
+        forced_terminal: Optional[str] = None
+        aggregated_usage: dict[str, int] = {}
+
+        def merge_usage(turn_usage: dict[str, Any]) -> None:
+            for key, value in turn_usage.items():
+                if isinstance(value, (int, float)) and not isinstance(
+                    value, bool
+                ):
+                    aggregated_usage[key] = int(
+                        aggregated_usage.get(key, 0)
+                    ) + int(value)
+        # Only the first provider call carries the mailbox session (which the
+        # adapters treat as crash-recovery); loop continuations resume the
+        # session through the runtime agent so discovery-result messages are
+        # delivered verbatim.
+        session_argument = mailbox_session_id
+        while True:
+            remaining = loop_deadline - time.monotonic()
+            if remaining < 1.0:
+                forced_terminal = (
+                    "I ran out of investigation time before finishing. "
+                    "Please narrow the request."
+                )
+                break
+            # Each provider turn is bounded by the remaining loop budget so
+            # the whole turn stays inside the router lease.
+            if hasattr(adapter, "timeout_seconds"):
+                adapter.timeout_seconds = max(1, int(remaining))
+
+            def provider_heartbeat() -> None:
+                lease_keeper.assert_owned()
+                store.heartbeat_router_mailbox(
+                    job.mailbox_id,
+                    worker_id,
+                    lease_seconds=effective_lease_seconds,
+                )
+
+            provider_heartbeat()
+            result = adapter.run_turn(
+                runtime_agent,
+                next_input,
+                session_argument,
+                on_session=lambda session_id: (
+                    store.attach_router_mailbox_session(
+                        job.mailbox_id,
+                        worker_id,
+                        session_id,
+                    )
+                ),
+                heartbeat=provider_heartbeat,
+            )
+            lease_keeper.assert_owned()
+            if time.monotonic() > loop_deadline:
+                forced_terminal = (
+                    "I ran out of investigation time before finishing. "
+                    "Please narrow the request."
+                )
+                break
+            merge_usage(result.usage)
+            mailbox_session_id = result.provider_session_id
+            runtime_agent = replace(
+                runtime_agent,
+                provider_session_id=result.provider_session_id,
+            )
+            session_argument = None
+            call = router_contract.parse_router_tool_call(
+                result.final_text,
+                allowed_slugs,
+                alias_resolution,
+                allowed_topics,
+            )
+            if call.tool not in router_contract.DISCOVERY_TOOL_NAMES:
+                break
+            steps_used = len(discovery_state["steps"])
+            if (
+                steps_used >= ROUTER_MAX_DISCOVERY_STEPS
+                or time.monotonic() >= loop_deadline
+                or len(discovery_state["refs"]) >= ROUTER_MAX_DISCOVERY_REFS
+            ):
+                forced_terminal = (
+                    "I hit the investigation limit before fully resolving "
+                    "this. Please narrow the request — for example name the "
+                    "directory or repository more precisely."
+                )
+                break
+            arguments = dict(call.arguments)
+            if (
+                call.tool == "inspect_directory"
+                and arguments.get("path") in discovery_state["refs"]
+            ):
+                arguments["path"] = str(
+                    discovery_state["refs"][arguments["path"]]["path"]
+                )
+            # Provenance always traces to the user's own bounded request,
+            # never to a model-supplied query or an absolute path.
+            derived_from = router_contract.extract_user_request(
+                job.input_text
+            )[:200]
+            try:
+                if discovery_roots is None:
+                    discovery_roots = discovery.load_discovery_roots()
+                step_result = discovery.execute_discovery_tool(
+                    call.tool,
+                    arguments,
+                    discovery_roots,
+                    deadline=loop_deadline,
+                )
+            except StoreError as exc:
+                step_result = {"error": str(exc)}
+            step_result = annotate_enrollment_metadata(store, step_result)
+            step_result, issued_refs = annotate_discovery_refs(
+                step_result,
+                discovery_state["refs"],
+                derived_from,
+                discovery_roots or [],
+                max(
+                    0,
+                    ROUTER_MAX_DISCOVERY_REFS
+                    - len(discovery_state["refs"]),
+                ),
+            )
+            discovery_state = store.append_router_discovery_step(
                 job.mailbox_id,
                 worker_id,
-                session_id,
-            ),
-            heartbeat=lambda: store.heartbeat_router_mailbox(
-                job.mailbox_id,
-                worker_id,
-            ),
-        )
-        call = router_contract.parse_router_tool_call(
-            result.final_text,
-            {project.slug for project in projects},
-            store.project_alias_resolution(),
-            {
-                int(topic.message_thread_id)
-                for topic in topics
-                if topic.message_thread_id is not None
-            },
-        )
+                call.tool,
+                call.arguments,
+                step_result,
+                issued_refs,
+            )
+            log_event(
+                "router_discovery_step",
+                mailbox_id=job.mailbox_id,
+                tool=call.tool,
+                steps=len(discovery_state["steps"]),
+                refs=len(discovery_state["refs"]),
+            )
+            next_input = router_contract.build_discovery_result_message(
+                call.tool,
+                call.arguments,
+                step_result,
+            )
+        if forced_terminal is not None:
+            call = router_contract.RouterToolCall(
+                tool="respond",
+                arguments={"message": forced_terminal},
+                requires_confirmation=False,
+            )
         # Explicit-mention validations must only consider the user-authored
         # part of the input, never quoted reply context.
         user_request_text = router_contract.extract_user_request(job.input_text)
@@ -705,6 +1219,7 @@ def process_router_mailbox_job(
         clarification_options = None
         project_creation_plan = None
         topic_rename_plan = None
+        agent_config_plan = None
         if call.tool == "send_to_agent":
             target = store.resolve_project_agent(
                 str(call.arguments["project_slug"])
@@ -715,30 +1230,38 @@ def process_router_mailbox_job(
                 )
             dispatch_agent_id = target.agent_id
             dispatch_message = str(call.arguments["message"])
-            response_text = router_preview_text(store, call)
+            response_text = dispatch_preview_text(store, call)
         elif call.tool == "inspect_project":
             inspection = project_inspection_text(
                 store,
                 str(call.arguments["project"]),
                 user_request_text,
+                discovery_state["refs"],
+                discovery_roots,
+                loop_deadline,
             )
             response_text = (
-                inspection
+                control_message(inspection)
                 if inspection is not None
-                else router_preview_text(store, call)
+                else control_message(
+                    "I could not validate that project or path read-only. "
+                    "Nothing was inspected — name an enrolled project, or "
+                    "describe the directory so I can locate it."
+                )
             )
         elif call.tool == "list_projects":
-            response_text = project_catalog_text(store)
+            response_text = control_message(project_catalog_text(store))
         elif call.tool == "respond":
-            response_text = str(call.arguments["message"])
+            response_text = control_message(str(call.arguments["message"]))
         elif call.tool == "ask_user":
-            response_text = str(call.arguments["question"])
+            response_text = control_message(str(call.arguments["question"]))
             clarification_options = list(call.arguments["options"]) or None
         elif call.tool == "create_project_agent":
             response_text, project_creation_plan = project_creation_proposal(
                 store,
                 user_request_text,
                 call.arguments,
+                discovery_state["refs"],
             )
         elif call.tool == "rename_topic":
             response_text, topic_rename_plan = topic_rename_proposal(
@@ -772,17 +1295,19 @@ def process_router_mailbox_job(
                         f"The requested {label} must appear explicitly in "
                         "the user's request."
                     )
-            configured = store.configure_agent_provider(
-                target.agent_id,
-                updates,
+            agent_config_plan = {
+                "project_slug": project.slug,
+                "updates": updates,
+            }
+            update_lines = "\n".join(
+                f"{key.title()}: "
+                + (str(value) if value is not None else "provider default")
+                for key, value in updates.items()
             )
-            response_text = (
-                f"✅ Updated {project.display_name}\n\n"
-                f"Provider: {configured.provider}\n"
-                f"Model: "
-                f"{configured.provider_config.get('model', 'provider default')}\n"
-                f"Effort: "
-                f"{configured.provider_config.get('effort', 'provider default')}"
+            response_text = control_message(
+                f"Change {project.display_name}'s configuration?\n\n"
+                f"{update_lines}\n\n"
+                "Nothing changes until you confirm."
             )
         elif call.tool == "set_project_alias":
             alias = str(call.arguments["alias"])
@@ -794,10 +1319,10 @@ def process_router_mailbox_job(
             if project is None:
                 raise StoreError("The selected project is not enrolled.")
             created = store.add_project_alias(project.slug, alias)
-            response_text = (
-                f"✅ {project.display_name} can now be called “{alias}”."
+            response_text = control_message(
+                f"{project.display_name} can now be called “{alias}”."
                 if created
-                else f"✅ “{alias}” is already an alias for {project.display_name}."
+                else f"“{alias}” is already an alias for {project.display_name}."
             )
         elif call.tool == "remove_project_alias":
             alias = str(call.arguments["alias"])
@@ -806,13 +1331,15 @@ def process_router_mailbox_job(
                     "The project alias must appear explicitly in the user's request."
                 )
             project = store.remove_project_alias(alias)
-            response_text = (
+            response_text = control_message(
                 f"Removed the alias “{alias}” from {project.display_name}."
                 if project is not None
                 else f"“{alias}” is not an active project alias."
             )
         else:
-            response_text = router_preview_text(store, call)
+            raise StoreError(
+                f"Terminal router tool is not executable: {call.tool}"
+            )
         store.complete_router_mailbox(
             job.mailbox_id,
             worker_id,
@@ -821,12 +1348,13 @@ def process_router_mailbox_job(
             call.tool,
             call.arguments,
             response_text,
-            result.usage,
+            aggregated_usage or result.usage,
             dispatch_agent_id=dispatch_agent_id,
             dispatch_message=dispatch_message,
             clarification_options=clarification_options,
             project_creation_plan=project_creation_plan,
             topic_rename_plan=topic_rename_plan,
+            agent_config_plan=agent_config_plan,
         )
         log_event(
             "router_turn_succeeded",
@@ -834,6 +1362,13 @@ def process_router_mailbox_job(
             attempts=job.attempts,
             tool=call.tool,
             provider_session_id=result.provider_session_id,
+        )
+    except LeaseLostError as exc:
+        log_event(
+            "router_turn_abandoned",
+            mailbox_id=job.mailbox_id,
+            attempts=job.attempts,
+            error=str(exc),
         )
     except (provider_adapters.ProviderAdapterError, OSError, StoreError) as exc:
         state = store.fail_router_mailbox(
@@ -848,6 +1383,15 @@ def process_router_mailbox_job(
             state=state,
             error=str(exc),
         )
+    finally:
+        try:
+            lease_keeper.stop()
+        except LeaseLostError as exc:
+            log_event(
+                "router_lease_keeper_stop_failed",
+                mailbox_id=job.mailbox_id,
+                error=str(exc),
+            )
 
 
 def work_router_command(args: argparse.Namespace) -> None:
@@ -863,7 +1407,12 @@ def work_router_command(args: argparse.Namespace) -> None:
                     return
                 time.sleep(args.idle_sleep)
                 continue
-            process_router_mailbox_job(store, job, worker_id)
+            process_router_mailbox_job(
+                store,
+                job,
+                worker_id,
+                lease_seconds=args.lease_seconds,
+            )
             if args.once:
                 return
 

@@ -1052,8 +1052,89 @@ and the 10/10 offline router evaluation:
   can never be bypassed by input length.
 
 This slice was verified offline; no live reply-continuity smoke test has been
-run yet. Live steering of running Codex/Claude turns (interrupt and mid-turn
-input) is the next priority slice.
+run yet.
+
+## Chunk: conversational multi-step Control agent
+
+The next tracked chunk (before live steering) replaces the one-shot router
+with a bounded, multi-step, identity-transparent Control agent, per the
+delegated specification. Deliverables:
+
+1. **Read-only discovery tools.** `find_directory` and `inspect_directory`
+   let the Control agent resolve natural path descriptions inside
+   user-authorized discovery roots only, with bounded depth/result counts,
+   hidden-directory skipping, and strict realpath containment so symlinks
+   cannot escape the roots. Results report Git-root status, containing Git
+   root, candidate subdirectories, and enrolled-project association.
+2. **Bounded durable multi-step routing.** One router turn may make several
+   discovery calls before exactly one terminal outcome (respond, ask_user,
+   confirmed-mutation proposal, or dispatch). Steps are persisted on the
+   router mailbox as they complete; a crash-recovery retry resumes from the
+   persisted steps instead of restarting blind. Step-count, elapsed-time,
+   and discovered-path bounds terminate the loop with a precise message.
+3. **Controller-issued provenance.** Every discovered directory receives an
+   opaque controller-issued reference ID persisted with the turn. Mutation
+   proposals may identify paths only by those IDs or by verbatim presence in
+   the user's own text — a model-asserted path with no issued ID fails
+   closed. Confirmation payloads carry `{value, source, derived_from}`
+   provenance for audit.
+4. **repository_root / working_directory split.** Schema v14 rebuilds
+   `managed_projects` without repository-path uniqueness (sibling working
+   directories in one repository are allowed; slugs stay unique), adds
+   `working_directory` to projects and agents backfilled to the repository
+   root, and expires legacy in-flight project-confirmation callbacks whose
+   payloads predate the split. Centralized validation requires both paths to
+   exist, the root to be a real Git root, and the working directory to be
+   contained in the root after symlink resolution — enforced at proposal,
+   confirmation (TOCTOU re-check), and launch time. Adapters and tmux start
+   in `working_directory`; Git validation uses `repository_root`.
+5. **Execution-boundary safety.** Project enrollment/creation, topic
+   renames, and now agent configuration changes are all confirmation-gated
+   with authorized one-time buttons; the agent can reason freely but can
+   never claim a mutation succeeded unless the controller executed it.
+   Schema v15 adds a durable mutation saga around Telegram project-topic
+   creation and topic renaming: a compare-and-set external claim admits only
+   one concurrent confirmation, successful API results resume local
+   application after a crash without repeating Telegram, and ambiguous lost
+   results enter an explicit reconciliation state instead of risking a
+   duplicate mutation.
+6. **Identity and handoffs.** Central speaker rendering labels every
+   Control-chat turn: `🎛 Control`, `🎛 Control → {Project}` on dispatch,
+   and `{Project}` on relayed or reply-continued agent responses.
+7. **Precise outcomes.** The "Router preview / Would inspect…" fallbacks are
+   removed from normal conversation; every response states exactly what was
+   done, found, or still needs validation. Topics still bound to
+   `controller/control` now route to the main router instead of the
+   transport-test acknowledgment.
+
+Acceptance criteria (offline fixtures; no live mutation without user
+confirmation): the Lovely request ("the Peter app subdirectory of the lovely
+repo in software inside my user directory") resolves the repository and
+`peter-app` working directory via discovery and produces a confirmation-backed
+proposal without requiring verbatim absolute paths; ambiguous references
+produce a clarification listing concrete candidates; forged provenance and
+escaped symlinks fail closed; bounded loops terminate precisely and resume
+correctly after a crash; v13 databases migrate atomically through schemas 14
+and 15 while preserving all IDs, sessions, topics, and aliases; sibling
+working-directory projects coexist; confirmations are idempotent even under
+concurrent delivery; and every response identifies its speaker.
+
+The conversational Control chunk is implemented: 179 offline tests and the
+13/13 offline router evaluation pass, covering the deterministic
+Lovely/peter-app fixture, candidate-listing clarification for ambiguity,
+forged-path and forged-ref rejection, bounded-loop termination and
+crash-retry resume from persisted steps, the v13→v15 migration (identity
+preservation, legacy project-confirmation expiry, sibling working
+directories), TOCTOU symlink-swap rejection at confirmation, configuration
+confirmation flow, speaker labeling, and concurrent/crash-recovery mutation
+sagas for both Telegram project creation and topic renaming. Schema v14 rebuilds
+`managed_projects` without repository-path uniqueness, adds working
+directories to projects and agents, and persists per-turn discovery state;
+schema v15 persists the Telegram mutation boundary and reconciliation state.
+No live Lovely mutation is performed without user confirmation.
+
+Live steering of running Codex/Claude turns (interrupt and mid-turn input)
+follows this chunk.
 
 ## References
 

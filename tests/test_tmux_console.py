@@ -1,3 +1,5 @@
+import os
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -11,8 +13,16 @@ from durable_store import DurableStore, StoreError
 class TmuxConsoleTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
-        self.project_path = Path(self.temporary_directory.name) / "project"
-        self.project_path.mkdir()
+        # A real, isolated Git repository: console launch revalidates the
+        # stored canonical paths and the exact Git root.
+        created = Path(self.temporary_directory.name) / "project"
+        created.mkdir()
+        subprocess.run(
+            ["git", "init", str(created)],
+            capture_output=True,
+            check=True,
+        )
+        self.project_path = Path(os.path.realpath(created))
         self.database_path = Path(self.temporary_directory.name) / "controller.sqlite3"
         self.store = DurableStore(self.database_path)
         self.store.ensure_surface_binding(
@@ -41,6 +51,11 @@ class TmuxConsoleTests(unittest.TestCase):
         self.store.close()
         self.temporary_directory.cleanup()
 
+    @mock.patch.object(
+        tmux_console.discovery,
+        "validate_repository_workspace",
+        side_effect=lambda root, workdir=None: (root, workdir or root),
+    )
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=False)
     @mock.patch.object(tmux_console, "codex_binary", return_value="/bin/codex")
     @mock.patch.object(tmux_console, "tmux_binary", return_value="/bin/tmux")
@@ -51,6 +66,7 @@ class TmuxConsoleTests(unittest.TestCase):
         _tmux_binary,
         _codex_binary,
         _has_session,
+        _validate,
     ):
         run.return_value = mock.Mock(returncode=0, stderr="")
 
@@ -64,6 +80,11 @@ class TmuxConsoleTests(unittest.TestCase):
         self.assertIn("workspace-write", command)
         self.assertEqual(command[-1], self.session_id)
 
+    @mock.patch.object(
+        tmux_console.discovery,
+        "validate_repository_workspace",
+        side_effect=lambda root, workdir=None: (root, workdir or root),
+    )
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=False)
     @mock.patch.object(tmux_console, "codex_binary", return_value="/bin/codex")
     @mock.patch.object(tmux_console, "tmux_binary", return_value="/bin/tmux")
@@ -74,6 +95,7 @@ class TmuxConsoleTests(unittest.TestCase):
         _tmux_binary,
         _codex_binary,
         _has_session,
+        _validate,
     ):
         run.return_value = mock.Mock(returncode=1, stderr="start failed")
 
@@ -85,6 +107,11 @@ class TmuxConsoleTests(unittest.TestCase):
             "stopped",
         )
 
+    @mock.patch.object(
+        tmux_console.discovery,
+        "validate_repository_workspace",
+        side_effect=lambda root, workdir=None: (root, workdir or root),
+    )
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=False)
     @mock.patch.object(tmux_console, "claude_binary", return_value="/bin/claude")
     @mock.patch.object(tmux_console, "tmux_binary", return_value="/bin/tmux")
@@ -95,6 +122,7 @@ class TmuxConsoleTests(unittest.TestCase):
         _tmux_binary,
         _claude_binary,
         _has_session,
+        _validate,
     ):
         run.return_value = mock.Mock(returncode=0, stderr="")
         claude_agent = replace(

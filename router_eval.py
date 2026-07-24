@@ -15,6 +15,7 @@ from typing import Any, Optional
 from durable_store import ManagedProject, StoreError, SurfaceBinding
 from router_contract import (
     CONTROLLER_TOOLS,
+    DISCOVERY_TOOLS,
     build_main_agent_prompt,
     parse_router_tool_call,
 )
@@ -37,7 +38,10 @@ def load_cases(path: Path) -> list[RouterCase]:
         payload = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise StoreError(f"Could not read router fixtures: {exc}") from exc
-    known_tools = {str(item["name"]) for item in CONTROLLER_TOOLS}
+    known_tools = {
+        str(item["name"])
+        for item in tuple(CONTROLLER_TOOLS) + tuple(DISCOVERY_TOOLS)
+    }
     if not isinstance(payload, list) or not payload:
         raise StoreError("Router fixtures must be a non-empty list.")
     cases: list[RouterCase] = []

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import discovery
 from durable_store import AgentConsole, DurableStore, ManagedAgent, StoreError
 
 
@@ -82,6 +83,16 @@ def open_agent_console(
         )
     if not agent.project_path or not Path(agent.project_path).is_dir():
         raise StoreError("Managed agent project directory is unavailable.")
+    launch_directory = agent.working_directory or agent.project_path
+    root_real, workdir_real = discovery.validate_repository_workspace(
+        agent.project_path,
+        agent.working_directory,
+    )
+    if root_real != agent.project_path or workdir_real != launch_directory:
+        raise StoreError(
+            "Managed agent workspace paths no longer resolve to their "
+            "enrolled locations."
+        )
     if not agent.provider_session_id:
         raise StoreError("Managed agent has no persisted provider session to resume.")
     if not re.fullmatch(r"[0-9a-fA-F-]{36}", agent.provider_session_id):
@@ -106,7 +117,7 @@ def open_agent_console(
             "--sandbox",
             sandbox,
             "--cd",
-            agent.project_path,
+            launch_directory,
         ]
         model = agent.provider_config.get("model")
         if model:
@@ -151,7 +162,7 @@ def open_agent_console(
                 "-s",
                 session_name,
                 "-c",
-                agent.project_path,
+                launch_directory,
                 *command,
             ],
             capture_output=True,

@@ -210,7 +210,8 @@ class RouterContractTests(unittest.TestCase):
         )
         self.assertEqual(configured.arguments["model"], "gpt-5.6-sol")
         self.assertEqual(configured.arguments["effort"], "high")
-        self.assertFalse(configured.requires_confirmation)
+        # Configuration changes are consequential and confirmation-gated.
+        self.assertTrue(configured.requires_confirmation)
 
         reset = parse_router_tool_call(
             '{"tool":"configure_agent","arguments":{'

@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 15
+
+CONTROL_SPEAKER = "🎛 Control"
 
 
 class StoreError(RuntimeError):
@@ -61,6 +63,7 @@ class OutboxMessage:
 @dataclass(frozen=True)
 class CallbackAction:
     action_id: int
+    operation_id: str
     token: str
     action_type: str
     payload: dict[str, Any]
@@ -119,6 +122,7 @@ class ManagedAgent:
     surface_binding_id: Optional[int]
     lifecycle_state: str
     provider_config: dict[str, Any]
+    working_directory: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +160,18 @@ class ManagedProject:
     provider: str
     project_path: str
     state: str
+    working_directory: str = ""
+
+
+@dataclass(frozen=True)
+class TelegramMutation:
+    operation_id: str
+    mutation_type: str
+    plan: dict[str, Any]
+    state: str
+    external_result: Optional[dict[str, Any]]
+    last_error: Optional[str]
+    attempts: int
 
 
 MIGRATION_1 = (
@@ -518,6 +534,91 @@ MIGRATION_13 = (
     """,
 )
 
+MIGRATION_14 = (
+    # Rebuild managed_projects without repository-path uniqueness so several
+    # projects can use sibling working directories of one repository, and add
+    # the working_directory column (backfilled to the repository root).
+    """
+    CREATE TABLE managed_projects_v14 (
+        project_id TEXT PRIMARY KEY,
+        slug TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude')),
+        project_path TEXT NOT NULL,
+        working_directory TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    INSERT INTO managed_projects_v14(
+        project_id, slug, display_name, provider, project_path,
+        working_directory, state, created_at, updated_at
+    )
+    SELECT project_id, slug, display_name, provider, project_path,
+        project_path, state, created_at, updated_at
+    FROM managed_projects
+    """,
+    """
+    DROP TABLE managed_projects
+    """,
+    """
+    ALTER TABLE managed_projects_v14 RENAME TO managed_projects
+    """,
+    """
+    CREATE INDEX managed_projects_state
+    ON managed_projects(state, slug)
+    """,
+    """
+    ALTER TABLE agents
+    ADD COLUMN working_directory TEXT
+    """,
+    """
+    UPDATE agents SET working_directory = project_path
+    WHERE project_path IS NOT NULL
+    """,
+    """
+    ALTER TABLE router_mailbox
+    ADD COLUMN discovery_json TEXT
+    """,
+    # Project-confirmation payloads created before the working-directory
+    # split cannot be validated under the new rules; expire any still-active
+    # ones together so a stale plan can never be confirmed.
+    """
+    UPDATE callback_actions
+    SET state = 'expired', updated_at = updated_at
+    WHERE action_type IN ('router_project_confirm', 'router_project_cancel')
+        AND state = 'active'
+    """,
+)
+
+MIGRATION_15 = (
+    """
+    CREATE TABLE telegram_mutations (
+        operation_id TEXT PRIMARY KEY
+            REFERENCES callback_actions(operation_id) ON DELETE RESTRICT,
+        mutation_type TEXT NOT NULL
+            CHECK (mutation_type IN ('project_create', 'topic_rename')),
+        plan_json TEXT NOT NULL,
+        state TEXT NOT NULL
+            CHECK (state IN (
+                'prepared', 'external_in_flight', 'external_succeeded',
+                'reconciliation_required', 'applied'
+            )),
+        external_result_json TEXT,
+        last_error TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX telegram_mutations_state
+    ON telegram_mutations(state, updated_at)
+    """,
+)
+
 
 ROUTER_INPUT_LIMIT = 8_000
 REPLY_QUOTE_LIMIT = 1_000
@@ -580,19 +681,29 @@ def compose_reply_context_input(
 
 
 def chunk_telegram_text(text: str, limit: int = 3800) -> list[str]:
-    remaining = text.strip() or "[empty agent response]"
-    chunks = []
-    while remaining:
-        if len(remaining) <= limit:
-            chunks.append(remaining)
-            break
-        split_at = remaining.rfind("\n", 0, limit)
-        if split_at < limit // 2:
-            split_at = remaining.rfind(" ", 0, limit)
-        if split_at < limit // 2:
-            split_at = limit
-        chunks.append(remaining[:split_at].rstrip())
-        remaining = remaining[split_at:].lstrip()
+    if limit <= 0:
+        raise StoreError("Telegram chunk limit must be positive.")
+    if text == "":
+        return ["[empty agent response]"]
+    chunks: list[str] = []
+    offset = 0
+    while offset < len(text):
+        hard_end = min(offset + limit, len(text))
+        if hard_end == len(text):
+            end = hard_end
+        else:
+            newline = text.rfind("\n", offset, hard_end)
+            space = text.rfind(" ", offset, hard_end)
+            split_at = newline if newline >= offset + limit // 2 else space
+            if split_at < offset + limit // 2:
+                end = hard_end
+            else:
+                # Keep the delimiter in exactly one chunk. Concatenating the
+                # returned chunks therefore reproduces the provider payload
+                # character-for-character, including code indentation.
+                end = split_at + 1
+        chunks.append(text[offset:end])
+        offset = end
     return chunks
 
 
@@ -610,6 +721,39 @@ def extract_user_request(input_text: str) -> str:
         if index != -1:
             return input_text[index + len(USER_REPLY_MARKER):]
     return input_text
+
+
+def validate_workspace_paths(
+    repository_root: str,
+    working_directory: Optional[str] = None,
+) -> tuple[str, str]:
+    """Resolve and containment-check a repository root and working directory.
+
+    Both paths are resolved through symlinks to real paths; the working
+    directory must exist and remain inside the resolved repository root, so
+    a symlink cannot escape it. Returns the resolved (root, workdir) pair.
+    Used at proposal, confirmation, and launch time so the checks cannot be
+    bypassed by state changing between steps.
+    """
+    if not repository_root or not Path(repository_root).is_absolute():
+        raise StoreError("The repository root must be an absolute path.")
+    root_real = Path(os.path.realpath(repository_root))
+    if not root_real.is_dir():
+        raise StoreError("The repository root does not exist.")
+    workdir_text = working_directory or repository_root
+    if not Path(workdir_text).is_absolute():
+        raise StoreError("The working directory must be an absolute path.")
+    workdir_real = Path(os.path.realpath(workdir_text))
+    if not workdir_real.is_dir():
+        raise StoreError("The working directory does not exist.")
+    if (
+        workdir_real != root_real
+        and root_real not in workdir_real.parents
+    ):
+        raise StoreError(
+            "The working directory must stay inside the repository root."
+        )
+    return str(root_real), str(workdir_real)
 
 
 def normalize_project_alias(alias: str) -> str:
@@ -716,6 +860,16 @@ class DurableStore:
         self.close()
 
     def _migrate(self) -> None:
+        # Table rebuilds (schema v14) must run without foreign-key
+        # enforcement; the pragma only takes effect outside a transaction,
+        # and referential integrity is verified explicitly afterwards.
+        self.connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self._run_migrations()
+        finally:
+            self.connection.execute("PRAGMA foreign_keys = ON")
+
+    def _run_migrations(self) -> None:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             current = int(self.connection.execute("PRAGMA user_version").fetchone()[0])
@@ -790,6 +944,26 @@ class DurableStore:
                 self._backfill_outbox_serialize_keys()
                 current = 13
                 self.connection.execute("PRAGMA user_version = 13")
+            if current < 14:
+                for statement in MIGRATION_14:
+                    self.connection.execute(statement)
+                current = 14
+                self.connection.execute("PRAGMA user_version = 14")
+            if current < 15:
+                for statement in MIGRATION_15:
+                    self.connection.execute(statement)
+                current = 15
+                self.connection.execute("PRAGMA user_version = 15")
+            # Referential integrity is audited before the commit so a failed
+            # check rolls the whole migration back instead of stranding an
+            # upgraded-but-broken database.
+            violations = self.connection.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+            if violations:
+                raise IncompatibleSchemaError(
+                    "Migration left foreign-key violations behind."
+                )
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -1120,6 +1294,7 @@ class DurableStore:
     def _callback_from_row(row: sqlite3.Row) -> CallbackAction:
         return CallbackAction(
             action_id=int(row["action_id"]),
+            operation_id=str(row["operation_id"]),
             token=str(row["token"]),
             action_type=str(row["action_type"]),
             payload=json.loads(row["payload_json"]),
@@ -1238,6 +1413,367 @@ class DurableStore:
             self.connection.execute("ROLLBACK")
             raise
 
+    @staticmethod
+    def _telegram_mutation_from_row(row: sqlite3.Row) -> TelegramMutation:
+        result = (
+            json.loads(row["external_result_json"])
+            if row["external_result_json"] is not None
+            else None
+        )
+        if result is not None and not isinstance(result, dict):
+            raise StoreError("Stored Telegram mutation result is invalid.")
+        plan = json.loads(row["plan_json"])
+        if not isinstance(plan, dict):
+            raise StoreError("Stored Telegram mutation plan is invalid.")
+        return TelegramMutation(
+            operation_id=str(row["operation_id"]),
+            mutation_type=str(row["mutation_type"]),
+            plan=plan,
+            state=str(row["state"]),
+            external_result=result,
+            last_error=(
+                str(row["last_error"])
+                if row["last_error"] is not None
+                else None
+            ),
+            attempts=int(row["attempts"]),
+        )
+
+    def _record_telegram_mutation_event(
+        self,
+        operation_id: str,
+        mutation_type: str,
+        state: str,
+        timestamp: float,
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO events(
+                kind, subject_type, subject_id, details_json, created_at
+            )
+            VALUES (?, 'telegram_mutation', ?, ?, ?)
+            """,
+            (
+                f"telegram_mutation_{state}",
+                operation_id,
+                json.dumps(
+                    {
+                        "mutation_type": mutation_type,
+                        "state": state,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                timestamp,
+            ),
+        )
+
+    def prepare_telegram_mutation(
+        self,
+        operation_id: str,
+        mutation_type: str,
+        plan: dict[str, Any],
+        now: Optional[float] = None,
+    ) -> TelegramMutation:
+        """Durably record a confirmed mutation before any Telegram API call.
+
+        Reusing an operation is allowed only with byte-for-byte equivalent
+        canonical input. This makes callback and inbox retries resume the same
+        operation instead of silently issuing a second external mutation.
+        """
+        if mutation_type not in {"project_create", "topic_rename"}:
+            raise StoreError("Telegram mutation type is invalid.")
+        if not operation_id or not isinstance(plan, dict):
+            raise StoreError("Telegram mutation plan is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        plan_json = json.dumps(plan, separators=(",", ":"), sort_keys=True)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            callback = self.connection.execute(
+                """
+                SELECT action_type, state
+                FROM callback_actions
+                WHERE operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+            expected_action = (
+                "router_project_confirm"
+                if mutation_type == "project_create"
+                else "router_topic_rename_confirm"
+            )
+            if (
+                callback is None
+                or str(callback["action_type"]) != expected_action
+                or str(callback["state"]) != "consumed"
+            ):
+                raise StoreError(
+                    "Telegram mutation does not match a confirmed action."
+                )
+            inserted = self.connection.execute(
+                """
+                INSERT INTO telegram_mutations(
+                    operation_id, mutation_type, plan_json, state, attempts,
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, 'prepared', 0, ?, ?)
+                ON CONFLICT(operation_id) DO NOTHING
+                """,
+                (
+                    operation_id,
+                    mutation_type,
+                    plan_json,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            if inserted.rowcount == 1:
+                self._record_telegram_mutation_event(
+                    operation_id,
+                    mutation_type,
+                    "prepared",
+                    timestamp,
+                )
+            row = self.connection.execute(
+                "SELECT * FROM telegram_mutations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["mutation_type"]) != mutation_type
+                or str(row["plan_json"]) != plan_json
+            ):
+                raise StoreError(
+                    "Confirmed Telegram mutation was reused with a "
+                    "different plan."
+                )
+            mutation = self._telegram_mutation_from_row(row)
+            self.connection.execute("COMMIT")
+            return mutation
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def resolve_telegram_mutation(
+        self,
+        operation_id: str,
+    ) -> Optional[TelegramMutation]:
+        row = self.connection.execute(
+            "SELECT * FROM telegram_mutations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        return (
+            self._telegram_mutation_from_row(row)
+            if row is not None
+            else None
+        )
+
+    def begin_telegram_mutation_external(
+        self,
+        operation_id: str,
+        now: Optional[float] = None,
+    ) -> tuple[TelegramMutation, bool]:
+        """Persist the external-call boundary before crossing it.
+
+        Only a prepared mutation can enter the boundary. A replay that sees
+        ``external_in_flight`` receives that state unchanged with
+        ``acquired=False``. Only the caller whose compare-and-swap changed
+        prepared→external_in_flight receives ``acquired=True`` and may cross
+        the Telegram API boundary.
+        """
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            transitioned = self.connection.execute(
+                """
+                UPDATE telegram_mutations
+                SET state = 'external_in_flight', attempts = attempts + 1,
+                    updated_at = ?
+                WHERE operation_id = ? AND state = 'prepared'
+                """,
+                (timestamp, operation_id),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM telegram_mutations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Confirmed Telegram mutation was not found.")
+            mutation = self._telegram_mutation_from_row(row)
+            if transitioned.rowcount == 1:
+                self._record_telegram_mutation_event(
+                    operation_id,
+                    mutation.mutation_type,
+                    "external_in_flight",
+                    timestamp,
+                )
+            self.connection.execute("COMMIT")
+            return mutation, transitioned.rowcount == 1
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def record_telegram_mutation_result(
+        self,
+        operation_id: str,
+        result: dict[str, Any],
+        *,
+        reconciled: bool = False,
+        now: Optional[float] = None,
+    ) -> TelegramMutation:
+        if not isinstance(result, dict):
+            raise StoreError("Telegram mutation result is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        result_json = json.dumps(
+            result,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        allowed = (
+            ("external_in_flight", "reconciliation_required", "prepared")
+            if reconciled
+            else ("external_in_flight",)
+        )
+        placeholders = ",".join("?" for _ in allowed)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM telegram_mutations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Confirmed Telegram mutation was not found.")
+            if str(row["state"]) == "external_succeeded":
+                if str(row["external_result_json"]) != result_json:
+                    raise StoreError(
+                        "Telegram mutation already has a different result."
+                    )
+            elif str(row["state"]) == "applied":
+                if str(row["external_result_json"]) != result_json:
+                    raise StoreError(
+                        "Applied Telegram mutation has a different result."
+                    )
+            else:
+                cursor = self.connection.execute(
+                    f"""
+                    UPDATE telegram_mutations
+                    SET state = 'external_succeeded',
+                        external_result_json = ?, last_error = NULL,
+                        updated_at = ?
+                    WHERE operation_id = ? AND state IN ({placeholders})
+                    """,
+                    (result_json, timestamp, operation_id, *allowed),
+                )
+                if cursor.rowcount != 1:
+                    raise StoreError(
+                        "Telegram mutation is not awaiting an external result."
+                    )
+                self._record_telegram_mutation_event(
+                    operation_id,
+                    str(row["mutation_type"]),
+                    "external_succeeded",
+                    timestamp,
+                )
+            updated = self.connection.execute(
+                "SELECT * FROM telegram_mutations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            mutation = self._telegram_mutation_from_row(updated)
+            self.connection.execute("COMMIT")
+            return mutation
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def require_telegram_mutation_reconciliation(
+        self,
+        operation_id: str,
+        error: str,
+        now: Optional[float] = None,
+    ) -> TelegramMutation:
+        message = str(error).strip() or "Telegram result was not recorded."
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            transitioned = self.connection.execute(
+                """
+                UPDATE telegram_mutations
+                SET state = 'reconciliation_required', last_error = ?,
+                    updated_at = ?
+                WHERE operation_id = ?
+                    AND state = 'external_in_flight'
+                """,
+                (message, timestamp, operation_id),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM telegram_mutations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Confirmed Telegram mutation was not found.")
+            mutation = self._telegram_mutation_from_row(row)
+            if mutation.state not in {
+                "reconciliation_required",
+                "external_succeeded",
+                "applied",
+            }:
+                raise StoreError(
+                    "Telegram mutation is not awaiting reconciliation."
+                )
+            if transitioned.rowcount == 1:
+                self._record_telegram_mutation_event(
+                    operation_id,
+                    mutation.mutation_type,
+                    "reconciliation_required",
+                    timestamp,
+                )
+            self.connection.execute("COMMIT")
+            return mutation
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def complete_telegram_mutation(
+        self,
+        operation_id: str,
+        now: Optional[float] = None,
+    ) -> TelegramMutation:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            transitioned = self.connection.execute(
+                """
+                UPDATE telegram_mutations
+                SET state = 'applied', last_error = NULL, updated_at = ?
+                WHERE operation_id = ? AND state = 'external_succeeded'
+                """,
+                (timestamp, operation_id),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM telegram_mutations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Confirmed Telegram mutation was not found.")
+            mutation = self._telegram_mutation_from_row(row)
+            if mutation.state != "applied":
+                raise StoreError(
+                    "Telegram mutation cannot complete before its external "
+                    "result is durable."
+                )
+            if transitioned.rowcount == 1:
+                self._record_telegram_mutation_event(
+                    operation_id,
+                    mutation.mutation_type,
+                    "applied",
+                    timestamp,
+                )
+            self.connection.execute("COMMIT")
+            return mutation
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
     def consume_callback_action(
         self,
         callback_data: str,
@@ -1285,6 +1821,46 @@ class DurableStore:
                     "unauthorized",
                     "This button is not authorized here.",
                 )
+            if row["state"] == "consumed":
+                # A callback that was validly consumed already crossed its
+                # authorization boundary. The same durable update may resume
+                # after any downtime, even if the button's original TTL has
+                # since elapsed.
+                if int(row["consumed_by_update_id"] or -1) == int(update_id):
+                    action = self._callback_from_row(row)
+                    self.connection.execute("COMMIT")
+                    return action
+                # Confirmation consumption must not strand a durable
+                # operation after a handler crash. A later authorized tap may
+                # resume prepared/local-apply work, but never starts another
+                # Telegram call or replays an already-applied mutation.
+                if str(row["action_type"]) in {
+                    "router_project_confirm",
+                    "router_topic_rename_confirm",
+                }:
+                    mutation = self.connection.execute(
+                        """
+                        SELECT state FROM telegram_mutations
+                        WHERE operation_id = ?
+                        """,
+                        (str(row["operation_id"]),),
+                    ).fetchone()
+                    if (
+                        mutation is not None
+                        and str(mutation["state"])
+                        in {
+                            "prepared",
+                            "external_succeeded",
+                            "reconciliation_required",
+                        }
+                    ):
+                        action = self._callback_from_row(row)
+                        self.connection.execute("COMMIT")
+                        return action
+                raise CallbackActionError(
+                    "consumed",
+                    "This button was already used.",
+                )
             if float(row["expires_at"]) <= timestamp:
                 if row["state"] == "active":
                     self.connection.execute(
@@ -1299,15 +1875,6 @@ class DurableStore:
                 raise CallbackActionError(
                     "expired",
                     "This button has expired.",
-                )
-            if row["state"] == "consumed":
-                if int(row["consumed_by_update_id"] or -1) == int(update_id):
-                    action = self._callback_from_row(row)
-                    self.connection.execute("COMMIT")
-                    return action
-                raise CallbackActionError(
-                    "consumed",
-                    "This button was already used.",
                 )
             if row["state"] != "active":
                 raise CallbackActionError(
@@ -1673,7 +2240,8 @@ class DurableStore:
                         if "source_inbox_job_id" in card_spec:
                             mailbox = self.connection.execute(
                                 """
-                            SELECT mailbox_id, state, input_text, response_text
+                                SELECT mailbox_id, agent_id, state,
+                                    input_text, response_text, reply_chat_id
                                 FROM agent_mailbox
                                 WHERE source_inbox_job_id = ?
                                 """,
@@ -1682,7 +2250,8 @@ class DurableStore:
                         else:
                             mailbox = self.connection.execute(
                                 """
-                                SELECT mailbox_id, state, input_text, response_text
+                                SELECT mailbox_id, agent_id, state,
+                                    input_text, response_text, reply_chat_id
                                 FROM agent_mailbox
                                 WHERE mailbox_id = ?
                                 """,
@@ -1695,17 +2264,22 @@ class DurableStore:
                         ):
                             params = json.loads(row["params_json"])
                             mailbox_id = int(mailbox["mailbox_id"])
-                            response_chunks = chunk_telegram_text(
-                                str(mailbox["response_text"])
+                            labeled = self.labeled_agent_chunks(
+                                str(mailbox["agent_id"]),
+                                str(mailbox["response_text"]),
                             )
-                            if len(response_chunks) == 1:
-                                edit_text = response_chunks[0]
+                            if len(labeled) == 1:
+                                edit_text = labeled[0]
                             else:
                                 # The chunked response was already delivered
                                 # as separate messages; resolve the receipt
                                 # instead of leaving it stuck on Working.
                                 edit_text = (
-                                    "✅ Done — the full response is below."
+                                    self.agent_speaker_header(
+                                        str(mailbox["agent_id"])
+                                    )
+                                    + "\n\n✅ Done — the full response is "
+                                    "below."
                                 )
                             self.enqueue_api_call(
                                 operation_id=(
@@ -2172,6 +2746,11 @@ class DurableStore:
             ),
             lifecycle_state=str(row["lifecycle_state"]),
             provider_config=json.loads(row["provider_config_json"]),
+            working_directory=(
+                str(row["working_directory"])
+                if row["working_directory"] is not None
+                else None
+            ),
         )
 
     def resolve_agent(self, agent_id: str) -> Optional[ManagedAgent]:
@@ -2197,6 +2776,11 @@ class DurableStore:
             provider=str(row["provider"]),
             project_path=str(row["project_path"]),
             state=str(row["state"]),
+            working_directory=str(
+                row["working_directory"]
+                if row["working_directory"] is not None
+                else row["project_path"]
+            ),
         )
 
     def enroll_project(
@@ -2205,6 +2789,7 @@ class DurableStore:
         display_name: str,
         provider: str,
         project_path: str,
+        working_directory: Optional[str] = None,
         now: Optional[float] = None,
     ) -> tuple[ManagedProject, bool]:
         if (
@@ -2223,32 +2808,45 @@ class DurableStore:
             raise StoreError("Project provider is invalid.")
         if not project_path or not Path(project_path).is_absolute():
             raise StoreError("Managed project path must be absolute.")
+        workdir = working_directory or project_path
+        if not Path(workdir).is_absolute():
+            raise StoreError("Managed working directory must be absolute.")
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             existing = self.connection.execute(
-                """
-                SELECT * FROM managed_projects
-                WHERE slug = ? OR project_path = ?
-                """,
-                (slug, project_path),
+                "SELECT * FROM managed_projects WHERE slug = ?",
+                (slug,),
             ).fetchone()
             if existing is not None:
                 project = self._managed_project_from_row(existing)
-                expected = (slug, name, provider, project_path, "active")
+                expected = (slug, name, provider, project_path, workdir, "active")
                 actual = (
                     project.slug,
                     project.display_name,
                     project.provider,
                     project.project_path,
+                    project.working_directory,
                     project.state,
                 )
                 if actual != expected:
                     raise StoreError(
-                        "Project slug or path is already enrolled differently."
+                        "Project slug is already enrolled differently."
                     )
                 self.connection.execute("COMMIT")
                 return project, False
+            workdir_collision = self.connection.execute(
+                """
+                SELECT slug FROM managed_projects
+                WHERE working_directory = ? AND state = 'active'
+                """,
+                (workdir,),
+            ).fetchone()
+            if workdir_collision is not None:
+                raise StoreError(
+                    "Another enrolled project already uses this working "
+                    "directory."
+                )
             alias_collision = self.connection.execute(
                 "SELECT project_id FROM project_aliases WHERE alias_key = ?",
                 (slug,),
@@ -2260,9 +2858,9 @@ class DurableStore:
                 """
                 INSERT INTO managed_projects(
                     project_id, slug, display_name, provider, project_path,
-                    state, created_at, updated_at
+                    working_directory, state, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
                 """,
                 (
                     project_id,
@@ -2270,6 +2868,7 @@ class DurableStore:
                     name,
                     provider,
                     project_path,
+                    workdir,
                     timestamp,
                     timestamp,
                 ),
@@ -2647,7 +3246,6 @@ class DurableStore:
                 SELECT 1
                 FROM surface_bindings
                 WHERE chat_id = ? AND message_thread_id = ?
-                    AND surface_type = 'control'
                     AND target_type = 'controller' AND target_id = 'control'
                     AND state = 'active'
                 """,
@@ -2754,7 +3352,6 @@ class DurableStore:
                 """
                 SELECT 1 FROM surface_bindings
                 WHERE chat_id = ? AND message_thread_id = ?
-                    AND surface_type = 'control'
                     AND target_type = 'controller' AND target_id = 'control'
                     AND state = 'active'
                 """,
@@ -2773,7 +3370,7 @@ class DurableStore:
                         if message_thread_id is not None
                         else None
                     ),
-                    "text": "🎙️ <b>Transcribing…</b>",
+                    "text": "🎙️ <b>Control is transcribing…</b>",
                     "parse_mode": "HTML",
                 },
                 route={
@@ -2805,9 +3402,13 @@ class DurableStore:
             transcript = transcript[:3397].rstrip() + "…"
         transcript = html.escape(transcript)
         if stage == "sending":
-            return f"📤 <b>Sending</b>\n<blockquote>{transcript}</blockquote>"
+            return (
+                "🎛 <b>Control</b>\n"
+                f"📤 <b>Sending</b>\n<blockquote>{transcript}</blockquote>"
+            )
         if stage == "working":
             return (
+                "🎛 <b>Control</b>\n"
                 "🧭 <b>Routing…</b>\n"
                 f"<blockquote>{transcript}</blockquote>"
             )
@@ -2880,7 +3481,6 @@ class DurableStore:
                 """
                 SELECT 1 FROM surface_bindings
                 WHERE chat_id = ? AND message_thread_id = ?
-                    AND surface_type = 'control'
                     AND target_type = 'controller' AND target_id = 'control'
                     AND state = 'active'
                 """,
@@ -3020,6 +3620,88 @@ class DurableStore:
             ),
             attempts=int(claimed["attempts"]),
         )
+
+    def load_router_discovery(self, mailbox_id: int) -> dict[str, Any]:
+        """Return the persisted multi-step discovery state for one turn."""
+        row = self.connection.execute(
+            "SELECT discovery_json FROM router_mailbox WHERE mailbox_id = ?",
+            (int(mailbox_id),),
+        ).fetchone()
+        if row is None:
+            raise StoreError("Router mailbox turn was not found.")
+        if row["discovery_json"] is None:
+            return {"steps": [], "refs": {}}
+        state = json.loads(row["discovery_json"])
+        if (
+            not isinstance(state, dict)
+            or not isinstance(state.get("steps"), list)
+            or not isinstance(state.get("refs"), dict)
+        ):
+            raise StoreError("Persisted router discovery state is invalid.")
+        return state
+
+    def append_router_discovery_step(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        tool: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+        refs: dict[str, dict[str, Any]],
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Durably record one completed discovery step under the turn lease.
+
+        Steps persist as they complete so a crash-recovery retry resumes the
+        loop from recorded history instead of restarting blind. Reference IDs
+        are controller-issued here and are the only trusted provenance for
+        discovered paths.
+        """
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT discovery_json
+                FROM router_mailbox
+                WHERE mailbox_id = ? AND state = 'leased' AND lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Router mailbox lease for {mailbox_id} is no longer owned."
+                )
+            if row["discovery_json"] is None:
+                state: dict[str, Any] = {"steps": [], "refs": {}}
+            else:
+                state = json.loads(row["discovery_json"])
+            state["steps"].append(
+                {
+                    "tool": str(tool),
+                    "arguments": arguments,
+                    "result": result,
+                }
+            )
+            state["refs"].update(refs)
+            self.connection.execute(
+                """
+                UPDATE router_mailbox
+                SET discovery_json = ?, updated_at = ?
+                WHERE mailbox_id = ?
+                """,
+                (
+                    json.dumps(state, separators=(",", ":"), sort_keys=True),
+                    timestamp,
+                    int(mailbox_id),
+                ),
+            )
+            self.connection.execute("COMMIT")
+            return state
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
 
     def attach_router_mailbox_session(
         self,
@@ -3345,6 +4027,7 @@ class DurableStore:
         clarification_options: Optional[list[str]] = None,
         project_creation_plan: Optional[dict[str, Any]] = None,
         topic_rename_plan: Optional[dict[str, Any]] = None,
+        agent_config_plan: Optional[dict[str, Any]] = None,
         now: Optional[float] = None,
     ) -> None:
         if not preview_text or len(preview_text) > 3800:
@@ -3365,11 +4048,20 @@ class DurableStore:
                 "display_name",
                 "provider",
                 "project_path",
+                "working_directory",
                 "topic_name",
                 "provider_config",
+                "provenance",
             }
         ):
             raise StoreError("Router project-creation plan is invalid.")
+        if agent_config_plan is not None and (
+            tool_name != "configure_agent"
+            or set(agent_config_plan) != {"project_slug", "updates"}
+            or not isinstance(agent_config_plan.get("updates"), dict)
+            or not agent_config_plan["updates"]
+        ):
+            raise StoreError("Router agent-configuration plan is invalid.")
         if topic_rename_plan is not None and (
             tool_name != "rename_topic"
             or set(topic_rename_plan)
@@ -3520,6 +4212,68 @@ class DurableStore:
                         raise StoreError(
                             "Could not allocate a project-confirmation token."
                         )
+            if agent_config_plan is not None:
+                if row["authorized_user_id"] is None:
+                    raise StoreError(
+                        "Router configuration change has no authorized user."
+                    )
+                for index, (action_type, label) in enumerate(
+                    (
+                        ("router_config_confirm", "Apply configuration"),
+                        ("router_config_cancel", "Cancel"),
+                    )
+                ):
+                    inserted = False
+                    for _ in range(5):
+                        token = secrets.token_urlsafe(6)
+                        payload = dict(agent_config_plan)
+                        payload["label"] = label
+                        payload["router_mailbox_id"] = int(mailbox_id)
+                        try:
+                            self.connection.execute(
+                                """
+                                INSERT INTO callback_actions(
+                                    operation_id, token, action_type,
+                                    payload_json, chat_id, message_thread_id,
+                                    authorized_user_id, one_time, state,
+                                    expires_at, created_at, updated_at
+                                )
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'active',
+                                    ?, ?, ?)
+                                """,
+                                (
+                                    (
+                                        f"router:{int(mailbox_id)}:"
+                                        f"config:{index}"
+                                    ),
+                                    token,
+                                    action_type,
+                                    json.dumps(
+                                        payload,
+                                        separators=(",", ":"),
+                                        sort_keys=True,
+                                    ),
+                                    int(row["chat_id"]),
+                                    (
+                                        int(row["message_thread_id"])
+                                        if int(row["message_thread_id"]) != 0
+                                        else None
+                                    ),
+                                    int(row["authorized_user_id"]),
+                                    timestamp + 10 * 60,
+                                    timestamp,
+                                    timestamp,
+                                ),
+                            )
+                        except sqlite3.IntegrityError:
+                            continue
+                        inserted = True
+                        break
+                    if not inserted:
+                        raise StoreError(
+                            "Could not allocate a configuration-confirmation "
+                            "token."
+                        )
             if topic_rename_plan is not None:
                 if row["authorized_user_id"] is None:
                     raise StoreError("Router topic rename has no authorized user.")
@@ -3646,6 +4400,7 @@ class DurableStore:
             state = "dead" if attempts >= max_attempts else "queued"
             delay = base_delay * (2 ** max(0, attempts - 1))
             final_text = (
+                f"{CONTROL_SPEAKER}\n\n"
                 "❌ I couldn’t safely interpret that request. Please try "
                 "rephrasing it."
             )
@@ -3783,6 +4538,21 @@ class DurableStore:
             (timestamp, f"router:{int(mailbox_id)}:topic-rename:%"),
         )
 
+    def expire_router_config_actions(
+        self,
+        mailbox_id: int,
+        now: Optional[float] = None,
+    ) -> None:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute(
+            """
+            UPDATE callback_actions
+            SET state = 'expired', updated_at = ?
+            WHERE operation_id LIKE ? AND state = 'active'
+            """,
+            (timestamp, f"router:{int(mailbox_id)}:config:%"),
+        )
+
     def attach_enrolled_project(
         self,
         chat_id: int,
@@ -3805,12 +4575,14 @@ class DurableStore:
                 project.slug,
                 project.provider,
                 project.project_path,
+                project.working_directory,
                 binding.binding_id,
             )
             actual = (
                 agent.slug,
                 agent.provider,
                 agent.project_path,
+                agent.working_directory or agent.project_path,
                 agent.surface_binding_id,
             )
             if actual != expected:
@@ -3833,6 +4605,7 @@ class DurableStore:
             provider=project.provider,
             project_path=project.project_path,
             provider_config=provider_config,
+            working_directory=project.working_directory,
             now=now,
         )
 
@@ -4102,6 +4875,7 @@ class DurableStore:
         provider: str,
         project_path: str,
         provider_config: Optional[dict[str, Any]] = None,
+        working_directory: Optional[str] = None,
         now: Optional[float] = None,
     ) -> tuple[ManagedAgent, bool]:
         if (
@@ -4117,6 +4891,9 @@ class DurableStore:
             raise StoreError("Agent provider is invalid.")
         if not project_path or not Path(project_path).is_absolute():
             raise StoreError("Agent project path must be absolute.")
+        workdir = working_directory or project_path
+        if not Path(workdir).is_absolute():
+            raise StoreError("Agent working directory must be absolute.")
         normalized_config = validate_provider_config(provider, provider_config)
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
@@ -4145,11 +4922,18 @@ class DurableStore:
                 if existing_row is None:
                     raise StoreError("Surface references a missing managed agent.")
                 existing = self._managed_agent_from_row(existing_row)
-                expected = (slug, provider, project_path, binding.binding_id)
+                expected = (
+                    slug,
+                    provider,
+                    project_path,
+                    workdir,
+                    binding.binding_id,
+                )
                 actual = (
                     existing.slug,
                     existing.provider,
                     existing.project_path,
+                    existing.working_directory or existing.project_path,
                     existing.surface_binding_id,
                 )
                 if actual != expected:
@@ -4210,10 +4994,11 @@ class DurableStore:
                 INSERT INTO agents(
                     agent_id, parent_agent_id, role, slug,
                     hierarchical_name, provider, project_path,
-                    provider_session_id, surface_binding_id,
-                    lifecycle_state, provider_config_json, created_at, updated_at
+                    working_directory, provider_session_id,
+                    surface_binding_id, lifecycle_state,
+                    provider_config_json, created_at, updated_at
                 )
-                VALUES (?, ?, 'project', ?, ?, ?, ?, NULL, ?,
+                VALUES (?, ?, 'project', ?, ?, ?, ?, ?, NULL, ?,
                     'registered', ?, ?, ?)
                 """,
                 (
@@ -4223,6 +5008,7 @@ class DurableStore:
                     hierarchical_name,
                     provider,
                     project_path,
+                    workdir,
                     binding.binding_id,
                     json.dumps(
                         normalized_config,
@@ -4337,6 +5123,44 @@ class DurableStore:
         except BaseException:
             self.connection.execute("ROLLBACK")
             raise
+
+    def agent_speaker_header(self, agent_id: str) -> str:
+        """Project display name used to label agent-authored Control-chat turns."""
+        row = self.connection.execute(
+            """
+            SELECT p.display_name
+            FROM agents AS a
+            JOIN managed_projects AS p
+                ON p.slug = a.slug AND p.state = 'active'
+            WHERE a.agent_id = ?
+            """,
+            (agent_id,),
+        ).fetchone()
+        if row is not None:
+            return str(row["display_name"])
+        fallback = self.connection.execute(
+            "SELECT slug FROM agents WHERE agent_id = ?",
+            (agent_id,),
+        ).fetchone()
+        return str(fallback["slug"]) if fallback is not None else "Agent"
+
+    def labeled_agent_chunks(
+        self,
+        agent_id: str,
+        response_text: str,
+    ) -> list[str]:
+        """Chunk a response so every chunk carries the project identity.
+
+        The chunk budget is reduced by the header length, so labeling never
+        truncates payload, and every continuation chunk repeats the durable
+        speaker label.
+        """
+        header = self.agent_speaker_header(agent_id)
+        budget = max(1000, 3800 - len(header) - 2)
+        return [
+            f"{header}\n\n{chunk}"
+            for chunk in chunk_telegram_text(response_text, limit=budget)
+        ]
 
     def enqueue_agent_message(
         self,
@@ -4787,16 +5611,22 @@ class DurableStore:
         stage: str,
         input_text: str,
         provider: str = "codex",
+        speaker: str = "Agent",
     ) -> str:
         transcript = input_text.strip()
         if len(transcript) > 3400:
             transcript = transcript[:3397].rstrip() + "…"
         transcript = html.escape(transcript)
+        escaped_speaker = html.escape(speaker)
         if stage == "sending":
-            return f"📤 <b>Sending</b>\n<blockquote>{transcript}</blockquote>"
+            return (
+                f"<b>{escaped_speaker}</b>\n"
+                f"📤 <b>Sending</b>\n<blockquote>{transcript}</blockquote>"
+            )
         if stage == "working":
             provider_name = "Claude" if provider == "claude" else "Codex"
             return (
+                f"<b>{escaped_speaker}</b>\n"
                 f"🧠 <b>{provider_name} is working…</b>\n"
                 f"<blockquote>{transcript}</blockquote>"
             )
@@ -4825,7 +5655,7 @@ class DurableStore:
             return None
         provider_row = self.connection.execute(
             """
-            SELECT a.provider
+            SELECT a.provider, a.agent_id
             FROM agent_mailbox AS m
             JOIN agents AS a ON a.agent_id = m.agent_id
             WHERE m.source_inbox_job_id = ?
@@ -4835,6 +5665,7 @@ class DurableStore:
         if provider_row is None:
             raise StoreError("Managed voice receipt agent is unavailable.")
         provider = str(provider_row["provider"])
+        speaker = self.agent_speaker_header(str(provider_row["agent_id"]))
         result = json.loads(receipt["telegram_result_json"])
         params = json.loads(receipt["params_json"])
         try:
@@ -4854,6 +5685,7 @@ class DurableStore:
                     stage,
                     input_text,
                     provider,
+                    speaker,
                 ),
                 "parse_mode": "HTML",
             },
@@ -5092,12 +5924,11 @@ class DurableStore:
         worker_id: str,
         provider_session_id: str,
         response_text: str,
-        response_chunks: list[str],
         usage: dict[str, Any],
         now: Optional[float] = None,
     ) -> None:
-        if not response_chunks or any(not chunk for chunk in response_chunks):
-            raise StoreError("Agent response chunks are invalid.")
+        if not str(response_text):
+            raise StoreError("Agent response text is invalid.")
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -5116,6 +5947,10 @@ class DurableStore:
                 raise LeaseLostError(
                     f"Agent mailbox lease for {mailbox_id} is no longer owned."
                 )
+            labeled_chunks = self.labeled_agent_chunks(
+                str(row["agent_id"]),
+                response_text,
+            )
             if row["reply_chat_id"] is not None:
                 # A reply-routed turn delivers back to the surface the user
                 # replied on, independent of the agent's own project topic.
@@ -5176,6 +6011,7 @@ class DurableStore:
             ).fetchone()
             if router_origin is not None:
                 router_mailbox_id = int(router_origin["mailbox_id"])
+                labeled_response = labeled_chunks[0]
                 self.connection.execute(
                     """
                     UPDATE router_mailbox
@@ -5183,14 +6019,14 @@ class DurableStore:
                     WHERE mailbox_id = ?
                     """,
                     (
-                        response_chunks[0],
+                        labeled_response,
                         timestamp,
                         router_mailbox_id,
                     ),
                 )
                 self._enqueue_router_final_edit(
                     router_mailbox_id,
-                    response_chunks[0],
+                    labeled_response,
                     timestamp,
                     operation_suffix="agent-final-edit",
                     route_retarget={
@@ -5199,7 +6035,9 @@ class DurableStore:
                     },
                 )
                 router_thread_id = int(router_origin["message_thread_id"])
-                for index, chunk in enumerate(response_chunks[1:], start=2):
+                for index, chunk in enumerate(labeled_chunks[1:], start=2):
+                    # Continuation chunks are the same agent speaking, so
+                    # they carry the same label and route back to the agent.
                     self.enqueue_api_call(
                         operation_id=(
                             f"router-mailbox:{router_mailbox_id}:"
@@ -5216,8 +6054,8 @@ class DurableStore:
                             "text": chunk,
                         },
                         route={
-                            "target_type": "controller",
-                            "target_id": "control",
+                            "target_type": "agent",
+                            "target_id": str(row["agent_id"]),
                             "policy": "reply",
                             "ttl_seconds": 30 * 24 * 60 * 60,
                         },
@@ -5251,7 +6089,7 @@ class DurableStore:
             # a single-chunk result whose receipt is still in flight defers
             # that edit to the receipt's own completion.
             replaces_receipt = receipt_sent or (
-                receipt is not None and len(response_chunks) == 1
+                receipt is not None and len(labeled_chunks) == 1
             )
             if receipt_sent:
                 receipt_result = json.loads(receipt["telegram_result_json"])
@@ -5261,13 +6099,14 @@ class DurableStore:
                     raise StoreError(
                         "Stored Telegram receipt result is invalid."
                     ) from None
+                final_text = labeled_chunks[0]
                 self.enqueue_api_call(
                     operation_id=f"agent-mailbox:{mailbox_id}:final-edit",
                     method="editMessageText",
                     params={
                         "chat_id": delivery_chat_id,
                         "message_id": receipt_message_id,
-                        "text": response_chunks[0],
+                        "text": final_text,
                     },
                     card={
                         "kind": "agent_turn",
@@ -5277,8 +6116,8 @@ class DurableStore:
                     now=timestamp,
                 )
             chunks_to_send = (
-                response_chunks[1:] if receipt_sent
-                else ([] if replaces_receipt else response_chunks)
+                labeled_chunks[1:] if receipt_sent
+                else ([] if replaces_receipt else labeled_chunks)
             )
             for index, chunk in enumerate(chunks_to_send, start=1):
                 self.enqueue_api_call(
@@ -5375,8 +6214,9 @@ class DurableStore:
                 if router_origin is not None:
                     router_mailbox_id = int(router_origin["mailbox_id"])
                     failure_text = (
-                        "❌ The project agent could not complete this request. "
-                        "You can retry or rephrase it."
+                        f"{CONTROL_SPEAKER}\n\n"
+                        "❌ The project agent could not complete this "
+                        "request. You can retry or rephrase it."
                     )
                     self.connection.execute(
                         """
@@ -5438,7 +6278,10 @@ class DurableStore:
             thread_id = int(binding["message_thread_id"])
         # Only the receipt edit (the first chunk) failed; later chunks were
         # queued separately, so the fallback resends just that first chunk.
-        fallback_text = chunk_telegram_text(str(row["response_text"]))[0]
+        fallback_text = self.labeled_agent_chunks(
+            str(row["agent_id"]),
+            str(row["response_text"]),
+        )[0]
         return self.enqueue_api_call(
             operation_id=f"agent-mailbox:{mailbox_id}:final-fallback",
             method="sendMessage",

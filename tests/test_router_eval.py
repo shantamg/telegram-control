@@ -19,6 +19,8 @@ class RouterEvaluationTests(unittest.TestCase):
                 "remove_project_alias",
                 "ask_user",
                 "respond",
+                "find_directory",
+                "inspect_directory",
             },
         )
         for case in cases:

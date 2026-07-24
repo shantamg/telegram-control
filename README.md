@@ -491,6 +491,51 @@ selection into a one-time authorized confirmation question (`Yes, send it` /
 text can never reach a project agent without an explicit user action.
 Consequential tools keep their existing controller-enforced confirmations.
 
+## Conversational Control agent
+
+The main Control chat is no longer a one-shot intent classifier. Each turn is
+a bounded, durable multi-step investigation:
+
+- Control can call two read-only discovery tools — `find_directory` and
+  `inspect_directory` — as many as six times per turn before committing to
+  exactly one terminal outcome. Discovery is confined to the configured
+  discovery roots (`discovery_roots` in the bridge config, defaulting to your
+  home directory), skips hidden directories, follows symlinks only inside the
+  roots, and reports Git-root status and subdirectories with hard result
+  caps. Completed steps persist on the turn, so a crash-recovery retry
+  resumes from recorded history, and step/time/path bounds end a runaway
+  investigation with a precise message.
+- Every discovered directory receives a controller-issued opaque ref ID.
+  A creation proposal may identify its repository root and working directory
+  only by those refs or by text you yourself wrote; a model-invented path or
+  forged ref fails closed, and confirmation payloads carry full
+  `{value, source, derived_from}` provenance.
+- Projects now separate `repository_root` from `working_directory`: the
+  agent runs (structured turns and tmux console alike) in the working
+  directory, which must stay inside the Git root through symlink-resolved
+  containment checks enforced at proposal, confirmation, and every launch.
+  Several projects can share one repository with sibling working
+  directories; existing projects migrated with working directory equal to
+  their root, and nothing else — IDs, sessions, topics, aliases — changed.
+- Mutations stay confirmation-gated behind authorized one-time buttons, now
+  including agent model/effort configuration changes. So a request like
+  “add a project called Lovely, the Peter app subdirectory of the lovely
+  repo in software inside my user directory” resolves the repository and
+  `peter-app` working directory by discovery and produces a validated,
+  confirmation-backed proposal — without requiring you to type absolute
+  paths. Schema v15 additionally records project-topic creation and topic
+  renaming as durable mutation sagas. A compare-and-set claim gives exactly
+  one concurrent confirmation permission to cross the Telegram API boundary;
+  durable external results resume local application after a crash, while an
+  ambiguous lost API result enters explicit reconciliation instead of
+  repeating a possibly successful Telegram mutation.
+- Every Control-chat turn identifies its speaker: `🎛 Control` for the
+  Control agent, `🎛 Control → Project` on dispatch handoffs, and the
+  project's name on relayed or reply-continued agent responses. The old
+  “Router preview / Would inspect…” fallbacks are gone; responses state
+  exactly what was done or found, and topics still bound to the controller
+  converse with Control directly.
+
 ## Prerequisites
 
 - macOS

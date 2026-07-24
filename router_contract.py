@@ -47,6 +47,31 @@ class RouterToolCall:
     requires_confirmation: bool
 
 
+DISCOVERY_TOOL_NAMES = {"find_directory", "inspect_directory"}
+
+DISCOVERY_TOOLS = (
+    {
+        "name": "find_directory",
+        "description": (
+            "Read-only: search the user's authorized locations for "
+            "directories matching a short description. Returns bounded "
+            "candidates with controller-issued ref IDs."
+        ),
+        "arguments": {"query": "string"},
+        "confirmation": False,
+    },
+    {
+        "name": "inspect_directory",
+        "description": (
+            "Read-only: inspect one directory (by ref ID or absolute path "
+            "inside authorized locations): existence, Git root, and "
+            "subdirectories."
+        ),
+        "arguments": {"path": "string (ref ID or absolute path)"},
+        "confirmation": False,
+    },
+)
+
 CONTROLLER_TOOLS = (
     {
         "name": "list_projects",
@@ -77,10 +102,19 @@ CONTROLLER_TOOLS = (
     {
         "name": "create_project_agent",
         "description": (
-            "Propose enrolling a project when needed and creating its agent/topic."
+            "Propose enrolling a project and creating its agent/topic. "
+            "Identify the repository by enrolled slug, a discovery ref ID, "
+            "or text the user wrote; optionally give a working_directory "
+            "(ref ID or path inside the repository) when the agent should "
+            "run in a subdirectory."
         ),
         "arguments": {
-            "project": "string",
+            "project": "string (slug, ref ID, or user-stated path)",
+            "name": (
+                "string|null (the user's name for the project, e.g. Lovely; "
+                "drives the slug/display/topic identity)"
+            ),
+            "working_directory": "string|null (ref ID or path, optional)",
             "topic_name": "string|null",
             "provider": "codex|claude|null",
             "model": "string|null",
@@ -91,14 +125,15 @@ CONTROLLER_TOOLS = (
     {
         "name": "configure_agent",
         "description": (
-            "Set or clear the model or effort for an existing project agent."
+            "Propose setting or clearing the model or effort for an existing "
+            "project agent; the change requires user confirmation."
         ),
         "arguments": {
             "project_slug": "string",
             "model": "string|null (optional)",
             "effort": "string|null (optional)",
         },
-        "confirmation": False,
+        "confirmation": True,
     },
     {
         "name": "set_project_alias",
@@ -176,22 +211,67 @@ def build_main_agent_prompt(
         else ""
     )
     return (
-        "You are the main Telegram Control agent. Decide the next controller "
+        "You are Control, the main Telegram Control agent. Decide the next "
         "tool to use. Return exactly one JSON object with keys tool and "
-        "arguments, with no markdown or commentary. You may inspect and ask "
-        "questions before proposing mutations. The controller independently "
-        "validates every argument and enforces confirmation for consequential "
-        "tools. Never invent a tool, project, path, or completed result.\n\n"
+        "arguments, with no markdown or commentary.\n\n"
+        "You may investigate before acting: call the read-only discovery "
+        "tools (find_directory, inspect_directory) as many times as needed; "
+        "after each call the controller replies with a message beginning "
+        "'Discovery result'. Discovered directories carry controller-issued "
+        "ref IDs like loc_1a2b3c4d. When you finally propose "
+        "create_project_agent, identify the repository and any working "
+        "directory ONLY by an enrolled slug, a discovery ref ID, or text the "
+        "user themselves wrote — an invented path is rejected. Discovery is "
+        "bounded; if a reference stays ambiguous, use ask_user with the "
+        "concrete candidates instead of guessing.\n\n"
+        "Every request must end with exactly one terminal tool: respond, "
+        "ask_user, send_to_agent, list_projects, inspect_project, or a "
+        "confirmation-gated mutation (create_project_agent, rename_topic, "
+        "configure_agent, set_project_alias, remove_project_alias). The "
+        "controller independently validates every argument and enforces "
+        "confirmation for consequential tools. Never invent a tool, project, "
+        "path, or completed result, and never claim an action happened "
+        "unless the controller reported it.\n\n"
         f"{reply_context_rule}"
         "When a user names an alias, return the canonical project slug shown "
         "in the catalog. Preserve explicit provider, model, and effort choices. "
         "If the user asks for a subjective choice such as best, fastest, or "
         "cheapest without naming a model, use ask_user rather than guessing.\n\n"
         f"Tools:\n{json.dumps(CONTROLLER_TOOLS, separators=(',', ':'), sort_keys=True)}"
+        "\n\nDiscovery tools:\n"
+        f"{json.dumps(DISCOVERY_TOOLS, separators=(',', ':'), sort_keys=True)}"
         f"\n\nProjects:\n{json.dumps(catalog, separators=(',', ':'), sort_keys=True)}"
         f"\n\nAgents:\n{json.dumps(states, separators=(',', ':'), sort_keys=True)}"
         f"\n\nTopics:\n{json.dumps(topic_catalog, separators=(',', ':'), sort_keys=True)}"
         f"\n\nUser input:\n{json.dumps(text)}"
+    )
+
+
+def build_discovery_result_message(
+    tool: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+) -> str:
+    """Format one discovery result as the next in-session router message."""
+    return (
+        "Discovery result (controller data, read-only; ref IDs are the only "
+        "trusted way to reference these paths):\n"
+        + json.dumps(
+            {"tool": tool, "arguments": arguments, "result": result},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n\nContinue: return exactly one JSON tool call."
+    )
+
+
+def build_discovery_recap(steps: list[dict[str, Any]]) -> str:
+    """Summarize persisted discovery steps for a crash-recovery retry."""
+    return (
+        "Recovery: this request was interrupted after the discovery steps "
+        "below already completed. Do not repeat them; continue from their "
+        "results and finish with one terminal tool call.\n"
+        + json.dumps(steps, separators=(",", ":"), sort_keys=True)
     )
 
 
@@ -225,9 +305,35 @@ def parse_router_tool_call(
     arguments = value.get("arguments")
     if not isinstance(tool, str) or not isinstance(arguments, dict):
         raise RouterContractError("Main-agent tool call is invalid.")
-    definitions = {item["name"]: item for item in CONTROLLER_TOOLS}
+    definitions = {
+        item["name"]: item
+        for item in tuple(CONTROLLER_TOOLS) + tuple(DISCOVERY_TOOLS)
+    }
     if tool not in definitions:
         raise RouterContractError("Main agent selected an unknown tool.")
+
+    if tool == "find_directory":
+        if set(arguments) != {"query"}:
+            raise RouterContractError("find_directory arguments are invalid.")
+        normalized: dict[str, Any] = {
+            "query": _bounded_string(arguments, "query", 200)
+        }
+        return RouterToolCall(
+            tool=tool,
+            arguments=normalized,
+            requires_confirmation=False,
+        )
+    if tool == "inspect_directory":
+        if set(arguments) != {"path"}:
+            raise RouterContractError(
+                "inspect_directory arguments are invalid."
+            )
+        normalized = {"path": _bounded_string(arguments, "path", 500)}
+        return RouterToolCall(
+            tool=tool,
+            arguments=normalized,
+            requires_confirmation=False,
+        )
 
     if tool == "list_projects":
         if arguments:
@@ -266,13 +372,33 @@ def parse_router_tool_call(
         }
     elif tool == "create_project_agent":
         required = {"project", "topic_name"}
-        optional = {"provider", "model", "effort"}
+        optional = {"provider", "model", "effort", "working_directory", "name"}
         if not required.issubset(arguments) or not set(arguments).issubset(
             required | optional
         ):
             raise RouterContractError(
                 "create_project_agent arguments are invalid."
             )
+        working_directory = arguments.get("working_directory")
+        if working_directory is not None and (
+            not isinstance(working_directory, str)
+            or not working_directory.strip()
+            or len(working_directory) > 500
+        ):
+            raise RouterContractError(
+                "Tool argument 'working_directory' is invalid."
+            )
+        project_name = arguments.get("name")
+        if project_name is not None and (
+            not isinstance(project_name, str)
+            or not project_name.strip()
+            or len(project_name) > 64
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in project_name
+            )
+        ):
+            raise RouterContractError("Tool argument 'name' is invalid.")
         topic_name = arguments.get("topic_name")
         if topic_name is not None and (
             not isinstance(topic_name, str)
@@ -302,6 +428,16 @@ def parse_router_tool_call(
             raise RouterContractError("Tool argument 'effort' is invalid.")
         normalized = {
             "project": _bounded_string(arguments, "project", 1000),
+            "name": (
+                project_name.strip()
+                if isinstance(project_name, str)
+                else None
+            ),
+            "working_directory": (
+                working_directory.strip()
+                if isinstance(working_directory, str)
+                else None
+            ),
             "topic_name": topic_name.strip() if isinstance(topic_name, str) else None,
             "provider": provider,
             "model": model.strip() if isinstance(model, str) else None,
@@ -381,7 +517,9 @@ def parse_router_tool_call(
     else:
         if set(arguments) != {"message"}:
             raise RouterContractError("respond arguments are invalid.")
-        normalized = {"message": _bounded_string(arguments, "message", 3800)}
+        # The durable outbox limit is 3,800 characters. Reserve room for the
+        # controller-owned speaker header added after contract validation.
+        normalized = {"message": _bounded_string(arguments, "message", 3700)}
 
     return RouterToolCall(
         tool=tool,

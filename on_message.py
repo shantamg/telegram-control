@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Handle authorized Telegram text and voice messages."""
 
+import html
 import json
 import os
 import re
@@ -11,10 +12,16 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import discovery
 import router_contract
 import telegram_bridge as bridge
 import tmux_console
-from durable_store import CallbackActionError, DurableStore, StoreError
+from durable_store import (
+    CallbackActionError,
+    DurableStore,
+    StoreError,
+    chunk_telegram_text,
+)
 
 
 HANDY_BINARY = Path("/Applications/Handy.app/Contents/MacOS/handy")
@@ -25,6 +32,7 @@ MAX_VOICE_SECONDS = 30 * 60
 TRANSCRIPTION_TIMEOUT_SECONDS = 15 * 60
 TELEGRAM_TEXT_CHUNK = 3_800
 OUTPUT_SEQUENCE = 0
+CONTROL_SPEAKER = "🎛 Control"
 
 
 def deliver_api_call(
@@ -89,6 +97,22 @@ def current_surface_binding():
         )
 
 
+def current_speaker_header() -> str:
+    """Controller-authored messages always identify Control as the source."""
+    return CONTROL_SPEAKER
+
+
+def speaker_labeled_text(text: str) -> str:
+    """Label every controller-authored response without double-prefixing."""
+    content = text.strip() or "[empty controller response]"
+    if content.startswith(CONTROL_SPEAKER):
+        return content
+    speaker = current_speaker_header()
+    if content == speaker or content.startswith(f"{speaker}\n"):
+        return content
+    return f"{speaker}\n\n{content}"
+
+
 def surface_coordinates():
     chat_id = int(os.environ["TELEGRAM_CHAT_ID"])
     thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
@@ -121,7 +145,7 @@ def status_card_text(store: DurableStore, binding, refresh_marker: str) -> str:
         else f"{binding.display_name} · topic {binding.message_thread_id}"
     )
     return (
-        "Telegram Control\n\n"
+        f"{CONTROL_SPEAKER}\n\nTelegram Control\n\n"
         f"Database: {store.quick_check()}\n"
         f"Surface: {surface}\n"
         f"Target: {binding.target_type}/{binding.target_id}\n"
@@ -245,29 +269,24 @@ def send_message(
         chat_id = int(bridge.load_config()["chat_id"])
     thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
     thread_id = int(thread_id_text) if thread_id_text else None
-    remaining = text.strip()
-    if not remaining:
-        remaining = "[empty transcript]"
+    labeled = speaker_labeled_text(text)
+    if "\n\n" in labeled:
+        speaker, payload = labeled.split("\n\n", 1)
+    else:
+        speaker, payload = current_speaker_header(), labeled
+    budget = max(1000, TELEGRAM_TEXT_CHUNK - len(speaker) - 2)
+    chunks = chunk_telegram_text(payload, limit=budget)
     if include_inspect_button:
         reply_markup = inspect_keyboard()
-    while remaining:
-        if len(remaining) <= TELEGRAM_TEXT_CHUNK:
-            chunk, remaining = remaining, ""
-        else:
-            split_at = remaining.rfind("\n", 0, TELEGRAM_TEXT_CHUNK)
-            if split_at < TELEGRAM_TEXT_CHUNK // 2:
-                split_at = remaining.rfind(" ", 0, TELEGRAM_TEXT_CHUNK)
-            if split_at < TELEGRAM_TEXT_CHUNK // 2:
-                split_at = TELEGRAM_TEXT_CHUNK
-            chunk = remaining[:split_at].rstrip()
-            remaining = remaining[split_at:].lstrip()
+    for index, payload_chunk in enumerate(chunks):
+        chunk = f"{speaker}\n\n{payload_chunk}"
         OUTPUT_SEQUENCE += 1
         params = {
             "chat_id": chat_id,
             "message_thread_id": thread_id,
             "text": chunk,
         }
-        if not remaining and reply_markup is not None:
+        if index == len(chunks) - 1 and reply_markup is not None:
             params["reply_markup"] = reply_markup
         deliver_api_call(
             "sendMessage",
@@ -315,6 +334,7 @@ def enqueue_agent_reply_input(route, text: str) -> None:
         raise StoreError("Managed agent input requires the durable controller.")
     chat_id, thread_id = surface_coordinates()
     with DurableStore(Path(database_path)) as store:
+        speaker = store.agent_speaker_header(route.target_id)
         store.enqueue_agent_reply_message_with_receipt(
             agent_id=route.target_id,
             source_inbox_job_id=int(job_id),
@@ -322,7 +342,7 @@ def enqueue_agent_reply_input(route, text: str) -> None:
             chat_id=chat_id,
             message_thread_id=thread_id,
             replied_message_id=route.telegram_message_id,
-            receipt_text="⏳ <b>Working…</b>",
+            receipt_text=f"⏳ <b>{html.escape(speaker)} is working…</b>",
             receipt_parse_mode="HTML",
         )
 
@@ -396,7 +416,22 @@ def send_agent_status() -> None:
     if agent is None:
         send_message("This Telegram surface has no managed agent.")
         return
-    project_name = Path(agent.project_path).name if agent.project_path else "controller"
+    with DurableStore(Path(database_path)) as store:
+        # Durable project identity, not a directory basename.
+        project_name = store.agent_speaker_header(agent.agent_id)
+    workspace_lines = ""
+    if agent.project_path:
+        repository_name = Path(agent.project_path).name
+        workspace_lines = f"\nRepository: {repository_name}"
+        workdir = agent.working_directory or agent.project_path
+        if workdir != agent.project_path:
+            try:
+                relative = Path(workdir).relative_to(agent.project_path)
+                workspace_lines += f"\nWorking directory: {relative}"
+            except ValueError:
+                workspace_lines += (
+                    f"\nWorking directory: {Path(workdir).name}"
+                )
     session = "not started" if not agent.provider_session_id else "persisted"
     console_state = console.state if console is not None else "stopped"
     usage_line = ""
@@ -421,7 +456,8 @@ def send_agent_status() -> None:
         f"Provider: {agent.provider}\n"
         f"Model: {agent.provider_config.get('model', 'provider default')}\n"
         f"Effort: {agent.provider_config.get('effort', 'provider default')}\n"
-        f"Project: {project_name}\n"
+        f"Project: {project_name}"
+        f"{workspace_lines}\n"
         f"State: {agent.lifecycle_state}\n"
         f"Session: {session}\n"
         f"Console: {console_state}"
@@ -491,7 +527,8 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
         if agent is None or agent.role not in {"project", "worker"}:
             raise StoreError("Managed agent route is no longer valid.")
         chat_id, thread_id = surface_coordinates()
-        receipt = "⏳ <b>Working…</b>"
+        speaker = html.escape(store.agent_speaker_header(agent.agent_id))
+        receipt = f"⏳ <b>{speaker} is working…</b>"
         store.enqueue_agent_message_with_receipt(
             agent_id=agent.agent_id,
             source_inbox_job_id=int(job_id),
@@ -521,8 +558,7 @@ def enqueue_router_input(text: str) -> None:
                 target_id="control",
             )
         if (
-            binding.surface_type != "control"
-            or binding.target_type != "controller"
+            binding.target_type != "controller"
             or binding.target_id != "control"
         ):
             raise StoreError("Main router surface is no longer valid.")
@@ -532,7 +568,7 @@ def enqueue_router_input(text: str) -> None:
             chat_id=chat_id,
             message_thread_id=thread_id,
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
-            receipt_text="🧭 <b>Routing…</b>",
+            receipt_text="🧭 <b>Control is routing…</b>",
             receipt_parse_mode="HTML",
         )
 
@@ -608,7 +644,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 chat_id=chat_id,
                 message_thread_id=thread_id,
                 authorized_user_id=user_id,
-                receipt_text="🧭 <b>Routing…</b>",
+                receipt_text="🧭 <b>Control is routing…</b>",
                 receipt_parse_mode="HTML",
             )
         if callback_query_id:
@@ -647,7 +683,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     },
                     "callback-answer",
                 )
-            send_message("Cancelled. The Telegram topic was not renamed.")
+            send_message("🎛 Control\n\nCancelled. The Telegram topic was not renamed.")
             return
 
         required = {
@@ -678,12 +714,68 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         ):
             raise StoreError("Stored topic-rename plan is invalid.")
         with DurableStore(Path(database_path)) as store:
+            mutation = store.prepare_telegram_mutation(
+                action.operation_id,
+                "topic_rename",
+                action.payload,
+            )
             binding = store.resolve_surface_binding_by_id(binding_id)
+        if mutation.state == "applied":
+            send_message(
+                "🎛 Control\n\n"
+                f"The topic rename from “{old_name}” to “{new_name}” "
+                "was already completed."
+            )
+            return
+        binding_identity_matches = (
+            binding is not None
+            and binding.chat_id == target_chat_id
+            and binding.message_thread_id == target_thread_id
+        )
+        if not binding_identity_matches:
+            raise StoreError(
+                "Managed topic changed before the rename was confirmed."
+            )
+
+        if mutation.state in {
+            "external_in_flight",
+            "reconciliation_required",
+        }:
+            # A durable local rename proves that the result was applied before
+            # a prior handler stopped. Otherwise Telegram provides no safe
+            # idempotency key or topic-read method, so never guess by issuing
+            # editForumTopic a second time.
+            if binding.display_name == new_name:
+                with DurableStore(Path(database_path)) as store:
+                    store.record_telegram_mutation_result(
+                        action.operation_id,
+                        {"telegram_result": True, "reconciled": "local_binding"},
+                        reconciled=True,
+                    )
+                    store.complete_telegram_mutation(action.operation_id)
+                send_message(
+                    "🎛 Control\n\n"
+                    f"Recovered the completed rename to “{new_name}” "
+                    "without sending it to Telegram again."
+                )
+            else:
+                with DurableStore(Path(database_path)) as store:
+                    store.require_telegram_mutation_reconciliation(
+                        action.operation_id,
+                        "The prior Telegram rename call has no durable result.",
+                    )
+                send_message(
+                    "🎛 Control\n\n"
+                    "The previous topic-rename attempt may have reached "
+                    "Telegram, but its result was not recorded. I did not "
+                    "repeat it. Check the topic name before retrying or "
+                    "changing anything."
+                )
+            return
+
         if (
-            binding is None
-            or binding.chat_id != target_chat_id
-            or binding.message_thread_id != target_thread_id
-            or binding.display_name != old_name
+            mutation.state == "prepared"
+            and binding.display_name != old_name
         ):
             raise StoreError(
                 "Managed topic changed before the rename was confirmed."
@@ -697,24 +789,157 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 },
                 "callback-answer",
             )
-        result = bridge.api_call(
-            bridge.read_token(),
-            "editForumTopic",
-            chat_id=target_chat_id,
-            message_thread_id=target_thread_id,
-            name=new_name,
-        )
-        if result is not True:
-            raise StoreError("Telegram returned an invalid topic-rename result.")
+        if mutation.state == "prepared":
+            with DurableStore(Path(database_path)) as store:
+                mutation, acquired = store.begin_telegram_mutation_external(
+                    action.operation_id
+                )
+            if mutation.state != "external_in_flight" or not acquired:
+                if mutation.state == "external_in_flight" and not acquired:
+                    send_message(
+                        "🎛 Control\n\n"
+                        "This confirmed topic rename is already being "
+                        "processed. I did not send a second Telegram request."
+                    )
+                    return
+                raise StoreError(
+                    "Topic rename is not ready for its Telegram call."
+                )
+            try:
+                result = bridge.api_call(
+                    bridge.read_token(),
+                    "editForumTopic",
+                    chat_id=target_chat_id,
+                    message_thread_id=target_thread_id,
+                    name=new_name,
+                )
+            except bridge.BridgeError as exc:
+                with DurableStore(Path(database_path)) as store:
+                    store.require_telegram_mutation_reconciliation(
+                        action.operation_id,
+                        str(exc),
+                    )
+                send_message(
+                    "🎛 Control\n\n"
+                    "Telegram did not return a durable result for the topic "
+                    "rename. I did not repeat the request automatically. "
+                    "Check the topic name before trying again."
+                )
+                return
+            if result is not True:
+                with DurableStore(Path(database_path)) as store:
+                    store.require_telegram_mutation_reconciliation(
+                        action.operation_id,
+                        "Telegram returned an invalid topic-rename result.",
+                    )
+                send_message(
+                    "🎛 Control\n\n"
+                    "Telegram returned an unexpected result for the topic "
+                    "rename. I did not repeat the request."
+                )
+                return
+            with DurableStore(Path(database_path)) as store:
+                mutation = store.record_telegram_mutation_result(
+                    action.operation_id,
+                    {"telegram_result": True},
+                )
+        if mutation.state != "external_succeeded":
+            raise StoreError("Topic rename has no durable Telegram result.")
         with DurableStore(Path(database_path)) as store:
-            store.rename_surface_binding(
-                binding_id=binding_id,
-                expected_chat_id=target_chat_id,
-                expected_message_thread_id=target_thread_id,
-                expected_display_name=old_name,
-                new_display_name=new_name,
+            current = store.resolve_surface_binding_by_id(binding_id)
+            if current is None or (
+                current.chat_id,
+                current.message_thread_id,
+            ) != (target_chat_id, target_thread_id):
+                raise StoreError(
+                    "Managed topic changed before its rename could be recorded."
+                )
+            if current.display_name == old_name:
+                store.rename_surface_binding(
+                    binding_id=binding_id,
+                    expected_chat_id=target_chat_id,
+                    expected_message_thread_id=target_thread_id,
+                    expected_display_name=old_name,
+                    new_display_name=new_name,
+                )
+            elif current.display_name != new_name:
+                raise StoreError(
+                    "Managed topic changed before its rename could be recorded."
+                )
+            store.complete_telegram_mutation(action.operation_id)
+        send_message(f"🎛 Control\n\nRenamed “{old_name}” to “{new_name}”.")
+        return
+    if action.action_type in {
+        "router_config_confirm",
+        "router_config_cancel",
+    }:
+        router_mailbox_id = int(action.payload.get("router_mailbox_id", 0))
+        with DurableStore(Path(database_path)) as store:
+            store.expire_router_config_actions(router_mailbox_id)
+        if action.action_type == "router_config_cancel":
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": "Cancelled.",
+                    },
+                    "callback-answer",
+                )
+            send_message("🎛 Control\n\nCancelled. The configuration was not changed.")
+            return
+        project_slug = str(action.payload.get("project_slug", ""))
+        updates = action.payload.get("updates")
+        if not project_slug or not isinstance(updates, dict) or not updates:
+            raise StoreError("Stored configuration plan is invalid.")
+        try:
+            with DurableStore(Path(database_path)) as store:
+                project = store.resolve_project(project_slug)
+                if project is None:
+                    raise StoreError("The project is no longer enrolled.")
+                target = store.resolve_project_agent(project.slug)
+                if target is None:
+                    raise StoreError(
+                        "The project no longer has a managed agent."
+                    )
+                configured = store.configure_agent_provider(
+                    target.agent_id,
+                    {
+                        key: (str(value) if value is not None else None)
+                        for key, value in updates.items()
+                        if key in {"model", "effort"}
+                    },
+                )
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Configuration applied.",
+                },
+                "callback-answer",
             )
-        send_message(f"✅ Renamed “{old_name}” to “{new_name}”.")
+        send_message(
+            "🎛 Control\n\n"
+            f"Updated {project.display_name}.\n"
+            f"Provider: {configured.provider}\n"
+            "Model: "
+            f"{configured.provider_config.get('model', 'provider default')}\n"
+            "Effort: "
+            f"{configured.provider_config.get('effort', 'provider default')}"
+        )
         return
     if action.action_type in {
         "router_project_confirm",
@@ -733,7 +958,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     },
                     "callback-answer",
                 )
-            send_message("Cancelled. No project or agent was created.")
+            send_message("🎛 Control\n\nCancelled. No project or agent was created.")
             return
 
         if callback_query_id:
@@ -750,27 +975,28 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "display_name",
             "provider",
             "project_path",
+            "working_directory",
             "topic_name",
             "provider_config",
+            "provenance",
         }
         if not required.issubset(action.payload):
             raise StoreError("Stored project-creation plan is invalid.")
-        requested_path = Path(str(action.payload["project_path"])).resolve()
-        if not requested_path.is_dir():
-            raise StoreError("The confirmed project directory no longer exists.")
-        git_result = subprocess.run(
-            ["git", "-C", str(requested_path), "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+        # TOCTOU re-check: the confirmed paths are fully revalidated —
+        # existence, Git root, and symlink-resolved containment — exactly as
+        # at proposal time.
+        repository_root, working_directory = (
+            discovery.validate_repository_workspace(
+                str(action.payload["project_path"]),
+                str(action.payload["working_directory"]),
+            )
         )
-        if (
-            git_result.returncode != 0
-            or Path(git_result.stdout.strip()).resolve() != requested_path
+        if repository_root != str(action.payload["project_path"]) or (
+            working_directory != str(action.payload["working_directory"])
         ):
             raise StoreError(
-                "The confirmed path is no longer the validated Git repository."
+                "The confirmed paths no longer resolve to the validated "
+                "locations."
             )
         slug = str(action.payload["slug"])
         display_name = str(action.payload["display_name"])
@@ -780,11 +1006,35 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             raise StoreError("Stored provider configuration is invalid.")
         topic_name = str(action.payload["topic_name"])
         with DurableStore(Path(database_path)) as store:
+            mutation = store.prepare_telegram_mutation(
+                action.operation_id,
+                "project_create",
+                action.payload,
+            )
+        if mutation.state == "applied":
+            with DurableStore(Path(database_path)) as store:
+                agent = store.resolve_project_agent(slug)
+            if agent is None:
+                raise StoreError(
+                    "Completed project creation references no managed agent."
+                )
+            send_message(
+                "🎛 Control\n\n"
+                f"{agent.hierarchical_name} is already attached to the "
+                f"{topic_name} project topic."
+            )
+            return
+
+        # Local enrollment is idempotent and occurs only after the confirmed
+        # saga exists. If the process stops here, the same operation resumes
+        # from its durable prepared stage.
+        with DurableStore(Path(database_path)) as store:
             store.enroll_project(
                 slug=slug,
                 display_name=display_name,
                 provider=provider,
-                project_path=str(requested_path),
+                project_path=repository_root,
+                working_directory=working_directory,
             )
             existing_agent = store.resolve_project_agent(slug)
             existing_surface = store.resolve_named_surface(
@@ -793,46 +1043,186 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 surface_type="project",
             )
         if existing_agent is not None:
+            with DurableStore(Path(database_path)) as store:
+                binding = (
+                    store.resolve_surface_binding_by_id(
+                        existing_agent.surface_binding_id
+                    )
+                    if existing_agent.surface_binding_id is not None
+                    else None
+                )
+                if binding is None or binding.message_thread_id is None:
+                    raise StoreError(
+                        "Existing project agent has no Telegram topic."
+                    )
+                if mutation.state == "external_succeeded":
+                    try:
+                        stored_thread_id = int(
+                            (mutation.external_result or {})[
+                                "message_thread_id"
+                            ]
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        raise StoreError(
+                            "Stored project-topic result is invalid."
+                        ) from None
+                    if stored_thread_id != binding.message_thread_id:
+                        raise StoreError(
+                            "Stored project-topic result does not match the "
+                            "attached agent."
+                        )
+                else:
+                    store.record_telegram_mutation_result(
+                        action.operation_id,
+                        {
+                            "message_thread_id": binding.message_thread_id,
+                            "reconciled": "existing_agent",
+                        },
+                        reconciled=True,
+                    )
+                store.complete_telegram_mutation(action.operation_id)
             send_message(
-                f"✅ {display_name} already has managed agent "
+                "🎛 Control\n\n"
+                f"{display_name} already has managed agent "
                 f"{existing_agent.hierarchical_name}."
             )
             return
-        if existing_surface is None:
-            topic = bridge.api_call(
-                bridge.read_token(),
-                "createForumTopic",
-                chat_id=chat_id,
-                name=topic_name,
-            )
+
+        if mutation.state in {
+            "external_in_flight",
+            "reconciliation_required",
+        }:
+            if existing_surface is None:
+                with DurableStore(Path(database_path)) as store:
+                    store.require_telegram_mutation_reconciliation(
+                        action.operation_id,
+                        "The prior Telegram topic-creation call has no "
+                        "durable result.",
+                    )
+                send_message(
+                    "🎛 Control\n\n"
+                    "The previous topic-creation request may have reached "
+                    "Telegram, but its topic ID was not recorded. I did not "
+                    "create a second topic. The project is enrolled, but its "
+                    "Telegram topic and agent still need reconciliation."
+                )
+                return
+            if existing_surface.message_thread_id is None:
+                raise StoreError(
+                    "Existing project surface is not a Telegram topic."
+                )
+            with DurableStore(Path(database_path)) as store:
+                mutation = store.record_telegram_mutation_result(
+                    action.operation_id,
+                    {
+                        "message_thread_id": existing_surface.message_thread_id,
+                        "reconciled": "existing_surface",
+                    },
+                    reconciled=True,
+                )
+
+        if mutation.state == "prepared" and existing_surface is not None:
+            if existing_surface.message_thread_id is None:
+                raise StoreError(
+                    "Existing project surface is not a Telegram topic."
+                )
+            with DurableStore(Path(database_path)) as store:
+                mutation = store.record_telegram_mutation_result(
+                    action.operation_id,
+                    {
+                        "message_thread_id": existing_surface.message_thread_id,
+                        "reconciled": "existing_surface",
+                    },
+                    reconciled=True,
+                )
+
+        if mutation.state == "prepared" and existing_surface is None:
+            with DurableStore(Path(database_path)) as store:
+                mutation, acquired = store.begin_telegram_mutation_external(
+                    action.operation_id
+                )
+            if mutation.state != "external_in_flight" or not acquired:
+                if mutation.state == "external_in_flight" and not acquired:
+                    send_message(
+                        "🎛 Control\n\n"
+                        "This confirmed project creation is already being "
+                        "processed. I did not send a second Telegram request."
+                    )
+                    return
+                raise StoreError(
+                    "Project creation is not ready for its Telegram call."
+                )
+            try:
+                topic = bridge.api_call(
+                    bridge.read_token(),
+                    "createForumTopic",
+                    chat_id=chat_id,
+                    name=topic_name,
+                )
+            except bridge.BridgeError as exc:
+                with DurableStore(Path(database_path)) as store:
+                    store.require_telegram_mutation_reconciliation(
+                        action.operation_id,
+                        str(exc),
+                    )
+                send_message(
+                    "🎛 Control\n\n"
+                    "Telegram did not return a durable topic ID. I did not "
+                    "repeat the create request automatically. The project is "
+                    "enrolled, but its Telegram topic and agent still need "
+                    "reconciliation."
+                )
+                return
             try:
                 project_thread_id = int(topic["message_thread_id"])
             except (KeyError, TypeError, ValueError):
-                raise StoreError(
-                    "Telegram returned an invalid project-topic result."
-                ) from None
-            with DurableStore(Path(database_path)) as store:
-                store.ensure_surface_binding(
-                    chat_id=chat_id,
-                    message_thread_id=project_thread_id,
-                    surface_type="project",
-                    display_name=topic_name,
-                    target_type="controller",
-                    target_id="control",
+                with DurableStore(Path(database_path)) as store:
+                    store.require_telegram_mutation_reconciliation(
+                        action.operation_id,
+                        "Telegram returned an invalid project-topic result.",
+                    )
+                send_message(
+                    "🎛 Control\n\n"
+                    "Telegram returned an unexpected topic result. I did not "
+                    "repeat the create request."
                 )
+                return
+            with DurableStore(Path(database_path)) as store:
+                mutation = store.record_telegram_mutation_result(
+                    action.operation_id,
+                    {"message_thread_id": project_thread_id},
+                )
+        if mutation.state != "external_succeeded":
+            raise StoreError("Project creation has no durable Telegram result.")
+        try:
+            project_thread_id = int(
+                (mutation.external_result or {})["message_thread_id"]
+            )
+        except (KeyError, TypeError, ValueError):
+            raise StoreError(
+                "Stored project-topic result is invalid."
+            ) from None
+        if project_thread_id <= 0:
+            raise StoreError("Stored project-topic result is invalid.")
         with DurableStore(Path(database_path)) as store:
+            store.ensure_surface_binding(
+                chat_id=chat_id,
+                message_thread_id=project_thread_id,
+                surface_type="project",
+                display_name=topic_name,
+                target_type="controller",
+                target_id="control",
+            )
             agent, _ = store.attach_enrolled_project(
                 chat_id,
-                (
-                    existing_surface.message_thread_id
-                    if existing_surface is not None
-                    else project_thread_id
-                ),
+                project_thread_id,
                 slug,
                 provider_config=provider_config,
             )
+            store.complete_telegram_mutation(action.operation_id)
         send_message(
-            f"✅ Created {agent.hierarchical_name} in the "
+            "🎛 Control\n\n"
+            f"Created {agent.hierarchical_name} in the "
             f"{topic_name} project topic."
         )
         return
@@ -1115,7 +1505,11 @@ def handle_voice(update: dict, voice: dict) -> None:
                 chat_id=chat_id,
                 message_thread_id=thread_id,
                 replied_message_id=agent_reply_route.telegram_message_id,
-                receipt_text="🎙️ <b>Transcribing…</b>",
+                receipt_text=(
+                    "🎙️ <b>"
+                    f"{html.escape(store.agent_speaker_header(managed_agent.agent_id))} "
+                    "is transcribing…</b>"
+                ),
                 input_kind="voice",
                 parse_mode="HTML",
             )
@@ -1138,7 +1532,11 @@ def handle_voice(update: dict, voice: dict) -> None:
                 source_inbox_job_id=int(job_id),
                 chat_id=chat_id,
                 message_thread_id=thread_id,
-                receipt_text="🎙️ <b>Transcribing…</b>",
+                receipt_text=(
+                    "🎙️ <b>"
+                    f"{html.escape(store.agent_speaker_header(managed_agent.agent_id))} "
+                    "is transcribing…</b>"
+                ),
                 input_kind="voice",
                 parse_mode="HTML",
             )
@@ -1156,7 +1554,6 @@ def handle_voice(update: dict, voice: dict) -> None:
                 )
         if (
             binding is not None
-            and binding.surface_type == "control"
             and binding.target_type == "controller"
             and binding.target_id == "control"
         ):
@@ -1298,10 +1695,17 @@ def main() -> int:
                 elif thread_id and binding is not None:
                     if binding.target_type == "agent":
                         enqueue_agent_input(binding.target_id, text)
+                    elif (
+                        binding.target_type == "controller"
+                        and binding.target_id == "control"
+                    ):
+                        # A Control-bound topic converses with the main
+                        # router, exactly like the root Control chat.
+                        enqueue_router_input(text)
                     else:
                         send_message(
-                            f"✅ {binding.display_name} route verified: {text}",
-                            include_inspect_button=True,
+                            "This topic's controller binding does not accept "
+                            "messages yet."
                         )
                 else:
                     enqueue_router_input(text)

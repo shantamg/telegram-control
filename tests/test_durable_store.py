@@ -150,7 +150,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            13,
+            15,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -936,7 +936,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent-a",
             "session-123",
             "done",
-            ["done"],
             {"input_tokens": 10, "output_tokens": 2},
             now=103,
         )
@@ -949,7 +948,10 @@ class DurableStoreTests(unittest.TestCase):
         )
         outbound = self.store.claim_outbox("sender", now=103)
         self.assertEqual(outbound.params["message_thread_id"], 62)
-        self.assertEqual(outbound.params["text"], "done")
+        self.assertEqual(
+            outbound.params["text"],
+            "telegram-control\n\ndone",
+        )
         route = json.loads(
             self.store.connection.execute(
                 "SELECT route_json FROM outbox_messages WHERE message_id = ?",
@@ -996,7 +998,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "session-123",
             "fast result",
-            ["fast result"],
             {},
             now=103,
         )
@@ -1015,7 +1016,10 @@ class DurableStoreTests(unittest.TestCase):
         final_edit = self.store.claim_outbox("sender", now=106)
         self.assertEqual(final_edit.method, "editMessageText")
         self.assertEqual(final_edit.params["message_id"], 700)
-        self.assertEqual(final_edit.params["text"], "fast result")
+        self.assertEqual(
+            final_edit.params["text"],
+            "telegram-control\n\nfast result",
+        )
 
     def test_failed_agent_turn_edit_falls_back_to_routed_message(self):
         self.store.ensure_surface_binding(
@@ -1061,7 +1065,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "session-123",
             "durable result",
-            ["durable result"],
             {},
             now=105,
         )
@@ -1081,7 +1084,10 @@ class DurableStoreTests(unittest.TestCase):
             )
         fallback = self.store.claim_outbox("sender", now=10**12)
         self.assertEqual(fallback.method, "sendMessage")
-        self.assertEqual(fallback.params["text"], "durable result")
+        self.assertEqual(
+            fallback.params["text"],
+            "telegram-control\n\ndurable result",
+        )
         self.assertEqual(fallback.params["message_thread_id"], 62)
 
     def _setup_routed_agent_turn(self):
@@ -1175,13 +1181,15 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             "agent answer",
-            ["agent answer"],
             {},
             now=110,
         )
         final_edit = self.store.claim_outbox("sender", now=111)
         self.assertEqual(final_edit.method, "editMessageText")
-        self.assertEqual(final_edit.params["text"], "agent answer")
+        self.assertEqual(
+            final_edit.params["text"],
+            "telegram-control\n\nagent answer",
+        )
         self.assertEqual(
             final_edit.card["route_retarget"],
             {"target_type": "agent", "target_id": agent.agent_id},
@@ -1225,7 +1233,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             "raced answer",
-            ["raced answer"],
             {},
             now=105,
         )
@@ -1238,7 +1245,10 @@ class DurableStoreTests(unittest.TestCase):
         )
         final_edit = self.store.claim_outbox("sender", now=108)
         self.assertEqual(final_edit.method, "editMessageText")
-        self.assertEqual(final_edit.params["text"], "raced answer")
+        self.assertEqual(
+            final_edit.params["text"],
+            "telegram-control\n\nraced answer",
+        )
         self.assertEqual(
             final_edit.card["route_retarget"],
             {"target_type": "agent", "target_id": agent.agent_id},
@@ -1274,7 +1284,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             "agent answer",
-            ["agent answer"],
             {},
             now=109,
         )
@@ -1296,7 +1305,10 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self._resolve_route(700, 111).target_type, "controller")
         fallback = self.store.claim_outbox("sender", now=10**12)
         self.assertEqual(fallback.method, "sendMessage")
-        self.assertEqual(fallback.params["text"], "agent answer")
+        self.assertEqual(
+            fallback.params["text"],
+            "telegram-control\n\nagent answer",
+        )
         self.assertEqual(
             fallback.operation_id,
             f"router-mailbox:{router_mailbox_id}:final-fallback",
@@ -1332,7 +1344,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             "agent answer",
-            ["agent answer"],
             {},
             now=109,
         )
@@ -1387,7 +1398,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             "tests are green",
-            ["tests are green"],
             {},
             now=124,
         )
@@ -1406,7 +1416,10 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(final_edit.method, "editMessageText")
         self.assertEqual(final_edit.params["chat_id"], 123)
         self.assertEqual(final_edit.params["message_id"], 800)
-        self.assertEqual(final_edit.params["text"], "tests are green")
+        self.assertEqual(
+            final_edit.params["text"],
+            "telegram-control\n\ntests are green",
+        )
         self.store.complete_outbox(
             final_edit.message_id,
             "sender",
@@ -1450,7 +1463,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             "durable reply result",
-            ["durable reply result"],
             {},
             now=125,
         )
@@ -1472,7 +1484,10 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(fallback.method, "sendMessage")
         self.assertEqual(fallback.params["chat_id"], 123)
         self.assertIsNone(fallback.params["message_thread_id"])
-        self.assertEqual(fallback.params["text"], "durable reply result")
+        self.assertEqual(
+            fallback.params["text"],
+            "telegram-control\n\ndurable reply result",
+        )
 
     def test_agent_reply_enqueue_rejects_foreign_or_stale_context(self):
         agent = self._retargeted_final_message()
@@ -1546,7 +1561,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             "raced answer",
-            ["raced answer"],
             {},
             now=105,
         )
@@ -1609,7 +1623,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             "agent answer",
-            ["agent answer"],
             {},
             now=106.5,
         )
@@ -1665,7 +1678,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             "agent answer",
-            ["agent answer"],
             {},
             now=106.2,
         )
@@ -1733,7 +1745,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             long_text,
-            ["A" * 3800, "A" * 200],
             {},
             now=123,
         )
@@ -1747,7 +1758,10 @@ class DurableStoreTests(unittest.TestCase):
         )
         chunk_one = self.store.claim_outbox("sender", now=126)
         self.assertEqual(chunk_one.method, "sendMessage")
-        self.assertEqual(chunk_one.params["text"], "A" * 3800)
+        self.assertEqual(
+            chunk_one.params["text"],
+            "telegram-control\n\n" + "A" * 3782,
+        )
         self.store.complete_outbox(
             chunk_one.message_id,
             "sender",
@@ -1755,7 +1769,10 @@ class DurableStoreTests(unittest.TestCase):
             now=127,
         )
         chunk_two = self.store.claim_outbox("sender", now=128)
-        self.assertEqual(chunk_two.params["text"], "A" * 200)
+        self.assertEqual(
+            chunk_two.params["text"],
+            "telegram-control\n\n" + "A" * 218,
+        )
         self.store.complete_outbox(
             chunk_two.message_id,
             "sender",
@@ -1768,7 +1785,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(resolve_edit.params["message_id"], 800)
         self.assertEqual(
             resolve_edit.params["text"],
-            "✅ Done — the full response is below.",
+            "telegram-control\n\n✅ Done — the full response is below.",
         )
 
     def test_whitespace_padded_single_chunk_response_edits_real_content(self):
@@ -1790,8 +1807,8 @@ class DurableStoreTests(unittest.TestCase):
             receipt_text="⏳ Working…",
             now=121,
         )
-        # Raw text is over 3800 characters, but it normalizes to one chunk;
-        # the receipt must show the real content, not a completion marker.
+        # Raw text is over 3800 characters. Chunking must preserve it exactly,
+        # including whitespace, rather than normalizing provider content.
         padded_text = (" " * 3801) + "OK"
         mailbox = self.store.claim_agent_mailbox("agent", now=122)
         self.store.complete_agent_mailbox(
@@ -1799,7 +1816,6 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             padded_text,
-            telegram_control.chunk_telegram_text(padded_text),
             {},
             now=123,
         )
@@ -1810,10 +1826,19 @@ class DurableStoreTests(unittest.TestCase):
             {"message_id": 800, "chat": {"id": 123}},
             now=125,
         )
-        final_edit = self.store.claim_outbox("sender", now=126)
+        first_response = self.store.claim_outbox("sender", now=126)
+        second_response = self.store.claim_outbox("sender", now=127)
+        final_edit = self.store.claim_outbox("sender", now=128)
+        self.assertEqual(first_response.method, "sendMessage")
+        self.assertEqual(second_response.method, "sendMessage")
+        delivered = (
+            first_response.params["text"].split("\n\n", 1)[1]
+            + second_response.params["text"].split("\n\n", 1)[1]
+        )
+        self.assertEqual(delivered, padded_text)
         self.assertEqual(final_edit.method, "editMessageText")
-        self.assertEqual(final_edit.params["text"], "OK")
-        self.assertIsNone(self.store.claim_outbox("sender", now=127))
+        self.assertIn("full response is below", final_edit.params["text"])
+        self.assertIsNone(self.store.claim_outbox("sender", now=129))
 
     def test_delivery_lock_serializes_and_blocks_second_acquirer(self):
         with telegram_control.outbox_delivery_lock(self.database_path):
@@ -2012,13 +2037,15 @@ class DurableStoreTests(unittest.TestCase):
             "agent",
             "project-session-1",
             long_text,
-            ["A" * 3800, "A" * 200],
             {},
             now=125,
         )
         final_edit = self.store.claim_outbox("sender", now=126)
         self.assertEqual(final_edit.method, "editMessageText")
-        self.assertEqual(final_edit.params["text"], "A" * 3800)
+        self.assertEqual(
+            final_edit.params["text"],
+            "telegram-control\n\n" + "A" * 3782,
+        )
         with mock.patch.object(
             telegram_control.bridge,
             "api_call",
@@ -2043,7 +2070,10 @@ class DurableStoreTests(unittest.TestCase):
             )
             fallback = self.store.claim_outbox("sender", now=10**12)
         self.assertEqual(fallback.method, "sendMessage")
-        self.assertEqual(fallback.params["text"], "A" * 3800)
+        self.assertEqual(
+            fallback.params["text"],
+            "telegram-control\n\n" + "A" * 3782,
+        )
 
     def test_multi_chunk_reply_response_still_edits_receipt(self):
         agent = self._retargeted_final_message()
@@ -2076,15 +2106,17 @@ class DurableStoreTests(unittest.TestCase):
             mailbox.mailbox_id,
             "agent",
             "project-session-1",
-            "part one\n\npart two",
-            ["part one", "part two"],
+            "A" * 4000,
             {},
             now=125,
         )
         final_edit = self.store.claim_outbox("sender", now=126)
         self.assertEqual(final_edit.method, "editMessageText")
         self.assertEqual(final_edit.params["message_id"], 800)
-        self.assertEqual(final_edit.params["text"], "part one")
+        self.assertEqual(
+            final_edit.params["text"],
+            "telegram-control\n\n" + "A" * 3782,
+        )
         self.store.complete_outbox(
             final_edit.message_id,
             "sender",
@@ -2094,7 +2126,11 @@ class DurableStoreTests(unittest.TestCase):
         continuation = self.store.claim_outbox("sender", now=128)
         self.assertEqual(continuation.method, "sendMessage")
         self.assertEqual(continuation.params["chat_id"], 123)
-        self.assertEqual(continuation.params["text"], "part two")
+        # Continuation chunks keep the durable identity and payload intact.
+        self.assertEqual(
+            continuation.params["text"],
+            "telegram-control\n\n" + "A" * 218,
+        )
 
     def test_route_provenance_labels_come_from_durable_operations(self):
         agent, _, router_mailbox_id = self._setup_routed_agent_turn()
@@ -2240,7 +2276,6 @@ class DurableStoreTests(unittest.TestCase):
             "worker",
             "019f924b-bbbf-7080-b778-a52e3e1bf4cc",
             "done",
-            ["done"],
             {},
             now=107,
         )
@@ -2349,7 +2384,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    13,
+                    15,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2373,7 +2408,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    13,
+                    15,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2398,7 +2433,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    13,
+                    15,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2422,7 +2457,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    13,
+                    15,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2448,7 +2483,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    13,
+                    15,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2479,7 +2514,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    13,
+                    15,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2511,7 +2546,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    13,
+                    15,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2544,7 +2579,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    13,
+                    15,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2578,7 +2613,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    13,
+                    15,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -2613,7 +2648,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    13,
+                    15,
                 )
                 columns = {
                     str(row["name"])
@@ -2787,7 +2822,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(reply.params["chat_id"], 123)
                 self.assertEqual(
                     reply.params["text"],
-                    "🧭 <b>Routing…</b>",
+                    "🧭 <b>Control is routing…</b>",
                 )
                 self.assertEqual(reply.params["parse_mode"], "HTML")
                 self.assertEqual(
@@ -2845,12 +2880,20 @@ class DurableIntegrationTests(unittest.TestCase):
                 "handler_path": str(Path(on_message.__file__).resolve()),
             }
             fake = FakeRouterAdapter()
+            created_root = Path(temporary_directory) / "secret-local-path"
+            created_root.mkdir()
+            telegram_control.subprocess.run(
+                ["git", "init", str(created_root)],
+                capture_output=True,
+                check=True,
+            )
+            secret_root = Path(os.path.realpath(created_root))
             with DurableStore(database_path) as store:
                 store.enroll_project(
                     slug="telegram-control",
                     display_name="Telegram Control",
                     provider="codex",
-                    project_path="/secret/local/path",
+                    project_path=str(secret_root),
                     now=99,
                 )
                 store.ensure_surface_binding(
@@ -2910,7 +2953,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 self.assertIsNone(fake.mailbox_session_id)
                 self.assertIn('"slug":"telegram-control"', fake.prompt)
-                self.assertNotIn("/secret/local/path", fake.prompt)
+                self.assertNotIn(str(secret_root), fake.prompt)
                 self.assertEqual(
                     store.status_counts()["router_mailbox"],
                     {"succeeded": 1},
@@ -2927,10 +2970,13 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(preview.method, "editMessageText")
                 self.assertEqual(preview.params["message_id"], 700)
                 self.assertIn(
-                    "📨 Sent to Telegram Control",
+                    "🎛 Control → Telegram Control",
                     preview.params["text"],
                 )
-                self.assertIn("Waiting for the agent", preview.params["text"])
+                self.assertIn(
+                    "Waiting for Telegram Control",
+                    preview.params["text"],
+                )
                 store.complete_outbox(
                     preview.message_id,
                     "sender-2",
@@ -2965,7 +3011,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(final.params["message_id"], 700)
                 self.assertEqual(
                     final.params["text"],
-                    "Stage 4 is progressing normally.",
+                    "Telegram Control\n\nStage 4 is progressing normally.",
                 )
 
     def test_project_inspection_is_read_only_and_path_safe(self):
@@ -3046,6 +3092,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     store,
                     str(unmanaged_root),
                     f"Inspect the repository at {unmanaged_root}",
+                    roots=[unmanaged_root.parent],
                 )
                 self.assertIn("🔎 Unmanaged Project", unmanaged)
                 self.assertIn("Provider: not enrolled", unmanaged)
@@ -3056,6 +3103,7 @@ class DurableIntegrationTests(unittest.TestCase):
                         store,
                         str(unmanaged_root),
                         "Inspect a repository I did not identify",
+                        roots=[unmanaged_root.parent],
                     )
                 )
 
@@ -3281,15 +3329,74 @@ class DurableIntegrationTests(unittest.TestCase):
                         store, router_job, "router"
                     )
 
+                # Configuration changes are confirmation-gated: nothing has
+                # changed yet, and the proposal presents opaque buttons.
+                unchanged = store.resolve_agent(project_agent.agent_id)
+                self.assertEqual(unchanged.provider_config, {})
+                response = store.claim_outbox("sender-2", now=10**12)
+                self.assertIn(
+                    "Change Telegram Control's configuration?",
+                    response.params["text"],
+                )
+                self.assertIn("Nothing changes", response.params["text"])
+                buttons = response.params["reply_markup"]["inline_keyboard"]
+                self.assertEqual(
+                    [row[0]["text"] for row in buttons],
+                    ["Apply configuration", "Cancel"],
+                )
+                confirm_data = buttons[0][0]["callback_data"]
+                confirm_update = callback_update(
+                    12,
+                    confirm_data,
+                    message_id=700,
+                )
+                store.ingest_update(confirm_update, now=101)
+                callback_job = store.connection.execute(
+                    "SELECT job_id FROM inbox_jobs WHERE update_id = 12"
+                ).fetchone()
+
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(int(callback_job["job_id"])),
+                "TELEGRAM_CHAT_ID": "123",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_MESSAGE_ID": "700",
+                "TELEGRAM_MESSAGE_THREAD_ID": "",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                on_message.handle_callback(
+                    confirm_update,
+                    confirm_update["callback_query"],
+                )
+
+            with DurableStore(database_path) as store:
                 configured = store.resolve_agent(project_agent.agent_id)
                 self.assertEqual(
                     configured.provider_config,
                     {"model": "gpt-5.6-sol", "effort": "high"},
                 )
-                response = store.claim_outbox("sender-2", now=10**12)
-                self.assertIn("Updated Telegram Control", response.params["text"])
-                self.assertIn("Model: gpt-5.6-sol", response.params["text"])
-                self.assertIn("Effort: high", response.params["text"])
+                texts = [
+                    json.loads(row["params_json"]).get("text")
+                    for row in store.connection.execute(
+                        "SELECT params_json FROM outbox_messages "
+                        "ORDER BY message_id"
+                    ).fetchall()
+                ]
+                self.assertTrue(
+                    any(
+                        text and "Updated Telegram Control" in text
+                        for text in texts
+                    )
+                )
+                # The sibling cancel button expired with the confirmation.
+                active = store.connection.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM callback_actions
+                    WHERE operation_id LIKE 'router:%:config:%'
+                        AND state = 'active'
+                    """
+                ).fetchone()
+                self.assertEqual(int(active["count"]), 0)
 
     def test_router_clarification_buttons_resume_with_selected_answer(self):
         class FakeRouterAdapter:
@@ -3353,7 +3460,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(question.method, "editMessageText")
                 self.assertEqual(
                     question.params["text"],
-                    "Which project should handle this?",
+                    "🎛 Control\n\nWhich project should handle this?",
                 )
                 buttons = question.params["reply_markup"]["inline_keyboard"]
                 self.assertEqual(
@@ -3518,6 +3625,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(initialized.returncode, 0)
+            real_root = os.path.realpath(root)
             database_path = Path(temporary_directory) / "controller.sqlite3"
             with DurableStore(database_path) as store:
                 action = store.create_callback_action(
@@ -3529,12 +3637,20 @@ class DurableIntegrationTests(unittest.TestCase):
                         "slug": "sample-project",
                         "display_name": "Sample Project",
                         "provider": "codex",
-                        "project_path": str(root),
+                        "project_path": real_root,
+                        "working_directory": real_root,
                         "topic_name": "Sample Project",
                         "provider_config": {
                             "model": "gpt-5.6-sol",
                             "effort": "high",
                         },
+                        "provenance": [
+                            {
+                                "value": real_root,
+                                "source": "read_only_discovery",
+                                "derived_from": "sample project",
+                            }
+                        ],
                     },
                     chat_id=123,
                     authorized_user_id=123,
@@ -3583,7 +3699,8 @@ class DurableIntegrationTests(unittest.TestCase):
             )
             with DurableStore(database_path) as store:
                 project = store.resolve_project("sample-project")
-                self.assertEqual(project.project_path, str(root.resolve()))
+                self.assertEqual(project.project_path, real_root)
+                self.assertEqual(project.working_directory, real_root)
                 agent = store.resolve_project_agent("sample-project")
                 self.assertEqual(
                     agent.hierarchical_name,
@@ -3770,17 +3887,18 @@ class DurableIntegrationTests(unittest.TestCase):
                     target_id="control",
                     now=99,
                 )
-                store.ingest_update(topic_message_update(), now=100)
-                first_job = store.claim_job("worker", now=100)
-                telegram_control.process_inbox_job(
-                    store,
-                    config,
-                    first_job,
-                    "worker",
+                created = store.create_callback_action(
+                    operation_id="test:inspect-transport",
+                    action_type="inspect_status",
+                    payload={"view": "transport"},
+                    chat_id=123,
+                    message_thread_id=62,
+                    authorized_user_id=123,
+                    one_time=True,
+                    ttl_seconds=10**12,
+                    now=100,
                 )
-                action = store.connection.execute(
-                    "SELECT token FROM callback_actions"
-                ).fetchone()
+                action = {"token": created.token}
 
                 store.ingest_update(
                     callback_update(
@@ -3822,7 +3940,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     (str(row["method"]), json.loads(row["params_json"]))
                     for row in rows
                 ]
-                self.assertEqual(store.status_counts()["inbox"], {"succeeded": 3})
+                self.assertEqual(store.status_counts()["inbox"], {"succeeded": 2})
                 self.assertEqual(
                     store.status_counts()["callbacks"],
                     {"consumed": 1},
@@ -3830,20 +3948,20 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     [method for method, _ in calls],
                     [
-                        "sendMessage",
                         "answerCallbackQuery",
                         "sendMessage",
                         "answerCallbackQuery",
                     ],
                 )
                 self.assertEqual(
-                    calls[2][1]["text"],
+                    calls[1][1]["text"],
+                    "🎛 Control\n\n"
                     "✅ Durable button route verified.\n\n"
                     "The opaque action was authorized, resolved from SQLite, "
                     "and consumed exactly once.",
                 )
                 self.assertEqual(
-                    calls[3][1]["text"],
+                    calls[2][1]["text"],
                     "This button was already used.",
                 )
 
@@ -3894,7 +4012,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 queued = reopened.claim_outbox("sender", now=10**12 + 1)
                 self.assertEqual(
                     queued.params["text"],
-                    "🧭 <b>Routing…</b>",
+                    "🧭 <b>Control is routing…</b>",
                 )
                 self.assertEqual(queued.params["parse_mode"], "HTML")
                 self.assertEqual(
@@ -3985,7 +4103,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(mailbox_row["state"], "queued")
                 receipt = store.claim_outbox("sender", now=10**12 + 2)
                 self.assertEqual(receipt.params["chat_id"], 123)
-                self.assertEqual(receipt.params["text"], "⏳ <b>Working…</b>")
+                self.assertEqual(
+                    receipt.params["text"],
+                    "⏳ <b>telegram-control is working…</b>",
+                )
                 self.assertEqual(receipt.params["parse_mode"], "HTML")
 
     def test_control_reply_to_router_message_carries_bounded_context(self):
@@ -4158,7 +4279,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 receipt = store.claim_outbox("sender", now=10**12 + 2)
                 self.assertEqual(
                     receipt.params["text"],
-                    "🎙️ <b>Transcribing…</b>",
+                    "🎙️ <b>telegram-control is transcribing…</b>",
                 )
                 self.assertEqual(receipt.params["chat_id"], 123)
                 self.assertIsNone(receipt.params["message_thread_id"])
@@ -4195,7 +4316,6 @@ class DurableIntegrationTests(unittest.TestCase):
                     "agent",
                     "voice-session",
                     "voice reply done",
-                    ["voice reply done"],
                     {},
                     now=10**12 + 7,
                 )
@@ -4203,7 +4323,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(final_edit.method, "editMessageText")
                 self.assertEqual(final_edit.params["chat_id"], 123)
                 self.assertEqual(final_edit.params["message_id"], 801)
-                self.assertEqual(final_edit.params["text"], "voice reply done")
+                self.assertEqual(
+                    final_edit.params["text"],
+                    "telegram-control\n\nvoice reply done",
+                )
 
     def test_voice_reply_to_router_message_carries_reply_context(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -4287,7 +4410,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 receipt = store.claim_outbox("sender", now=10**12 + 2)
                 self.assertEqual(
                     receipt.params["text"],
-                    "🎙️ <b>Transcribing…</b>",
+                    "🎙️ <b>Control is transcribing…</b>",
                 )
                 store.complete_outbox(
                     receipt.message_id,
@@ -4805,11 +4928,16 @@ class DurableIntegrationTests(unittest.TestCase):
                 telegram_control.process_inbox_job(store, config, job, "worker")
                 response = store.claim_outbox("sender", now=10**12)
 
+                # A Control-bound topic converses with the main router.
                 self.assertEqual(response.method, "sendMessage")
                 self.assertEqual(response.params["message_thread_id"], 62)
                 self.assertEqual(
                     response.params["text"],
-                    "✅ Stage 2 Test route verified: topic routing test",
+                    "🧭 <b>Control is routing…</b>",
+                )
+                self.assertEqual(
+                    store.status_counts()["router_mailbox"],
+                    {"queued": 1},
                 )
 
     def test_status_command_reuses_existing_project_topic_binding(self):
@@ -4919,6 +5047,14 @@ class DurableIntegrationTests(unittest.TestCase):
                 "handler_path": str(Path(on_message.__file__).resolve()),
             }
             fake = FakeAdapter()
+            repo = Path(temporary_directory) / "telegram-control"
+            repo.mkdir()
+            telegram_control.subprocess.run(
+                ["git", "init", str(repo)],
+                capture_output=True,
+                check=True,
+            )
+            repo_real = os.path.realpath(repo)
             with DurableStore(database_path) as store:
                 store.ensure_surface_binding(
                     chat_id=123,
@@ -4933,7 +5069,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     surface_name="Stage 2 Test",
                     slug="telegram-control",
                     provider="codex",
-                    project_path="/tmp/telegram-control",
+                    project_path=repo_real,
                 )
                 store.ingest_update(
                     topic_message_update(10, "inspect this repository"),
@@ -4953,7 +5089,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 receipt = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     receipt.params["text"],
-                    "⏳ <b>Working…</b>",
+                    "⏳ <b>telegram-control is working…</b>",
                 )
                 self.assertEqual(receipt.params["parse_mode"], "HTML")
                 store.complete_outbox(
@@ -4993,7 +5129,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 response = store.claim_outbox("sender-2", now=10**12)
                 self.assertEqual(response.method, "editMessageText")
                 self.assertEqual(response.params["message_id"], 500)
-                self.assertEqual(response.params["text"], "Codex adapter response")
+                self.assertEqual(
+                    response.params["text"],
+                    "telegram-control\n\nCodex adapter response",
+                )
                 usage = store.latest_agent_usage(agent.agent_id)
                 self.assertEqual(usage["input_tokens"], 50)
                 self.assertEqual(usage["output_tokens"], 5)
@@ -5051,7 +5190,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 receipt = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     receipt.params["text"],
-                    "🎙️ <b>Transcribing…</b>",
+                    "🎙️ <b>Control is transcribing…</b>",
                 )
                 store.complete_outbox(
                     receipt.message_id,
@@ -5062,6 +5201,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 sending = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     sending.params["text"],
+                    "🎛 <b>Control</b>\n"
                     "📤 <b>Sending</b>\n"
                     "<blockquote>what projects are enrolled</blockquote>",
                 )
@@ -5088,6 +5228,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 working = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     working.params["text"],
+                    "🎛 <b>Control</b>\n"
                     "🧭 <b>Routing…</b>\n"
                     "<blockquote>what projects are enrolled</blockquote>",
                 )
@@ -5102,7 +5243,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(final.params["message_id"], 900)
                 self.assertEqual(
                     final.params["text"],
-                    "voice router complete",
+                    "🎛 Control\n\nvoice router complete",
                 )
 
     def test_topic_voice_transcript_routes_to_agent_and_reuses_turn_card(self):
@@ -5152,7 +5293,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 receipt = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     receipt.params["text"],
-                    "🎙️ <b>Transcribing…</b>",
+                    "🎙️ <b>telegram-control is transcribing…</b>",
                 )
                 self.assertEqual(receipt.params["parse_mode"], "HTML")
                 self.assertEqual(
@@ -5179,13 +5320,13 @@ class DurableIntegrationTests(unittest.TestCase):
                     "agent",
                     "session-voice",
                     "voice route complete",
-                    ["voice route complete"],
                     {},
                     now=103,
                 )
                 sending_edit = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     sending_edit.params["text"],
+                    "<b>telegram-control</b>\n"
                     "📤 <b>Sending</b>\n"
                     "<blockquote>inspect &lt;voice&gt; &amp; route</blockquote>",
                 )
@@ -5199,6 +5340,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 working_edit = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     working_edit.params["text"],
+                    "<b>telegram-control</b>\n"
                     "🧠 <b>Codex is working…</b>\n"
                     "<blockquote>inspect &lt;voice&gt; &amp; route</blockquote>",
                 )
@@ -5208,6 +5350,7 @@ class DurableIntegrationTests(unittest.TestCase):
                         "inspect <voice> & route",
                         "claude",
                     ),
+                    "<b>Agent</b>\n"
                     "🧠 <b>Claude is working…</b>\n"
                     "<blockquote>inspect &lt;voice&gt; &amp; route</blockquote>",
                 )
@@ -5221,7 +5364,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 final_edit = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(final_edit.method, "editMessageText")
                 self.assertEqual(final_edit.params["message_id"], 800)
-                self.assertEqual(final_edit.params["text"], "voice route complete")
+                self.assertEqual(
+                    final_edit.params["text"],
+                    "telegram-control\n\nvoice route complete",
+                )
 
     def test_handler_queues_reply_instead_of_calling_telegram(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -5256,7 +5402,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     {
                         "chat_id": 123,
                         "message_thread_id": 7,
-                        "text": "durable reply",
+                        "text": "🎛 Control\n\ndurable reply",
                     },
                 )
 
