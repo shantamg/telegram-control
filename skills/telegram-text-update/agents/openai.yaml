@@ -1,0 +1,6 @@
+interface:
+  display_name: "Telegram Text Update"
+  short_description: "Send a text update to the current Telegram topic"
+  default_prompt: "Use $telegram-text-update to send me a concise Telegram progress update."
+policy:
+  allow_implicit_invocation: true

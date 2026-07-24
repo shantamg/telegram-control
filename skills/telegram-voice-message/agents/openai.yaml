@@ -1,0 +1,6 @@
+interface:
+  display_name: "Telegram Voice Message"
+  short_description: "Send a voice message to the current Telegram topic"
+  default_prompt: "Use $telegram-voice-message to send me a short voice message when this task finishes."
+policy:
+  allow_implicit_invocation: true

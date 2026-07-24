@@ -494,16 +494,17 @@ continuity:
   outbox references before removing completed audio.
 
 Managed Codex and Claude turns can also send an update before their final
-answer through the installed `telegram-agent-updates` skill. The
-provider-neutral `agent_telegram.py` helper accepts concise text or voice on
-standard input, verifies the caller's active mailbox lease, resolves that
-turn's owning Telegram topic, and writes to the durable outbox. It does not
-receive the Telegram bot token. Stable caller-provided keys and a content hash
-make retries idempotent. The canonical skill definition lives under
-`skills/telegram-agent-updates` and is installed in both the Codex and Claude
-user skill directories. Voice updates send their bounded text to Microsoft
-Edge TTS, so agents should use them only when requested or for a genuinely
-useful milestone, blocker, or completion.
+answer through the implicitly triggered `telegram-voice-message` and
+`telegram-text-update` skills. Natural requests such as “send me a voice
+message when you finish” or “keep me updated in Telegram” are sufficient; the
+user does not need to name a skill. The provider-neutral `agent_telegram.py`
+helper accepts concise text or voice on standard input, verifies the caller's
+active mailbox lease, resolves that turn's owning Telegram topic, and writes
+to the durable outbox. It does not receive the Telegram bot token. Stable
+caller-provided keys and a content hash make retries idempotent. Canonical
+skill definitions live under `skills/` and are installed in both the Codex and
+Claude user skill directories. Voice messages send their bounded text to
+Microsoft Edge TTS.
 
 ## Live Codex worker control
 
