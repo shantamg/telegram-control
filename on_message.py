@@ -29,6 +29,7 @@ def deliver_api_call(
     params: dict,
     operation_name: str,
     route: Optional[dict] = None,
+    card: Optional[dict] = None,
 ) -> None:
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
@@ -39,6 +40,7 @@ def deliver_api_call(
                 method,
                 params,
                 route=route,
+                card=card,
             )
         return
 
@@ -115,7 +117,7 @@ def send_status_card(update: dict) -> None:
             target_id="control",
         )
         action = store.create_callback_action(
-            operation_id=f"inbox:{job_id}:refresh-status",
+            operation_id=f"surface:{binding.binding_id}:status-refresh",
             action_type="refresh_status",
             payload={"binding_id": binding.binding_id},
             chat_id=chat_id,
@@ -124,18 +126,34 @@ def send_status_card(update: dict) -> None:
             one_time=False,
             ttl_seconds=30 * 24 * 60 * 60,
         )
+        card, created = store.ensure_surface_card(
+            binding_id=binding.binding_id,
+            card_type="status",
+            callback_action_id=action.action_id,
+        )
         text = status_card_text(store, binding, f"created by update {update['update_id']}")
-    deliver_api_call(
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "message_thread_id": thread_id,
-            "text": text,
-            "reply_markup": refresh_keyboard(action.token),
-        },
-        "status-card",
-        route=controller_reply_route(),
-    )
+    params = {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": refresh_keyboard(action.token),
+    }
+    if card.state == "active" and card.telegram_message_id is not None:
+        params["message_id"] = card.telegram_message_id
+        deliver_api_call(
+            "editMessageText",
+            params,
+            "status-card-edit",
+            card={"card_id": card.card_id, "mode": "edit"},
+        )
+    elif created:
+        params["message_thread_id"] = thread_id
+        deliver_api_call(
+            "sendMessage",
+            params,
+            f"status-card-create:{card.generation}",
+            route=controller_reply_route(),
+            card={"card_id": card.card_id, "mode": "activate"},
+        )
 
 
 def inspect_keyboard() -> Optional[dict]:
@@ -266,16 +284,16 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             )
         return
 
-    if callback_query_id:
-        deliver_api_call(
-            "answerCallbackQuery",
-            {
-                "callback_query_id": callback_query_id,
-                "text": "Durable route verified.",
-            },
-            "callback-answer",
-        )
     if action.action_type == "inspect_status":
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Durable route verified.",
+                },
+                "callback-answer",
+            )
         send_message(
             "✅ Durable button route verified.\n\n"
             "The opaque action was authorized, resolved from SQLite, and "
@@ -296,10 +314,37 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 or binding.target_id != "control"
             ):
                 raise StoreError("Status card surface binding is no longer valid.")
+            card = store.resolve_surface_card(binding.binding_id, "status")
+            if (
+                card is None
+                or card.state != "active"
+                or card.callback_action_id != action.action_id
+                or card.telegram_message_id
+                != int(os.environ["TELEGRAM_MESSAGE_ID"])
+            ):
+                if callback_query_id:
+                    deliver_api_call(
+                        "answerCallbackQuery",
+                        {
+                            "callback_query_id": callback_query_id,
+                            "text": "This status card was replaced. Send /status.",
+                        },
+                        "callback-answer",
+                    )
+                return
             text = status_card_text(
                 store,
                 binding,
                 f"update {update['update_id']} at {time.strftime('%H:%M:%S')}",
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Status refreshed.",
+                },
+                "callback-answer",
             )
         deliver_api_call(
             "editMessageText",
@@ -310,6 +355,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 "reply_markup": refresh_keyboard(action.token),
             },
             "status-edit",
+            card={"card_id": card.card_id, "mode": "edit"},
         )
         return
     raise StoreError(f"Unsupported callback action: {action.action_type}")

@@ -1,10 +1,11 @@
+import argparse
 import json
 import os
 import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -15,6 +16,7 @@ from durable_store import (
     MIGRATION_1,
     MIGRATION_2,
     MIGRATION_3,
+    MIGRATION_4,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -80,7 +82,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            4,
+            5,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -512,6 +514,64 @@ class DurableStoreTests(unittest.TestCase):
                 now=103,
             )
 
+    def test_surface_card_activates_and_can_be_recreated_after_becoming_stale(self):
+        binding = self.store.ensure_surface_binding(
+            chat_id=123,
+            surface_type="control",
+            display_name="Control",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        action = self.store.create_callback_action(
+            operation_id="surface:1:status-refresh",
+            action_type="refresh_status",
+            payload={"binding_id": binding.binding_id},
+            chat_id=123,
+            authorized_user_id=123,
+            one_time=False,
+            now=100,
+        )
+        card, created = self.store.ensure_surface_card(
+            binding.binding_id,
+            "status",
+            action.action_id,
+            now=100,
+        )
+        self.assertTrue(created)
+        self.assertEqual(card.state, "pending")
+
+        self.store.enqueue_api_call(
+            "status:create:1",
+            "sendMessage",
+            {"chat_id": 123, "text": "status"},
+            card={"card_id": card.card_id, "mode": "activate"},
+            now=100,
+        )
+        outbound = self.store.claim_outbox("sender", now=100)
+        self.store.complete_outbox(
+            outbound.message_id,
+            "sender",
+            {"message_id": 700},
+            now=101,
+        )
+        active = self.store.resolve_surface_card(binding.binding_id)
+        self.assertEqual(active.state, "active")
+        self.assertEqual(active.telegram_message_id, 700)
+
+        self.store.mark_surface_card_stale(active.card_id, now=102)
+        replacement, recreated = self.store.ensure_surface_card(
+            binding.binding_id,
+            "status",
+            action.action_id,
+            now=103,
+        )
+        self.assertTrue(recreated)
+        self.assertEqual(replacement.card_id, card.card_id)
+        self.assertEqual(replacement.generation, 2)
+        self.assertEqual(replacement.state, "pending")
+        self.assertIsNone(replacement.telegram_message_id)
+
 
 class SchemaCompatibilityTests(unittest.TestCase):
     def test_schema_one_database_migrates_to_current_schema(self):
@@ -528,7 +588,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    4,
+                    5,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -552,7 +612,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    4,
+                    5,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -563,7 +623,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
                     1,
                 )
 
-    def test_schema_three_database_migrates_to_schema_four(self):
+    def test_schema_three_database_migrates_to_current_schema(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "schema-three.sqlite3"
             connection = sqlite3.connect(str(path), isolation_level=None)
@@ -577,12 +637,36 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    4,
+                    5,
                 )
                 self.assertEqual(
                     store.connection.execute(
                         "SELECT COUNT(*) FROM sqlite_master "
                         "WHERE type = 'table' AND name = 'surface_bindings'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_schema_four_database_migrates_to_current_schema(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-four.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for statement in MIGRATION_1 + MIGRATION_2 + MIGRATION_3 + MIGRATION_4:
+                connection.execute(statement)
+            connection.execute("PRAGMA user_version = 4")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    5,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'surface_cards'"
                     ).fetchone()[0],
                     1,
                 )
@@ -895,9 +979,147 @@ class DurableIntegrationTests(unittest.TestCase):
                     store.status_counts()["surfaces"],
                     {"active": 1},
                 )
+                self.assertEqual(
+                    store.status_counts()["cards"],
+                    {"active": 1},
+                )
                 binding = store.resolve_surface_binding(123)
                 self.assertEqual(binding.display_name, "Control")
                 self.assertEqual(binding.target_id, "control")
+
+    def test_repeated_status_command_edits_persisted_singleton_after_reopen(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ingest_update(message_update(10, "/status"), now=100)
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(store, config, job, "worker")
+                initial = store.claim_outbox("sender", now=10**12)
+                store.complete_outbox(
+                    initial.message_id,
+                    "sender",
+                    {"message_id": 700},
+                    now=10**12,
+                )
+
+            with DurableStore(database_path) as reopened:
+                reopened.ingest_update(message_update(11, "/status"), now=10**12 + 1)
+                job = reopened.claim_job("worker", now=10**12 + 1)
+                telegram_control.process_inbox_job(reopened, config, job, "worker")
+                edit = reopened.claim_outbox("sender", now=10**12 + 1)
+                self.assertEqual(edit.method, "editMessageText")
+                self.assertEqual(edit.params["message_id"], 700)
+                self.assertEqual(edit.card["mode"], "edit")
+                self.assertEqual(
+                    reopened.connection.execute(
+                        "SELECT COUNT(*) FROM surface_cards"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertEqual(
+                    reopened.connection.execute(
+                        "SELECT COUNT(*) FROM outbox_messages "
+                        "WHERE method = 'sendMessage'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_permanent_telegram_edit_failure_marks_singleton_stale(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            with DurableStore(database_path) as store:
+                binding = store.ensure_surface_binding(
+                    chat_id=123,
+                    surface_type="control",
+                    display_name="Control",
+                    target_type="controller",
+                    target_id="control",
+                )
+                action = store.create_callback_action(
+                    operation_id="surface:1:status-refresh",
+                    action_type="refresh_status",
+                    payload={"binding_id": binding.binding_id},
+                    chat_id=123,
+                    authorized_user_id=123,
+                    one_time=False,
+                )
+                card, _ = store.ensure_surface_card(
+                    binding.binding_id,
+                    "status",
+                    action.action_id,
+                )
+                store.mark_surface_card_stale(card.card_id)
+                card, _ = store.ensure_surface_card(
+                    binding.binding_id,
+                    "status",
+                    action.action_id,
+                )
+                store.connection.execute(
+                    "UPDATE surface_cards SET state = 'active', "
+                    "telegram_message_id = 700 WHERE card_id = ?",
+                    (card.card_id,),
+                )
+                store.enqueue_api_call(
+                    "status:edit",
+                    "editMessageText",
+                    {"chat_id": 123, "message_id": 700, "text": "status"},
+                    card={"card_id": card.card_id, "mode": "edit"},
+                )
+                outbound = store.claim_outbox("sender", now=10**12)
+                with mock.patch.object(
+                    telegram_control.bridge,
+                    "api_call",
+                    side_effect=telegram_control.bridge.BridgeError(
+                        "Bad Request: message to edit not found"
+                    ),
+                ):
+                    telegram_control.send_outbox_message(
+                        store,
+                        "token",
+                        outbound,
+                        "sender",
+                    )
+
+                self.assertEqual(store.status_counts()["outbox"], {"dead": 1})
+                self.assertEqual(
+                    store.resolve_surface_card(binding.binding_id).state,
+                    "stale",
+                )
+
+    def test_topic_capability_reports_get_me_flags(self):
+        stdout = StringIO()
+        with mock.patch.object(
+            telegram_control.bridge,
+            "read_token",
+            return_value="token",
+        ):
+            with mock.patch.object(
+                telegram_control.bridge,
+                "api_call",
+                return_value={
+                    "username": "slam_paws_bot",
+                    "has_topics_enabled": True,
+                    "allows_users_to_create_topics": False,
+                },
+            ) as api_call:
+                with redirect_stdout(stdout):
+                    telegram_control.topic_capability_command(
+                        argparse.Namespace()
+                    )
+
+        self.assertEqual(
+            json.loads(stdout.getvalue()),
+            {
+                "username": "slam_paws_bot",
+                "has_topics_enabled": True,
+                "allows_users_to_create_topics": False,
+            },
+        )
+        api_call.assert_called_once_with("token", "getMe")
 
     def test_handler_queues_reply_instead_of_calling_telegram(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

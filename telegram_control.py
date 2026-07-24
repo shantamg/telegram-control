@@ -170,18 +170,35 @@ def send_outbox_message(
             attempts=message.attempts,
         )
     except bridge.BridgeError as exc:
+        error = str(exc)
+        permanent_card_edit_failure = (
+            message.method == "editMessageText"
+            and message.card is not None
+            and message.card.get("mode") == "edit"
+            and any(
+                marker in error.lower()
+                for marker in (
+                    "message to edit not found",
+                    "message can't be edited",
+                    "message_id_invalid",
+                )
+            )
+        )
         state = store.fail_outbox(
             message.message_id,
             worker_id,
-            str(exc),
+            error,
+            max_attempts=message.attempts if permanent_card_edit_failure else 8,
         )
+        if permanent_card_edit_failure and state == "dead":
+            store.mark_surface_card_stale(int(message.card["card_id"]))
         log_event(
             "outbox_failed",
             message_id=message.message_id,
             operation_id=message.operation_id,
             attempts=message.attempts,
             state=state,
-            error=str(exc),
+            error=error,
         )
 
 
@@ -390,6 +407,18 @@ def status_command(args: argparse.Namespace) -> None:
     print(json.dumps(status, indent=2, sort_keys=True))
 
 
+def topic_capability_command(_: argparse.Namespace) -> None:
+    bot = bridge.api_call(bridge.read_token(), "getMe")
+    capability = {
+        "username": bot.get("username"),
+        "has_topics_enabled": bool(bot.get("has_topics_enabled", False)),
+        "allows_users_to_create_topics": bool(
+            bot.get("allows_users_to_create_topics", False)
+        ),
+    }
+    print(json.dumps(capability, indent=2, sort_keys=True))
+
+
 def doctor_command(args: argparse.Namespace) -> None:
     problems = []
     try:
@@ -478,6 +507,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status", help="Show durable queue status.")
     status_parser.set_defaults(function=status_command)
+
+    topic_parser = subparsers.add_parser(
+        "topic-capability",
+        help="Show whether Telegram private-chat topics are enabled for this bot.",
+    )
+    topic_parser.set_defaults(function=topic_capability_command)
 
     doctor_parser = subparsers.add_parser("doctor", help="Check Stage 1 prerequisites.")
     doctor_parser.set_defaults(function=doctor_command)

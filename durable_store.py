@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class StoreError(RuntimeError):
@@ -53,6 +53,7 @@ class OutboxMessage:
     operation_id: str
     method: str
     params: dict[str, Any]
+    card: Optional[dict[str, Any]]
     attempts: int
 
 
@@ -90,6 +91,17 @@ class SurfaceBinding:
     display_name: str
     target_type: str
     target_id: str
+    state: str
+
+
+@dataclass(frozen=True)
+class SurfaceCard:
+    card_id: int
+    binding_id: int
+    card_type: str
+    callback_action_id: int
+    telegram_message_id: Optional[int]
+    generation: int
     state: str
 
 
@@ -249,6 +261,34 @@ MIGRATION_4 = (
     """,
 )
 
+MIGRATION_5 = (
+    """
+    ALTER TABLE outbox_messages
+    ADD COLUMN card_json TEXT
+    """,
+    """
+    CREATE TABLE surface_cards (
+        card_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        binding_id INTEGER NOT NULL
+            REFERENCES surface_bindings(binding_id) ON DELETE RESTRICT,
+        card_type TEXT NOT NULL CHECK (card_type IN ('status')),
+        callback_action_id INTEGER NOT NULL
+            REFERENCES callback_actions(action_id) ON DELETE RESTRICT,
+        telegram_message_id INTEGER,
+        generation INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
+        state TEXT NOT NULL
+            CHECK (state IN ('pending', 'active', 'stale')),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        UNIQUE(binding_id, card_type)
+    )
+    """,
+    """
+    CREATE INDEX surface_cards_state
+    ON surface_cards(binding_id, card_type, state)
+    """,
+)
+
 
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
@@ -314,6 +354,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 4
                 self.connection.execute("PRAGMA user_version = 4")
+            if current < 5:
+                for statement in MIGRATION_5:
+                    self.connection.execute(statement)
+                current = 5
+                self.connection.execute("PRAGMA user_version = 5")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -552,6 +597,7 @@ class DurableStore:
         method: str,
         params: dict[str, Any],
         route: Optional[dict[str, Any]] = None,
+        card: Optional[dict[str, Any]] = None,
         now: Optional[float] = None,
     ) -> int:
         if not operation_id or not method:
@@ -563,13 +609,18 @@ class DurableStore:
             if route is not None
             else None
         )
+        card_json = (
+            json.dumps(card, separators=(",", ":"), sort_keys=True)
+            if card is not None
+            else None
+        )
         self.connection.execute(
             """
             INSERT INTO outbox_messages(
                 operation_id, method, params_json, state, attempts,
-                available_at, created_at, updated_at, route_json
+                available_at, created_at, updated_at, route_json, card_json
             )
-            VALUES (?, ?, ?, 'queued', 0, ?, ?, ?, ?)
+            VALUES (?, ?, ?, 'queued', 0, ?, ?, ?, ?, ?)
             ON CONFLICT(operation_id) DO NOTHING
             """,
             (
@@ -580,11 +631,12 @@ class DurableStore:
                 timestamp,
                 timestamp,
                 route_json,
+                card_json,
             ),
         )
         row = self.connection.execute(
             """
-            SELECT message_id, method, params_json, route_json
+            SELECT message_id, method, params_json, route_json, card_json
             FROM outbox_messages
             WHERE operation_id = ?
             """,
@@ -594,6 +646,7 @@ class DurableStore:
             row["method"] != method
             or row["params_json"] != params_json
             or row["route_json"] != route_json
+            or row["card_json"] != card_json
         ):
             raise StoreError(
                 f"Outbox operation {operation_id!r} was reused with a different payload."
@@ -879,6 +932,11 @@ class DurableStore:
             operation_id=str(claimed["operation_id"]),
             method=str(claimed["method"]),
             params=json.loads(claimed["params_json"]),
+            card=(
+                json.loads(claimed["card_json"])
+                if claimed["card_json"] is not None
+                else None
+            ),
             attempts=int(claimed["attempts"]),
         )
 
@@ -895,7 +953,7 @@ class DurableStore:
         try:
             row = self.connection.execute(
                 """
-                SELECT method, params_json, route_json
+                SELECT method, params_json, route_json, card_json
                 FROM outbox_messages
                 WHERE message_id = ? AND state = 'leased' AND lease_owner = ?
                 """,
@@ -975,6 +1033,52 @@ class DurableStore:
                         timestamp,
                     ),
                 )
+            if row["card_json"] is not None:
+                card_spec = json.loads(row["card_json"])
+                try:
+                    card_id = int(card_spec["card_id"])
+                    mode = str(card_spec["mode"])
+                except (KeyError, TypeError, ValueError):
+                    raise StoreError("Outbox surface card metadata is invalid.") from None
+                if mode == "activate":
+                    if row["method"] != "sendMessage" or not isinstance(result, dict):
+                        raise StoreError(
+                            "Only sendMessage can activate a surface card."
+                        )
+                    try:
+                        telegram_message_id = int(result["message_id"])
+                    except (KeyError, TypeError, ValueError):
+                        raise StoreError(
+                            "Telegram result cannot activate its surface card."
+                        ) from None
+                    card_cursor = self.connection.execute(
+                        """
+                        UPDATE surface_cards
+                        SET telegram_message_id = ?, state = 'active', updated_at = ?
+                        WHERE card_id = ? AND state = 'pending'
+                        """,
+                        (telegram_message_id, timestamp, card_id),
+                    )
+                    if card_cursor.rowcount != 1:
+                        raise StoreError(
+                            "Surface card is no longer pending activation."
+                        )
+                elif mode == "edit":
+                    if row["method"] != "editMessageText":
+                        raise StoreError(
+                            "Only editMessageText can update a surface card."
+                        )
+                    active = self.connection.execute(
+                        """
+                        SELECT 1 FROM surface_cards
+                        WHERE card_id = ? AND state = 'active'
+                        """,
+                        (card_id,),
+                    ).fetchone()
+                    if active is None:
+                        raise StoreError("Surface card is no longer active.")
+                else:
+                    raise StoreError("Outbox surface card mode is invalid.")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -1146,6 +1250,125 @@ class DurableStore:
         ).fetchone()
         return self._surface_binding_from_row(row) if row is not None else None
 
+    @staticmethod
+    def _surface_card_from_row(row: sqlite3.Row) -> SurfaceCard:
+        return SurfaceCard(
+            card_id=int(row["card_id"]),
+            binding_id=int(row["binding_id"]),
+            card_type=str(row["card_type"]),
+            callback_action_id=int(row["callback_action_id"]),
+            telegram_message_id=(
+                int(row["telegram_message_id"])
+                if row["telegram_message_id"] is not None
+                else None
+            ),
+            generation=int(row["generation"]),
+            state=str(row["state"]),
+        )
+
+    def ensure_surface_card(
+        self,
+        binding_id: int,
+        card_type: str,
+        callback_action_id: int,
+        now: Optional[float] = None,
+    ) -> tuple[SurfaceCard, bool]:
+        if card_type != "status":
+            raise StoreError("Surface card type is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT *
+                FROM surface_cards
+                WHERE binding_id = ? AND card_type = ?
+                """,
+                (int(binding_id), card_type),
+            ).fetchone()
+            created = False
+            if row is None:
+                cursor = self.connection.execute(
+                    """
+                    INSERT INTO surface_cards(
+                        binding_id, card_type, callback_action_id,
+                        telegram_message_id, generation, state,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, NULL, 1, 'pending', ?, ?)
+                    """,
+                    (
+                        int(binding_id),
+                        card_type,
+                        int(callback_action_id),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                row = self.connection.execute(
+                    "SELECT * FROM surface_cards WHERE card_id = ?",
+                    (int(cursor.lastrowid),),
+                ).fetchone()
+                created = True
+            elif row["state"] == "stale":
+                self.connection.execute(
+                    """
+                    UPDATE surface_cards
+                    SET callback_action_id = ?, telegram_message_id = NULL,
+                        generation = generation + 1, state = 'pending',
+                        updated_at = ?
+                    WHERE card_id = ? AND state = 'stale'
+                    """,
+                    (
+                        int(callback_action_id),
+                        timestamp,
+                        int(row["card_id"]),
+                    ),
+                )
+                row = self.connection.execute(
+                    "SELECT * FROM surface_cards WHERE card_id = ?",
+                    (int(row["card_id"]),),
+                ).fetchone()
+                created = True
+            elif int(row["callback_action_id"]) != int(callback_action_id):
+                raise StoreError("Surface card callback action changed unexpectedly.")
+            card = self._surface_card_from_row(row)
+            self.connection.execute("COMMIT")
+            return card, created
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def resolve_surface_card(
+        self,
+        binding_id: int,
+        card_type: str = "status",
+    ) -> Optional[SurfaceCard]:
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM surface_cards
+            WHERE binding_id = ? AND card_type = ?
+            """,
+            (int(binding_id), card_type),
+        ).fetchone()
+        return self._surface_card_from_row(row) if row is not None else None
+
+    def mark_surface_card_stale(
+        self,
+        card_id: int,
+        now: Optional[float] = None,
+    ) -> None:
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute(
+            """
+            UPDATE surface_cards
+            SET state = 'stale', updated_at = ?
+            WHERE card_id = ? AND state IN ('pending', 'active')
+            """,
+            (timestamp, int(card_id)),
+        )
+
     def fail_outbox(
         self,
         message_id: int,
@@ -1235,6 +1458,7 @@ class DurableStore:
             ("callbacks", "callback_actions"),
             ("routes", "telegram_message_routes"),
             ("surfaces", "surface_bindings"),
+            ("cards", "surface_cards"),
         ):
             state_column = "ingest_state" if label == "updates" else "state"
             rows = self.connection.execute(

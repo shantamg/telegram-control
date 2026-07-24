@@ -116,6 +116,23 @@ The live status-card test passed on July 23, 2026. Two consecutive Refresh taps
 edited the same Telegram message ID in place, kept the same active action and
 return route, and created no duplicate card.
 
+Schema version 5 persists one singleton card record per surface and card type.
+Repeated `/status` commands edit the registered Telegram message instead of
+creating additional cards. If Telegram reports that the message was deleted or
+can no longer be edited, the record becomes stale and the next `/status`
+creates and registers a replacement.
+
+The live singleton test passed on July 23, 2026. The first `/status` registered
+Telegram message ID 40 and the second `/status` edited message 40 in place
+without creating another status card.
+
+Check whether BotFather's Threaded Mode is enabled before provisioning private
+chat topics:
+
+```sh
+/Users/shantam/telegram-control/telegram_control.py topic-capability
+```
+
 For controlled debugging, each loop can run separately:
 
 ```sh

@@ -696,8 +696,21 @@ tests on July 23, 2026:
 - two live refreshes edited the same Telegram message ID in place;
 - no duplicate card or return route was created.
 
-Persistent singleton menu cards and live topic provisioning remain before the
-Stage 2 UI is complete.
+The persistent singleton-card slice passed 37 offline tests and its live test
+on July 23, 2026:
+
+- schema version 5 registers one status card per surface;
+- the Telegram message ID survives process and database reopen;
+- repeated `/status` commands edit the registered card;
+- a permanent Telegram edit failure marks the card stale so the next command
+  can register a replacement;
+- `topic-capability` reads the private-topic feature flags returned by `getMe`.
+- two live `/status` commands created then edited Telegram message ID 40, with
+  one active singleton record and no duplicate status-card message.
+
+Topic provisioning remains before the Stage 2 UI is complete. The live bot
+currently reports Threaded Mode disabled, so it must be enabled in BotFather
+before creating private-chat topics.
 
 ## References
 
