@@ -409,17 +409,20 @@ corresponding agent/outbox queue name.
 ## Durable reply continuity
 
 When the main router dispatches a root Control request to a managed project
-agent, the agent's final response replaces the root `🧭 Routing…` receipt in
-place. That edited final message now also carries durable reply continuity:
+agent, the dispatch preview and then the agent's final response replace the
+root `🧭 Routing…` receipt in place. That single card carries durable reply
+continuity:
 
-- Once Telegram acknowledges the final edit, the receipt's stored reply route
+- Once Telegram acknowledges the dispatch-preview edit, the receipt's stored
+  reply route
   is retargeted, in the same completing transaction, from the main router to
-  the exact project agent that produced the response. Route ownership never
-  switches before the acknowledgment, the transition is idempotent and
-  crash-safe, and it is scoped to the exact `(chat, topic, message)`.
+  the exact project agent that owns the now-running turn. This makes the live
+  card steerable before the final answer exists. Route ownership never switches
+  before the visible dispatch acknowledgment; the transition is idempotent,
+  crash-safe, and scoped to the exact `(chat, topic, message)`.
 - Replying to that edited final message therefore continues the same managed
   agent conversation—using its persisted provider session—directly from the
-  root Control chat. The reply gets its own `⏳ Working…` receipt in the
+  root Control chat. A new turn gets its own `📨 Queued…` receipt in the
   Control chat, the response edits that receipt in place, and the new final
   message routes back to the same agent, so follow-up replies chain
   indefinitely.
@@ -427,8 +430,8 @@ place. That edited final message now also carries durable reply continuity:
   wrong chat or topic, to the wrong message, after route expiry, or against a
   different agent fails closed.
 - If Telegram permanently rejects the final edit, the existing fallback sends
-  the response as a new routed message and route ownership stays with the main
-  router, so nothing is lost and nothing switches without a visible edit.
+  the response as a new agent-routed message. The acknowledged dispatch card
+  and fallback both continue to reach the same agent, so nothing is lost.
 - Delivery order is enforced, not hoped for: every sender process wraps the
   actual Telegram call in one exclusive, non-reentrant kernel advisory lock
   (an owner-only flock file derived from the canonically resolved controller
@@ -468,6 +471,27 @@ place. That edited final message now also carries durable reply continuity:
   and the one Telegram message progresses to the agent's final response. The
   stored route is revalidated durably before any mailbox work is created, so
   foreign, stale, or mismatched voice replies fail closed exactly like text.
+
+## Live Codex worker control
+
+Schema v17 persists the provider turn ID separately from the provider session
+ID and adds a durable control queue for active worker turns:
+
+- A turn card progresses from `📨 Queued` through bounded Codex-authored
+  statuses and exposes a one-time `⏹ Stop` button while work is active.
+- Replying to the exact active turn card queues guidance for that exact Codex
+  turn through app-server `turn/steer`. Replying to any other agent message
+  starts an ordinary follow-up turn instead.
+- Stop is durable before and after the provider turn ID becomes available. It
+  is delivered through app-server `turn/interrupt`; a cancellation is terminal
+  and is never retried as a failed turn.
+- Controls are tied to the active mailbox lease and expected provider turn.
+  Lease recovery rejects uncertain in-flight controls instead of replaying
+  them against a replacement turn.
+- Status, terminal, voice, and router-card edits share per-turn serialization
+  keys. Terminal completion supersedes queued status edits and removes the
+  inline keyboard, preventing an old `Working` or `Stop` state from
+  overwriting a final response.
 
 Replies that legitimately remain with the main router (receipts, direct
 responses, relayed continuation chunks, fallback deliveries) now carry bounded

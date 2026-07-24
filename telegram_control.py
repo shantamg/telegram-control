@@ -214,6 +214,48 @@ def process_agent_mailbox_job(
             job.input_text,
         )
         adapter = provider_adapters.adapter_for(agent)
+
+        def on_progress(stage: str, detail: str) -> None:
+            if stage == "turn_started":
+                store.attach_agent_mailbox_turn(
+                    job.mailbox_id,
+                    worker_id,
+                    detail,
+                )
+            else:
+                store.update_agent_mailbox_progress(
+                    job.mailbox_id,
+                    worker_id,
+                    stage,
+                )
+
+        def poll_control() -> Optional[provider_adapters.ProviderControl]:
+            control = store.claim_agent_turn_control(
+                job.mailbox_id,
+                worker_id,
+            )
+            if control is None:
+                return None
+            return provider_adapters.ProviderControl(
+                control_id=control.control_id,
+                kind=control.control_type,
+                text=control.input_text,
+                expected_turn_id=control.expected_turn_id,
+            )
+
+        def on_control(
+            control: provider_adapters.ProviderControl,
+            outcome: str,
+            detail: str,
+        ) -> None:
+            store.finish_agent_turn_control(
+                control.control_id,
+                job.mailbox_id,
+                worker_id,
+                outcome,
+                detail,
+            )
+
         result = adapter.run_turn(
             agent,
             job.input_text,
@@ -227,6 +269,9 @@ def process_agent_mailbox_job(
                 job.mailbox_id,
                 worker_id,
             ),
+            on_progress=on_progress,
+            poll_control=poll_control,
+            on_control=on_control,
         )
         store.complete_agent_mailbox(
             job.mailbox_id,
@@ -241,6 +286,18 @@ def process_agent_mailbox_job(
             agent_id=job.agent_id,
             attempts=job.attempts,
             provider_session_id=result.provider_session_id,
+        )
+    except provider_adapters.ProviderTurnCancelled as exc:
+        store.cancel_agent_mailbox(
+            job.mailbox_id,
+            worker_id,
+            str(exc),
+        )
+        log_event(
+            "agent_turn_cancelled",
+            mailbox_id=job.mailbox_id,
+            agent_id=job.agent_id,
+            attempts=job.attempts,
         )
     except (provider_adapters.ProviderAdapterError, OSError, StoreError) as exc:
         state = store.fail_agent_mailbox(
@@ -1485,7 +1542,10 @@ def send_outbox_message(
                 attempts=message.attempts,
             )
             return
-        if store.router_final_edit_superseded(message.operation_id):
+        if (
+            store.router_final_edit_superseded(message.operation_id)
+            or store.agent_status_edit_superseded(message.operation_id)
+        ):
             # A newer agent-outcome edit for the same routing receipt exists,
             # so delivering this stale preview edit would overwrite the final
             # answer.
@@ -1617,6 +1677,10 @@ def handle_outbox_send_failure(
             store.enqueue_router_response_fallback(
                 int(message.card["mailbox_id"])
             )
+        elif message.card.get("kind") == "agent_control":
+            # The original steering receipt remains truthful ("Steering…");
+            # the durable control outcome is still retained for inspection.
+            pass
         else:
             store.mark_surface_card_stale(int(message.card["card_id"]))
     log_event(

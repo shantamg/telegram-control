@@ -342,9 +342,31 @@ def enqueue_agent_reply_input(route, text: str) -> None:
             chat_id=chat_id,
             message_thread_id=thread_id,
             replied_message_id=route.telegram_message_id,
-            receipt_text=f"⏳ <b>{html.escape(speaker)} is working…</b>",
+            receipt_text=f"📨 <b>Queued for {html.escape(speaker)}</b>",
             receipt_parse_mode="HTML",
+            authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
         )
+
+
+def try_enqueue_agent_steer(route, text: str) -> bool:
+    """Treat a reply to the exact active turn card as live guidance."""
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    if not database_path or not job_id or not chat_id_text:
+        raise StoreError("Managed agent steering requires the durable controller.")
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    thread_id = int(thread_id_text) if thread_id_text else None
+    with DurableStore(Path(database_path)) as store:
+        control = store.enqueue_agent_steer_from_receipt(
+            agent_id=route.target_id,
+            source_inbox_job_id=int(job_id),
+            input_text=text,
+            chat_id=int(chat_id_text),
+            message_thread_id=thread_id,
+            replied_message_id=route.telegram_message_id,
+        )
+    return control is not None
 
 
 def send_agent_status() -> None:
@@ -533,7 +555,7 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
             raise StoreError("Managed agent route is no longer valid.")
         chat_id, thread_id = surface_coordinates()
         speaker = html.escape(store.agent_speaker_header(agent.agent_id))
-        receipt = f"⏳ <b>{speaker} is working…</b>"
+        receipt = f"📨 <b>Queued for {speaker}</b>"
         store.enqueue_agent_message_with_receipt(
             agent_id=agent.agent_id,
             source_inbox_job_id=int(job_id),
@@ -542,6 +564,7 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
             message_thread_id=thread_id,
             receipt_text=receipt,
             receipt_parse_mode="HTML",
+            authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
         )
 
 
@@ -634,6 +657,36 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "The opaque action was authorized, resolved from SQLite, and "
             "consumed exactly once."
         )
+        return
+    if action.action_type == "agent_turn_stop":
+        mailbox_id = int(action.payload.get("mailbox_id", 0))
+        agent_id = str(action.payload.get("agent_id", ""))
+        source_job_id = int(os.environ["TELEGRAM_CONTROL_JOB_ID"])
+        if mailbox_id <= 0 or not agent_id:
+            raise StoreError("Stored Stop action is invalid.")
+        with DurableStore(Path(database_path)) as store:
+            outcome = store.request_agent_turn_cancel(
+                mailbox_id=mailbox_id,
+                agent_id=agent_id,
+                source_inbox_job_id=source_job_id,
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+            )
+        answer = {
+            "stopping": "Stopping the active Codex turn…",
+            "starting": "Stop queued while Codex starts…",
+            "cancelled": "Cancelled before it started.",
+            "finished": "That turn already finished.",
+        }[outcome]
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": answer,
+                },
+                "callback-answer",
+            )
         return
     if action.action_type == "router_clarification":
         router_mailbox_id = int(action.payload.get("router_mailbox_id", 0))
@@ -1476,6 +1529,12 @@ def handle_voice(update: dict, voice: dict) -> None:
         raise bridge.BridgeError("Voice message exceeds Telegram's 20 MB bot download limit.")
     if duration > MAX_VOICE_SECONDS:
         raise bridge.BridgeError("Voice message is longer than the configured 30-minute limit.")
+    message = update.get("message") or {}
+    sender = message.get("from") or {}
+    try:
+        authorized_user_id = int(sender["id"])
+    except (KeyError, TypeError, ValueError):
+        raise StoreError("Voice message sender identity is unavailable.") from None
 
     binding = current_surface_binding()
     managed_agent = None
@@ -1575,7 +1634,7 @@ def handle_voice(update: dict, voice: dict) -> None:
                     source_inbox_job_id=int(job_id),
                     chat_id=chat_id,
                     message_thread_id=thread_id,
-                    authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
+                    authorized_user_id=authorized_user_id,
                 )
         else:
             send_message(
@@ -1614,12 +1673,14 @@ def handle_voice(update: dict, voice: dict) -> None:
                     replied_message_id=(
                         agent_reply_route.telegram_message_id
                     ),
+                    authorized_user_id=authorized_user_id,
                 )
             else:
                 store.enqueue_agent_voice_message(
                     agent_id=managed_agent.agent_id,
                     source_inbox_job_id=int(job_id),
                     input_text=agent_input,
+                    authorized_user_id=authorized_user_id,
                 )
     elif routes_to_main_router:
         router_input = transcript or (
@@ -1639,7 +1700,7 @@ def handle_voice(update: dict, voice: dict) -> None:
                 input_text=router_input,
                 chat_id=chat_id,
                 message_thread_id=thread_id,
-                authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
+                authorized_user_id=authorized_user_id,
             )
     elif transcript:
         send_message(f"📝 Transcript:\n\n{transcript}")
@@ -1686,15 +1747,16 @@ def main() -> int:
                         build_router_reply_input(update, route, text)
                     )
                 elif route is not None and route.target_type == "agent":
-                    binding = current_surface_binding()
-                    if (
-                        binding is not None
-                        and binding.target_type == "agent"
-                        and binding.target_id == route.target_id
-                    ):
-                        enqueue_agent_input(route.target_id, text)
-                    else:
-                        enqueue_agent_reply_input(route, text)
+                    if not try_enqueue_agent_steer(route, text):
+                        binding = current_surface_binding()
+                        if (
+                            binding is not None
+                            and binding.target_type == "agent"
+                            and binding.target_id == route.target_id
+                        ):
+                            enqueue_agent_input(route.target_id, text)
+                        else:
+                            enqueue_agent_reply_input(route, text)
                 else:
                     send_message(
                         "That replied-to message has no active durable route."

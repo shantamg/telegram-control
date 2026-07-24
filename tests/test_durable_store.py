@@ -27,6 +27,10 @@ from durable_store import (
     MIGRATION_10,
     MIGRATION_11,
     MIGRATION_12,
+    MIGRATION_13,
+    MIGRATION_14,
+    MIGRATION_15,
+    MIGRATION_16,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -1156,7 +1160,7 @@ class DurableStoreTests(unittest.TestCase):
             now=now,
         )
 
-    def test_agent_final_edit_retargets_root_route_only_after_ack(self):
+    def test_dispatch_preview_retargets_root_route_before_live_work(self):
         agent, _, router_mailbox_id = self._setup_routed_agent_turn()
         receipt = self.store.claim_outbox("sender", now=104)
         self.store.complete_outbox(
@@ -1167,14 +1171,17 @@ class DurableStoreTests(unittest.TestCase):
         )
         preview = self.store.claim_outbox("sender", now=106)
         self.assertEqual(preview.method, "editMessageText")
-        self.assertNotIn("route_retarget", preview.card)
+        self.assertEqual(
+            preview.card["route_retarget"],
+            {"target_type": "agent", "target_id": agent.agent_id},
+        )
         self.store.complete_outbox(
             preview.message_id,
             "sender",
             {"message_id": 700, "chat": {"id": 123}},
             now=107,
         )
-        self.assertEqual(self._resolve_route(700, 108).target_type, "controller")
+        self.assertEqual(self._resolve_route(700, 108).target_type, "agent")
 
         mailbox = self.store.claim_agent_mailbox("agent", now=109)
         self.store.complete_agent_mailbox(
@@ -1195,9 +1202,10 @@ class DurableStoreTests(unittest.TestCase):
             final_edit.card["route_retarget"],
             {"target_type": "agent", "target_id": agent.agent_id},
         )
-        # Ownership must not switch before Telegram acknowledges the edit.
+        # Dispatch preview already transferred ownership so the live turn is
+        # steerable before its final response exists.
         before = self._resolve_route(700, 112)
-        self.assertEqual(before.target_type, "controller")
+        self.assertEqual(before.target_type, "agent")
         self.store.complete_outbox(
             final_edit.message_id,
             "sender",
@@ -1225,6 +1233,404 @@ class DurableStoreTests(unittest.TestCase):
             )
             self.assertEqual(durable.target_type, "agent")
             self.assertEqual(durable.target_id, agent.agent_id)
+
+    def test_live_reply_steers_exact_active_provider_turn(self):
+        agent, _, _ = self._setup_routed_agent_turn()
+        receipt = self.store.claim_outbox("sender", now=104)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=105,
+        )
+        preview = self.store.claim_outbox("sender", now=106)
+        self.store.complete_outbox(
+            preview.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=107,
+        )
+        mailbox = self.store.claim_agent_mailbox("agent", now=109)
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            "agent",
+            "turn-live-1",
+            now=110,
+        )
+        self.store.ingest_update(
+            message_update(
+                11,
+                text="also check the migration",
+                reply_to_message_id=700,
+            ),
+            now=111,
+        )
+        source_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+            ).fetchone()["job_id"]
+        )
+        control = self.store.enqueue_agent_steer_from_receipt(
+            agent.agent_id,
+            source_job_id,
+            "also check the migration",
+            123,
+            None,
+            700,
+            now=112,
+        )
+        self.assertIsNotNone(control)
+        claimed = self.store.claim_agent_turn_control(
+            mailbox.mailbox_id,
+            "agent",
+            now=113,
+        )
+        self.assertEqual(claimed.control_id, control.control_id)
+        self.assertEqual(claimed.control_type, "steer")
+        self.assertEqual(claimed.expected_turn_id, "turn-live-1")
+        self.store.finish_agent_turn_control(
+            claimed.control_id,
+            mailbox.mailbox_id,
+            "agent",
+            "applied",
+            "Guidance accepted.",
+            now=114,
+        )
+        state = self.store.connection.execute(
+            "SELECT state FROM agent_turn_controls WHERE control_id = ?",
+            (control.control_id,),
+        ).fetchone()["state"]
+        self.assertEqual(state, "applied")
+
+    def test_stop_queued_during_start_attaches_to_exact_turn_and_cancels(self):
+        agent, source_job_id, _ = self._setup_routed_agent_turn()
+        receipt = self.store.claim_outbox("sender", now=104)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=105,
+        )
+        preview = self.store.claim_outbox("sender", now=106)
+        self.store.complete_outbox(
+            preview.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=107,
+        )
+        mailbox = self.store.claim_agent_mailbox("agent", now=109)
+        self.store.ingest_update(callback_update(12, data="a:unused"), now=110)
+        callback_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 12"
+            ).fetchone()["job_id"]
+        )
+        outcome = self.store.request_agent_turn_cancel(
+            mailbox.mailbox_id,
+            agent.agent_id,
+            callback_job_id,
+            123,
+            None,
+            now=111,
+        )
+        self.assertEqual(outcome, "starting")
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            "agent",
+            "turn-stop-1",
+            now=112,
+        )
+        control = self.store.claim_agent_turn_control(
+            mailbox.mailbox_id,
+            "agent",
+            now=113,
+        )
+        self.assertEqual(control.control_type, "cancel")
+        self.assertEqual(control.expected_turn_id, "turn-stop-1")
+        self.store.finish_agent_turn_control(
+            control.control_id,
+            mailbox.mailbox_id,
+            "agent",
+            "applied",
+            "Interrupt acknowledged.",
+            now=114,
+        )
+        self.store.cancel_agent_mailbox(
+            mailbox.mailbox_id,
+            "agent",
+            "Cancelled by user.",
+            now=115,
+        )
+        mailbox_state = self.store.connection.execute(
+            "SELECT state FROM agent_mailbox WHERE mailbox_id = ?",
+            (mailbox.mailbox_id,),
+        ).fetchone()["state"]
+        self.assertEqual(mailbox_state, "cancelled")
+        action_state = self.store.connection.execute(
+            "SELECT state FROM callback_actions WHERE operation_id = ?",
+            (f"agent-mailbox:{mailbox.mailbox_id}:stop",),
+        ).fetchone()["state"]
+        self.assertEqual(action_state, "expired")
+        self.assertEqual(source_job_id, mailbox.source_inbox_job_id)
+
+    def test_agent_worker_delivers_queued_stop_to_adapter(self):
+        class CancellingAdapter:
+            def run_turn(
+                self,
+                agent,
+                prompt,
+                mailbox_session_id,
+                on_session,
+                heartbeat,
+                on_progress=None,
+                poll_control=None,
+                on_control=None,
+            ):
+                on_session("session-cancel")
+                on_progress("turn_started", "turn-cancel")
+                control = poll_control()
+                self.control = control
+                on_control(control, "applied", "Interrupt acknowledged.")
+                raise provider_adapters.ProviderTurnCancelled(
+                    "Cancelled by the test user."
+                )
+
+        agent, _, _ = self._setup_routed_agent_turn()
+        receipt = self.store.claim_outbox("sender", now=104)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=105,
+        )
+        preview = self.store.claim_outbox("sender", now=106)
+        self.store.complete_outbox(
+            preview.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=107,
+        )
+        mailbox = self.store.claim_agent_mailbox("agent-worker", now=109)
+        self.store.ingest_update(callback_update(14, data="a:unused"), now=110)
+        callback_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 14"
+            ).fetchone()["job_id"]
+        )
+        self.assertEqual(
+            self.store.request_agent_turn_cancel(
+                mailbox.mailbox_id,
+                agent.agent_id,
+                callback_job_id,
+                123,
+                None,
+                now=111,
+            ),
+            "starting",
+        )
+        fake = CancellingAdapter()
+        with mock.patch.object(
+            telegram_control.discovery,
+            "validate_agent_workspace",
+            return_value=(
+                "/tmp/telegram-control",
+                "/tmp/telegram-control",
+                None,
+            ),
+        ):
+            with mock.patch.object(
+                telegram_control.provider_adapters,
+                "adapter_for",
+                return_value=fake,
+            ):
+                telegram_control.process_agent_mailbox_job(
+                    self.store,
+                    mailbox,
+                    "agent-worker",
+                )
+        self.assertEqual(fake.control.kind, "cancel")
+        state = self.store.connection.execute(
+            "SELECT state FROM agent_mailbox WHERE mailbox_id = ?",
+            (mailbox.mailbox_id,),
+        ).fetchone()["state"]
+        self.assertEqual(state, "cancelled")
+
+    def _assert_stop_survives_worker_crash_and_is_never_retried(
+        self,
+        control_state,
+    ):
+        agent, _, _ = self._setup_routed_agent_turn()
+        receipt = self.store.claim_outbox("sender", now=104)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=105,
+        )
+        preview = self.store.claim_outbox("sender", now=106)
+        self.store.complete_outbox(
+            preview.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=107,
+        )
+        mailbox = self.store.claim_agent_mailbox(
+            "crashing-worker",
+            now=109,
+            lease_seconds=10,
+        )
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            "crashing-worker",
+            "turn-crash-stop",
+            now=110,
+        )
+        self.store.ingest_update(callback_update(15, data="a:unused"), now=111)
+        callback_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 15"
+            ).fetchone()["job_id"]
+        )
+        self.assertEqual(
+            self.store.request_agent_turn_cancel(
+                mailbox.mailbox_id,
+                agent.agent_id,
+                callback_job_id,
+                123,
+                None,
+                now=112,
+            ),
+            "stopping",
+        )
+        if control_state in {"delivery_in_flight", "applied"}:
+            control = self.store.claim_agent_turn_control(
+                mailbox.mailbox_id,
+                "crashing-worker",
+                now=113,
+            )
+            self.assertEqual(control.state, "delivery_in_flight")
+            if control_state == "applied":
+                self.store.finish_agent_turn_control(
+                    control.control_id,
+                    mailbox.mailbox_id,
+                    "crashing-worker",
+                    "applied",
+                    "Provider interrupt acknowledged.",
+                    now=114,
+                )
+        persisted_control_state = self.store.connection.execute(
+            """
+            SELECT state
+            FROM agent_turn_controls
+            WHERE mailbox_id = ? AND control_type = 'cancel'
+            """,
+            (mailbox.mailbox_id,),
+        ).fetchone()["state"]
+        self.assertEqual(persisted_control_state, control_state)
+        # Simulate the worker dying before cancel_agent_mailbox() commits.
+        reclaimed = self.store.claim_agent_mailbox(
+            "replacement-worker",
+            now=120,
+        )
+        self.assertIsNone(reclaimed)
+        recovered = self.store.connection.execute(
+            """
+            SELECT state, attempts, provider_turn_id
+            FROM agent_mailbox
+            WHERE mailbox_id = ?
+            """,
+            (mailbox.mailbox_id,),
+        ).fetchone()
+        self.assertEqual(recovered["state"], "cancelled")
+        self.assertEqual(int(recovered["attempts"]), 1)
+        self.assertIsNone(recovered["provider_turn_id"])
+        recovered_control = self.store.connection.execute(
+            """
+            SELECT state, result_text
+            FROM agent_turn_controls
+            WHERE mailbox_id = ? AND control_type = 'cancel'
+            """,
+            (mailbox.mailbox_id,),
+        ).fetchone()
+        self.assertEqual(recovered_control["state"], "applied")
+        if control_state != "applied":
+            self.assertIn("lease recovery", recovered_control["result_text"])
+
+    def test_queued_stop_survives_worker_crash_and_is_never_retried(self):
+        self._assert_stop_survives_worker_crash_and_is_never_retried("queued")
+
+    def test_in_flight_stop_survives_worker_crash_and_is_never_retried(self):
+        self._assert_stop_survives_worker_crash_and_is_never_retried(
+            "delivery_in_flight"
+        )
+
+    def test_applied_stop_survives_worker_crash_and_is_never_retried(self):
+        self._assert_stop_survives_worker_crash_and_is_never_retried("applied")
+
+    def test_expired_live_turn_rejects_uncertain_control_before_retry(self):
+        agent, _, _ = self._setup_routed_agent_turn()
+        receipt = self.store.claim_outbox("sender", now=104)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=105,
+        )
+        preview = self.store.claim_outbox("sender", now=106)
+        self.store.complete_outbox(
+            preview.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=107,
+        )
+        mailbox = self.store.claim_agent_mailbox(
+            "agent-1",
+            now=109,
+            lease_seconds=10,
+        )
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            "agent-1",
+            "turn-expiring",
+            now=110,
+        )
+        self.store.ingest_update(
+            message_update(13, text="new direction", reply_to_message_id=700),
+            now=111,
+        )
+        source_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 13"
+            ).fetchone()["job_id"]
+        )
+        control = self.store.enqueue_agent_steer_from_receipt(
+            agent.agent_id,
+            source_job_id,
+            "new direction",
+            123,
+            None,
+            700,
+            now=112,
+        )
+        in_flight = self.store.claim_agent_turn_control(
+            mailbox.mailbox_id,
+            "agent-1",
+            now=113,
+        )
+        self.assertEqual(in_flight.control_id, control.control_id)
+        retried = self.store.claim_agent_mailbox("agent-2", now=121)
+        self.assertEqual(retried.mailbox_id, mailbox.mailbox_id)
+        self.assertIsNone(retried.provider_turn_id)
+        control_row = self.store.connection.execute(
+            """
+            SELECT state, result_text
+            FROM agent_turn_controls
+            WHERE control_id = ?
+            """,
+            (control.control_id,),
+        ).fetchone()
+        self.assertEqual(control_row["state"], "rejected")
+        self.assertIn("ended", control_row["result_text"])
 
     def test_receipt_after_agent_completion_still_retargets_route(self):
         agent, _, _ = self._setup_routed_agent_turn()
@@ -1302,8 +1708,9 @@ class DurableStoreTests(unittest.TestCase):
                 final_edit,
                 "sender",
             )
-        # The edit was rejected, so route ownership must stay with the router.
-        self.assertEqual(self._resolve_route(700, 111).target_type, "controller")
+        # Dispatch already transferred reply ownership so the active turn can
+        # be steered even if its later final-text edit fails.
+        self.assertEqual(self._resolve_route(700, 111).target_type, "agent")
         fallback = self.store.claim_outbox("sender", now=10**12)
         self.assertEqual(fallback.method, "sendMessage")
         self.assertEqual(
@@ -1320,8 +1727,8 @@ class DurableStoreTests(unittest.TestCase):
             {"message_id": 701, "chat": {"id": 123}},
             now=113,
         )
-        self.assertEqual(self._resolve_route(700, 114).target_type, "controller")
-        self.assertEqual(self._resolve_route(701, 114).target_type, "controller")
+        self.assertEqual(self._resolve_route(700, 114).target_type, "agent")
+        self.assertEqual(self._resolve_route(701, 114).target_type, "agent")
 
     def _retargeted_final_message(self):
         agent, _, _ = self._setup_routed_agent_turn()
@@ -2734,6 +3141,136 @@ class SchemaCompatibilityTests(unittest.TestCase):
                 self.assertIsNone(keys["normal:agent-final-edit:status"])
                 self.assertIsNone(keys["router-mailbox:x:final-edit"])
 
+    def test_schema_sixteen_database_adds_durable_live_controls(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-sixteen.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for migration in (
+                MIGRATION_1,
+                MIGRATION_2,
+                MIGRATION_3,
+                MIGRATION_4,
+                MIGRATION_5,
+                MIGRATION_6,
+                MIGRATION_7,
+                MIGRATION_8,
+                MIGRATION_9,
+                MIGRATION_10,
+                MIGRATION_11,
+                MIGRATION_12,
+                MIGRATION_13,
+                MIGRATION_14,
+                MIGRATION_15,
+                MIGRATION_16,
+            ):
+                for statement in migration:
+                    connection.execute(statement)
+            connection.execute(
+                """
+                INSERT INTO telegram_updates(
+                    update_id, raw_json, received_at, ingest_state
+                )
+                VALUES (41, '{}', 100, 'accepted')
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO inbox_jobs(
+                    job_id, update_id, kind, payload_json, state, attempts,
+                    available_at, created_at, updated_at
+                )
+                VALUES (51, 41, 'message', '{}', 'succeeded', 1, 100, 100, 100)
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO surface_bindings(
+                    binding_id, chat_id, message_thread_id, surface_type,
+                    display_name, target_type, target_id, state,
+                    created_at, updated_at
+                )
+                VALUES (
+                    61, 123, 62, 'project', 'Legacy', 'agent',
+                    'agent_legacy', 'active', 100, 100
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO agents(
+                    agent_id, parent_agent_id, role, slug, hierarchical_name,
+                    provider, project_path, provider_session_id,
+                    surface_binding_id, lifecycle_state, created_at, updated_at,
+                    provider_config_json, working_directory,
+                    git_repository_root
+                )
+                VALUES (
+                    'agent_legacy', NULL, 'project', 'legacy',
+                    'tc--root--legacy', 'codex', '/tmp/legacy',
+                    'session-legacy', 61, 'running', 100, 100, '{}',
+                    '/tmp/legacy', '/tmp/legacy'
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO agent_mailbox(
+                    mailbox_id, agent_id, source_inbox_job_id, input_text,
+                    provider_session_id, state, attempts, available_at,
+                    lease_owner, lease_expires_at, last_error, response_text,
+                    usage_json, reply_chat_id, reply_message_thread_id,
+                    created_at, updated_at
+                )
+                VALUES (
+                    71, 'agent_legacy', 51, 'legacy work',
+                    'session-legacy', 'leased', 2, 100, 'legacy-worker',
+                    999, NULL, NULL, NULL, 123, 62, 100, 100
+                )
+                """
+            )
+            connection.execute("PRAGMA user_version = 16")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+                mailbox_columns = {
+                    str(row["name"])
+                    for row in store.connection.execute(
+                        "PRAGMA table_info(agent_mailbox)"
+                    ).fetchall()
+                }
+                self.assertIn("provider_turn_id", mailbox_columns)
+                controls = store.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM sqlite_master
+                    WHERE type = 'table' AND name = 'agent_turn_controls'
+                    """
+                ).fetchone()[0]
+                self.assertEqual(controls, 1)
+                preserved = store.connection.execute(
+                    """
+                    SELECT mailbox_id, provider_turn_id, state, attempts,
+                        reply_chat_id, reply_message_thread_id
+                    FROM agent_mailbox
+                    WHERE mailbox_id = 71
+                    """
+                ).fetchone()
+                self.assertEqual(int(preserved["mailbox_id"]), 71)
+                self.assertIsNone(preserved["provider_turn_id"])
+                self.assertEqual(str(preserved["state"]), "leased")
+                self.assertEqual(int(preserved["attempts"]), 2)
+                self.assertEqual(int(preserved["reply_chat_id"]), 123)
+                self.assertEqual(
+                    int(preserved["reply_message_thread_id"]),
+                    62,
+                )
+                self.assertEqual(store.quick_check(), "ok")
+
     def test_cli_fails_cleanly_for_non_database_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "corrupt.sqlite3"
@@ -2864,6 +3401,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 mailbox_session_id,
                 on_session,
                 heartbeat,
+                on_progress=None,
+                poll_control=None,
+                on_control=None,
             ):
                 self.prompt = prompt
                 on_session("project-session-123")
@@ -4108,7 +4648,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(receipt.params["chat_id"], 123)
                 self.assertEqual(
                     receipt.params["text"],
-                    "⏳ <b>telegram-control is working…</b>",
+                    "📨 <b>Queued for telegram-control</b>",
                 )
                 self.assertEqual(receipt.params["parse_mode"], "HTML")
 
@@ -5029,6 +5569,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 mailbox_session_id,
                 on_session,
                 heartbeat,
+                on_progress=None,
+                poll_control=None,
+                on_control=None,
             ):
                 self.assertions = (
                     agent.hierarchical_name,
@@ -5092,7 +5635,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 receipt = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     receipt.params["text"],
-                    "⏳ <b>telegram-control is working…</b>",
+                    "📨 <b>Queued for telegram-control</b>",
                 )
                 self.assertEqual(receipt.params["parse_mode"], "HTML")
                 store.complete_outbox(
@@ -5279,7 +5822,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 "TELEGRAM_CHAT_ID": "123",
                 "TELEGRAM_MESSAGE_THREAD_ID": "62",
             }
-            with mock.patch.dict(os.environ, environment, clear=False):
+            with mock.patch.dict(os.environ, environment, clear=True):
                 with mock.patch.object(on_message.bridge, "download_telegram_file"):
                     with mock.patch.object(on_message, "convert_to_wav"):
                         with mock.patch.object(
@@ -5293,6 +5836,15 @@ class DurableIntegrationTests(unittest.TestCase):
                             )
 
             with DurableStore(database_path) as store:
+                stop_action = store.connection.execute(
+                    """
+                    SELECT authorized_user_id
+                    FROM callback_actions
+                    WHERE action_type = 'agent_turn_stop'
+                    """
+                ).fetchone()
+                self.assertIsNotNone(stop_action)
+                self.assertEqual(int(stop_action["authorized_user_id"]), 123)
                 receipt = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     receipt.params["text"],

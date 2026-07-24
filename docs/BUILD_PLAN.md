@@ -136,18 +136,26 @@ reused automatically.
 
 ### Conversation surfaces
 
-Begin with the paired private bot chat. Prefer Telegram's bot private-chat
-topics when enabled for the bot. If that feature is unavailable or awkward,
-use one private forum supergroup with topics. The persistence model always
-stores both `chat_id` and optional `message_thread_id`, so the transport can
-support either without redesign.
+Use one Slam Paws bot identity across every surface:
 
-Suggested surfaces:
+- the paired private bot chat is the global Control concierge;
+- each substantial workspace may use its own private forum group, with the same
+  bot added as an administrator;
+- topics inside that forum are durable subjects or workstreams;
+- smaller or temporary workspaces may share a forum instead of requiring a new
+  group.
 
-- `Control` — main Codex router and global commands.
-- one topic per project agent;
-- optional task topics bound directly to long-lived workers;
-- transient buttons for one-off routes and approvals.
+This gives large workspaces separate, spacious Telegram surfaces without
+creating another BotFather token or another controller process. A forum group
+maps to an authorized workspace; a topic maps to a lightweight subject
+orchestrator. The same `(chat_id, optional message_thread_id)` persistence
+model already used by private-chat topics supports all of these surfaces.
+Multiple bot identities remain an optional future extension and are not part
+of the current release.
+
+Transient buttons remain appropriate for approvals and one-off routes. Worker
+sessions normally remain underneath a topic rather than receiving their own
+Telegram surface.
 
 ### Return routes
 
@@ -494,10 +502,10 @@ Deliverables:
 
 - parent-enforced child creation;
 - full appended naming convention;
-- Claude adapter;
+- Codex native live-control adapter;
 - worker lifecycle and heartbeats;
 - project-agent controls for child inspection and cancellation;
-- project/task Telegram surfaces created on demand.
+- project/subject Telegram surfaces bound conversationally.
 
 Acceptance:
 
@@ -505,7 +513,10 @@ Acceptance:
 - grandchild name contains the full ancestry;
 - main router relays to the project agent by default;
 - parent and root views show the complete hierarchy;
-- all logical routes survive disposal of every tmux session.
+- all logical routes survive disposal of every optional tmux view.
+
+A Claude adapter remains a possible later provider implementation. It is not a
+release gate while Codex is the selected provider.
 
 ### Stage 6 — Voice responses
 
@@ -604,8 +615,9 @@ duplicate operations.
 
 ## Decisions intentionally deferred
 
-- Private bot topics versus a private forum supergroup: implement a common
-  `(chat_id, topic_id)` abstraction, then choose after a live UI test.
+- Additional bot identities: use one Slam Paws identity across private forum
+  groups first. Add bot-token namespacing only if a real Telegram usability or
+  isolation limitation appears.
 - Rich provider responses: controller-owned statuses may use escaped Telegram
   HTML now. Before styling arbitrary agent output, build fixture coverage for a
   safe Markdown-to-entity renderer and evaluate Telegram Rich Messages. Never
@@ -1155,8 +1167,55 @@ offered as callable tools that can be used repeatedly in one turn. Mutations
 continue to create confirmation proposals rather than gaining direct Telegram,
 database, or credential access.
 
-Live steering of running Codex/Claude turns (interrupt and mid-turn input)
-follows this chunk.
+## Chunk: subject orchestrators
+
+The durable unit presented in Telegram is a **subject orchestrator**, not a
+worker session and not necessarily a Git project. The paired Slam Paws chat is
+the global orchestrator. A private forum group may bind to an authorized
+workspace such as `~/life` or a software repository, and each topic in that
+group may host a subject orchestrator scoped within that workspace.
+
+A subject orchestrator:
+
+- converses with the user and reasons about ambiguous or multi-step requests;
+- owns the subject's durable purpose, workspace boundary, decisions, active
+  jobs, worker results, and a compact rolling memory;
+- exposes validated controller capabilities as native Codex tools;
+- delegates substantive execution to Codex workers instead of doing the work
+  in its own conversational turn;
+- receives worker progress and results, summarizes them for the user, and can
+  steer, stop, retry, or create additional workers;
+- survives provider-session rotation by reconstructing a fresh session from
+  durable subject memory. Underlying provider sessions may compact or rotate,
+  but that lifecycle is invisible at the Telegram product layer.
+
+Workers are execution records underneath an orchestrator. They may be
+ephemeral or durable and may use different working directories within the
+orchestrator's authorized workspace. They do not receive Telegram topics by
+default; a separate topic is created only when the user explicitly wants a
+long-lived conversational surface for that worker or sub-subject.
+
+The first release keeps this deliberately small: one bot token, one controller
+process, one SQLite database, one global Control orchestrator, one workspace
+binding per private forum group, and one lightweight subject per provisioned
+topic. Subject turns may use a current Codex worker directly; the
+orchestrator/worker distinction is logical and does not require a separate
+daemon or actor runtime. Hierarchical sub-subjects, automatic worker fan-out,
+multiple bot identities, and richer long-term memory are extensions rather
+than prerequisites for basic messaging and voice use.
+
+Remaining release work:
+
+1. Deploy durable live progress, reply-to-steer, and Stop for Codex worker
+   turns, including race and restart recovery.
+2. Detect and conversationally bind private forum groups to arbitrary
+   workspaces; Git metadata remains optional.
+3. Give each forum topic lightweight durable subject state and conversational
+   worker/session controls, with proactive crash and hang reporting.
+4. Add adoption of discoverable existing Codex sessions, voice replies, and
+   status presentation polish.
+5. Run the full acceptance matrix and an independent Codex review before each
+   live schema migration and deployment.
 
 ## References
 

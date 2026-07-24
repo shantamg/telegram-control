@@ -29,6 +29,7 @@ from durable_store import (
     MIGRATION_14,
     MIGRATION_15,
     DurableStore,
+    SCHEMA_VERSION,
     StoreError,
     validate_workspace_paths,
 )
@@ -863,7 +864,7 @@ class SchemaFourteenMigrationTests(unittest.TestCase):
                     store.connection.execute(
                         "PRAGMA user_version"
                     ).fetchone()[0],
-                    16,
+                    SCHEMA_VERSION,
                 )
                 project = store.resolve_project("legacy")
                 self.assertEqual(project.project_id, "project_legacy")

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 CONTROL_SPEAKER = "🎛 Control"
 
@@ -138,6 +138,19 @@ class AgentMailboxJob:
     source_inbox_job_id: int
     input_text: str
     provider_session_id: Optional[str]
+    attempts: int
+    provider_turn_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class AgentTurnControl:
+    control_id: int
+    mailbox_id: int
+    source_inbox_job_id: int
+    control_type: str
+    input_text: str
+    expected_turn_id: Optional[str]
+    state: str
     attempts: int
 
 
@@ -689,6 +702,93 @@ MIGRATION_16 = (
     """,
 )
 
+MIGRATION_17 = (
+    # A provider turn can now be steered or interrupted while its mailbox
+    # lease is active. Rebuild the mailbox to add exact provider-turn
+    # identity and an explicit cancelled terminal state.
+    """
+    CREATE TABLE agent_mailbox_v17 (
+        mailbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id TEXT NOT NULL
+            REFERENCES agents(agent_id) ON DELETE RESTRICT,
+        source_inbox_job_id INTEGER NOT NULL UNIQUE
+            REFERENCES inbox_jobs(job_id) ON DELETE RESTRICT,
+        input_text TEXT NOT NULL,
+        provider_session_id TEXT,
+        provider_turn_id TEXT,
+        state TEXT NOT NULL
+            CHECK (state IN (
+                'queued', 'leased', 'succeeded', 'cancelled', 'dead'
+            )),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        available_at REAL NOT NULL,
+        lease_owner TEXT,
+        lease_expires_at REAL,
+        last_error TEXT,
+        response_text TEXT,
+        usage_json TEXT,
+        reply_chat_id INTEGER,
+        reply_message_thread_id INTEGER,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    INSERT INTO agent_mailbox_v17(
+        mailbox_id, agent_id, source_inbox_job_id, input_text,
+        provider_session_id, provider_turn_id, state, attempts, available_at,
+        lease_owner, lease_expires_at, last_error, response_text, usage_json,
+        reply_chat_id, reply_message_thread_id, created_at, updated_at
+    )
+    SELECT mailbox_id, agent_id, source_inbox_job_id, input_text,
+        provider_session_id, NULL, state, attempts, available_at,
+        lease_owner, lease_expires_at, last_error, response_text, usage_json,
+        reply_chat_id, reply_message_thread_id, created_at, updated_at
+    FROM agent_mailbox
+    """,
+    """
+    DROP TABLE agent_mailbox
+    """,
+    """
+    ALTER TABLE agent_mailbox_v17 RENAME TO agent_mailbox
+    """,
+    """
+    CREATE INDEX agent_mailbox_ready
+    ON agent_mailbox(state, available_at, mailbox_id)
+    """,
+    """
+    CREATE INDEX agent_mailbox_agent
+    ON agent_mailbox(agent_id, state, mailbox_id)
+    """,
+    """
+    CREATE TABLE agent_turn_controls (
+        control_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        mailbox_id INTEGER NOT NULL
+            REFERENCES agent_mailbox(mailbox_id) ON DELETE RESTRICT,
+        source_inbox_job_id INTEGER NOT NULL UNIQUE
+            REFERENCES inbox_jobs(job_id) ON DELETE RESTRICT,
+        control_type TEXT NOT NULL
+            CHECK (control_type IN ('steer', 'cancel')),
+        input_text TEXT NOT NULL DEFAULT '',
+        expected_turn_id TEXT,
+        state TEXT NOT NULL
+            CHECK (state IN (
+                'queued', 'delivery_in_flight', 'applied', 'rejected'
+            )),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        result_text TEXT,
+        reply_chat_id INTEGER NOT NULL,
+        reply_message_thread_id INTEGER NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX agent_turn_controls_ready
+    ON agent_turn_controls(mailbox_id, state, control_id)
+    """,
+)
+
 
 ROUTER_INPUT_LIMIT = 8_000
 REPLY_QUOTE_LIMIT = 1_000
@@ -1031,6 +1131,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 16
                 self.connection.execute("PRAGMA user_version = 16")
+            if current < 17:
+                for statement in MIGRATION_17:
+                    self.connection.execute(statement)
+                current = 17
+                self.connection.execute("PRAGMA user_version = 17")
             # Referential integrity is audited before the commit so a failed
             # check rolls the whole migration back instead of stranding an
             # upgraded-but-broken database.
@@ -1415,7 +1520,9 @@ class DurableStore:
             int(bool(one_time)),
         )
 
-        self.connection.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.connection.in_transaction
+        if owns_transaction:
+            self.connection.execute("BEGIN IMMEDIATE")
         try:
             existing = self.connection.execute(
                 "SELECT * FROM callback_actions WHERE operation_id = ?",
@@ -1440,7 +1547,8 @@ class DurableStore:
                         "with a different action."
                     )
                 action = self._callback_from_row(existing)
-                self.connection.execute("COMMIT")
+                if owns_transaction:
+                    self.connection.execute("COMMIT")
                 return action
 
             action = None
@@ -1484,10 +1592,12 @@ class DurableStore:
                 break
             if action is None:
                 raise StoreError("Could not allocate a unique callback token.")
-            self.connection.execute("COMMIT")
+            if owns_transaction:
+                self.connection.execute("COMMIT")
             return action
         except BaseException:
-            self.connection.execute("ROLLBACK")
+            if owns_transaction and self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
             raise
 
     @staticmethod
@@ -2235,7 +2345,10 @@ class DurableStore:
                                     SELECT agent_id
                                     FROM agent_mailbox
                                     WHERE source_inbox_job_id = ?
-                                        AND state = 'succeeded'
+                                        AND state IN (
+                                            'queued', 'leased', 'succeeded',
+                                            'cancelled', 'dead'
+                                        )
                                     """,
                                     (source_inbox_job_id,),
                                 ).fetchone()
@@ -2318,7 +2431,8 @@ class DurableStore:
                             mailbox = self.connection.execute(
                                 """
                                 SELECT mailbox_id, agent_id, state,
-                                    input_text, response_text, reply_chat_id
+                                    input_text, response_text, reply_chat_id,
+                                    provider_turn_id, last_error
                                 FROM agent_mailbox
                                 WHERE source_inbox_job_id = ?
                                 """,
@@ -2328,7 +2442,8 @@ class DurableStore:
                             mailbox = self.connection.execute(
                                 """
                                 SELECT mailbox_id, agent_id, state,
-                                    input_text, response_text, reply_chat_id
+                                    input_text, response_text, reply_chat_id,
+                                    provider_turn_id, last_error
                                 FROM agent_mailbox
                                 WHERE mailbox_id = ?
                                 """,
@@ -2377,6 +2492,43 @@ class DurableStore:
                             )
                         elif (
                             mailbox is not None
+                            and str(mailbox["state"]) == "leased"
+                            and mailbox["provider_turn_id"] is not None
+                        ):
+                            self._enqueue_agent_status_edit(
+                                int(mailbox["mailbox_id"]),
+                                "turn-started",
+                                (
+                                    f"{self.agent_speaker_header(str(mailbox['agent_id']))}"
+                                    "\n\n🧠 Codex is working…"
+                                ),
+                                timestamp,
+                            )
+                        elif mailbox is not None and str(mailbox["state"]) in {
+                            "cancelled",
+                            "dead",
+                        }:
+                            terminal_text = (
+                                f"{self.agent_speaker_header(str(mailbox['agent_id']))}"
+                                + (
+                                    "\n\n⏹ Cancelled."
+                                    if str(mailbox["state"]) == "cancelled"
+                                    else "\n\n❌ Codex could not complete this request."
+                                )
+                            )
+                            self._enqueue_agent_status_edit(
+                                int(mailbox["mailbox_id"]),
+                                (
+                                    "cancelled"
+                                    if str(mailbox["state"]) == "cancelled"
+                                    else "failed"
+                                ),
+                                terminal_text,
+                                timestamp,
+                                terminal=True,
+                            )
+                        elif (
+                            mailbox is not None
                             and card_spec.get("input_kind") == "voice"
                         ):
                             stage = (
@@ -2408,6 +2560,40 @@ class DurableStore:
                             )
                     else:
                         raise StoreError("Outbox agent-turn mode is invalid.")
+                    self.connection.execute("COMMIT")
+                    return
+                if card_spec.get("kind") == "agent_control":
+                    try:
+                        control_id = int(card_spec["control_id"])
+                        mode = str(card_spec["mode"])
+                    except (KeyError, TypeError, ValueError):
+                        raise StoreError(
+                            "Outbox agent-control metadata is invalid."
+                        ) from None
+                    if mode == "receipt":
+                        if row["method"] != "sendMessage" or not isinstance(
+                            result, dict
+                        ):
+                            raise StoreError(
+                                "Only sendMessage can deliver a control receipt."
+                            )
+                        try:
+                            int(result["message_id"])
+                        except (KeyError, TypeError, ValueError):
+                            raise StoreError(
+                                "Telegram result cannot identify its control receipt."
+                            ) from None
+                        self._enqueue_agent_control_result_edit(
+                            control_id,
+                            timestamp,
+                        )
+                    elif mode == "final_edit":
+                        if row["method"] != "editMessageText":
+                            raise StoreError(
+                                "Only editMessageText can finish a control card."
+                            )
+                    else:
+                        raise StoreError("Outbox agent-control mode is invalid.")
                     self.connection.execute("COMMIT")
                     return
                 try:
@@ -3954,6 +4140,12 @@ class DurableStore:
         reply_markup = self._router_reply_markup(mailbox_id)
         if reply_markup is not None:
             params["reply_markup"] = reply_markup
+        elif operation_suffix in {
+            "agent-final-edit",
+            "agent-failed-edit",
+            "agent-cancelled-edit",
+        }:
+            params["reply_markup"] = {"inline_keyboard": []}
         card: dict[str, Any] = {
             "kind": "router_turn",
             "mailbox_id": int(mailbox_id),
@@ -3974,7 +4166,11 @@ class DurableStore:
             serialize_key=f"router-turn:{int(mailbox_id)}",
             now=timestamp,
         )
-        if operation_suffix in {"agent-final-edit", "agent-failed-edit"}:
+        if operation_suffix in {
+            "agent-final-edit",
+            "agent-failed-edit",
+            "agent-cancelled-edit",
+        }:
             # The dispatch-preview edit for this receipt is now stale; a still
             # queued copy must never be delivered after the agent outcome.
             self.connection.execute(
@@ -4116,6 +4312,28 @@ class DurableStore:
         ).fetchone()
         return row is not None
 
+    def agent_status_edit_superseded(self, operation_id: str) -> bool:
+        """Prevent a stale live-status edit from overwriting a terminal card."""
+        match = re.fullmatch(
+            (
+                r"agent-mailbox:(\d+):"
+                r"(turn-started|stopping|retry-\d+|progress-[a-z]+|"
+                r"voice-(sending|working))"
+            ),
+            str(operation_id),
+        )
+        if match is None:
+            return False
+        row = self.connection.execute(
+            "SELECT state FROM agent_mailbox WHERE mailbox_id = ?",
+            (int(match.group(1)),),
+        ).fetchone()
+        return row is None or str(row["state"]) in {
+            "succeeded",
+            "cancelled",
+            "dead",
+        }
+
     def complete_router_mailbox(
         self,
         mailbox_id: int,
@@ -4195,14 +4413,36 @@ class DurableStore:
                 raise LeaseLostError(
                     f"Router mailbox lease for {mailbox_id} is no longer owned."
                 )
+            dispatch_mailbox_id: Optional[int] = None
             if dispatch_agent_id is not None and dispatch_message is not None:
                 agent = self.resolve_agent(dispatch_agent_id)
                 if agent is None or agent.role != "project":
                     raise StoreError("Router dispatch target is not a project agent.")
-                self.enqueue_agent_message(
+                dispatch_mailbox_id = self.enqueue_agent_message(
                     agent_id=dispatch_agent_id,
                     source_inbox_job_id=int(row["source_inbox_job_id"]),
                     input_text=dispatch_message,
+                    now=timestamp,
+                )
+                if row["authorized_user_id"] is None:
+                    raise StoreError("Router dispatch has no authorized user.")
+                self.create_callback_action(
+                    operation_id=f"agent-mailbox:{dispatch_mailbox_id}:stop",
+                    action_type="agent_turn_stop",
+                    payload={
+                        "agent_id": dispatch_agent_id,
+                        "mailbox_id": dispatch_mailbox_id,
+                        "label": "⏹ Stop",
+                    },
+                    chat_id=int(row["chat_id"]),
+                    message_thread_id=(
+                        int(row["message_thread_id"])
+                        if int(row["message_thread_id"]) != 0
+                        else None
+                    ),
+                    authorized_user_id=int(row["authorized_user_id"]),
+                    one_time=True,
+                    ttl_seconds=2 * 60 * 60,
                     now=timestamp,
                 )
             if clarification_options is not None:
@@ -4471,7 +4711,21 @@ class DurableStore:
                 """,
                 (provider_session_id, timestamp, main_agent.agent_id),
             )
-            self._enqueue_router_final_edit(mailbox_id, preview_text, timestamp)
+            dispatch_route = (
+                {
+                    "target_type": "agent",
+                    "target_id": str(dispatch_agent_id),
+                }
+                if dispatch_mailbox_id is not None
+                and dispatch_agent_id is not None
+                else None
+            )
+            self._enqueue_router_final_edit(
+                mailbox_id,
+                preview_text,
+                timestamp,
+                route_retarget=dispatch_route,
+            )
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -4544,16 +4798,35 @@ class DurableStore:
         timestamp = time.time() if now is None else float(now)
         row = self.connection.execute(
             """
-            SELECT chat_id, message_thread_id, preview_text
-            FROM router_mailbox
-            WHERE mailbox_id = ? AND state IN ('succeeded', 'dead')
-                AND preview_text IS NOT NULL
+            SELECT r.chat_id, r.message_thread_id, r.preview_text,
+                r.tool_name, a.agent_id
+            FROM router_mailbox AS r
+            LEFT JOIN agent_mailbox AS a
+                ON a.source_inbox_job_id = r.source_inbox_job_id
+            WHERE r.mailbox_id = ? AND r.state IN ('succeeded', 'dead')
+                AND r.preview_text IS NOT NULL
             """,
             (int(mailbox_id),),
         ).fetchone()
         if row is None:
             raise StoreError("Completed router response is unavailable for fallback.")
         thread_id = int(row["message_thread_id"])
+        route = {
+            "target_type": (
+                "agent"
+                if str(row["tool_name"] or "") == "send_to_agent"
+                and row["agent_id"] is not None
+                else "controller"
+            ),
+            "target_id": (
+                str(row["agent_id"])
+                if str(row["tool_name"] or "") == "send_to_agent"
+                and row["agent_id"] is not None
+                else "control"
+            ),
+            "policy": "reply",
+            "ttl_seconds": 30 * 24 * 60 * 60,
+        }
         return self.enqueue_api_call(
             operation_id=f"router-mailbox:{int(mailbox_id)}:final-fallback",
             method="sendMessage",
@@ -4562,12 +4835,7 @@ class DurableStore:
                 "message_thread_id": thread_id if thread_id != 0 else None,
                 "text": str(row["preview_text"]),
             },
-            route={
-                "target_type": "controller",
-                "target_id": "control",
-                "policy": "reply",
-                "ttl_seconds": 30 * 24 * 60 * 60,
-            },
+            route=route,
             now=timestamp,
         )
 
@@ -5335,6 +5603,7 @@ class DurableStore:
         message_thread_id: Optional[int],
         receipt_text: str,
         receipt_parse_mode: Optional[str] = None,
+        authorized_user_id: Optional[int] = None,
         now: Optional[float] = None,
     ) -> int:
         timestamp = time.time() if now is None else float(now)
@@ -5346,6 +5615,22 @@ class DurableStore:
                 input_text=input_text,
                 now=timestamp,
             )
+            if authorized_user_id is not None:
+                self.create_callback_action(
+                    operation_id=f"agent-mailbox:{mailbox_id}:stop",
+                    action_type="agent_turn_stop",
+                    payload={
+                        "agent_id": agent_id,
+                        "mailbox_id": mailbox_id,
+                        "label": "⏹ Stop",
+                    },
+                    chat_id=chat_id,
+                    message_thread_id=message_thread_id,
+                    authorized_user_id=int(authorized_user_id),
+                    one_time=True,
+                    ttl_seconds=2 * 60 * 60,
+                    now=timestamp,
+                )
             self.enqueue_agent_receipt(
                 agent_id,
                 source_inbox_job_id,
@@ -5400,6 +5685,799 @@ class DurableStore:
             "worker",
         }:
             raise StoreError("Managed agent route is no longer valid.")
+
+    @staticmethod
+    def _agent_control_from_row(row: sqlite3.Row) -> AgentTurnControl:
+        return AgentTurnControl(
+            control_id=int(row["control_id"]),
+            mailbox_id=int(row["mailbox_id"]),
+            source_inbox_job_id=int(row["source_inbox_job_id"]),
+            control_type=str(row["control_type"]),
+            input_text=str(row["input_text"]),
+            expected_turn_id=(
+                str(row["expected_turn_id"])
+                if row["expected_turn_id"] is not None
+                else None
+            ),
+            state=str(row["state"]),
+            attempts=int(row["attempts"]),
+        )
+
+    def _agent_receipt_target(
+        self,
+        mailbox_id: int,
+    ) -> Optional[dict[str, Any]]:
+        """Resolve the one Telegram card representing an agent mailbox."""
+        mailbox = self.connection.execute(
+            """
+            SELECT source_inbox_job_id
+            FROM agent_mailbox
+            WHERE mailbox_id = ?
+            """,
+            (int(mailbox_id),),
+        ).fetchone()
+        if mailbox is None:
+            return None
+        source_job_id = int(mailbox["source_inbox_job_id"])
+        direct = self.connection.execute(
+            """
+            SELECT params_json, telegram_result_json
+            FROM outbox_messages
+            WHERE operation_id IN (?, ?) AND state = 'sent'
+                AND telegram_result_json IS NOT NULL
+            ORDER BY message_id
+            LIMIT 1
+            """,
+            (
+                f"agent-input:{source_job_id}:receipt",
+                f"agent-mailbox:{int(mailbox_id)}:receipt",
+            ),
+        ).fetchone()
+        if direct is not None:
+            params = json.loads(direct["params_json"])
+            result = json.loads(direct["telegram_result_json"])
+            return {
+                "chat_id": int(params["chat_id"]),
+                "message_thread_id": int(params.get("message_thread_id") or 0),
+                "telegram_message_id": int(result["message_id"]),
+                "serialize_key": f"agent-turn:{int(mailbox_id)}",
+            }
+        router = self.connection.execute(
+            """
+            SELECT r.mailbox_id, o.params_json, o.telegram_result_json
+            FROM router_mailbox AS r
+            JOIN outbox_messages AS o
+                ON o.operation_id =
+                    'router-input:' || r.source_inbox_job_id || ':receipt'
+            WHERE r.source_inbox_job_id = ? AND r.tool_name = 'send_to_agent'
+                AND o.state = 'sent' AND o.telegram_result_json IS NOT NULL
+            """,
+            (source_job_id,),
+        ).fetchone()
+        if router is None:
+            return None
+        params = json.loads(router["params_json"])
+        result = json.loads(router["telegram_result_json"])
+        return {
+            "chat_id": int(params["chat_id"]),
+            "message_thread_id": int(params.get("message_thread_id") or 0),
+            "telegram_message_id": int(result["message_id"]),
+            "serialize_key": f"router-turn:{int(router['mailbox_id'])}",
+        }
+
+    def _agent_stop_reply_markup(
+        self,
+        mailbox_id: int,
+    ) -> Optional[dict[str, Any]]:
+        row = self.connection.execute(
+            """
+            SELECT token
+            FROM callback_actions
+            WHERE operation_id = ? AND action_type = 'agent_turn_stop'
+                AND state = 'active'
+            """,
+            (f"agent-mailbox:{int(mailbox_id)}:stop",),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "⏹ Stop",
+                        "callback_data": f"a:{str(row['token'])}",
+                    }
+                ]
+            ]
+        }
+
+    def _expire_agent_stop_action(
+        self,
+        mailbox_id: int,
+        timestamp: float,
+    ) -> None:
+        self.connection.execute(
+            """
+            UPDATE callback_actions
+            SET state = 'expired', updated_at = ?
+            WHERE operation_id = ? AND state = 'active'
+            """,
+            (timestamp, f"agent-mailbox:{int(mailbox_id)}:stop"),
+        )
+
+    def _enqueue_agent_status_edit(
+        self,
+        mailbox_id: int,
+        operation_suffix: str,
+        text: str,
+        timestamp: float,
+        terminal: bool = False,
+    ) -> bool:
+        target = self._agent_receipt_target(mailbox_id)
+        if target is None:
+            return False
+        params: dict[str, Any] = {
+            "chat_id": int(target["chat_id"]),
+            "message_id": int(target["telegram_message_id"]),
+            "text": str(text)[:3800],
+        }
+        if terminal:
+            params["reply_markup"] = {"inline_keyboard": []}
+        else:
+            markup = self._agent_stop_reply_markup(mailbox_id)
+            if markup is not None:
+                params["reply_markup"] = markup
+            else:
+                params["reply_markup"] = {"inline_keyboard": []}
+        self.enqueue_api_call(
+            operation_id=(
+                f"agent-mailbox:{int(mailbox_id)}:{operation_suffix}"
+            ),
+            method="editMessageText",
+            params=params,
+            card={
+                "kind": "agent_turn",
+                "mailbox_id": int(mailbox_id),
+                "mode": "status_edit",
+                "terminal": bool(terminal),
+            },
+            serialize_key=str(target["serialize_key"]),
+            now=timestamp,
+        )
+        return True
+
+    def attach_agent_mailbox_turn(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        provider_turn_id: str,
+        now: Optional[float] = None,
+    ) -> None:
+        turn_id = str(provider_turn_id).strip()
+        if not turn_id or len(turn_id) > 256:
+            raise StoreError("Provider turn ID is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT m.provider_turn_id, m.agent_id, a.provider
+                FROM agent_mailbox AS m
+                JOIN agents AS a ON a.agent_id = m.agent_id
+                WHERE m.mailbox_id = ? AND m.state = 'leased'
+                    AND m.lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Agent mailbox lease for {mailbox_id} is no longer owned."
+                )
+            existing = row["provider_turn_id"]
+            if existing is not None and str(existing) != turn_id:
+                raise StoreError("Managed agent provider turn changed unexpectedly.")
+            self.connection.execute(
+                """
+                UPDATE agent_mailbox
+                SET provider_turn_id = ?, updated_at = ?
+                WHERE mailbox_id = ?
+                """,
+                (turn_id, timestamp, int(mailbox_id)),
+            )
+            self.connection.execute(
+                """
+                UPDATE agent_turn_controls
+                SET expected_turn_id = ?, updated_at = ?
+                WHERE mailbox_id = ? AND control_type = 'cancel'
+                    AND state = 'queued' AND expected_turn_id IS NULL
+                """,
+                (turn_id, timestamp, int(mailbox_id)),
+            )
+            speaker = self.agent_speaker_header(str(row["agent_id"]))
+            provider_name = "Claude" if str(row["provider"]) == "claude" else "Codex"
+            self._enqueue_agent_status_edit(
+                mailbox_id,
+                "turn-started",
+                f"{speaker}\n\n🧠 {provider_name} is working…",
+                timestamp,
+            )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def update_agent_mailbox_progress(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        stage: str,
+        now: Optional[float] = None,
+    ) -> None:
+        labels = {
+            "starting": "🚀 Starting Codex…",
+            "steering": "🧭 Applying new guidance…",
+            "working": "🧠 Codex is continuing…",
+            "responding": "✍️ Codex is preparing the response…",
+            "cancelling": "⏹ Stopping Codex…",
+        }
+        if stage not in labels:
+            return
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT agent_id
+                FROM agent_mailbox
+                WHERE mailbox_id = ? AND state = 'leased'
+                    AND lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Agent mailbox lease for {mailbox_id} is no longer owned."
+                )
+            speaker = self.agent_speaker_header(str(row["agent_id"]))
+            self._enqueue_agent_status_edit(
+                mailbox_id,
+                f"progress-{stage}",
+                f"{speaker}\n\n{labels[stage]}",
+                timestamp,
+            )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def enqueue_agent_steer_from_receipt(
+        self,
+        agent_id: str,
+        source_inbox_job_id: int,
+        input_text: str,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        replied_message_id: int,
+        now: Optional[float] = None,
+    ) -> Optional[AgentTurnControl]:
+        """Create a steer only for the exact receipt of a live provider turn."""
+        text = input_text.strip()
+        if not text or len(text) > ROUTER_INPUT_LIMIT:
+            raise StoreError("Agent steering input must contain 1 to 8000 characters.")
+        timestamp = time.time() if now is None else float(now)
+        thread_id = int(message_thread_id) if message_thread_id is not None else 0
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self._validate_agent_reply_route(
+                agent_id,
+                chat_id,
+                thread_id,
+                replied_message_id,
+                timestamp,
+            )
+            rows = self.connection.execute(
+                """
+                SELECT mailbox_id, provider_turn_id
+                FROM agent_mailbox
+                WHERE agent_id = ? AND state = 'leased'
+                    AND provider_turn_id IS NOT NULL
+                ORDER BY mailbox_id DESC
+                """,
+                (agent_id,),
+            ).fetchall()
+            mailbox_id: Optional[int] = None
+            provider_turn_id: Optional[str] = None
+            for row in rows:
+                target = self._agent_receipt_target(int(row["mailbox_id"]))
+                if (
+                    target is not None
+                    and int(target["chat_id"]) == int(chat_id)
+                    and int(target["message_thread_id"]) == thread_id
+                    and int(target["telegram_message_id"])
+                    == int(replied_message_id)
+                ):
+                    mailbox_id = int(row["mailbox_id"])
+                    provider_turn_id = str(row["provider_turn_id"])
+                    break
+            if mailbox_id is None or provider_turn_id is None:
+                self.connection.execute("COMMIT")
+                return None
+            self.connection.execute(
+                """
+                INSERT INTO agent_turn_controls(
+                    mailbox_id, source_inbox_job_id, control_type, input_text,
+                    expected_turn_id, state, attempts, reply_chat_id,
+                    reply_message_thread_id, created_at, updated_at
+                )
+                VALUES (?, ?, 'steer', ?, ?, 'queued', 0, ?, ?, ?, ?)
+                ON CONFLICT(source_inbox_job_id) DO NOTHING
+                """,
+                (
+                    mailbox_id,
+                    int(source_inbox_job_id),
+                    text,
+                    provider_turn_id,
+                    int(chat_id),
+                    thread_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = self.connection.execute(
+                """
+                SELECT * FROM agent_turn_controls
+                WHERE source_inbox_job_id = ?
+                """,
+                (int(source_inbox_job_id),),
+            ).fetchone()
+            if (
+                row is None
+                or int(row["mailbox_id"]) != mailbox_id
+                or str(row["control_type"]) != "steer"
+                or str(row["input_text"]) != text
+                or str(row["expected_turn_id"]) != provider_turn_id
+            ):
+                raise StoreError(
+                    "Inbox job was reused for a different steering request."
+                )
+            control = self._agent_control_from_row(row)
+            speaker = html.escape(self.agent_speaker_header(agent_id))
+            excerpt = html.escape(text[:1200])
+            self.enqueue_api_call(
+                operation_id=f"agent-control:{control.control_id}:receipt",
+                method="sendMessage",
+                params={
+                    "chat_id": int(chat_id),
+                    "message_thread_id": (
+                        int(message_thread_id)
+                        if message_thread_id is not None
+                        else None
+                    ),
+                    "text": (
+                        f"🧭 <b>Steering {speaker}…</b>\n"
+                        f"<blockquote>{excerpt}</blockquote>"
+                    ),
+                    "parse_mode": "HTML",
+                },
+                route={
+                    "target_type": "agent",
+                    "target_id": agent_id,
+                    "policy": "reply",
+                    "ttl_seconds": 30 * 24 * 60 * 60,
+                },
+                card={
+                    "kind": "agent_control",
+                    "control_id": control.control_id,
+                    "mode": "receipt",
+                },
+                serialize_key=f"agent-control:{control.control_id}",
+                now=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return control
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def claim_agent_turn_control(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        now: Optional[float] = None,
+    ) -> Optional[AgentTurnControl]:
+        """Lease the next control for this exact active provider turn."""
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            mailbox = self.connection.execute(
+                """
+                SELECT provider_turn_id
+                FROM agent_mailbox
+                WHERE mailbox_id = ? AND state = 'leased'
+                    AND lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if mailbox is None:
+                raise LeaseLostError(
+                    f"Agent mailbox lease for {mailbox_id} is no longer owned."
+                )
+            active_turn_id = (
+                str(mailbox["provider_turn_id"])
+                if mailbox["provider_turn_id"] is not None
+                else None
+            )
+            while True:
+                row = self.connection.execute(
+                    """
+                    SELECT *
+                    FROM agent_turn_controls
+                    WHERE mailbox_id = ? AND state = 'queued'
+                    ORDER BY control_id
+                    LIMIT 1
+                    """,
+                    (int(mailbox_id),),
+                ).fetchone()
+                if row is None:
+                    self.connection.execute("COMMIT")
+                    return None
+                expected_turn_id = (
+                    str(row["expected_turn_id"])
+                    if row["expected_turn_id"] is not None
+                    else None
+                )
+                if (
+                    active_turn_id is None
+                    or expected_turn_id is None
+                    or expected_turn_id != active_turn_id
+                ):
+                    self.connection.execute(
+                        """
+                        UPDATE agent_turn_controls
+                        SET state = 'rejected',
+                            result_text =
+                                'The requested provider turn is no longer active.',
+                            updated_at = ?
+                        WHERE control_id = ? AND state = 'queued'
+                        """,
+                        (timestamp, int(row["control_id"])),
+                    )
+                    continue
+                cursor = self.connection.execute(
+                    """
+                    UPDATE agent_turn_controls
+                    SET state = 'delivery_in_flight', attempts = attempts + 1,
+                        updated_at = ?
+                    WHERE control_id = ? AND state = 'queued'
+                    """,
+                    (timestamp, int(row["control_id"])),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                claimed = self.connection.execute(
+                    "SELECT * FROM agent_turn_controls WHERE control_id = ?",
+                    (int(row["control_id"]),),
+                ).fetchone()
+                self.connection.execute("COMMIT")
+                return self._agent_control_from_row(claimed)
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def _enqueue_agent_control_result_edit(
+        self,
+        control_id: int,
+        timestamp: float,
+    ) -> bool:
+        row = self.connection.execute(
+            """
+            SELECT c.*, o.params_json, o.telegram_result_json
+            FROM agent_turn_controls AS c
+            JOIN outbox_messages AS o
+                ON o.operation_id =
+                    'agent-control:' || c.control_id || ':receipt'
+            WHERE c.control_id = ? AND c.state IN ('applied', 'rejected')
+                AND o.state = 'sent' AND o.telegram_result_json IS NOT NULL
+            """,
+            (int(control_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        params = json.loads(row["params_json"])
+        result = json.loads(row["telegram_result_json"])
+        try:
+            chat_id = int(params["chat_id"])
+            message_id = int(result["message_id"])
+        except (KeyError, TypeError, ValueError):
+            raise StoreError(
+                "Stored Telegram steering receipt is invalid."
+            ) from None
+        result_text = str(row["result_text"] or "").strip()
+        if str(row["state"]) == "applied":
+            if str(row["control_type"]) == "steer":
+                text = "✅ <b>Guidance added to the active Codex turn.</b>"
+            else:
+                text = "⏹ <b>Stop request accepted.</b>"
+        else:
+            text = "⚠️ <b>That live control could not be applied.</b>"
+        if result_text:
+            text += f"\n\n{html.escape(result_text[:1400])}"
+        self.enqueue_api_call(
+            operation_id=f"agent-control:{int(control_id)}:final-edit",
+            method="editMessageText",
+            params={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "parse_mode": "HTML",
+                "reply_markup": {"inline_keyboard": []},
+            },
+            card={
+                "kind": "agent_control",
+                "control_id": int(control_id),
+                "mode": "final_edit",
+            },
+            serialize_key=f"agent-control:{int(control_id)}",
+            now=timestamp,
+        )
+        return True
+
+    def _enqueue_finished_agent_control_edits(
+        self,
+        mailbox_id: int,
+        timestamp: float,
+    ) -> None:
+        rows = self.connection.execute(
+            """
+            SELECT control_id
+            FROM agent_turn_controls
+            WHERE mailbox_id = ? AND state IN ('applied', 'rejected')
+            ORDER BY control_id
+            """,
+            (int(mailbox_id),),
+        ).fetchall()
+        for row in rows:
+            self._enqueue_agent_control_result_edit(
+                int(row["control_id"]),
+                timestamp,
+            )
+
+    def finish_agent_turn_control(
+        self,
+        control_id: int,
+        mailbox_id: int,
+        worker_id: str,
+        outcome: str,
+        detail: str,
+        now: Optional[float] = None,
+    ) -> None:
+        if outcome not in {"applied", "rejected"}:
+            raise StoreError("Agent turn control outcome is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            mailbox = self.connection.execute(
+                """
+                SELECT 1
+                FROM agent_mailbox
+                WHERE mailbox_id = ? AND state = 'leased'
+                    AND lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if mailbox is None:
+                raise LeaseLostError(
+                    f"Agent mailbox lease for {mailbox_id} is no longer owned."
+                )
+            cursor = self.connection.execute(
+                """
+                UPDATE agent_turn_controls
+                SET state = ?, result_text = ?, updated_at = ?
+                WHERE control_id = ? AND mailbox_id = ?
+                    AND state = 'delivery_in_flight'
+                """,
+                (
+                    outcome,
+                    str(detail)[:2000],
+                    timestamp,
+                    int(control_id),
+                    int(mailbox_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("Agent turn control is no longer in flight.")
+            self._enqueue_agent_control_result_edit(control_id, timestamp)
+            self.connection.execute("COMMIT")
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def request_agent_turn_cancel(
+        self,
+        mailbox_id: int,
+        agent_id: str,
+        source_inbox_job_id: int,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        now: Optional[float] = None,
+    ) -> str:
+        """Persist Stop, or cancel locally if the provider has not started."""
+        timestamp = time.time() if now is None else float(now)
+        thread_id = int(message_thread_id) if message_thread_id is not None else 0
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT state, provider_turn_id
+                FROM agent_mailbox
+                WHERE mailbox_id = ? AND agent_id = ?
+                """,
+                (int(mailbox_id), agent_id),
+            ).fetchone()
+            if row is None:
+                raise StoreError("That managed turn no longer exists.")
+            state = str(row["state"])
+            if state in {"succeeded", "cancelled", "dead"}:
+                self.connection.execute("COMMIT")
+                return "finished"
+            if state == "queued":
+                self.connection.execute(
+                    """
+                    UPDATE agent_mailbox
+                    SET state = 'cancelled',
+                        last_error = 'Cancelled before start.',
+                        updated_at = ?
+                    WHERE mailbox_id = ? AND state = 'queued'
+                    """,
+                    (timestamp, int(mailbox_id)),
+                )
+                self._expire_agent_stop_action(mailbox_id, timestamp)
+                self._enqueue_agent_status_edit(
+                    mailbox_id,
+                    "cancelled",
+                    f"{self.agent_speaker_header(agent_id)}\n\n⏹ Cancelled.",
+                    timestamp,
+                    terminal=True,
+                )
+                self.connection.execute("COMMIT")
+                return "cancelled"
+            provider_turn_id = (
+                str(row["provider_turn_id"])
+                if row["provider_turn_id"] is not None
+                else None
+            )
+            self.connection.execute(
+                """
+                INSERT INTO agent_turn_controls(
+                    mailbox_id, source_inbox_job_id, control_type, input_text,
+                    expected_turn_id, state, attempts, reply_chat_id,
+                    reply_message_thread_id, created_at, updated_at
+                )
+                VALUES (?, ?, 'cancel', '', ?, 'queued', 0, ?, ?, ?, ?)
+                ON CONFLICT(source_inbox_job_id) DO NOTHING
+                """,
+                (
+                    int(mailbox_id),
+                    int(source_inbox_job_id),
+                    provider_turn_id,
+                    int(chat_id),
+                    thread_id,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            control = self.connection.execute(
+                """
+                SELECT mailbox_id, control_type, expected_turn_id
+                FROM agent_turn_controls
+                WHERE source_inbox_job_id = ?
+                """,
+                (int(source_inbox_job_id),),
+            ).fetchone()
+            if (
+                control is None
+                or int(control["mailbox_id"]) != int(mailbox_id)
+                or str(control["control_type"]) != "cancel"
+                or (
+                    (
+                        str(control["expected_turn_id"])
+                        if control["expected_turn_id"] is not None
+                        else None
+                    )
+                    != provider_turn_id
+                )
+            ):
+                raise StoreError("Inbox job was reused for a different Stop request.")
+            self._enqueue_agent_status_edit(
+                mailbox_id,
+                "stopping",
+                f"{self.agent_speaker_header(agent_id)}\n\n⏹ Stopping Codex…",
+                timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return "stopping" if provider_turn_id is not None else "starting"
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def cancel_agent_mailbox(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        detail: str,
+        now: Optional[float] = None,
+    ) -> None:
+        """Finish a leased mailbox after its provider turn was interrupted."""
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT agent_id
+                FROM agent_mailbox
+                WHERE mailbox_id = ? AND state = 'leased'
+                    AND lease_owner = ?
+                """,
+                (int(mailbox_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Agent mailbox lease for {mailbox_id} is no longer owned."
+                )
+            self.connection.execute(
+                """
+                UPDATE agent_mailbox
+                SET state = 'cancelled', lease_owner = NULL,
+                    lease_expires_at = NULL, provider_turn_id = NULL,
+                    last_error = ?, updated_at = ?
+                WHERE mailbox_id = ? AND state = 'leased'
+                    AND lease_owner = ?
+                """,
+                (
+                    str(detail)[:2000],
+                    timestamp,
+                    int(mailbox_id),
+                    worker_id,
+                ),
+            )
+            self.connection.execute(
+                """
+                UPDATE agents
+                SET lifecycle_state = 'registered', updated_at = ?
+                WHERE agent_id = ?
+                """,
+                (timestamp, str(row["agent_id"])),
+            )
+            self.connection.execute(
+                """
+                UPDATE agent_turn_controls
+                SET state = 'rejected',
+                    result_text = 'The provider turn was cancelled.',
+                    updated_at = ?
+                WHERE mailbox_id = ? AND state = 'queued'
+                """,
+                (timestamp, int(mailbox_id)),
+            )
+            self._enqueue_finished_agent_control_edits(mailbox_id, timestamp)
+            self._expire_agent_stop_action(mailbox_id, timestamp)
+            self._enqueue_agent_status_edit(
+                mailbox_id,
+                "cancelled",
+                f"{self.agent_speaker_header(str(row['agent_id']))}\n\n⏹ Cancelled.",
+                timestamp,
+                terminal=True,
+            )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
 
     def _insert_agent_reply_mailbox(
         self,
@@ -5474,6 +6552,7 @@ class DurableStore:
         replied_message_id: int,
         receipt_text: str,
         receipt_parse_mode: Optional[str] = None,
+        authorized_user_id: Optional[int] = None,
         now: Optional[float] = None,
     ) -> int:
         """Queue a reply-routed turn that answers on the replying surface.
@@ -5508,6 +6587,22 @@ class DurableStore:
                 thread_id,
                 timestamp,
             )
+            if authorized_user_id is not None:
+                self.create_callback_action(
+                    operation_id=f"agent-mailbox:{mailbox_id}:stop",
+                    action_type="agent_turn_stop",
+                    payload={
+                        "agent_id": agent_id,
+                        "mailbox_id": mailbox_id,
+                        "label": "⏹ Stop",
+                    },
+                    chat_id=chat_id,
+                    message_thread_id=message_thread_id,
+                    authorized_user_id=int(authorized_user_id),
+                    one_time=True,
+                    ttl_seconds=2 * 60 * 60,
+                    now=timestamp,
+                )
             params: dict[str, Any] = {
                 "chat_id": int(chat_id),
                 "message_thread_id": (
@@ -5616,6 +6711,7 @@ class DurableStore:
         chat_id: int,
         message_thread_id: Optional[int],
         replied_message_id: int,
+        authorized_user_id: Optional[int] = None,
         now: Optional[float] = None,
     ) -> int:
         """Queue the transcribed mailbox turn for a reply-routed voice note."""
@@ -5641,6 +6737,22 @@ class DurableStore:
                 thread_id,
                 timestamp,
             )
+            if authorized_user_id is not None:
+                self.create_callback_action(
+                    operation_id=f"agent-mailbox:{mailbox_id}:stop",
+                    action_type="agent_turn_stop",
+                    payload={
+                        "agent_id": agent_id,
+                        "mailbox_id": mailbox_id,
+                        "label": "⏹ Stop",
+                    },
+                    chat_id=chat_id,
+                    message_thread_id=message_thread_id,
+                    authorized_user_id=int(authorized_user_id),
+                    one_time=True,
+                    ttl_seconds=2 * 60 * 60,
+                    now=timestamp,
+                )
             self.enqueue_agent_voice_status(
                 source_inbox_job_id,
                 "sending",
@@ -5773,7 +6885,7 @@ class DurableStore:
             return None
         provider_row = self.connection.execute(
             """
-            SELECT a.provider, a.agent_id
+            SELECT a.provider, a.agent_id, m.mailbox_id
             FROM agent_mailbox AS m
             JOIN agents AS a ON a.agent_id = m.agent_id
             WHERE m.source_inbox_job_id = ?
@@ -5793,7 +6905,7 @@ class DurableStore:
             raise StoreError("Stored Telegram voice receipt is invalid.") from None
         return self.enqueue_api_call(
             operation_id=(
-                f"agent-input:{int(source_inbox_job_id)}:status:{stage}"
+                f"agent-mailbox:{int(provider_row['mailbox_id'])}:voice-{stage}"
             ),
             method="editMessageText",
             params={
@@ -5810,8 +6922,10 @@ class DurableStore:
             card={
                 "kind": "agent_turn",
                 "source_inbox_job_id": int(source_inbox_job_id),
+                "mailbox_id": int(provider_row["mailbox_id"]),
                 "mode": "status_edit",
             },
+            serialize_key=f"agent-turn:{int(provider_row['mailbox_id'])}",
             now=timestamp,
         )
 
@@ -5820,6 +6934,7 @@ class DurableStore:
         agent_id: str,
         source_inbox_job_id: int,
         input_text: str,
+        authorized_user_id: Optional[int] = None,
         now: Optional[float] = None,
     ) -> int:
         timestamp = time.time() if now is None else float(now)
@@ -5831,6 +6946,38 @@ class DurableStore:
                 input_text,
                 now=timestamp,
             )
+            if authorized_user_id is not None:
+                binding = self.connection.execute(
+                    """
+                    SELECT b.chat_id, b.message_thread_id
+                    FROM agents AS a
+                    JOIN surface_bindings AS b
+                        ON b.binding_id = a.surface_binding_id
+                    WHERE a.agent_id = ? AND b.state = 'active'
+                    """,
+                    (agent_id,),
+                ).fetchone()
+                if binding is None:
+                    raise StoreError("Managed agent surface is unavailable.")
+                self.create_callback_action(
+                    operation_id=f"agent-mailbox:{mailbox_id}:stop",
+                    action_type="agent_turn_stop",
+                    payload={
+                        "agent_id": agent_id,
+                        "mailbox_id": mailbox_id,
+                        "label": "⏹ Stop",
+                    },
+                    chat_id=int(binding["chat_id"]),
+                    message_thread_id=(
+                        int(binding["message_thread_id"])
+                        if int(binding["message_thread_id"]) != 0
+                        else None
+                    ),
+                    authorized_user_id=int(authorized_user_id),
+                    one_time=True,
+                    ttl_seconds=2 * 60 * 60,
+                    now=timestamp,
+                )
             self.enqueue_agent_voice_status(
                 source_inbox_job_id,
                 "sending",
@@ -5854,29 +7001,123 @@ class DurableStore:
         try:
             expired = self.connection.execute(
                 """
-                SELECT DISTINCT agent_id
+                SELECT mailbox_id, agent_id
                 FROM agent_mailbox
                 WHERE state = 'leased' AND lease_expires_at <= ?
                 """,
                 (timestamp,),
             ).fetchall()
-            self.connection.execute(
-                """
-                UPDATE agent_mailbox
-                SET state = 'queued', lease_owner = NULL,
-                    lease_expires_at = NULL, available_at = ?, updated_at = ?
-                WHERE state = 'leased' AND lease_expires_at <= ?
-                """,
-                (timestamp, timestamp, timestamp),
-            )
-            for row in expired:
+            for expired_row in expired:
+                expired_mailbox_id = int(expired_row["mailbox_id"])
+                durable_stop = self.connection.execute(
+                    """
+                    SELECT 1
+                    FROM agent_turn_controls
+                    WHERE mailbox_id = ? AND control_type = 'cancel'
+                        AND state IN (
+                            'queued', 'delivery_in_flight', 'applied'
+                        )
+                    LIMIT 1
+                    """,
+                    (expired_mailbox_id,),
+                ).fetchone()
+                if durable_stop is not None:
+                    self.connection.execute(
+                        """
+                        UPDATE agent_turn_controls
+                        SET state = 'applied',
+                            result_text =
+                                'Stop was completed during lease recovery.',
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND control_type = 'cancel'
+                            AND state IN ('queued', 'delivery_in_flight')
+                        """,
+                        (timestamp, expired_mailbox_id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE agent_turn_controls
+                        SET state = 'rejected',
+                            result_text =
+                                'The provider turn was cancelled before this guidance was applied.',
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND control_type = 'steer'
+                            AND state IN ('queued', 'delivery_in_flight')
+                        """,
+                        (timestamp, expired_mailbox_id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE agent_mailbox
+                        SET state = 'cancelled', lease_owner = NULL,
+                            lease_expires_at = NULL, provider_turn_id = NULL,
+                            last_error =
+                                'Recovered a durable Stop after worker lease expiry.',
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND state = 'leased'
+                            AND lease_expires_at <= ?
+                        """,
+                        (timestamp, expired_mailbox_id, timestamp),
+                    )
+                    self._expire_agent_stop_action(
+                        expired_mailbox_id,
+                        timestamp,
+                    )
+                    self._enqueue_finished_agent_control_edits(
+                        expired_mailbox_id,
+                        timestamp,
+                    )
+                    self._enqueue_agent_status_edit(
+                        expired_mailbox_id,
+                        "cancelled",
+                        (
+                            f"{self.agent_speaker_header(str(expired_row['agent_id']))}"
+                            "\n\n⏹ Cancelled."
+                        ),
+                        timestamp,
+                        terminal=True,
+                    )
+                else:
+                    self.connection.execute(
+                        """
+                        UPDATE agent_turn_controls
+                        SET state = 'rejected',
+                            result_text =
+                                'The provider turn ended before this control could be confirmed.',
+                            updated_at = ?
+                        WHERE mailbox_id = ?
+                            AND state IN ('queued', 'delivery_in_flight')
+                        """,
+                        (timestamp, expired_mailbox_id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE agent_mailbox
+                        SET state = 'queued', lease_owner = NULL,
+                            lease_expires_at = NULL,
+                            provider_turn_id = NULL, available_at = ?,
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND state = 'leased'
+                            AND lease_expires_at <= ?
+                        """,
+                        (
+                            timestamp,
+                            timestamp,
+                            expired_mailbox_id,
+                            timestamp,
+                        ),
+                    )
+                    self._enqueue_finished_agent_control_edits(
+                        expired_mailbox_id,
+                        timestamp,
+                    )
                 self.connection.execute(
                     """
                     UPDATE agents
                     SET lifecycle_state = 'registered', updated_at = ?
                     WHERE agent_id = ? AND lifecycle_state = 'running'
                     """,
-                    (timestamp, str(row["agent_id"])),
+                    (timestamp, str(expired_row["agent_id"])),
                 )
             row = self.connection.execute(
                 """
@@ -5950,6 +7191,11 @@ class DurableStore:
                 else None
             ),
             attempts=int(claimed["attempts"]),
+            provider_turn_id=(
+                str(claimed["provider_turn_id"])
+                if claimed["provider_turn_id"] is not None
+                else None
+            ),
         )
 
     def attach_agent_mailbox_session(
@@ -6095,7 +7341,8 @@ class DurableStore:
                 UPDATE agent_mailbox
                 SET provider_session_id = ?, state = 'succeeded',
                     lease_owner = NULL, lease_expires_at = NULL,
-                    response_text = ?, usage_json = ?, updated_at = ?
+                    provider_turn_id = NULL, response_text = ?,
+                    usage_json = ?, updated_at = ?
                 WHERE mailbox_id = ? AND state = 'leased'
                     AND lease_owner = ?
                 """,
@@ -6117,6 +7364,20 @@ class DurableStore:
                 """,
                 (provider_session_id, timestamp, str(row["agent_id"])),
             )
+            self.connection.execute(
+                """
+                UPDATE agent_turn_controls
+                SET state = 'rejected',
+                    result_text =
+                        'The provider turn finished before this control was applied.',
+                    updated_at = ?
+                WHERE mailbox_id = ?
+                    AND state IN ('queued', 'delivery_in_flight')
+                """,
+                (timestamp, int(mailbox_id)),
+            )
+            self._enqueue_finished_agent_control_edits(mailbox_id, timestamp)
+            self._expire_agent_stop_action(mailbox_id, timestamp)
             router_origin = self.connection.execute(
                 """
                 SELECT mailbox_id, chat_id, message_thread_id
@@ -6225,12 +7486,14 @@ class DurableStore:
                         "chat_id": delivery_chat_id,
                         "message_id": receipt_message_id,
                         "text": final_text,
+                        "reply_markup": {"inline_keyboard": []},
                     },
                     card={
                         "kind": "agent_turn",
                         "mailbox_id": mailbox_id,
                         "mode": "final_edit",
                     },
+                    serialize_key=f"agent-turn:{int(mailbox_id)}",
                     now=timestamp,
                 )
             chunks_to_send = (
@@ -6295,7 +7558,8 @@ class DurableStore:
                 """
                 UPDATE agent_mailbox
                 SET state = ?, available_at=?, lease_owner = NULL,
-                    lease_expires_at = NULL, last_error = ?, updated_at = ?
+                    lease_expires_at = NULL, provider_turn_id = NULL,
+                    last_error = ?, updated_at = ?
                 WHERE mailbox_id = ?
                 """,
                 (
@@ -6318,7 +7582,21 @@ class DurableStore:
                     str(row["agent_id"]),
                 ),
             )
+            self.connection.execute(
+                """
+                UPDATE agent_turn_controls
+                SET state = 'rejected',
+                    result_text =
+                        'The provider turn ended before this control was confirmed.',
+                    updated_at = ?
+                WHERE mailbox_id = ?
+                    AND state IN ('queued', 'delivery_in_flight')
+                """,
+                (timestamp, int(mailbox_id)),
+            )
+            self._enqueue_finished_agent_control_edits(mailbox_id, timestamp)
             if state == "dead":
+                self._expire_agent_stop_action(mailbox_id, timestamp)
                 router_origin = self.connection.execute(
                     """
                     SELECT mailbox_id
@@ -6350,6 +7628,28 @@ class DurableStore:
                         timestamp,
                         operation_suffix="agent-failed-edit",
                     )
+                else:
+                    self._enqueue_agent_status_edit(
+                        mailbox_id,
+                        "failed",
+                        (
+                            f"{self.agent_speaker_header(str(row['agent_id']))}"
+                            "\n\n❌ Codex could not complete this request. "
+                            "You can retry or rephrase it."
+                        ),
+                        timestamp,
+                        terminal=True,
+                    )
+            else:
+                self._enqueue_agent_status_edit(
+                    mailbox_id,
+                    f"retry-{attempts}",
+                    (
+                        f"{self.agent_speaker_header(str(row['agent_id']))}"
+                        "\n\n🔄 Codex will retry this turn."
+                    ),
+                    timestamp,
+                )
             self.connection.execute("COMMIT")
             return state
         except BaseException:
