@@ -624,6 +624,42 @@ def register_agent_command(args: argparse.Namespace) -> None:
     )
 
 
+def enroll_project_command(args: argparse.Namespace) -> None:
+    requested_path = Path(args.project_path).expanduser().resolve()
+    if not requested_path.is_dir():
+        raise StoreError(f"Project directory does not exist: {requested_path}")
+    git_result = subprocess.run(
+        ["git", "-C", str(requested_path), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+    )
+    if git_result.returncode != 0:
+        raise StoreError("Managed projects must be Git repositories.")
+    project_path = str(Path(git_result.stdout.strip()).resolve())
+    display_name = args.name or args.slug.replace("-", " ").title()
+    with open_store(args.db) as store:
+        project, created = store.enroll_project(
+            slug=args.slug,
+            display_name=display_name,
+            provider=args.provider,
+            project_path=project_path,
+        )
+    print(
+        json.dumps(
+            {
+                "created": created,
+                "project_id": project.project_id,
+                "slug": project.slug,
+                "display_name": project.display_name,
+                "provider": project.provider,
+                "project_path": project.project_path,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
 def resolve_cli_agent(store: DurableStore, name: str):
     agent = store.resolve_agent_by_name(name)
     if agent is None or agent.role not in {"project", "worker"}:
@@ -796,6 +832,20 @@ def build_parser() -> argparse.ArgumentParser:
         default="codex",
     )
     register_parser.set_defaults(function=register_agent_command)
+
+    enroll_parser = subparsers.add_parser(
+        "enroll-project",
+        help="Enroll a validated local Git repository for Telegram selection.",
+    )
+    enroll_parser.add_argument("slug", help="Stable lowercase project slug.")
+    enroll_parser.add_argument("project_path", help="Local Git project directory.")
+    enroll_parser.add_argument("--name", help="User-facing project name.")
+    enroll_parser.add_argument(
+        "--provider",
+        choices=("codex", "claude"),
+        default="codex",
+    )
+    enroll_parser.set_defaults(function=enroll_project_command)
 
     console_open_parser = subparsers.add_parser(
         "console-open",

@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -379,6 +380,57 @@ def send_agent_status() -> None:
         f"{usage_line}",
         reply_markup=keyboard,
     )
+
+
+def send_project_catalog() -> None:
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    if not database_path:
+        send_message("Project catalog requires the durable controller.")
+        return
+    with DurableStore(Path(database_path)) as store:
+        projects = store.list_projects()
+    if not projects:
+        send_message("No local projects are enrolled.")
+        return
+    lines = ["Enrolled projects", ""]
+    for project in projects:
+        lines.append(
+            f"{project.slug} — {project.display_name} ({project.provider})"
+        )
+    lines.extend(
+        [
+            "",
+            "Inside a provisioned project topic, send:",
+            "/agent create <slug>",
+        ]
+    )
+    send_message("\n".join(lines))
+
+
+def create_agent_from_catalog(project_slug: str) -> None:
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    if not database_path:
+        raise StoreError("Project creation requires the durable controller.")
+    chat_id, thread_id = surface_coordinates()
+    try:
+        with DurableStore(Path(database_path)) as store:
+            agent, created = store.attach_enrolled_project(
+                chat_id,
+                thread_id,
+                project_slug,
+            )
+    except StoreError as exc:
+        send_message(f"❌ {exc}")
+        return
+    if created:
+        send_message(
+            f"✅ Created managed agent {agent.hierarchical_name}.\n"
+            "Send a message in this topic to start its provider session."
+        )
+    else:
+        send_message(
+            f"✅ {agent.hierarchical_name} is already attached to this topic."
+        )
 
 
 def enqueue_agent_input(agent_id: str, text: str) -> None:
@@ -766,8 +818,16 @@ def main() -> int:
             text = str(message["text"])
             print(f"Received text message from @{username}: {text}", flush=True)
             replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
+            agent_create = re.fullmatch(
+                r"/agent\s+create\s+([a-z0-9]+(?:-[a-z0-9]+)*)",
+                text.strip().lower(),
+            )
             if text.strip().lower() == "/status":
                 send_status_card(update)
+            elif text.strip().lower() == "/projects":
+                send_project_catalog()
+            elif agent_create is not None:
+                create_agent_from_catalog(agent_create.group(1))
             elif text.strip().lower() in {"/agent", "/agent status"}:
                 send_agent_status()
             elif replied_message_id:

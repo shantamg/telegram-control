@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 class StoreError(RuntimeError):
@@ -135,6 +135,16 @@ class AgentMailboxJob:
 class AgentConsole:
     agent_id: str
     tmux_session_name: str
+    state: str
+
+
+@dataclass(frozen=True)
+class ManagedProject:
+    project_id: str
+    slug: str
+    display_name: str
+    provider: str
+    project_path: str
     state: str
 
 
@@ -404,6 +414,25 @@ MIGRATION_8 = (
     """,
 )
 
+MIGRATION_9 = (
+    """
+    CREATE TABLE managed_projects (
+        project_id TEXT PRIMARY KEY,
+        slug TEXT NOT NULL UNIQUE,
+        display_name TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK (provider IN ('codex', 'claude')),
+        project_path TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX managed_projects_state
+    ON managed_projects(state, slug)
+    """,
+)
+
 
 class DurableStore:
     """Small transactional repository used by collector, worker, and sender."""
@@ -489,6 +518,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 8
                 self.connection.execute("PRAGMA user_version = 8")
+            if current < 9:
+                for statement in MIGRATION_9:
+                    self.connection.execute(statement)
+                current = 9
+                self.connection.execute("PRAGMA user_version = 9")
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -1542,6 +1576,159 @@ class DurableStore:
             (hierarchical_name,),
         ).fetchone()
         return self._managed_agent_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _managed_project_from_row(row: sqlite3.Row) -> ManagedProject:
+        return ManagedProject(
+            project_id=str(row["project_id"]),
+            slug=str(row["slug"]),
+            display_name=str(row["display_name"]),
+            provider=str(row["provider"]),
+            project_path=str(row["project_path"]),
+            state=str(row["state"]),
+        )
+
+    def enroll_project(
+        self,
+        slug: str,
+        display_name: str,
+        provider: str,
+        project_path: str,
+        now: Optional[float] = None,
+    ) -> tuple[ManagedProject, bool]:
+        if (
+            len(slug) > 48
+            or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug)
+            or "--" in slug
+            or slug == "root"
+        ):
+            raise StoreError(
+                "Project slug must use lowercase letters, digits, and single hyphens."
+            )
+        name = display_name.strip()
+        if not name or len(name) > 128:
+            raise StoreError("Project display name must contain 1 to 128 characters.")
+        if provider not in {"codex", "claude"}:
+            raise StoreError("Project provider is invalid.")
+        if not project_path or not Path(project_path).is_absolute():
+            raise StoreError("Managed project path must be absolute.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self.connection.execute(
+                """
+                SELECT * FROM managed_projects
+                WHERE slug = ? OR project_path = ?
+                """,
+                (slug, project_path),
+            ).fetchone()
+            if existing is not None:
+                project = self._managed_project_from_row(existing)
+                expected = (slug, name, provider, project_path, "active")
+                actual = (
+                    project.slug,
+                    project.display_name,
+                    project.provider,
+                    project.project_path,
+                    project.state,
+                )
+                if actual != expected:
+                    raise StoreError(
+                        "Project slug or path is already enrolled differently."
+                    )
+                self.connection.execute("COMMIT")
+                return project, False
+            project_id = f"project_{secrets.token_urlsafe(12)}"
+            self.connection.execute(
+                """
+                INSERT INTO managed_projects(
+                    project_id, slug, display_name, provider, project_path,
+                    state, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (
+                    project_id,
+                    slug,
+                    name,
+                    provider,
+                    project_path,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM managed_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+            return self._managed_project_from_row(row), True
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def resolve_project(self, slug: str) -> Optional[ManagedProject]:
+        row = self.connection.execute(
+            """
+            SELECT * FROM managed_projects
+            WHERE slug = ? AND state = 'active'
+            """,
+            (slug,),
+        ).fetchone()
+        return self._managed_project_from_row(row) if row is not None else None
+
+    def list_projects(self) -> list[ManagedProject]:
+        rows = self.connection.execute(
+            """
+            SELECT * FROM managed_projects
+            WHERE state = 'active'
+            ORDER BY slug
+            """
+        ).fetchall()
+        return [self._managed_project_from_row(row) for row in rows]
+
+    def attach_enrolled_project(
+        self,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        project_slug: str,
+        now: Optional[float] = None,
+    ) -> tuple[ManagedAgent, bool]:
+        project = self.resolve_project(project_slug)
+        if project is None:
+            raise StoreError("That project is not enrolled.")
+        binding = self.resolve_surface_binding(chat_id, message_thread_id)
+        if binding is None or binding.surface_type != "project":
+            raise StoreError("Use this command inside a provisioned project topic.")
+        if binding.target_type == "agent":
+            agent = self.resolve_agent(binding.target_id)
+            if agent is None:
+                raise StoreError("Project topic references a missing managed agent.")
+            expected = (
+                project.slug,
+                project.provider,
+                project.project_path,
+                binding.binding_id,
+            )
+            actual = (
+                agent.slug,
+                agent.provider,
+                agent.project_path,
+                agent.surface_binding_id,
+            )
+            if actual != expected:
+                raise StoreError("This topic is attached to a different project.")
+            return agent, False
+        if (binding.target_type, binding.target_id) != ("controller", "control"):
+            raise StoreError("Project topic is not eligible for agent creation.")
+        return self.register_project_agent(
+            chat_id=chat_id,
+            surface_name=binding.display_name,
+            slug=project.slug,
+            provider=project.provider,
+            project_path=project.project_path,
+            now=now,
+        )
 
     @staticmethod
     def _agent_console_from_row(row: sqlite3.Row) -> AgentConsole:
@@ -2861,6 +3048,7 @@ class DurableStore:
             ("agents", "agents"),
             ("agent_mailbox", "agent_mailbox"),
             ("agent_consoles", "agent_consoles"),
+            ("projects", "managed_projects"),
         ):
             if label == "updates":
                 state_column = "ingest_state"

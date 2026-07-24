@@ -255,6 +255,23 @@ The live lifecycle test passed on July 23, 2026. A paused turn remained durably
 queued with zero attempts and completed after Resume. Opening New Session
 displayed its second confirmation without changing the current session.
 
+Schema version 9 adds a path-safe managed-project catalog. A local Git
+repository must first be explicitly enrolled from the terminal:
+
+```sh
+/Users/shantam/telegram-control/telegram_control.py \
+  enroll-project project-slug /absolute/project/path --name "Project Name"
+```
+
+Telegram exposes only the catalog slug and display name through `/projects`;
+it never accepts or displays an arbitrary filesystem path. Within an existing
+provisioned project topic, `/agent create project-slug` atomically attaches the
+enrolled project and is idempotent when the correct agent is already present.
+
+The live catalog test passed on July 23, 2026. Control listed the enrolled
+`telegram-control` slug without its path, and the topic creation command
+recognized the existing matching agent without creating a duplicate.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

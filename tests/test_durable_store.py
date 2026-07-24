@@ -21,6 +21,7 @@ from durable_store import (
     MIGRATION_5,
     MIGRATION_6,
     MIGRATION_7,
+    MIGRATION_8,
     CallbackActionError,
     DurableStore,
     IncompatibleSchemaError,
@@ -112,7 +113,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
             self.store.connection.execute("PRAGMA user_version").fetchone()[0],
-            8,
+            9,
         )
         self.assertEqual(
             self.store.connection.execute("PRAGMA foreign_keys").fetchone()[0],
@@ -666,6 +667,60 @@ class DurableStoreTests(unittest.TestCase):
                 project_path="/tmp/telegram-control",
             )
 
+    def test_enrolled_project_attaches_to_topic_idempotently(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        project, created = self.store.enroll_project(
+            slug="telegram-control",
+            display_name="Telegram Control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        self.assertTrue(created)
+        duplicate, duplicate_created = self.store.enroll_project(
+            slug="telegram-control",
+            display_name="Telegram Control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=101,
+        )
+        self.assertFalse(duplicate_created)
+        self.assertEqual(duplicate.project_id, project.project_id)
+        self.assertEqual(
+            [item.slug for item in self.store.list_projects()],
+            ["telegram-control"],
+        )
+
+        agent, attached = self.store.attach_enrolled_project(
+            123,
+            62,
+            "telegram-control",
+            now=102,
+        )
+        self.assertTrue(attached)
+        again, attached_again = self.store.attach_enrolled_project(
+            123,
+            62,
+            "telegram-control",
+            now=103,
+        )
+        self.assertFalse(attached_again)
+        self.assertEqual(again.agent_id, agent.agent_id)
+        self.assertEqual(
+            self.store.resolve_surface_binding(123, 62).target_id,
+            agent.agent_id,
+        )
+        with self.assertRaisesRegex(StoreError, "not enrolled"):
+            self.store.attach_enrolled_project(123, 62, "missing")
+
     def test_agent_mailbox_is_serialized_and_completes_to_routed_outbox(self):
         self.store.ensure_surface_binding(
             chat_id=123,
@@ -993,7 +1048,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    8,
+                    9,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1017,7 +1072,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    8,
+                    9,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1042,7 +1097,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    8,
+                    9,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1066,7 +1121,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    8,
+                    9,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1092,7 +1147,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    8,
+                    9,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1123,7 +1178,7 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    8,
+                    9,
                 )
                 self.assertEqual(
                     store.connection.execute(
@@ -1155,12 +1210,45 @@ class SchemaCompatibilityTests(unittest.TestCase):
             with DurableStore(path) as store:
                 self.assertEqual(
                     store.connection.execute("PRAGMA user_version").fetchone()[0],
-                    8,
+                    9,
                 )
                 self.assertEqual(
                     store.connection.execute(
                         "SELECT COUNT(*) FROM sqlite_master "
                         "WHERE type = 'table' AND name = 'agent_consoles'"
+                    ).fetchone()[0],
+                    1,
+                )
+
+    def test_schema_eight_database_migrates_to_current_schema(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-eight.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for statement in (
+                MIGRATION_1
+                + MIGRATION_2
+                + MIGRATION_3
+                + MIGRATION_4
+                + MIGRATION_5
+                + MIGRATION_6
+                + MIGRATION_7
+                + MIGRATION_8
+            ):
+                connection.execute(statement)
+            connection.execute("PRAGMA user_version = 8")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    9,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM sqlite_master "
+                        "WHERE type = 'table' AND name = 'managed_projects'"
                     ).fetchone()[0],
                     1,
                 )
@@ -1681,6 +1769,58 @@ class DurableIntegrationTests(unittest.TestCase):
             existing = json.loads(stdout.getvalue())
             self.assertFalse(existing["created"])
             self.assertEqual(existing["message_thread_id"], 77)
+
+    def test_enrolled_project_can_be_created_from_telegram_topic(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Stage 2 Test",
+                    target_type="controller",
+                    target_id="control",
+                )
+                store.enroll_project(
+                    slug="telegram-control",
+                    display_name="Telegram Control",
+                    provider="codex",
+                    project_path="/tmp/telegram-control",
+                )
+                store.ingest_update(
+                    topic_message_update(
+                        10,
+                        "/agent create telegram-control",
+                    ),
+                    now=100,
+                )
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(store, config, job, "worker")
+                response = store.claim_outbox("sender", now=10**12)
+                self.assertIn(
+                    "Created managed agent tc--root--telegram-control",
+                    response.params["text"],
+                )
+                agent = store.resolve_agent_for_surface(123, 62)
+                self.assertEqual(agent.slug, "telegram-control")
+
+                store.ingest_update(
+                    topic_message_update(11, "/projects"),
+                    now=101,
+                )
+                job = store.claim_job("worker", now=101)
+                telegram_control.process_inbox_job(store, config, job, "worker")
+                catalog = store.claim_outbox("sender-2", now=10**12)
+                self.assertIn(
+                    "telegram-control — Telegram Control (codex)",
+                    catalog.params["text"],
+                )
+                self.assertNotIn("/tmp/telegram-control", catalog.params["text"])
 
     def test_ordinary_topic_message_uses_binding_not_reply_route(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

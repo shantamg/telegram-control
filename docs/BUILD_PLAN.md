@@ -844,6 +844,27 @@ test on July 23, 2026:
   Resume, and New Session stopped at its separate confirmation without changing
   the persisted session.
 
+The managed-project catalog slice passed 62 offline tests and its live test on
+July 23, 2026:
+
+- schema version 9 stores immutable enrolled project IDs, validated slugs,
+  display names, providers, canonical Git roots, and lifecycle state;
+- terminal enrollment is strict and idempotent, and rejects non-Git paths;
+- Telegram `/projects` reveals only catalog names and slugs, never filesystem
+  paths;
+- `/agent create <slug>` works only inside an existing project topic and only
+  for an explicitly enrolled project;
+- topic attachment and agent creation are atomic and idempotent, while
+  mismatched topics, slugs, and paths fail closed.
+- live `/projects` exposed no local path, and live `/agent create
+  telegram-control` resolved the existing topic attachment without creating a
+  duplicate.
+
+This completes the Stage 3 acceptance checkpoint: managed creation is limited
+to enrolled Git projects; repeated turns, restart resume, voice input, explicit
+tmux disposal/recreation, pause/resume, inspection, and guarded session
+replacement all operate through durable logical agent state.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)
