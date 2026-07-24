@@ -24,6 +24,186 @@ class RouterDecision:
     options: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class RouterToolCall:
+    tool: str
+    arguments: dict[str, Any]
+    requires_confirmation: bool
+
+
+CONTROLLER_TOOLS = (
+    {
+        "name": "list_projects",
+        "description": "List enrolled projects and active managed agents.",
+        "arguments": {},
+        "confirmation": False,
+    },
+    {
+        "name": "inspect_project",
+        "description": (
+            "Inspect an enrolled slug or a user-supplied local path read-only."
+        ),
+        "arguments": {"project": "string"},
+        "confirmation": False,
+    },
+    {
+        "name": "send_to_agent",
+        "description": "Send work to an existing managed project agent.",
+        "arguments": {"project_slug": "string", "message": "string"},
+        "confirmation": False,
+    },
+    {
+        "name": "create_project_agent",
+        "description": (
+            "Propose enrolling a project when needed and creating its agent/topic."
+        ),
+        "arguments": {"project": "string", "topic_name": "string|null"},
+        "confirmation": True,
+    },
+    {
+        "name": "ask_user",
+        "description": "Ask one concise question with optional button choices.",
+        "arguments": {"question": "string", "options": "string[]"},
+        "confirmation": False,
+    },
+    {
+        "name": "respond",
+        "description": "Reply without invoking another controller operation.",
+        "arguments": {"message": "string"},
+        "confirmation": False,
+    },
+)
+
+
+def build_main_agent_prompt(
+    user_input: str,
+    projects: Iterable[ManagedProject],
+    agent_states: Iterable[dict[str, Any]],
+) -> str:
+    text = user_input.strip()
+    if not text or len(text) > 8000:
+        raise RouterContractError("Main-agent input is invalid.")
+    catalog = [
+        {
+            "slug": project.slug,
+            "name": project.display_name,
+            "provider": project.provider,
+        }
+        for project in projects
+        if project.state == "active"
+    ]
+    states = [
+        {
+            "project_slug": str(state["project_slug"]),
+            "state": str(state["state"]),
+            "session": bool(state["session"]),
+        }
+        for state in agent_states
+    ]
+    return (
+        "You are the main Telegram Control agent. Decide the next controller "
+        "tool to use. Return exactly one JSON object with keys tool and "
+        "arguments, with no markdown or commentary. You may inspect and ask "
+        "questions before proposing mutations. The controller independently "
+        "validates every argument and enforces confirmation for consequential "
+        "tools. Never invent a tool, project, path, or completed result.\n\n"
+        f"Tools:\n{json.dumps(CONTROLLER_TOOLS, separators=(',', ':'), sort_keys=True)}"
+        f"\n\nProjects:\n{json.dumps(catalog, separators=(',', ':'), sort_keys=True)}"
+        f"\n\nAgents:\n{json.dumps(states, separators=(',', ':'), sort_keys=True)}"
+        f"\n\nUser input:\n{json.dumps(text)}"
+    )
+
+
+def _bounded_string(arguments: dict[str, Any], key: str, limit: int) -> str:
+    value = arguments.get(key)
+    if not isinstance(value, str) or not value.strip() or len(value) > limit:
+        raise RouterContractError(f"Tool argument {key!r} is invalid.")
+    return value.strip()
+
+
+def parse_router_tool_call(
+    raw_text: str,
+    allowed_project_slugs: set[str],
+) -> RouterToolCall:
+    try:
+        value = json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise RouterContractError("Main-agent output is not valid JSON.") from None
+    if not isinstance(value, dict) or set(value) != {"tool", "arguments"}:
+        raise RouterContractError("Main-agent tool-call envelope is invalid.")
+    tool = value.get("tool")
+    arguments = value.get("arguments")
+    if not isinstance(tool, str) or not isinstance(arguments, dict):
+        raise RouterContractError("Main-agent tool call is invalid.")
+    definitions = {item["name"]: item for item in CONTROLLER_TOOLS}
+    if tool not in definitions:
+        raise RouterContractError("Main agent selected an unknown tool.")
+
+    if tool == "list_projects":
+        if arguments:
+            raise RouterContractError("list_projects takes no arguments.")
+        normalized: dict[str, Any] = {}
+    elif tool == "inspect_project":
+        if set(arguments) != {"project"}:
+            raise RouterContractError("inspect_project arguments are invalid.")
+        normalized = {"project": _bounded_string(arguments, "project", 1000)}
+    elif tool == "send_to_agent":
+        if set(arguments) != {"project_slug", "message"}:
+            raise RouterContractError("send_to_agent arguments are invalid.")
+        project_slug = _bounded_string(arguments, "project_slug", 48)
+        if project_slug not in allowed_project_slugs:
+            raise RouterContractError("send_to_agent selected an unknown project.")
+        normalized = {
+            "project_slug": project_slug,
+            "message": _bounded_string(arguments, "message", 8000),
+        }
+    elif tool == "create_project_agent":
+        if set(arguments) != {"project", "topic_name"}:
+            raise RouterContractError(
+                "create_project_agent arguments are invalid."
+            )
+        topic_name = arguments.get("topic_name")
+        if topic_name is not None and (
+            not isinstance(topic_name, str)
+            or not topic_name.strip()
+            or len(topic_name) > 128
+        ):
+            raise RouterContractError("Tool argument 'topic_name' is invalid.")
+        normalized = {
+            "project": _bounded_string(arguments, "project", 1000),
+            "topic_name": topic_name.strip() if isinstance(topic_name, str) else None,
+        }
+    elif tool == "ask_user":
+        if set(arguments) != {"question", "options"}:
+            raise RouterContractError("ask_user arguments are invalid.")
+        options = arguments.get("options")
+        if (
+            not isinstance(options, list)
+            or len(options) > 4
+            or any(
+                not isinstance(option, str)
+                or not option.strip()
+                or len(option) > 80
+                for option in options
+            )
+        ):
+            raise RouterContractError("Tool argument 'options' is invalid.")
+        normalized = {
+            "question": _bounded_string(arguments, "question", 500),
+            "options": [option.strip() for option in options],
+        }
+    else:
+        if set(arguments) != {"message"}:
+            raise RouterContractError("respond arguments are invalid.")
+        normalized = {"message": _bounded_string(arguments, "message", 3800)}
+
+    return RouterToolCall(
+        tool=tool,
+        arguments=normalized,
+        requires_confirmation=bool(definitions[tool]["confirmation"]),
+    )
+
+
 def build_router_prompt(
     user_input: str,
     projects: Iterable[ManagedProject],

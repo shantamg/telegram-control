@@ -274,12 +274,18 @@ recognized the existing matching agent without creating a duplicate.
 
 ## Stage 4 router contract
 
-The main-router boundary begins with a strict three-action contract:
-`route`, `clarify`, or `reject`. The prompt includes only active project slugs,
-display names, and providers—never local paths. Model output must be one plain
-JSON object with the exact fields for its action. Unknown projects, extra
-fields, markdown fences, invalid confidence values, duplicate clarification
-options, and oversized messages fail closed before any dispatch is possible.
+The main-router boundary now has a small typed controller-tool vocabulary:
+list or inspect projects, send work to an existing agent, propose creating a
+project agent, ask a concise question, or respond directly. The prompt includes
+only active project slugs, display names, providers, and compact agent
+state—never catalog filesystem paths. Every tool call is strict JSON and is
+validated again by the controller. Unknown tools, projects, arguments, extra
+fields, and oversized values fail closed; project-agent creation always
+requires controller-enforced confirmation.
+
+The earlier strict `route`, `clarify`, or `reject` schema remains as a compact
+classification and evaluation primitive. It is not intended to become a
+user-facing command language.
 
 For controlled debugging, each loop can run separately:
 

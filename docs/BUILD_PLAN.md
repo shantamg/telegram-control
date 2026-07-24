@@ -865,7 +865,7 @@ to enrolled Git projects; repeated turns, restart resume, voice input, explicit
 tmux disposal/recreation, pause/resume, inspection, and guarded session
 replacement all operate through durable logical agent state.
 
-The first Stage 4 router-contract slice passed 67 offline tests:
+The Stage 4 router-contract slices pass 72 offline tests:
 
 - router prompts contain only path-safe active catalog metadata;
 - normalized output is limited to exact `route`, `clarify`, and `reject`
@@ -874,6 +874,15 @@ The first Stage 4 router-contract slice passed 67 offline tests:
   slugs;
 - unknown targets, extra fields, markdown wrappers, malformed confidence, and
   duplicate choices fail closed;
+- the main agent also receives a compact, typed controller-tool catalog for
+  listing or inspecting projects, sending to an existing agent, proposing
+  project-agent creation, asking a question, or responding directly;
+- tool calls use exact JSON envelopes, tool-specific bounded arguments, and
+  catalog validation; unknown tools and extra fields fail closed;
+- consequential project-agent creation is always marked for
+  controller-enforced confirmation rather than left to model discretion;
+- the command handlers remain recovery and power-user wrappers, not the
+  intended conversational interface;
 - no Telegram dispatch is enabled in this slice; the next checkpoint adds a
   durable router mailbox and preview-only live evaluation before real routing.
 
