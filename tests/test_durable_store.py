@@ -2113,6 +2113,7 @@ class DurableIntegrationTests(unittest.TestCase):
                             "arguments": {
                                 "project": self.project_path,
                                 "topic_name": "Sample Project",
+                                "provider": "claude",
                             },
                         }
                     ),
@@ -2172,6 +2173,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     "Nothing will be created until you confirm.",
                     proposal.params["text"],
                 )
+                self.assertIn("Provider: claude", proposal.params["text"])
                 buttons = proposal.params["reply_markup"]["inline_keyboard"]
                 self.assertEqual(
                     [row[0]["text"] for row in buttons],
@@ -3207,6 +3209,15 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     working_edit.params["text"],
                     "🧠 <b>Codex is working…</b>\n"
+                    "<blockquote>inspect &lt;voice&gt; &amp; route</blockquote>",
+                )
+                self.assertEqual(
+                    DurableStore.agent_voice_status_text(
+                        "working",
+                        "inspect <voice> & route",
+                        "claude",
+                    ),
+                    "🧠 <b>Claude is working…</b>\n"
                     "<blockquote>inspect &lt;voice&gt; &amp; route</blockquote>",
                 )
                 self.assertEqual(working_edit.params["parse_mode"], "HTML")

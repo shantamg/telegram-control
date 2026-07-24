@@ -431,8 +431,14 @@ def project_creation_proposal(
 ) -> tuple[str, Optional[dict[str, str]]]:
     project_reference = str(arguments["project"]).strip()
     topic_name = arguments.get("topic_name")
+    requested_provider = arguments.get("provider")
     enrolled = store.resolve_project(project_reference)
     if enrolled is not None:
+        if requested_provider is not None and requested_provider != enrolled.provider:
+            raise StoreError(
+                f"{enrolled.display_name} is already enrolled for "
+                f"{enrolled.provider}, not {requested_provider}."
+            )
         existing_agent = store.resolve_project_agent(enrolled.slug)
         if existing_agent is not None:
             return (
@@ -473,7 +479,11 @@ def project_creation_proposal(
         if collision is not None and collision.project_path != project_path:
             raise StoreError("Another enrolled project already uses this slug.")
         display_name = git_root.name.replace("-", " ").replace("_", " ").title()
-        provider = "codex"
+        provider = (
+            str(requested_provider)
+            if requested_provider in {"codex", "claude"}
+            else "codex"
+        )
     resolved_topic = (
         str(topic_name).strip()
         if isinstance(topic_name, str) and topic_name.strip()

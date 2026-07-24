@@ -31,6 +31,20 @@ def codex_binary() -> str:
     raise StoreError("Codex CLI is not installed.")
 
 
+def claude_binary() -> str:
+    binary = shutil.which("claude")
+    if binary:
+        return binary
+    for candidate in (
+        Path.home() / ".local" / "bin" / "claude",
+        Path("/opt/homebrew/bin/claude"),
+        Path("/usr/local/bin/claude"),
+    ):
+        if candidate.is_file():
+            return str(candidate)
+    raise StoreError("Claude Code CLI is not installed.")
+
+
 def has_tmux_session(session_name: str) -> bool:
     result = subprocess.run(
         [tmux_binary(), "has-session", "-t", f"={session_name}"],
@@ -62,16 +76,16 @@ def open_agent_console(
     store: DurableStore,
     agent: ManagedAgent,
 ) -> AgentConsole:
-    if agent.provider != "codex":
+    if agent.provider not in {"codex", "claude"}:
         raise StoreError(
             f"Interactive console is not implemented for provider: {agent.provider}"
         )
     if not agent.project_path or not Path(agent.project_path).is_dir():
         raise StoreError("Managed agent project directory is unavailable.")
     if not agent.provider_session_id:
-        raise StoreError("Managed agent has no persisted Codex session to resume.")
+        raise StoreError("Managed agent has no persisted provider session to resume.")
     if not re.fullmatch(r"[0-9a-fA-F-]{36}", agent.provider_session_id):
-        raise StoreError("Persisted Codex session ID is invalid.")
+        raise StoreError("Persisted provider session ID is invalid.")
 
     session_name = agent.hierarchical_name
     existing = reconcile_agent_console(store, agent.agent_id)
@@ -83,20 +97,43 @@ def open_agent_console(
         )
 
     store.reserve_agent_console(agent.agent_id, session_name)
-    sandbox = str(agent.provider_config.get("sandbox", "workspace-write"))
-    command = [
-        codex_binary(),
-        "resume",
-        "--include-non-interactive",
-        "--sandbox",
-        sandbox,
-        "--cd",
-        agent.project_path,
-    ]
-    model = agent.provider_config.get("model")
-    if model:
-        command.extend(["--model", str(model)])
-    command.append(agent.provider_session_id)
+    if agent.provider == "codex":
+        sandbox = str(agent.provider_config.get("sandbox", "workspace-write"))
+        command = [
+            codex_binary(),
+            "resume",
+            "--include-non-interactive",
+            "--sandbox",
+            sandbox,
+            "--cd",
+            agent.project_path,
+        ]
+        model = agent.provider_config.get("model")
+        if model:
+            command.extend(["--model", str(model)])
+        command.append(agent.provider_session_id)
+    else:
+        permission_mode = str(
+            agent.provider_config.get("permission_mode", "bypassPermissions")
+        )
+        if permission_mode not in {
+            "acceptEdits",
+            "auto",
+            "bypassPermissions",
+            "dontAsk",
+            "plan",
+        }:
+            raise StoreError("Claude permission mode is invalid.")
+        command = [
+            claude_binary(),
+            "--resume",
+            agent.provider_session_id,
+            "--permission-mode",
+            permission_mode,
+        ]
+        model = agent.provider_config.get("model")
+        if model:
+            command.extend(["--model", str(model)])
     try:
         result = subprocess.run(
             [

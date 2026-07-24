@@ -124,6 +124,22 @@ class RouterContractTests(unittest.TestCase):
         )
         self.assertTrue(call.requires_confirmation)
         self.assertEqual(call.arguments["project"], "~/Code/new-project")
+        self.assertIsNone(call.arguments["provider"])
+
+        claude = parse_router_tool_call(
+            '{"tool":"create_project_agent","arguments":{'
+            '"project":"/tmp/new-project","topic_name":"New Project",'
+            '"provider":"claude"}}',
+            {"telegram-control"},
+        )
+        self.assertEqual(claude.arguments["provider"], "claude")
+        with self.assertRaisesRegex(RouterContractError, "provider"):
+            parse_router_tool_call(
+                '{"tool":"create_project_agent","arguments":{'
+                '"project":"/tmp/new-project","topic_name":null,'
+                '"provider":"invented"}}',
+                {"telegram-control"},
+            )
 
     def test_alias_tools_are_strict_and_alias_dispatch_is_canonicalized(self):
         call = parse_router_tool_call(

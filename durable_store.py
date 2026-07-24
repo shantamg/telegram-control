@@ -3717,7 +3717,11 @@ class DurableStore:
             raise
 
     @staticmethod
-    def agent_voice_status_text(stage: str, input_text: str) -> str:
+    def agent_voice_status_text(
+        stage: str,
+        input_text: str,
+        provider: str = "codex",
+    ) -> str:
         transcript = input_text.strip()
         if len(transcript) > 3400:
             transcript = transcript[:3397].rstrip() + "…"
@@ -3725,8 +3729,9 @@ class DurableStore:
         if stage == "sending":
             return f"📤 <b>Sending</b>\n<blockquote>{transcript}</blockquote>"
         if stage == "working":
+            provider_name = "Claude" if provider == "claude" else "Codex"
             return (
-                "🧠 <b>Codex is working…</b>\n"
+                f"🧠 <b>{provider_name} is working…</b>\n"
                 f"<blockquote>{transcript}</blockquote>"
             )
         raise StoreError("Managed voice status stage is invalid.")
@@ -3752,6 +3757,18 @@ class DurableStore:
         card = json.loads(receipt["card_json"])
         if card.get("input_kind") != "voice":
             return None
+        provider_row = self.connection.execute(
+            """
+            SELECT a.provider
+            FROM agent_mailbox AS m
+            JOIN agents AS a ON a.agent_id = m.agent_id
+            WHERE m.source_inbox_job_id = ?
+            """,
+            (int(source_inbox_job_id),),
+        ).fetchone()
+        if provider_row is None:
+            raise StoreError("Managed voice receipt agent is unavailable.")
+        provider = str(provider_row["provider"])
         result = json.loads(receipt["telegram_result_json"])
         params = json.loads(receipt["params_json"])
         try:
@@ -3767,7 +3784,11 @@ class DurableStore:
             params={
                 "chat_id": chat_id,
                 "message_id": message_id,
-                "text": self.agent_voice_status_text(stage, input_text),
+                "text": self.agent_voice_status_text(
+                    stage,
+                    input_text,
+                    provider,
+                ),
                 "parse_mode": "HTML",
             },
             card={

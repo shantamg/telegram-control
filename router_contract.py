@@ -57,7 +57,11 @@ CONTROLLER_TOOLS = (
         "description": (
             "Propose enrolling a project when needed and creating its agent/topic."
         ),
-        "arguments": {"project": "string", "topic_name": "string|null"},
+        "arguments": {
+            "project": "string",
+            "topic_name": "string|null",
+            "provider": "codex|claude|null",
+        },
         "confirmation": True,
     },
     {
@@ -181,7 +185,10 @@ def parse_router_tool_call(
             "message": _bounded_string(arguments, "message", 8000),
         }
     elif tool == "create_project_agent":
-        if set(arguments) != {"project", "topic_name"}:
+        if set(arguments) not in (
+            {"project", "topic_name"},
+            {"project", "topic_name", "provider"},
+        ):
             raise RouterContractError(
                 "create_project_agent arguments are invalid."
             )
@@ -192,9 +199,13 @@ def parse_router_tool_call(
             or len(topic_name) > 128
         ):
             raise RouterContractError("Tool argument 'topic_name' is invalid.")
+        provider = arguments.get("provider")
+        if provider is not None and provider not in {"codex", "claude"}:
+            raise RouterContractError("Tool argument 'provider' is invalid.")
         normalized = {
             "project": _bounded_string(arguments, "project", 1000),
             "topic_name": topic_name.strip() if isinstance(topic_name, str) else None,
+            "provider": provider,
         }
     elif tool == "set_project_alias":
         if set(arguments) != {"project_slug", "alias"}:

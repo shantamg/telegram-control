@@ -745,6 +745,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
             if bound_agent is None or bound_agent.agent_id != agent_id:
                 raise StoreError("Managed agent surface changed.")
+            provider_name = (
+                "Claude" if bound_agent.provider == "claude" else "Codex"
+            )
             confirm = store.create_callback_action(
                 operation_id=f"callback:{update['update_id']}:agent-new-session-confirm",
                 action_type="agent_new_session_confirm",
@@ -765,8 +768,8 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 "callback-answer",
             )
         send_message(
-            "Start a fresh Codex conversation?\n\n"
-            "The current conversation is retained by Codex, but new messages "
+            f"Start a fresh {provider_name} conversation?\n\n"
+            f"The current conversation is retained by {provider_name}, but new messages "
             "will no longer continue it.",
             reply_markup={
                 "inline_keyboard": [
@@ -787,6 +790,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
                 if bound_agent is None or bound_agent.agent_id != agent_id:
                     raise StoreError("Managed agent surface changed.")
+                provider_name = (
+                    "Claude" if bound_agent.provider == "claude" else "Codex"
+                )
                 store.reset_agent_session(agent_id)
         except StoreError as exc:
             if callback_query_id:
@@ -809,7 +815,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 },
                 "callback-answer",
             )
-        send_message("✅ The next message will start a fresh Codex conversation.")
+        send_message(
+            f"✅ The next message will start a fresh {provider_name} conversation."
+        )
         return
     if action.action_type == "refresh_status":
         chat_id, thread_id = surface_coordinates()

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -83,6 +84,39 @@ class TmuxConsoleTests(unittest.TestCase):
             self.store.resolve_agent_console(self.agent.agent_id).state,
             "stopped",
         )
+
+    @mock.patch.object(tmux_console, "has_tmux_session", return_value=False)
+    @mock.patch.object(tmux_console, "claude_binary", return_value="/bin/claude")
+    @mock.patch.object(tmux_console, "tmux_binary", return_value="/bin/tmux")
+    @mock.patch.object(tmux_console.subprocess, "run")
+    def test_claude_console_resumes_same_session(
+        self,
+        run,
+        _tmux_binary,
+        _claude_binary,
+        _has_session,
+    ):
+        run.return_value = mock.Mock(returncode=0, stderr="")
+        claude_agent = replace(
+            self.agent,
+            provider="claude",
+            provider_config={
+                "model": "sonnet",
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+        console = tmux_console.open_agent_console(self.store, claude_agent)
+
+        self.assertEqual(console.state, "running")
+        command = run.call_args.args[0]
+        self.assertIn("/bin/claude", command)
+        self.assertIn("--resume", command)
+        self.assertIn(self.session_id, command)
+        self.assertIn("--permission-mode", command)
+        self.assertIn("acceptEdits", command)
+        self.assertIn("--model", command)
+        self.assertIn("sonnet", command)
 
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=True)
     def test_unmanaged_name_collision_fails_closed(self, _has_session):

@@ -934,6 +934,24 @@ The Stage 4 router-contract and durable-routing slices pass 88 offline tests:
   alias-expanded benchmark 8/8 on July 23, 2026, with the expanded cold-session
   decisions taking 5.2–10.0 seconds each.
 
+The first Stage 5 provider-adapter slice passes 92 offline tests:
+
+- Claude Code implements the same provider-neutral structured turn contract as
+  Codex, using stream-JSON output and durable session UUIDs;
+- new and resumed Claude turns validate session continuity, normalize the final
+  public result and usage, heartbeat the durable mailbox while streaming, and
+  retain the existing crash-recovery prompt;
+- Claude permission modes and model overrides are validated controller-side;
+  unattended agents default to `bypassPermissions`, while restrictive modes
+  remain configurable per agent;
+- explicit tmux takeover can resume either Codex or Claude using the same
+  logical agent reservation and persisted provider session;
+- conversational project creation can explicitly select `codex` or `claude`,
+  and still requires the existing validated confirmation;
+- a live adapter-level Claude probe completed two turns using the same session
+  UUID, and the Codex router benchmark still passed 8/8 after provider
+  selection was added.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)

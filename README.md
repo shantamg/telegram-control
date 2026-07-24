@@ -181,6 +181,16 @@ parses the final public agent message and usage metadata, and resumes the stored
 session ID. Codex runs with `workspace-write` by default; unrestricted/yolo
 mode is never enabled by the controller.
 
+The Stage 5 provider expansion adds Claude Code behind that same contract.
+Claude runs in non-interactive stream-JSON mode, checkpoints its session UUID
+before completion, normalizes the final result and usage, and resumes the same
+conversation on later mailbox turns. Managed Claude agents default to
+`bypassPermissions` because unattended print-mode turns cannot answer
+permission prompts; set `provider_config.permission_mode` to `acceptEdits`,
+`auto`, `dontAsk`, or `plan` for a more restrictive agent. The explicit tmux
+console can resume either a Codex or Claude session without changing its
+logical agent identity.
+
 Each accepted agent turn immediately sends a compact `⏳ Working…` receipt.
 For normal
 single-message responses, completion edits that same Telegram message into the
@@ -217,6 +227,11 @@ and are claimed after the console closes. Existing unmanaged tmux sessions are
 never adopted or killed, and Codex retains the configured sandbox rather than
 enabling unrestricted/yolo mode.
 
+Project-creation requests may explicitly name `codex` or `claude`. The
+controller validates that provider and shows it in the existing confirmation
+card before enrolling the repository, creating its topic, or attaching its
+agent.
+
 The live console test passed on July 23, 2026. The real Codex TUI resumed the
 same conversation in tmux, `/agent` reported `Console: running`, and a Telegram
 turn remained queued until `console-close`. It then completed on its first
@@ -231,8 +246,9 @@ controller queued the receipt within 0.46 seconds of ingestion.
 Voice notes sent inside a managed agent topic use that same turn card. The
 `🎙️ Transcribing…` receipt is queued before local download, ffmpeg conversion,
 and Parakeet V3 transcription. The same message then shows `📤 Sending:` with
-the transcript, changes to `🧠 Codex is working…`, and finally becomes the
-agent's response. Durable outbox ordering prevents a delayed progress edit from
+the transcript, changes to `🧠 Codex is working…` or
+`🧠 Claude is working…`, and finally becomes the agent's response. Durable
+outbox ordering prevents a delayed progress edit from
 overwriting the final answer. Voice notes outside a managed agent surface
 retain the original transcript-only behavior.
 

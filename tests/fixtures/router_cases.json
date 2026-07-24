@@ -33,13 +33,14 @@
   },
   {
     "name": "create_project_agent",
-    "input": "Add the Git project at /tmp/example-project and create its agent.",
+    "input": "Add the Git project at /tmp/example-project with a Claude agent.",
     "expected_tool": "create_project_agent",
     "sample_output": {
       "tool": "create_project_agent",
       "arguments": {
         "project": "/tmp/example-project",
-        "topic_name": "Example Project"
+        "topic_name": "Example Project",
+        "provider": "claude"
       }
     }
   },
