@@ -327,6 +327,25 @@ escaped transcript display, main-router work, and the final routed response.
 The router session, validation, clarification, confirmation, and project-agent
 relay rules are identical for text and voice input.
 
+The router contract has a repeatable six-case quality gate covering every
+controller tool. The offline run validates the fixtures and parser without
+calling a model:
+
+```sh
+/usr/bin/python3 router_eval.py
+```
+
+The optional live run sends the same cases through isolated Codex sessions,
+without changing the bot's durable router session:
+
+```sh
+/usr/bin/python3 router_eval.py --live
+```
+
+Pass `--model MODEL` to compare a candidate model. A router or model change is
+ready only when all cases pass. The default model passed 6/6 on July 23, 2026,
+with individual cold-session decisions taking 6.1–8.1 seconds.
+
 The earlier strict `route`, `clarify`, or `reject` schema remains as a compact
 classification and evaluation primitive. It is not intended to become a
 user-facing command language.

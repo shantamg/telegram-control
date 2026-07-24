@@ -1,0 +1,72 @@
+[
+  {
+    "name": "list_projects",
+    "input": "List my enrolled projects.",
+    "expected_tool": "list_projects",
+    "sample_output": {
+      "tool": "list_projects",
+      "arguments": {}
+    }
+  },
+  {
+    "name": "inspect_project",
+    "input": "Inspect the telegram-control project status read-only.",
+    "expected_tool": "inspect_project",
+    "sample_output": {
+      "tool": "inspect_project",
+      "arguments": {
+        "project": "telegram-control"
+      }
+    }
+  },
+  {
+    "name": "send_to_agent",
+    "input": "Send this to the Telegram Control project agent: report current test status.",
+    "expected_tool": "send_to_agent",
+    "sample_output": {
+      "tool": "send_to_agent",
+      "arguments": {
+        "project_slug": "telegram-control",
+        "message": "Report current test status."
+      }
+    }
+  },
+  {
+    "name": "create_project_agent",
+    "input": "Add the Git project at /tmp/example-project and create its agent.",
+    "expected_tool": "create_project_agent",
+    "sample_output": {
+      "tool": "create_project_agent",
+      "arguments": {
+        "project": "/tmp/example-project",
+        "topic_name": "Example Project"
+      }
+    }
+  },
+  {
+    "name": "ask_user",
+    "input": "Do not choose for me. Ask whether I want a status check or to send a task.",
+    "expected_tool": "ask_user",
+    "sample_output": {
+      "tool": "ask_user",
+      "arguments": {
+        "question": "Which would you like?",
+        "options": [
+          "Status check",
+          "Send a task"
+        ]
+      }
+    }
+  },
+  {
+    "name": "respond",
+    "input": "Reply with a short acknowledgment that the controller is online.",
+    "expected_tool": "respond",
+    "sample_output": {
+      "tool": "respond",
+      "arguments": {
+        "message": "The controller is online."
+      }
+    }
+  }
+]

@@ -865,7 +865,7 @@ to enrolled Git projects; repeated turns, restart resume, voice input, explicit
 tmux disposal/recreation, pause/resume, inspection, and guarded session
 replacement all operate through durable logical agent state.
 
-The Stage 4 router-contract and durable-routing slices pass 81 offline tests:
+The Stage 4 router-contract and durable-routing slices pass 83 offline tests:
 
 - router prompts contain only path-safe active catalog metadata;
 - normalized output is limited to exact `route`, `clarify`, and `reject`
@@ -922,7 +922,12 @@ The Stage 4 router-contract and durable-routing slices pass 81 offline tests:
   contract as text;
 - unenrolled Git roots can be inspected read-only only when the exact path
   appears in the current user request; the response omits the local path, and
-  invented, missing, nested, or non-Git paths fail closed.
+  invented, missing, nested, or non-Git paths fail closed;
+- a versioned six-case router fixture suite covers every controller tool and
+  can run either fully offline or through isolated live Codex sessions without
+  mutating the durable router conversation;
+- the default Codex model passed the first live benchmark 6/6 on July 23, 2026,
+  with cold-session decisions taking 6.1–8.1 seconds each.
 
 ## References
 
