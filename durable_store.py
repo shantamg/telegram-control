@@ -1282,7 +1282,7 @@ class DurableStore:
                             ) from None
                         mailbox = self.connection.execute(
                             """
-                            SELECT mailbox_id, state, preview_text
+                            SELECT mailbox_id, state, input_text, preview_text
                             FROM router_mailbox
                             WHERE source_inbox_job_id = ?
                             """,
@@ -1298,6 +1298,21 @@ class DurableStore:
                                 str(mailbox["preview_text"]),
                                 timestamp,
                             )
+                        elif (
+                            mailbox is not None
+                            and card_spec.get("input_kind") == "voice"
+                        ):
+                            stage = (
+                                "working"
+                                if str(mailbox["state"]) == "leased"
+                                else "sending"
+                            )
+                            self.enqueue_router_voice_status(
+                                source_inbox_job_id,
+                                stage,
+                                str(mailbox["input_text"]),
+                                now=timestamp,
+                            )
                     elif mode == "final_edit":
                         try:
                             int(card_spec["mailbox_id"])
@@ -1308,6 +1323,11 @@ class DurableStore:
                         if row["method"] != "editMessageText":
                             raise StoreError(
                                 "Only editMessageText can finish a router turn card."
+                            )
+                    elif mode == "status_edit":
+                        if row["method"] != "editMessageText":
+                            raise StoreError(
+                                "Only editMessageText can update router status."
                             )
                     else:
                         raise StoreError("Outbox router-turn mode is invalid.")
@@ -2105,6 +2125,215 @@ class DurableStore:
                     "source_inbox_job_id": int(source_inbox_job_id),
                     "mode": "receipt",
                 },
+                now=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return int(row["mailbox_id"])
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def enqueue_router_voice_receipt(
+        self,
+        source_inbox_job_id: int,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        authorized_user_id: int,
+        now: Optional[float] = None,
+    ) -> int:
+        timestamp = time.time() if now is None else float(now)
+        thread_id = int(message_thread_id) if message_thread_id is not None else 0
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            binding = self.connection.execute(
+                """
+                SELECT 1 FROM surface_bindings
+                WHERE chat_id = ? AND message_thread_id = ?
+                    AND surface_type = 'control'
+                    AND target_type = 'controller' AND target_id = 'control'
+                    AND state = 'active'
+                """,
+                (int(chat_id), thread_id),
+            ).fetchone()
+            if binding is None:
+                raise StoreError("Main router surface is no longer valid.")
+            self._ensure_main_agent(timestamp)
+            message_id = self.enqueue_api_call(
+                operation_id=f"router-input:{int(source_inbox_job_id)}:receipt",
+                method="sendMessage",
+                params={
+                    "chat_id": int(chat_id),
+                    "message_thread_id": (
+                        int(message_thread_id)
+                        if message_thread_id is not None
+                        else None
+                    ),
+                    "text": "🎙️ <b>Transcribing…</b>",
+                    "parse_mode": "HTML",
+                },
+                route={
+                    "target_type": "controller",
+                    "target_id": "control",
+                    "policy": "reply",
+                    "ttl_seconds": 30 * 24 * 60 * 60,
+                },
+                card={
+                    "kind": "router_turn",
+                    "source_inbox_job_id": int(source_inbox_job_id),
+                    "input_kind": "voice",
+                    "authorized_user_id": int(authorized_user_id),
+                    "mode": "receipt",
+                },
+                now=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return message_id
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def router_voice_status_text(stage: str, input_text: str) -> str:
+        transcript = input_text.strip()
+        if len(transcript) > 3400:
+            transcript = transcript[:3397].rstrip() + "…"
+        transcript = html.escape(transcript)
+        if stage == "sending":
+            return f"📤 <b>Sending</b>\n<blockquote>{transcript}</blockquote>"
+        if stage == "working":
+            return (
+                "🧭 <b>Routing…</b>\n"
+                f"<blockquote>{transcript}</blockquote>"
+            )
+        raise StoreError("Router voice status stage is invalid.")
+
+    def enqueue_router_voice_status(
+        self,
+        source_inbox_job_id: int,
+        stage: str,
+        input_text: str,
+        now: Optional[float] = None,
+    ) -> Optional[int]:
+        timestamp = time.time() if now is None else float(now)
+        receipt = self.connection.execute(
+            """
+            SELECT params_json, card_json, telegram_result_json
+            FROM outbox_messages
+            WHERE operation_id = ? AND state = 'sent'
+            """,
+            (f"router-input:{int(source_inbox_job_id)}:receipt",),
+        ).fetchone()
+        if receipt is None or receipt["telegram_result_json"] is None:
+            return None
+        card = json.loads(receipt["card_json"])
+        if card.get("input_kind") != "voice":
+            return None
+        result = json.loads(receipt["telegram_result_json"])
+        params = json.loads(receipt["params_json"])
+        try:
+            message_id = int(result["message_id"])
+            chat_id = int(params["chat_id"])
+        except (KeyError, TypeError, ValueError):
+            raise StoreError("Stored Telegram router voice receipt is invalid.") from None
+        return self.enqueue_api_call(
+            operation_id=(
+                f"router-input:{int(source_inbox_job_id)}:status:{stage}"
+            ),
+            method="editMessageText",
+            params={
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": self.router_voice_status_text(stage, input_text),
+                "parse_mode": "HTML",
+            },
+            card={
+                "kind": "router_turn",
+                "source_inbox_job_id": int(source_inbox_job_id),
+                "mode": "status_edit",
+            },
+            now=timestamp,
+        )
+
+    def enqueue_router_voice_message(
+        self,
+        source_inbox_job_id: int,
+        input_text: str,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        authorized_user_id: int,
+        now: Optional[float] = None,
+    ) -> int:
+        text = input_text.strip()
+        if not text or len(text) > 8000:
+            raise StoreError("Router input must contain 1 to 8000 characters.")
+        timestamp = time.time() if now is None else float(now)
+        thread_id = int(message_thread_id) if message_thread_id is not None else 0
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            binding = self.connection.execute(
+                """
+                SELECT 1 FROM surface_bindings
+                WHERE chat_id = ? AND message_thread_id = ?
+                    AND surface_type = 'control'
+                    AND target_type = 'controller' AND target_id = 'control'
+                    AND state = 'active'
+                """,
+                (int(chat_id), thread_id),
+            ).fetchone()
+            if binding is None:
+                raise StoreError("Main router surface is no longer valid.")
+            main_agent = self._ensure_main_agent(timestamp)
+            self.connection.execute(
+                """
+                INSERT INTO router_mailbox(
+                    source_inbox_job_id, chat_id, message_thread_id,
+                    authorized_user_id, input_text, provider_session_id,
+                    state, attempts, available_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
+                ON CONFLICT(source_inbox_job_id) DO NOTHING
+                """,
+                (
+                    int(source_inbox_job_id),
+                    int(chat_id),
+                    thread_id,
+                    int(authorized_user_id),
+                    text,
+                    main_agent.provider_session_id,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = self.connection.execute(
+                """
+                SELECT mailbox_id, chat_id, message_thread_id,
+                    authorized_user_id, input_text
+                FROM router_mailbox
+                WHERE source_inbox_job_id = ?
+                """,
+                (int(source_inbox_job_id),),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Could not enqueue the main-router voice message.")
+            expected = (
+                int(chat_id),
+                thread_id,
+                int(authorized_user_id),
+                text,
+            )
+            actual = (
+                int(row["chat_id"]),
+                int(row["message_thread_id"]),
+                int(row["authorized_user_id"]),
+                str(row["input_text"]),
+            )
+            if actual != expected:
+                raise StoreError("Inbox job was reused for a different router message.")
+            self.enqueue_router_voice_status(
+                source_inbox_job_id,
+                "sending",
+                text,
                 now=timestamp,
             )
             self.connection.execute("COMMIT")

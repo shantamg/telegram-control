@@ -865,7 +865,7 @@ to enrolled Git projects; repeated turns, restart resume, voice input, explicit
 tmux disposal/recreation, pause/resume, inspection, and guarded session
 replacement all operate through durable logical agent state.
 
-The Stage 4 router-contract and durable-routing slices pass 80 offline tests:
+The Stage 4 router-contract and durable-routing slices pass 81 offline tests:
 
 - router prompts contain only path-safe active catalog metadata;
 - normalized output is limited to exact `route`, `clarify`, and `reject`
@@ -917,6 +917,9 @@ The Stage 4 router-contract and durable-routing slices pass 80 offline tests:
   a separate summarization call;
 - controller status reports current router turns, tokens, limits, and rotation
   count;
+- root Control voice notes use local Parakeet transcription and one
+  self-editing Telegram receipt before entering the same durable main-router
+  contract as text;
 - unknown-path inspection remains staged behind the same validation boundary.
 
 ## References

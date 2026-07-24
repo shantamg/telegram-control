@@ -488,6 +488,11 @@ def process_router_mailbox_job(
                     old_provider_session_id=old_session_id,
                     reason=rotation_reason,
                 )
+        store.enqueue_router_voice_status(
+            job.source_inbox_job_id,
+            "working",
+            job.input_text,
+        )
         main_agent = store.resolve_main_agent()
         if main_agent is None:
             raise StoreError("Main router agent no longer exists.")

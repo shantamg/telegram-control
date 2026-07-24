@@ -936,6 +936,7 @@ def handle_voice(voice: dict) -> None:
 
     binding = current_surface_binding()
     managed_agent = None
+    routes_to_main_router = False
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
     if (
@@ -960,6 +961,37 @@ def handle_voice(voice: dict) -> None:
                 receipt_text="🎙️ <b>Transcribing…</b>",
                 input_kind="voice",
                 parse_mode="HTML",
+            )
+    elif database_path and job_id:
+        chat_id, thread_id = surface_coordinates()
+        if binding is None and thread_id is None:
+            with DurableStore(Path(database_path)) as store:
+                binding = store.ensure_surface_binding(
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    surface_type="control",
+                    display_name="Control",
+                    target_type="controller",
+                    target_id="control",
+                )
+        if (
+            binding is not None
+            and binding.surface_type == "control"
+            and binding.target_type == "controller"
+            and binding.target_id == "control"
+        ):
+            routes_to_main_router = True
+            with DurableStore(Path(database_path)) as store:
+                store.enqueue_router_voice_receipt(
+                    source_inbox_job_id=int(job_id),
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
+                )
+        else:
+            send_message(
+                "🎙️ Voice message received. Transcribing locally with "
+                "Parakeet V3…"
             )
     else:
         send_message("🎙️ Voice message received. Transcribing locally with Parakeet V3…")
@@ -986,6 +1018,20 @@ def handle_voice(voice: dict) -> None:
                 agent_id=managed_agent.agent_id,
                 source_inbox_job_id=int(job_id),
                 input_text=agent_input,
+            )
+    elif routes_to_main_router:
+        router_input = transcript or (
+            "The user's voice note contained no detectable speech. "
+            "Briefly ask them to try recording it again."
+        )
+        chat_id, thread_id = surface_coordinates()
+        with DurableStore(Path(database_path)) as store:
+            store.enqueue_router_voice_message(
+                source_inbox_job_id=int(job_id),
+                input_text=router_input,
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
             )
     elif transcript:
         send_message(f"📝 Transcript:\n\n{transcript}")

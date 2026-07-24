@@ -102,6 +102,18 @@ def topic_voice_update(update_id=10, thread_id=62):
     return update
 
 
+def voice_update(update_id=10):
+    update = message_update(update_id)
+    message = update["message"]
+    message.pop("text")
+    message["voice"] = {
+        "file_id": "voice-file",
+        "file_size": 1024,
+        "duration": 3,
+    }
+    return update
+
+
 class DurableStoreTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -2763,6 +2775,112 @@ class DurableIntegrationTests(unittest.TestCase):
                 usage = store.latest_agent_usage(agent.agent_id)
                 self.assertEqual(usage["input_tokens"], 50)
                 self.assertEqual(usage["output_tokens"], 5)
+
+    def test_root_voice_transcript_routes_through_main_router_turn_card(self):
+        class FakeRouterAdapter:
+            def run_turn(
+                self,
+                agent,
+                prompt,
+                mailbox_session_id,
+                on_session,
+                heartbeat,
+            ):
+                on_session("router-session-voice")
+                heartbeat()
+                return provider_adapters.ProviderTurnResult(
+                    provider_session_id="router-session-voice",
+                    final_text=(
+                        '{"tool":"respond","arguments":'
+                        '{"message":"voice router complete"}}'
+                    ),
+                    usage={"input_tokens": 20, "output_tokens": 3},
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            with DurableStore(database_path) as store:
+                store.ingest_update(voice_update(), now=100)
+                job = store.connection.execute(
+                    "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+                ).fetchone()
+
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(job["job_id"]),
+                "TELEGRAM_CHAT_ID": "123",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_MESSAGE_THREAD_ID": "",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(on_message.bridge, "download_telegram_file"):
+                    with mock.patch.object(on_message, "convert_to_wav"):
+                        with mock.patch.object(
+                            on_message,
+                            "transcribe_wav",
+                            return_value="what projects are enrolled",
+                        ):
+                            on_message.handle_voice(
+                                voice_update()["message"]["voice"]
+                            )
+
+            with DurableStore(database_path) as store:
+                receipt = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(
+                    receipt.params["text"],
+                    "🎙️ <b>Transcribing…</b>",
+                )
+                store.complete_outbox(
+                    receipt.message_id,
+                    "sender",
+                    {"message_id": 900, "chat": {"id": 123}},
+                    now=101,
+                )
+                sending = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(
+                    sending.params["text"],
+                    "📤 <b>Sending</b>\n"
+                    "<blockquote>what projects are enrolled</blockquote>",
+                )
+                store.complete_outbox(
+                    sending.message_id,
+                    "sender",
+                    True,
+                    now=102,
+                )
+                router_job = store.claim_router_mailbox(
+                    "router",
+                    now=10**12,
+                )
+                with mock.patch.object(
+                    telegram_control.provider_adapters,
+                    "adapter_for",
+                    return_value=FakeRouterAdapter(),
+                ):
+                    telegram_control.process_router_mailbox_job(
+                        store,
+                        router_job,
+                        "router",
+                    )
+                working = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(
+                    working.params["text"],
+                    "🧭 <b>Routing…</b>\n"
+                    "<blockquote>what projects are enrolled</blockquote>",
+                )
+                store.complete_outbox(
+                    working.message_id,
+                    "sender",
+                    True,
+                    now=103,
+                )
+                final = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(final.method, "editMessageText")
+                self.assertEqual(final.params["message_id"], 900)
+                self.assertEqual(
+                    final.params["text"],
+                    "voice router complete",
+                )
 
     def test_topic_voice_transcript_routes_to_agent_and_reuses_turn_card(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

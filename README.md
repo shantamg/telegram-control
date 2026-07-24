@@ -320,6 +320,12 @@ extra summarization turn. Crash-recovery attempts always resume their attached
 session instead of rotating mid-recovery. CLI and Telegram status expose the
 current counters and durable rotation count.
 
+Voice notes sent to the root Control chat now enter the same durable router
+mailbox as text. One Telegram message progresses through local transcription,
+escaped transcript display, main-router work, and the final routed response.
+The router session, validation, clarification, confirmation, and project-agent
+relay rules are identical for text and voice input.
+
 The earlier strict `route`, `clarify`, or `reject` schema remains as a compact
 classification and evaluation primitive. It is not intended to become a
 user-facing command language.
