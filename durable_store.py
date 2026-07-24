@@ -1250,6 +1250,25 @@ class DurableStore:
         ).fetchone()
         return self._surface_binding_from_row(row) if row is not None else None
 
+    def resolve_named_surface(
+        self,
+        chat_id: int,
+        display_name: str,
+        surface_type: str = "project",
+    ) -> Optional[SurfaceBinding]:
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM surface_bindings
+            WHERE chat_id = ? AND display_name = ? AND surface_type = ?
+                AND state = 'active'
+            ORDER BY binding_id
+            LIMIT 1
+            """,
+            (int(chat_id), display_name, surface_type),
+        ).fetchone()
+        return self._surface_binding_from_row(row) if row is not None else None
+
     @staticmethod
     def _surface_card_from_row(row: sqlite3.Row) -> SurfaceCard:
         return SurfaceCard(

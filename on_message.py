@@ -49,12 +49,41 @@ def deliver_api_call(
 
 
 def controller_reply_route() -> dict:
-    return {
+    route = {
         "target_type": "controller",
         "target_id": "control",
         "policy": "reply",
         "ttl_seconds": 30 * 24 * 60 * 60,
     }
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not database_path or not chat_id:
+        return route
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    thread_id = int(thread_id_text) if thread_id_text else None
+    with DurableStore(Path(database_path)) as store:
+        binding = store.resolve_surface_binding(
+            chat_id=int(chat_id),
+            message_thread_id=thread_id,
+        )
+    if binding is not None:
+        route["target_type"] = binding.target_type
+        route["target_id"] = binding.target_id
+    return route
+
+
+def current_surface_binding():
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not database_path or not chat_id:
+        return None
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    thread_id = int(thread_id_text) if thread_id_text else None
+    with DurableStore(Path(database_path)) as store:
+        return store.resolve_surface_binding(
+            chat_id=int(chat_id),
+            message_thread_id=thread_id,
+        )
 
 
 def surface_coordinates():
@@ -108,14 +137,21 @@ def send_status_card(update: dict) -> None:
     chat_id, thread_id = surface_coordinates()
     user_id = int(os.environ["TELEGRAM_FROM_ID"])
     with DurableStore(Path(database_path)) as store:
-        binding = store.ensure_surface_binding(
+        binding = store.resolve_surface_binding(
             chat_id=chat_id,
             message_thread_id=thread_id,
-            surface_type="control",
-            display_name="Control",
-            target_type="controller",
-            target_id="control",
         )
+        if binding is None:
+            if thread_id is not None:
+                raise StoreError("This topic has no durable controller binding.")
+            binding = store.ensure_surface_binding(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                surface_type="control",
+                display_name="Control",
+                target_type="controller",
+                target_id="control",
+            )
         action = store.create_callback_action(
             operation_id=f"surface:{binding.binding_id}:status-refresh",
             action_type="refresh_status",
@@ -476,10 +512,20 @@ def main() -> int:
                         "That replied-to message has no active durable route."
                     )
             else:
-                send_message(
-                    f"✅ Mac script ran and received: {text}",
-                    include_inspect_button=True,
-                )
+                binding = current_surface_binding()
+                thread_id = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID")
+                if thread_id and binding is None:
+                    send_message("This topic has no durable controller binding.")
+                elif thread_id and binding is not None:
+                    send_message(
+                        f"✅ {binding.display_name} route verified: {text}",
+                        include_inspect_button=True,
+                    )
+                else:
+                    send_message(
+                        f"✅ Mac script ran and received: {text}",
+                        include_inspect_button=True,
+                    )
         else:
             send_message("Send me a text or Telegram voice message.")
         return 0

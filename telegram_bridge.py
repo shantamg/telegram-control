@@ -328,6 +328,23 @@ def handler_command(handler_path: Path) -> list[str]:
     return [str(handler_path)]
 
 
+def explicit_reply_message_id(message: dict[str, Any]) -> str:
+    reply = message.get("reply_to_message")
+    if not isinstance(reply, dict):
+        return ""
+    if (
+        message.get("is_topic_message") is True
+        and reply.get("forum_topic_created") is not None
+        and reply.get("message_thread_id") == message.get("message_thread_id")
+    ):
+        # Telegram automatically represents an ordinary top-level topic
+        # message as a reply to the topic-creation service message. It is not a
+        # user-selected reply and therefore must not enter return-route lookup.
+        return ""
+    message_id = reply.get("message_id")
+    return str(message_id) if message_id is not None else ""
+
+
 def process_update(
     config: dict[str, Any],
     update: dict[str, Any],
@@ -364,9 +381,7 @@ def process_update(
             "TELEGRAM_CHAT_ID": str(chat["id"]),
             "TELEGRAM_MESSAGE_ID": str(message.get("message_id", "")),
             "TELEGRAM_MESSAGE_THREAD_ID": str(message.get("message_thread_id", "")),
-            "TELEGRAM_REPLY_TO_MESSAGE_ID": str(
-                message.get("reply_to_message", {}).get("message_id", "")
-            ),
+            "TELEGRAM_REPLY_TO_MESSAGE_ID": explicit_reply_message_id(message),
             "TELEGRAM_TEXT": str(message.get("text", "")),
             "TELEGRAM_FROM_ID": str(sender.get("id", "")),
             "TELEGRAM_FROM_USERNAME": str(sender.get("username", "")),

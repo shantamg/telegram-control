@@ -54,6 +54,40 @@ class MessageDescriptionTests(unittest.TestCase):
         )
         self.assertEqual(message, snapshot)
 
+    def test_ignores_automatic_topic_root_reply(self):
+        message = {
+            "message_id": 43,
+            "message_thread_id": 62,
+            "is_topic_message": True,
+            "reply_to_message": {
+                "message_id": 42,
+                "message_thread_id": 62,
+                "forum_topic_created": {"name": "Stage 2 Test"},
+            },
+        }
+
+        self.assertEqual(
+            telegram_bridge.explicit_reply_message_id(message),
+            "",
+        )
+
+    def test_preserves_explicit_reply_inside_topic(self):
+        message = {
+            "message_id": 45,
+            "message_thread_id": 62,
+            "is_topic_message": True,
+            "reply_to_message": {
+                "message_id": 44,
+                "message_thread_id": 62,
+                "text": "bot response",
+            },
+        }
+
+        self.assertEqual(
+            telegram_bridge.explicit_reply_message_id(message),
+            "44",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

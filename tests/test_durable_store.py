@@ -68,6 +68,20 @@ def callback_update(
     return update
 
 
+def topic_message_update(update_id=10, text="hello", thread_id=62):
+    update = message_update(update_id, text)
+    message = update["message"]
+    message["is_topic_message"] = True
+    message["message_thread_id"] = int(thread_id)
+    message["reply_to_message"] = {
+        "message_id": 42,
+        "message_thread_id": int(thread_id),
+        "chat": {"id": 123, "type": "private"},
+        "forum_topic_created": {"name": "Stage 2 Test"},
+    }
+    return update
+
+
 class DurableStoreTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -502,6 +516,13 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(
             self.store.resolve_surface_binding(123, 7).target_id,
             "reservations",
+        )
+        self.assertEqual(
+            self.store.resolve_named_surface(123, "Reservations").binding_id,
+            project.binding_id,
+        )
+        self.assertIsNone(
+            self.store.resolve_named_surface(123, "Missing")
         )
         self.assertIsNone(self.store.resolve_surface_binding(123, 8))
         with self.assertRaises(StoreError):
@@ -1120,6 +1141,134 @@ class DurableIntegrationTests(unittest.TestCase):
             },
         )
         api_call.assert_called_once_with("token", "getMe")
+
+    def test_topic_provisioning_creates_binding_once(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            args = argparse.Namespace(
+                db=database_path,
+                name="Stage 2 Test",
+                surface_type="project",
+                target_type="controller",
+                target_id="control",
+            )
+            stdout = StringIO()
+            with mock.patch.object(
+                telegram_control.bridge,
+                "load_config",
+                return_value={"chat_id": 123},
+            ):
+                with mock.patch.object(
+                    telegram_control.bridge,
+                    "read_token",
+                    return_value="token",
+                ):
+                    with mock.patch.object(
+                        telegram_control.bridge,
+                        "api_call",
+                        side_effect=[
+                            {"has_topics_enabled": True},
+                            {"message_thread_id": 77, "name": "Stage 2 Test"},
+                        ],
+                    ) as api_call:
+                        with redirect_stdout(stdout):
+                            telegram_control.provision_topic_command(args)
+
+            created = json.loads(stdout.getvalue())
+            self.assertTrue(created["created"])
+            self.assertEqual(created["message_thread_id"], 77)
+            self.assertEqual(created["target"], "controller/control")
+            self.assertEqual(
+                api_call.call_args_list,
+                [
+                    mock.call("token", "getMe"),
+                    mock.call(
+                        "token",
+                        "createForumTopic",
+                        chat_id=123,
+                        name="Stage 2 Test",
+                    ),
+                ],
+            )
+
+            stdout = StringIO()
+            with mock.patch.object(
+                telegram_control.bridge,
+                "load_config",
+                return_value={"chat_id": 123},
+            ):
+                with mock.patch.object(
+                    telegram_control.bridge,
+                    "api_call",
+                    side_effect=AssertionError("duplicate topic creation"),
+                ):
+                    with redirect_stdout(stdout):
+                        telegram_control.provision_topic_command(args)
+
+            existing = json.loads(stdout.getvalue())
+            self.assertFalse(existing["created"])
+            self.assertEqual(existing["message_thread_id"], 77)
+
+    def test_ordinary_topic_message_uses_binding_not_reply_route(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Stage 2 Test",
+                    target_type="controller",
+                    target_id="control",
+                )
+                store.ingest_update(
+                    topic_message_update(10, "topic routing test"),
+                    now=100,
+                )
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(store, config, job, "worker")
+                response = store.claim_outbox("sender", now=10**12)
+
+                self.assertEqual(response.method, "sendMessage")
+                self.assertEqual(response.params["message_thread_id"], 62)
+                self.assertEqual(
+                    response.params["text"],
+                    "✅ Stage 2 Test route verified: topic routing test",
+                )
+
+    def test_status_command_reuses_existing_project_topic_binding(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            update = topic_message_update(10, "/status")
+            with DurableStore(database_path) as store:
+                binding = store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Stage 2 Test",
+                    target_type="controller",
+                    target_id="control",
+                )
+                store.ingest_update(update, now=100)
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(store, config, job, "worker")
+                response = store.claim_outbox("sender", now=10**12)
+
+                self.assertEqual(response.method, "sendMessage")
+                self.assertEqual(response.params["message_thread_id"], 62)
+                self.assertIn("Surface: Stage 2 Test · topic 62", response.params["text"])
+                self.assertEqual(
+                    store.resolve_surface_card(binding.binding_id).state,
+                    "pending",
+                )
 
     def test_handler_queues_reply_instead_of_calling_telegram(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

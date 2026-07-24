@@ -133,6 +133,25 @@ chat topics:
 /Users/shantam/telegram-control/telegram_control.py topic-capability
 ```
 
+Create and durably bind a managed project topic:
+
+```sh
+/Users/shantam/telegram-control/telegram_control.py \
+  provision-topic "Project Name"
+```
+
+Provisioning the same name again returns its existing binding instead of
+creating a duplicate topic. Ordinary top-level topic messages ignore
+Telegram's automatic reply link to the topic-creation service message, while
+explicit replies to bot messages continue through their stored return routes.
+
+The live topic test passed on July 23, 2026. The controller created and bound
+**Stage 2 Test** as topic ID 62. A direct message, an explicit reply, and an
+opaque callback button all routed successfully within that topic. Repeating
+the provisioning command returned the same binding without creating another
+topic. `/status` in the project topic created its own singleton card while
+preserving the separate main Control card.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

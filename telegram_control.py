@@ -419,6 +419,66 @@ def topic_capability_command(_: argparse.Namespace) -> None:
     print(json.dumps(capability, indent=2, sort_keys=True))
 
 
+def provision_topic_command(args: argparse.Namespace) -> None:
+    name = str(args.name).strip()
+    if not name or len(name) > 128:
+        raise StoreError("Topic name must contain between 1 and 128 characters.")
+    config = bridge.load_config()
+    chat_id = int(config["chat_id"])
+    with open_store(args.db) as store:
+        existing = store.resolve_named_surface(
+            chat_id,
+            name,
+            surface_type=args.surface_type,
+        )
+        if existing is not None:
+            result = {
+                "created": False,
+                "binding_id": existing.binding_id,
+                "chat_id": existing.chat_id,
+                "message_thread_id": existing.message_thread_id,
+                "display_name": existing.display_name,
+                "target": f"{existing.target_type}/{existing.target_id}",
+            }
+        else:
+            token = bridge.read_token()
+            bot = bridge.api_call(token, "getMe")
+            if not bool(bot.get("has_topics_enabled", False)):
+                raise StoreError(
+                    "Telegram Threaded Mode is disabled for this bot. "
+                    "Enable it in BotFather first."
+                )
+            topic = bridge.api_call(
+                token,
+                "createForumTopic",
+                chat_id=chat_id,
+                name=name,
+            )
+            try:
+                message_thread_id = int(topic["message_thread_id"])
+            except (KeyError, TypeError, ValueError):
+                raise StoreError(
+                    "Telegram returned an invalid forum-topic result."
+                ) from None
+            binding = store.ensure_surface_binding(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                surface_type=args.surface_type,
+                display_name=name,
+                target_type=args.target_type,
+                target_id=args.target_id,
+            )
+            result = {
+                "created": True,
+                "binding_id": binding.binding_id,
+                "chat_id": binding.chat_id,
+                "message_thread_id": binding.message_thread_id,
+                "display_name": binding.display_name,
+                "target": f"{binding.target_type}/{binding.target_id}",
+            }
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def doctor_command(args: argparse.Namespace) -> None:
     problems = []
     try:
@@ -513,6 +573,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show whether Telegram private-chat topics are enabled for this bot.",
     )
     topic_parser.set_defaults(function=topic_capability_command)
+
+    provision_parser = subparsers.add_parser(
+        "provision-topic",
+        help="Create and bind one managed private-chat topic.",
+    )
+    provision_parser.add_argument("name", help="Telegram topic and surface name.")
+    provision_parser.add_argument(
+        "--surface-type",
+        choices=("project", "task"),
+        default="project",
+    )
+    provision_parser.add_argument("--target-type", default="controller")
+    provision_parser.add_argument("--target-id", default="control")
+    provision_parser.set_defaults(function=provision_topic_command)
 
     doctor_parser = subparsers.add_parser("doctor", help="Check Stage 1 prerequisites.")
     doctor_parser.set_defaults(function=doctor_command)

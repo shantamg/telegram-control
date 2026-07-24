@@ -708,9 +708,25 @@ on July 23, 2026:
 - two live `/status` commands created then edited Telegram message ID 40, with
   one active singleton record and no duplicate status-card message.
 
-Topic provisioning remains before the Stage 2 UI is complete. The live bot
-currently reports Threaded Mode disabled, so it must be enabled in BotFather
-before creating private-chat topics.
+The managed private-topic slice passed 42 offline tests and its live test on
+July 23, 2026:
+
+- BotFather Threaded Mode is enabled and user-created topics are disabled;
+- `provision-topic` created **Stage 2 Test**, bound topic ID 62 to
+  `controller/control`, and returned that binding on a repeated command without
+  creating a duplicate;
+- transport normalization ignores Telegram's automatic pseudo-reply to the
+  topic-creation service message but preserves genuine user replies;
+- a direct topic message resolved the stored surface and replied in topic 62;
+- replying to that bot response resolved its durable topic-scoped return route;
+- its opaque callback validated topic context and executed once inside the same
+  topic.
+- `/status` reused the project binding and registered a second singleton card
+  for topic 62 without affecting the main Control card.
+
+This completes the Stage 2 buttons, topics, return-routing, and persistent-card
+checkpoint. Stage 3 can now introduce the first managed Codex project agent
+behind a project topic without changing the Telegram transport model.
 
 ## References
 
