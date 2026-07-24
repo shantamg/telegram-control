@@ -240,6 +240,11 @@ The live managed-voice test passed on July 23, 2026: one voice note progressed
 through every status stage and returned the requested exact Codex response in
 the same Telegram message.
 
+Controller-owned progress text uses Telegram HTML formatting with escaped
+dynamic content: stage labels are bold and voice transcripts are block quotes.
+Provider output remains plain text until a tested renderer can safely support a
+documented Markdown subset without interpreting arbitrary model text as markup.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

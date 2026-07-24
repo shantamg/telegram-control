@@ -1793,8 +1793,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 receipt = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     receipt.params["text"],
-                    "⏳ Working…",
+                    "⏳ <b>Working…</b>",
                 )
+                self.assertEqual(receipt.params["parse_mode"], "HTML")
                 store.complete_outbox(
                     receipt.message_id,
                     "sender",
@@ -1873,7 +1874,7 @@ class DurableIntegrationTests(unittest.TestCase):
                         with mock.patch.object(
                             on_message,
                             "transcribe_wav",
-                            return_value="inspect the voice route",
+                            return_value="inspect <voice> & route",
                         ):
                             on_message.handle_voice(
                                 topic_voice_update()["message"]["voice"]
@@ -1881,7 +1882,11 @@ class DurableIntegrationTests(unittest.TestCase):
 
             with DurableStore(database_path) as store:
                 receipt = store.claim_outbox("sender", now=10**12)
-                self.assertEqual(receipt.params["text"], "🎙️ Transcribing…")
+                self.assertEqual(
+                    receipt.params["text"],
+                    "🎙️ <b>Transcribing…</b>",
+                )
+                self.assertEqual(receipt.params["parse_mode"], "HTML")
                 self.assertEqual(
                     receipt.card["source_inbox_job_id"],
                     int(job["job_id"]),
@@ -1894,7 +1899,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 mailbox = store.claim_agent_mailbox("agent", now=10**12)
                 self.assertEqual(mailbox.agent_id, agent.agent_id)
-                self.assertEqual(mailbox.input_text, "inspect the voice route")
+                self.assertEqual(mailbox.input_text, "inspect <voice> & route")
                 store.enqueue_agent_voice_status(
                     mailbox.source_inbox_job_id,
                     "working",
@@ -1913,8 +1918,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 sending_edit = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     sending_edit.params["text"],
-                    "📤 Sending:\n\ninspect the voice route",
+                    "📤 <b>Sending</b>\n"
+                    "<blockquote>inspect &lt;voice&gt; &amp; route</blockquote>",
                 )
+                self.assertEqual(sending_edit.params["parse_mode"], "HTML")
                 store.complete_outbox(
                     sending_edit.message_id,
                     "sender",
@@ -1924,9 +1931,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 working_edit = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     working_edit.params["text"],
-                    "🧠 Codex is working…\n\n"
-                    "You said:\ninspect the voice route",
+                    "🧠 <b>Codex is working…</b>\n"
+                    "<blockquote>inspect &lt;voice&gt; &amp; route</blockquote>",
                 )
+                self.assertEqual(working_edit.params["parse_mode"], "HTML")
                 store.complete_outbox(
                     working_edit.message_id,
                     "sender",

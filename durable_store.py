@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -1907,6 +1908,7 @@ class DurableStore:
         chat_id: int,
         message_thread_id: Optional[int],
         receipt_text: str,
+        receipt_parse_mode: Optional[str] = None,
         now: Optional[float] = None,
     ) -> int:
         timestamp = time.time() if now is None else float(now)
@@ -1925,6 +1927,7 @@ class DurableStore:
                 message_thread_id,
                 receipt_text,
                 input_kind="text",
+                parse_mode=receipt_parse_mode,
                 now=timestamp,
             )
             self.connection.execute("COMMIT")
@@ -1941,6 +1944,7 @@ class DurableStore:
         message_thread_id: Optional[int],
         receipt_text: str,
         input_kind: str = "text",
+        parse_mode: Optional[str] = None,
         now: Optional[float] = None,
     ) -> int:
         if input_kind not in {"text", "voice"}:
@@ -1963,18 +1967,23 @@ class DurableStore:
             ).fetchone()
             if binding is None:
                 raise StoreError("Managed agent receipt route is no longer valid.")
+            params = {
+                "chat_id": int(chat_id),
+                "message_thread_id": (
+                    int(message_thread_id)
+                    if message_thread_id is not None
+                    else None
+                ),
+                "text": receipt_text,
+            }
+            if parse_mode is not None:
+                if parse_mode != "HTML":
+                    raise StoreError("Managed agent receipt parse mode is invalid.")
+                params["parse_mode"] = parse_mode
             message_id = self.enqueue_api_call(
                 operation_id=f"agent-input:{int(source_inbox_job_id)}:receipt",
                 method="sendMessage",
-                params={
-                    "chat_id": int(chat_id),
-                    "message_thread_id": (
-                        int(message_thread_id)
-                        if message_thread_id is not None
-                        else None
-                    ),
-                    "text": receipt_text,
-                },
+                params=params,
                 route={
                     "target_type": "agent",
                     "target_id": agent_id,
@@ -2002,10 +2011,14 @@ class DurableStore:
         transcript = input_text.strip()
         if len(transcript) > 3400:
             transcript = transcript[:3397].rstrip() + "…"
+        transcript = html.escape(transcript)
         if stage == "sending":
-            return f"📤 Sending:\n\n{transcript}"
+            return f"📤 <b>Sending</b>\n<blockquote>{transcript}</blockquote>"
         if stage == "working":
-            return f"🧠 Codex is working…\n\nYou said:\n{transcript}"
+            return (
+                "🧠 <b>Codex is working…</b>\n"
+                f"<blockquote>{transcript}</blockquote>"
+            )
         raise StoreError("Managed voice status stage is invalid.")
 
     def enqueue_agent_voice_status(
@@ -2045,6 +2058,7 @@ class DurableStore:
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "text": self.agent_voice_status_text(stage, input_text),
+                "parse_mode": "HTML",
             },
             card={
                 "kind": "agent_turn",

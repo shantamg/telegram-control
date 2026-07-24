@@ -606,6 +606,10 @@ duplicate operations.
 
 - Private bot topics versus a private forum supergroup: implement a common
   `(chat_id, topic_id)` abstraction, then choose after a live UI test.
+- Rich provider responses: controller-owned statuses may use escaped Telegram
+  HTML now. Before styling arbitrary agent output, build fixture coverage for a
+  safe Markdown-to-entity renderer and evaluate Telegram Rich Messages. Never
+  pass untrusted model text directly to an HTML or Markdown parse mode.
 - Exact fast Codex router model: benchmark against routing fixtures.
 - Local versus online TTS: begin by adapting the known working voice script,
   retain an adapter boundary.

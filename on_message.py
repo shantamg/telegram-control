@@ -337,7 +337,7 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
         if agent is None or agent.role not in {"project", "worker"}:
             raise StoreError("Managed agent route is no longer valid.")
         chat_id, thread_id = surface_coordinates()
-        receipt = "⏳ Working…"
+        receipt = "⏳ <b>Working…</b>"
         store.enqueue_agent_message_with_receipt(
             agent_id=agent.agent_id,
             source_inbox_job_id=int(job_id),
@@ -345,6 +345,7 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
             chat_id=chat_id,
             message_thread_id=thread_id,
             receipt_text=receipt,
+            receipt_parse_mode="HTML",
         )
 
 
@@ -551,8 +552,9 @@ def handle_voice(voice: dict) -> None:
                 source_inbox_job_id=int(job_id),
                 chat_id=chat_id,
                 message_thread_id=thread_id,
-                receipt_text="🎙️ Transcribing…",
+                receipt_text="🎙️ <b>Transcribing…</b>",
                 input_kind="voice",
+                parse_mode="HTML",
             )
     else:
         send_message("🎙️ Voice message received. Transcribing locally with Parakeet V3…")
