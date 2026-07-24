@@ -82,7 +82,7 @@ class TmuxConsoleTests(unittest.TestCase):
         self.assertEqual(command[:5], ["/bin/tmux", "new-session", "-d", "-s", "tc--root--project"])
         self.assertIn("--include-non-interactive", command)
         self.assertIn("--sandbox", command)
-        self.assertIn("workspace-write", command)
+        self.assertIn("danger-full-access", command)
         self.assertEqual(command[-1], self.session_id)
         _validate.assert_called_once_with(
             str(self.project_path),
@@ -162,6 +162,7 @@ class TmuxConsoleTests(unittest.TestCase):
         self.assertIn(self.session_id, command)
         self.assertIn("--permission-mode", command)
         self.assertIn("acceptEdits", command)
+        self.assertNotIn("--dangerously-skip-permissions", command)
         self.assertIn("--model", command)
         self.assertIn("sonnet", command)
         self.assertIn("--effort", command)

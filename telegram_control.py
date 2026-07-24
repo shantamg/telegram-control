@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import fcntl
 import json
 import os
@@ -18,7 +19,6 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -43,6 +43,7 @@ from durable_store import (
 
 DATABASE_PATH = bridge.CONFIG_DIR / "controller.sqlite3"
 SCRIPT_PATH = Path(__file__).resolve()
+DEFAULT_AGENT_WORKERS = 3
 ROUTER_MAX_COMPLETED_TURNS = 12
 ROUTER_MAX_INPUT_TOKENS = 180_000
 ROUTER_MAX_DISCOVERY_STEPS = 6
@@ -238,6 +239,15 @@ def process_agent_mailbox_job(
             job.source_inbox_job_id,
             "working",
             job.input_text,
+        )
+        agent = replace(
+            agent,
+            runtime_environment={
+                "TELEGRAM_CONTROL_DB": str(store.path),
+                "TELEGRAM_CONTROL_AGENT_ID": agent.agent_id,
+                "TELEGRAM_CONTROL_MAILBOX_ID": str(job.mailbox_id),
+                "TELEGRAM_CONTROL_WORKER_ID": worker_id,
+            },
         )
         adapter = provider_adapters.adapter_for(agent)
 
@@ -1935,6 +1945,24 @@ def send_outbox_command(args: argparse.Namespace) -> None:
                 return
 
 
+def supervisor_commands(
+    database_path: Path,
+    agent_workers: int = DEFAULT_AGENT_WORKERS,
+) -> list[list[str]]:
+    count = int(agent_workers)
+    if count < 1 or count > 8:
+        raise StoreError("Agent worker count must be between 1 and 8.")
+    base = [sys.executable, str(SCRIPT_PATH), "--db", str(database_path)]
+    commands = [
+        [*base, "collect"],
+        [*base, "work"],
+        [*base, "work-router"],
+    ]
+    commands.extend([*base, "work-agents"] for _ in range(count))
+    commands.append([*base, "send-outbox"])
+    return commands
+
+
 def run_command(args: argparse.Namespace) -> None:
     """Run the independently restartable controller loops under a supervisor."""
     previous_sigterm = signal.getsignal(signal.SIGTERM)
@@ -1945,13 +1973,7 @@ def run_command(args: argparse.Namespace) -> None:
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop_on_sigterm)
-    commands = [
-        [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "collect"],
-        [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "work"],
-        [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "work-router"],
-        [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "work-agents"],
-        [sys.executable, str(SCRIPT_PATH), "--db", str(args.db), "send-outbox"],
-    ]
+    commands = supervisor_commands(args.db, args.agent_workers)
     processes: list[subprocess.Popen[Any]] = []
     try:
         for command in commands:
@@ -1959,6 +1981,7 @@ def run_command(args: argparse.Namespace) -> None:
         log_event(
             "supervisor_started",
             child_pids=[process.pid for process in processes],
+            agent_workers=int(args.agent_workers),
         )
         while True:
             for process in processes:
@@ -2412,6 +2435,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run", help="Run collector, inbox worker, and outbox sender."
+    )
+    run_parser.add_argument(
+        "--agent-workers",
+        type=int,
+        choices=range(1, 9),
+        default=DEFAULT_AGENT_WORKERS,
+        help=(
+            "Managed-agent turns to run concurrently across distinct agents "
+            f"(default: {DEFAULT_AGENT_WORKERS})."
+        ),
     )
     run_parser.set_defaults(function=run_command)
 

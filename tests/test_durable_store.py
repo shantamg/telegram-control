@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 import on_message
+import agent_telegram
 import codex_sessions
 import provider_adapters
 import router_contract
@@ -1224,6 +1225,71 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(route["target_type"], "agent")
         self.assertEqual(route["target_id"], agent.agent_id)
 
+    def test_distinct_agents_can_be_leased_concurrently(self):
+        agents = []
+        for thread_id, name, slug in (
+            (62, "First", "first"),
+            (63, "Second", "second"),
+        ):
+            self.store.ensure_surface_binding(
+                chat_id=123,
+                message_thread_id=thread_id,
+                surface_type="project",
+                display_name=name,
+                target_type="controller",
+                target_id="control",
+                now=100,
+            )
+            agent, _ = self.store.register_project_agent(
+                chat_id=123,
+                surface_name=name,
+                slug=slug,
+                provider="codex",
+                project_path=f"/tmp/{slug}",
+                now=100,
+            )
+            agents.append(agent)
+        for update_id, thread_id, text in (
+            (10, 62, "first task"),
+            (11, 63, "second task"),
+            (12, 62, "later first task"),
+        ):
+            self.store.ingest_update(
+                topic_message_update(update_id, text, thread_id),
+                now=100,
+            )
+        jobs = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs ORDER BY update_id"
+        ).fetchall()
+        self.store.enqueue_agent_message(
+            agents[0].agent_id,
+            int(jobs[0]["job_id"]),
+            "first task",
+            now=100,
+        )
+        self.store.enqueue_agent_message(
+            agents[1].agent_id,
+            int(jobs[1]["job_id"]),
+            "second task",
+            now=100,
+        )
+        self.store.enqueue_agent_message(
+            agents[0].agent_id,
+            int(jobs[2]["job_id"]),
+            "later first task",
+            now=100,
+        )
+
+        first = self.store.claim_agent_mailbox("worker-one", now=101)
+        second = self.store.claim_agent_mailbox("worker-two", now=101)
+        self.assertEqual(
+            {first.agent_id, second.agent_id},
+            {agents[0].agent_id, agents[1].agent_id},
+        )
+        self.assertIsNone(
+            self.store.claim_agent_mailbox("worker-three", now=101)
+        )
+
     def test_completed_agent_response_offers_bound_voice_action(self):
         agent, mailbox_id, response = (
             self._completed_agent_response_with_voice_button()
@@ -1571,6 +1637,142 @@ class DurableStoreTests(unittest.TestCase):
             final_edit.params["text"],
             "telegram-control\n\nfast result",
         )
+
+    def test_active_agent_turn_can_enqueue_scoped_telegram_update(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Stage 2 Test",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        self.store.ingest_update(topic_message_update(10, "work"), now=100)
+        inbox = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+        ).fetchone()
+        mailbox_id = self.store.enqueue_agent_message(
+            agent.agent_id,
+            int(inbox["job_id"]),
+            "work",
+            now=101,
+        )
+        mailbox = self.store.claim_agent_mailbox(
+            "agent-worker",
+            now=102,
+            lease_seconds=10**12,
+        )
+        self.assertEqual(mailbox.mailbox_id, mailbox_id)
+
+        target = self.store.agent_notification_target(
+            agent_id=agent.agent_id,
+            mailbox_id=mailbox_id,
+            worker_id="agent-worker",
+            now=103,
+        )
+        self.assertEqual(target.chat_id, 123)
+        self.assertEqual(target.message_thread_id, 62)
+        self.assertEqual(target.speaker, "telegram-control")
+
+        operation_id = (
+            f"agent-mailbox:{mailbox_id}:notification:text:milestone:abc"
+        )
+        message_id = self.store.enqueue_agent_notification(
+            operation_id=operation_id,
+            agent_id=agent.agent_id,
+            mailbox_id=mailbox_id,
+            worker_id="agent-worker",
+            text="Tests are running.",
+            now=104,
+        )
+        row = self.store.connection.execute(
+            """
+            SELECT method, params_json, route_json
+            FROM outbox_messages
+            WHERE message_id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+        self.assertEqual(row["method"], "sendMessage")
+        self.assertEqual(
+            json.loads(row["params_json"]),
+            {
+                "chat_id": 123,
+                "message_thread_id": 62,
+                "text": "telegram-control\n\nTests are running.",
+            },
+        )
+        self.assertEqual(
+            json.loads(row["route_json"])["target_id"],
+            agent.agent_id,
+        )
+        self.assertEqual(self.store.outbox_operation_state(operation_id), "queued")
+
+        environment = {
+            "TELEGRAM_CONTROL_DB": str(self.database_path),
+            "TELEGRAM_CONTROL_AGENT_ID": agent.agent_id,
+            "TELEGRAM_CONTROL_MAILBOX_ID": str(mailbox_id),
+            "TELEGRAM_CONTROL_WORKER_ID": "agent-worker",
+        }
+        voice_path = Path(self.temporary_directory.name) / "update.ogg"
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with mock.patch.object(
+                agent_telegram.sys,
+                "argv",
+                [
+                    "agent_telegram.py",
+                    "voice",
+                    "--key",
+                    "completion",
+                ],
+            ):
+                with mock.patch.object(
+                    agent_telegram.sys,
+                    "stdin",
+                    StringIO("The work is complete."),
+                ):
+                    with mock.patch.object(
+                        agent_telegram.voice_responses,
+                        "synthesize_voice",
+                        return_value=voice_path,
+                    ):
+                        with redirect_stdout(StringIO()):
+                            self.assertEqual(agent_telegram.main(), 0)
+        voice_row = self.store.connection.execute(
+            """
+            SELECT method, params_json
+            FROM outbox_messages
+            WHERE operation_id LIKE
+                'agent-mailbox:%:notification:voice:completion:%'
+            """
+        ).fetchone()
+        self.assertEqual(voice_row["method"], "sendVoice")
+        self.assertEqual(
+            json.loads(voice_row["params_json"])["__voice_file_path"],
+            str(voice_path),
+        )
+
+        with self.assertRaisesRegex(
+            LeaseLostError,
+            "active managed turn",
+        ):
+            self.store.enqueue_agent_notification(
+                operation_id=operation_id + "-wrong",
+                agent_id=agent.agent_id,
+                mailbox_id=mailbox_id,
+                worker_id="another-worker",
+                text="This must not send.",
+                now=105,
+            )
 
     def test_failed_agent_turn_edit_falls_back_to_routed_message(self):
         self.store.ensure_surface_binding(
@@ -4190,6 +4392,30 @@ class DurableIntegrationTests(unittest.TestCase):
         self.assertTrue(plist["RunAtLoad"])
         self.assertTrue(plist["KeepAlive"])
 
+    def test_supervisor_runs_three_distinct_agent_workers_by_default(self):
+        commands = telegram_control.supervisor_commands(
+            telegram_control.DATABASE_PATH
+        )
+        roles = [command[-1] for command in commands]
+        self.assertEqual(roles.count("work-agents"), 3)
+        self.assertEqual(
+            roles,
+            [
+                "collect",
+                "work",
+                "work-router",
+                "work-agents",
+                "work-agents",
+                "work-agents",
+                "send-outbox",
+            ],
+        )
+        with self.assertRaisesRegex(StoreError, "between 1 and 8"):
+            telegram_control.supervisor_commands(
+                telegram_control.DATABASE_PATH,
+                0,
+            )
+
     def test_control_message_enters_durable_router_mailbox(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"
@@ -4254,6 +4480,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 poll_control=None,
                 on_control=None,
             ):
+                self.agent = agent
                 self.prompt = prompt
                 on_session("project-session-123")
                 heartbeat()
@@ -4390,6 +4617,15 @@ class DurableIntegrationTests(unittest.TestCase):
                         "agent-worker",
                     )
                 self.assertEqual(project_fake.prompt, "Summarize Stage 4")
+                self.assertEqual(
+                    project_fake.agent.runtime_environment,
+                    {
+                        "TELEGRAM_CONTROL_DB": str(database_path),
+                        "TELEGRAM_CONTROL_AGENT_ID": project_agent.agent_id,
+                        "TELEGRAM_CONTROL_MAILBOX_ID": str(agent_job.mailbox_id),
+                        "TELEGRAM_CONTROL_WORKER_ID": "agent-worker",
+                    },
+                )
                 self.assertEqual(
                     store.resolve_agent(
                         project_agent.agent_id
@@ -7343,6 +7579,115 @@ class DurableIntegrationTests(unittest.TestCase):
                     receipt_params["text"],
                     "🧭 <b>Control is routing…</b>",
                 )
+
+    def test_new_private_forum_can_authorize_and_bind_in_one_confirmation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            workspace = root / "life"
+            workspace.mkdir()
+            database_path = root / "controller.sqlite3"
+            update = topic_message_update(
+                10,
+                f"Set up this group for {workspace} using Claude.",
+            )
+            update["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            update["message"]["reply_to_message"]["forum_topic_created"][
+                "name"
+            ] = "General"
+            with DurableStore(database_path) as store:
+                store.ingest_update(update, now=100)
+                job = store.connection.execute(
+                    "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+                ).fetchone()
+
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(job["job_id"]),
+                "TELEGRAM_CHAT_ID": "-100777",
+                "TELEGRAM_CHAT_TYPE": "supergroup",
+                "TELEGRAM_CHAT_TITLE": "Life",
+                "TELEGRAM_TOPIC_NAME": "General",
+                "TELEGRAM_MESSAGE_ID": "99",
+                "TELEGRAM_MESSAGE_THREAD_ID": "62",
+                "TELEGRAM_REPLY_TO_MESSAGE_ID": "",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_FROM_USERNAME": "tester",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    on_message.discovery,
+                    "load_discovery_roots",
+                    return_value=[root.resolve()],
+                ):
+                    with mock.patch.object(
+                        on_message.sys,
+                        "stdin",
+                        StringIO(json.dumps(update)),
+                    ):
+                        self.assertEqual(on_message.main(), 0)
+
+            with DurableStore(database_path) as store:
+                prompt = store.claim_outbox("sender", now=10**12)
+                self.assertIn("Set up Life", prompt.params["text"])
+                self.assertIn(str(workspace.resolve()), prompt.params["text"])
+                buttons = prompt.params["reply_markup"]["inline_keyboard"]
+                self.assertEqual(
+                    [row[0]["text"] for row in buttons],
+                    ["Authorize and bind", "Cancel"],
+                )
+                self.assertIsNone(store.resolve_surface_binding(-100777))
+                self.assertIsNone(store.resolve_forum_workspace(-100777))
+                callback = callback_update(
+                    11,
+                    buttons[0][0]["callback_data"],
+                    message_id=700,
+                    message_thread_id=62,
+                )
+                callback["callback_query"]["message"]["chat"] = dict(
+                    update["message"]["chat"]
+                )
+                store.ingest_update(callback, now=101)
+                callback_job = store.connection.execute(
+                    "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+                ).fetchone()
+
+            callback_environment = {
+                **environment,
+                "TELEGRAM_CONTROL_JOB_ID": str(callback_job["job_id"]),
+                "TELEGRAM_MESSAGE_ID": "700",
+            }
+            with mock.patch.dict(
+                os.environ,
+                callback_environment,
+                clear=False,
+            ):
+                with mock.patch.object(
+                    on_message.sys,
+                    "stdin",
+                    StringIO(json.dumps(callback)),
+                ):
+                    self.assertEqual(on_message.main(), 0)
+
+            with DurableStore(database_path) as store:
+                binding = store.resolve_surface_binding(-100777)
+                workspace_record = store.resolve_forum_workspace(-100777)
+                self.assertIsNotNone(binding)
+                self.assertIsNotNone(workspace_record)
+                self.assertEqual(
+                    workspace_record.forum_binding_id,
+                    binding.binding_id,
+                )
+                self.assertEqual(
+                    workspace_record.project_path,
+                    str(workspace.resolve()),
+                )
+                self.assertEqual(workspace_record.provider, "claude")
+                self.assertEqual(workspace_record.provider_config, {})
 
     def test_status_command_reuses_existing_project_topic_binding(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -5,6 +5,7 @@ import html
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -640,7 +641,49 @@ def enqueue_router_input(
         )
 
 
-def forum_is_authorized_or_prompt() -> bool:
+def proposed_forum_setup(text: str) -> Optional[dict]:
+    """Recognize an explicit first-message forum setup with a local path."""
+    if not re.search(r"\b(?:set\s*up|bind|workspace)\b", text, re.IGNORECASE):
+        return None
+    lowered = text.casefold()
+    mentions_codex = bool(re.search(r"\bcodex\b", lowered))
+    mentions_claude = bool(re.search(r"\bclaude\b", lowered))
+    if mentions_codex and mentions_claude:
+        return None
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        return None
+    for token in tokens:
+        raw_path = token.strip("`'\"()[]{}.,;:!?")
+        if not (raw_path.startswith("/") or raw_path.startswith("~/")):
+            continue
+        candidate = Path(raw_path).expanduser()
+        if not candidate.is_absolute():
+            continue
+        roots = discovery.load_discovery_roots()
+        if not discovery.within_roots(str(candidate), roots):
+            continue
+        real = os.path.realpath(candidate)
+        if not Path(real).is_dir():
+            continue
+        git_root = discovery.exact_git_root(real)
+        workspace_root, workdir, git_root = discovery.validate_agent_workspace(
+            real,
+            real,
+            git_root,
+        )
+        return {
+            "project_path": workspace_root,
+            "working_directory": workdir,
+            "git_repository_root": git_root,
+            "provider": "claude" if mentions_claude else "codex",
+            "provider_config": {},
+        }
+    return None
+
+
+def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
     """Require one explicit owner confirmation before a forum reaches Control."""
     if os.environ.get("TELEGRAM_CHAT_TYPE") != "supergroup":
         return True
@@ -672,6 +715,60 @@ def forum_is_authorized_or_prompt() -> bool:
             ):
                 raise StoreError("Private forum authorization is invalid.")
             return True
+        setup = proposed_forum_setup(text) if text else None
+        if setup is not None:
+            payload = {
+                "chat_id": chat_id,
+                "display_name": display_name,
+                **setup,
+            }
+            confirm = store.create_callback_action(
+                operation_id=f"inbox:{job_id}:authorize-bind-forum",
+                action_type="authorize_bind_forum",
+                payload=payload,
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=int(user_id_text),
+                one_time=True,
+                ttl_seconds=60 * 60,
+            )
+            cancel = store.create_callback_action(
+                operation_id=f"inbox:{job_id}:authorize-bind-forum-cancel",
+                action_type="authorize_bind_forum_cancel",
+                payload={
+                    "chat_id": chat_id,
+                    "display_name": display_name,
+                },
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=int(user_id_text),
+                one_time=True,
+                ttl_seconds=60 * 60,
+            )
+            send_message(
+                f"Set up {display_name} for this workspace?\n\n"
+                f"Workspace: {setup['project_path']}\n"
+                f"Provider: {setup['provider']}\n\n"
+                "This authorizes the private forum and binds its topics to "
+                "that workspace. Nothing changes until you confirm.",
+                reply_markup={
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "Authorize and bind",
+                                "callback_data": f"a:{confirm.token}",
+                            }
+                        ],
+                        [
+                            {
+                                "text": "Cancel",
+                                "callback_data": f"a:{cancel.token}",
+                            }
+                        ],
+                    ]
+                },
+            )
+            return False
         action = store.create_callback_action(
             operation_id=f"inbox:{job_id}:authorize-forum",
             action_type="authorize_forum",
@@ -829,6 +926,105 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         send_message(
             f"✅ {display_name} is authorized.\n\n"
             "Send your text or voice request in this topic again."
+        )
+        return
+    if action.action_type in {
+        "authorize_bind_forum",
+        "authorize_bind_forum_cancel",
+    }:
+        target_chat_id = int(action.payload.get("chat_id", 0))
+        display_name = str(action.payload.get("display_name", "")).strip()
+        if (
+            target_chat_id != chat_id
+            or target_chat_id >= 0
+            or not display_name
+            or len(display_name) > 128
+        ):
+            raise StoreError("Stored forum setup action is invalid.")
+        if action.action_type == "authorize_bind_forum_cancel":
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": "Cancelled.",
+                    },
+                    "callback-answer",
+                )
+            deliver_api_call(
+                "editMessageReplyMarkup",
+                {
+                    "chat_id": chat_id,
+                    "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                    "reply_markup": {"inline_keyboard": []},
+                },
+                "forum-setup-clear",
+            )
+            send_message("Cancelled. The forum was not authorized or bound.")
+            return
+        required = {
+            "project_path",
+            "working_directory",
+            "git_repository_root",
+            "provider",
+            "provider_config",
+        }
+        if not required.issubset(action.payload):
+            raise StoreError("Stored forum setup plan is invalid.")
+        provider_config = action.payload["provider_config"]
+        if not isinstance(provider_config, dict):
+            raise StoreError("Stored forum setup configuration is invalid.")
+        workspace_root, working_directory, git_repository_root = (
+            discovery.validate_agent_workspace(
+                str(action.payload["project_path"]),
+                str(action.payload["working_directory"]),
+                (
+                    str(action.payload["git_repository_root"])
+                    if action.payload["git_repository_root"] is not None
+                    else None
+                ),
+            )
+        )
+        if (
+            workspace_root != str(action.payload["project_path"])
+            or working_directory != str(action.payload["working_directory"])
+            or git_repository_root != action.payload["git_repository_root"]
+        ):
+            raise StoreError(
+                "The forum workspace changed before confirmation."
+            )
+        with DurableStore(Path(database_path)) as store:
+            workspace, _created = store.authorize_and_bind_forum_workspace(
+                chat_id=target_chat_id,
+                display_name=display_name,
+                project_path=workspace_root,
+                working_directory=working_directory,
+                git_repository_root=git_repository_root,
+                provider=str(action.payload["provider"]),
+                provider_config=provider_config,
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": f"{display_name} is ready.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "forum-setup-clear",
+        )
+        send_message(
+            f"✅ {workspace.display_name} is authorized and bound.\n\n"
+            "Create or open any topic and send your request. Its subject "
+            "agent will be created automatically."
         )
         return
 
@@ -2402,7 +2598,7 @@ def main() -> int:
         elif message and "text" in message:
             text = str(message["text"])
             print(f"Received text message from @{username}: {text}", flush=True)
-            if not forum_is_authorized_or_prompt():
+            if not forum_is_authorized_or_prompt(text):
                 return 0
             replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
             agent_create = re.fullmatch(

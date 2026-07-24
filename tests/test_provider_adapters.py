@@ -131,6 +131,27 @@ def claude_agent(**overrides):
 
 
 class CodexEventTests(unittest.TestCase):
+    def test_managed_codex_default_is_unrestricted_without_approvals(self):
+        self.assertEqual(
+            provider_adapters.CodexExecAdapter._sandbox_mode(codex_agent()),
+            "danger-full-access",
+        )
+        method, params = provider_adapters.CodexExecAdapter._thread_request(
+            None,
+            "/tmp/project",
+            None,
+            "danger-full-access",
+        )
+        self.assertEqual(method, "thread/start")
+        self.assertEqual(
+            params,
+            {
+                "cwd": "/tmp/project",
+                "sandbox": "danger-full-access",
+                "approvalPolicy": "never",
+            },
+        )
+
     def test_consumes_persistent_session_final_message_and_usage(self):
         sessions = []
         result = provider_adapters.consume_codex_events(
@@ -272,6 +293,7 @@ class ClaudeEventTests(unittest.TestCase):
         fresh = adapter.command(self.agent, None)
         self.assertIn("stream-json", fresh)
         self.assertIn("bypassPermissions", fresh)
+        self.assertIn("--dangerously-skip-permissions", fresh)
         self.assertNotIn("--resume", fresh)
 
         configured = ManagedAgent(
@@ -291,6 +313,7 @@ class ClaudeEventTests(unittest.TestCase):
         self.assertIn("high", resumed)
         self.assertEqual(resumed[-2:], ["--resume", "session-123"])
         self.assertIn("acceptEdits", resumed)
+        self.assertNotIn("--dangerously-skip-permissions", resumed)
 
         invalid = ManagedAgent(
             **{
@@ -452,7 +475,8 @@ class LiveControlContractTests(unittest.TestCase):
                     "model": "gpt-test",
                     "effort": "high",
                     "sandbox": "workspace-write",
-                }
+                },
+                runtime_environment={"TELEGRAM_CONTROL_MAILBOX_ID": "42"},
             ),
             "SECRET prompt at /private/project",
             None,
@@ -467,6 +491,10 @@ class LiveControlContractTests(unittest.TestCase):
 
         self.assertEqual(factory.command, ["/bin/codex", "app-server", "--stdio"])
         self.assertEqual(factory.kwargs["cwd"], "/tmp/project/app")
+        self.assertEqual(
+            factory.kwargs["env"]["TELEGRAM_CONTROL_MAILBOX_ID"],
+            "42",
+        )
         self.assertTrue(factory.kwargs["start_new_session"])
         self.assertEqual(process.payloads[0]["method"], "initialize")
         self.assertEqual(process.payloads[1], {"method": "initialized"})
@@ -692,7 +720,9 @@ class LiveControlContractTests(unittest.TestCase):
             _popen_factory=factory,
         )
         result = adapter.run_turn(
-            claude_agent(),
+            claude_agent(
+                runtime_environment={"TELEGRAM_CONTROL_MAILBOX_ID": "43"}
+            ),
             "SECRET prompt at /private/project",
             None,
             lambda _session: None,
@@ -708,6 +738,10 @@ class LiveControlContractTests(unittest.TestCase):
         self.assertIn("--replay-user-messages", factory.command)
         self.assertIn("--session-id", factory.command)
         self.assertEqual(factory.kwargs["cwd"], "/tmp/project/app")
+        self.assertEqual(
+            factory.kwargs["env"]["TELEGRAM_CONTROL_MAILBOX_ID"],
+            "43",
+        )
         self.assertTrue(factory.kwargs["start_new_session"])
         self.assertEqual(len(user_messages), 2)
         self.assertEqual(user_messages[1]["message"]["content"], "Focus on tests.")

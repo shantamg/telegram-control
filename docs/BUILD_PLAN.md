@@ -782,8 +782,10 @@ live test on July 23, 2026:
 - the provider-neutral adapter contract separates session creation/resume,
   structured events, usage, and capabilities from Telegram and persistence;
 - the Codex adapter uses JSONL events, checkpoints `thread.started` before
-  completion, captures the final public message and token usage, and defaults
-  to `workspace-write` rather than unrestricted/yolo execution;
+  completion, captures the final public message and token usage, and originally
+  defaulted to `workspace-write`; managed project/topic agents now deliberately
+  default to `danger-full-access` with approval policy `never`, while the
+  global router stays read-only;
 - a fourth supervised worker owns agent mailbox leases and routes durable final
   responses back to the bound topic;
 - accepted turns produce an immediate receipt while final output is still a
@@ -800,8 +802,8 @@ July 23, 2026:
   collisions fail closed;
 - `starting` and `running` reservations exclude that agent from mailbox claims,
   preventing concurrent structured and interactive control;
-- Codex resumes inside tmux with the agent's configured sandbox, without
-  enabling unrestricted/yolo mode;
+- Codex resumes inside tmux with the agent's configured sandbox; the current
+  project-agent default is `danger-full-access`;
 - `/agent` reports the reconciled console state, and a vanished tmux session is
   released durably;
 - the live Codex TUI displayed both earlier structured turns from the persisted
@@ -1265,8 +1267,11 @@ a private forum supergroup topic. Public groups, non-forum groups, channels,
 unrelated private chats, and other users fail before their content is written
 to SQLite. A new forum does not reach the global router immediately: its first
 text or voice request produces an exact user/chat/topic-bound **Authorize
-forum** action. Only the confirmed forum receives a root Control binding; the
-user then resends the request and its topic becomes a Control surface.
+forum** action. When the first text message is itself an explicit setup request
+with a validated local path, the controller may instead offer one
+**Authorize and bind** action that atomically creates the Control surface and
+forum workspace. Otherwise the confirmed forum continues through the existing
+conversational binding flow.
 
 Telegram enables Group Privacy by default, so Slam Paws must be promoted to
 administrator in each private forum before ordinary topic text and voice can
@@ -1279,9 +1284,9 @@ Schema v18 adds one durable workspace boundary per authorized private forum.
 The conversational Control agent receives bounded current-surface state and
 may propose `bind_forum_workspace` only for the forum containing the request.
 The proposal accepts an enrolled workspace, an explicit user path, or an
-opaque result from read-only discovery; Git remains optional and Claude is not
-enabled for this release. Model and effort overrides must appear explicitly in
-the user's request.
+opaque result from read-only discovery; Git remains optional and both Codex
+and Claude are supported. Model and effort overrides must appear explicitly
+in the user's request.
 
 The controller revalidates the forum authorization and every realpath at
 confirmation time, then persists the binding only after the owner presses the
@@ -1315,6 +1320,24 @@ replies do not trigger provisioning: `/status` remains read-only, existing
 project-agent topics retain their current route/session, and historical
 Control reply routes continue to reach Control with bounded text or voice
 context after a topic has become a subject.
+
+### Lightweight execution and agent-update checkpoint
+
+The controller keeps one queue per persisted agent but now supervises three
+agent workers, allowing different topic agents to execute concurrently while
+preserving single-writer ordering within each conversation. Managed Codex
+agents default to `danger-full-access` with approval policy `never`; managed
+Claude agents default to `bypassPermissions` with
+`--dangerously-skip-permissions`. The global router remains read-only.
+
+An active managed turn receives only its database path, agent ID, mailbox ID,
+and lease-owner ID as runtime context. The provider-neutral
+`agent_telegram.py` helper uses that context to verify the live lease and
+durably enqueue a concise text or voice update to the owning topic. No bot
+token is passed through the helper. The matching `telegram-agent-updates`
+skill is installed for Codex and Claude and retained canonically in this
+repository. This deliberately avoids a second notification service or
+provider-specific Telegram integration.
 
 ## References
 

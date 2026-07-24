@@ -114,7 +114,9 @@ def open_agent_console(
 
     store.reserve_agent_console(agent.agent_id, session_name)
     if agent.provider == "codex":
-        sandbox = str(agent.provider_config.get("sandbox", "workspace-write"))
+        sandbox = str(
+            agent.provider_config.get("sandbox", "danger-full-access")
+        )
         command = [
             codex_binary(),
             "resume",
@@ -152,6 +154,8 @@ def open_agent_console(
             "--permission-mode",
             permission_mode,
         ]
+        if permission_mode == "bypassPermissions":
+            command.append("--dangerously-skip-permissions")
         model = agent.provider_config.get("model")
         if model:
             command.extend(["--model", str(model)])

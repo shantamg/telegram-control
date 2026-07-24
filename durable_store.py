@@ -12,7 +12,7 @@ import secrets
 import sqlite3
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -126,11 +126,23 @@ class ManagedAgent:
     provider_config: dict[str, Any]
     working_directory: Optional[str] = None
     git_repository_root: Optional[str] = None
+    runtime_environment: dict[str, str] = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
 
     @property
     def workspace_root(self) -> Optional[str]:
         """Application-facing name for the legacy project_path column."""
         return self.project_path
+
+
+@dataclass(frozen=True)
+class AgentNotificationTarget:
+    chat_id: int
+    message_thread_id: Optional[int]
+    speaker: str
 
 
 @dataclass(frozen=True)
@@ -2981,7 +2993,9 @@ class DurableStore:
             "active",
         )
 
-        self.connection.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.connection.in_transaction
+        if owns_transaction:
+            self.connection.execute("BEGIN IMMEDIATE")
         try:
             row = self.connection.execute(
                 """
@@ -3028,10 +3042,12 @@ class DurableStore:
                         "Telegram surface is already bound to a different target."
                     )
             binding = self._surface_binding_from_row(row)
-            self.connection.execute("COMMIT")
+            if owns_transaction:
+                self.connection.execute("COMMIT")
             return binding
         except BaseException:
-            self.connection.execute("ROLLBACK")
+            if owns_transaction and self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
             raise
 
     def resolve_surface_binding(
@@ -3487,7 +3503,9 @@ class DurableStore:
             git_root = None
         normalized_config = validate_provider_config(provider, provider_config)
         timestamp = time.time() if now is None else float(now)
-        self.connection.execute("BEGIN IMMEDIATE")
+        owns_transaction = not self.connection.in_transaction
+        if owns_transaction:
+            self.connection.execute("BEGIN IMMEDIATE")
         try:
             binding_row = self.connection.execute(
                 """
@@ -3537,7 +3555,8 @@ class DurableStore:
                     raise StoreError(
                         "This forum is already bound to a different workspace."
                     )
-                self.connection.execute("COMMIT")
+                if owns_transaction:
+                    self.connection.execute("COMMIT")
                 return current, False
             self.connection.execute(
                 """
@@ -3590,10 +3609,55 @@ class DurableStore:
                 "SELECT * FROM forum_workspaces WHERE chat_id = ?",
                 (int(chat_id),),
             ).fetchone()
-            self.connection.execute("COMMIT")
+            if owns_transaction:
+                self.connection.execute("COMMIT")
             return self._forum_workspace_from_row(row), True
         except BaseException:
-            self.connection.execute("ROLLBACK")
+            if owns_transaction and self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def authorize_and_bind_forum_workspace(
+        self,
+        *,
+        chat_id: int,
+        display_name: str,
+        project_path: str,
+        working_directory: Optional[str] = None,
+        git_repository_root: Optional[str] = None,
+        provider: str = "codex",
+        provider_config: Optional[dict[str, Any]] = None,
+        now: Optional[float] = None,
+    ) -> tuple[ForumWorkspace, bool]:
+        """Atomically authorize one private forum and bind its workspace."""
+        if int(chat_id) >= 0:
+            raise StoreError("A forum workspace requires a supergroup chat.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            binding = self.ensure_surface_binding(
+                chat_id=int(chat_id),
+                surface_type="control",
+                display_name=display_name,
+                target_type="controller",
+                target_id="control",
+                now=timestamp,
+            )
+            workspace, created = self.bind_forum_workspace(
+                chat_id=int(chat_id),
+                forum_binding_id=binding.binding_id,
+                project_path=project_path,
+                working_directory=working_directory,
+                git_repository_root=git_repository_root,
+                provider=provider,
+                provider_config=provider_config,
+                now=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return workspace, created
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
             raise
 
     def resolve_surface_binding_by_id(
@@ -6606,6 +6670,137 @@ class DurableStore:
             (agent_id,),
         ).fetchone()
         return str(fallback["slug"]) if fallback is not None else "Agent"
+
+    def agent_notification_target(
+        self,
+        *,
+        agent_id: str,
+        mailbox_id: int,
+        worker_id: str,
+        now: Optional[float] = None,
+    ) -> AgentNotificationTarget:
+        """Resolve the Telegram destination for one currently leased turn."""
+        timestamp = time.time() if now is None else float(now)
+        row = self.connection.execute(
+            """
+            SELECT m.reply_chat_id, m.reply_message_thread_id,
+                a.surface_binding_id
+            FROM agent_mailbox AS m
+            JOIN agents AS a ON a.agent_id = m.agent_id
+            WHERE m.mailbox_id = ? AND m.agent_id = ?
+                AND m.state = 'leased' AND m.lease_owner = ?
+                AND m.lease_expires_at > ?
+            """,
+            (
+                int(mailbox_id),
+                str(agent_id),
+                str(worker_id),
+                timestamp,
+            ),
+        ).fetchone()
+        if row is None:
+            raise LeaseLostError(
+                "Telegram updates are only available to the active managed turn."
+            )
+        if row["reply_chat_id"] is not None:
+            chat_id = int(row["reply_chat_id"])
+            thread_id = int(row["reply_message_thread_id"] or 0)
+        else:
+            binding = self.connection.execute(
+                """
+                SELECT chat_id, message_thread_id
+                FROM surface_bindings
+                WHERE binding_id = ? AND target_type = 'agent'
+                    AND target_id = ? AND state = 'active'
+                """,
+                (int(row["surface_binding_id"]), str(agent_id)),
+            ).fetchone()
+            if binding is None:
+                raise StoreError("Managed agent surface is unavailable.")
+            chat_id = int(binding["chat_id"])
+            thread_id = int(binding["message_thread_id"])
+        return AgentNotificationTarget(
+            chat_id=chat_id,
+            message_thread_id=thread_id if thread_id != 0 else None,
+            speaker=self.agent_speaker_header(agent_id),
+        )
+
+    def outbox_operation_state(self, operation_id: str) -> Optional[str]:
+        row = self.connection.execute(
+            """
+            SELECT state
+            FROM outbox_messages
+            WHERE operation_id = ?
+            """,
+            (str(operation_id),),
+        ).fetchone()
+        return str(row["state"]) if row is not None else None
+
+    def enqueue_agent_notification(
+        self,
+        *,
+        operation_id: str,
+        agent_id: str,
+        mailbox_id: int,
+        worker_id: str,
+        text: str,
+        voice_file_path: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> int:
+        """Durably enqueue a scoped text or voice update from an active turn."""
+        body = str(text).strip()
+        if not body or len(body) > 3_500:
+            raise StoreError(
+                "Agent Telegram updates must contain 1 to 3,500 characters."
+            )
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            target = self.agent_notification_target(
+                agent_id=agent_id,
+                mailbox_id=mailbox_id,
+                worker_id=worker_id,
+                now=timestamp,
+            )
+            route = {
+                "target_type": "agent",
+                "target_id": str(agent_id),
+                "policy": "reply",
+                "ttl_seconds": 30 * 24 * 60 * 60,
+            }
+            if voice_file_path is None:
+                method = "sendMessage"
+                params: dict[str, Any] = {
+                    "chat_id": target.chat_id,
+                    "message_thread_id": target.message_thread_id,
+                    "text": f"{target.speaker}\n\n{body}",
+                }
+            else:
+                method = "sendVoice"
+                params = {
+                    "chat_id": target.chat_id,
+                    "message_thread_id": target.message_thread_id,
+                    "__voice_file_path": str(voice_file_path),
+                    "caption": target.speaker,
+                }
+            message_id = self.enqueue_api_call(
+                operation_id=operation_id,
+                method=method,
+                params=params,
+                route=route,
+                card={
+                    "kind": "agent_notification",
+                    "mailbox_id": int(mailbox_id),
+                },
+                serialize_key=f"agent-notification:{int(mailbox_id)}",
+                now=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return message_id
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
 
     def labeled_agent_chunks(
         self,

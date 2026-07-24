@@ -1,0 +1,4 @@
+interface:
+  display_name: "Telegram Agent Updates"
+  short_description: "Send durable Telegram text or voice updates"
+  default_prompt: "Use $telegram-agent-updates to send me a concise Telegram voice update when this task finishes."

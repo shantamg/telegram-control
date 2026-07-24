@@ -371,6 +371,12 @@ class CodexExecAdapter:
         )
 
     @staticmethod
+    def _sandbox_mode(agent: ManagedAgent) -> str:
+        return str(
+            agent.provider_config.get("sandbox", "danger-full-access")
+        )
+
+    @staticmethod
     def _thread_request(
         persisted_session: Optional[str],
         launch_directory: str,
@@ -484,7 +490,7 @@ class CodexExecAdapter:
         launch_directory = agent.working_directory or agent.project_path
         model = agent.provider_config.get("model")
         effort = agent.provider_config.get("effort")
-        sandbox = str(agent.provider_config.get("sandbox", "workspace-write"))
+        sandbox = self._sandbox_mode(agent)
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
         effective_prompt = prompt
@@ -504,6 +510,7 @@ class CodexExecAdapter:
             process = self._popen_factory(
                 command,
                 cwd=launch_directory,
+                env={**os.environ, **agent.runtime_environment},
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,
@@ -996,6 +1003,8 @@ class ClaudePrintAdapter:
             "--permission-mode",
             permission_mode,
         ]
+        if permission_mode == "bypassPermissions":
+            command.append("--dangerously-skip-permissions")
         model = agent.provider_config.get("model")
         if model:
             command.extend(["--model", str(model)])
@@ -1094,6 +1103,7 @@ class ClaudePrintAdapter:
             process = self._popen_factory(
                 command,
                 cwd=launch_directory,
+                env={**os.environ, **agent.runtime_environment},
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,

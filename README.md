@@ -9,8 +9,8 @@ agents. The intended experience is:
 4. Receive text, a Telegram voice note, and contextual buttons that route
    follow-up actions back to the originating agent.
 
-The repository currently contains the working Stage 0 proof of concept plus the
-plan for building the durable controller. See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md).
+The repository contains the working durable local controller plus its staged
+design history. See [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md).
 
 ## What works now
 
@@ -179,18 +179,25 @@ Schema version 7 adds a serialized durable mailbox per managed agent and a
 provider-neutral execution contract. The first adapter uses structured JSONL
 from `codex exec --json`, checkpoints `thread.started` before turn completion,
 parses the final public agent message and usage metadata, and resumes the stored
-session ID. Codex runs with `workspace-write` by default; unrestricted/yolo
-mode is never enabled by the controller.
+session ID. Managed project and topic agents now run with
+`danger-full-access` and approval policy `never` by default. This is the Codex
+equivalent of the user's normal `--yolo` workflow. The central conversational
+router remains explicitly read-only.
 
 The Stage 5 provider expansion adds Claude Code behind that same contract.
 Claude runs in non-interactive stream-JSON mode, checkpoints its session UUID
 before completion, normalizes the final result and usage, and resumes the same
 conversation on later mailbox turns. Managed Claude agents default to
-`bypassPermissions` because unattended print-mode turns cannot answer
-permission prompts; set `provider_config.permission_mode` to `acceptEdits`,
-`auto`, `dontAsk`, or `plan` for a more restrictive agent. The explicit tmux
-console can resume either a Codex or Claude session without changing its
-logical agent identity.
+`bypassPermissions` plus `--dangerously-skip-permissions` because unattended
+turns cannot answer permission prompts; set `provider_config.permission_mode`
+to `acceptEdits`, `auto`, `dontAsk`, or `plan` for a more restrictive agent.
+The explicit tmux console can resume either a Codex or Claude session without
+changing its logical agent identity.
+
+Three supervised agent workers may lease different agents concurrently. The
+mailbox still serializes turns for each individual agent, so two topics can
+work at once without allowing two processes to mutate the same persisted
+conversation concurrently.
 
 Each accepted agent turn immediately sends a compact `⏳ Working…` receipt.
 For normal
@@ -225,8 +232,8 @@ Opening fails unless the agent has a persisted provider session and an idle
 mailbox. The reservation prevents the mailbox worker from controlling the same
 agent concurrently. New Telegram turns may still queue durably during takeover
 and are claimed after the console closes. Existing unmanaged tmux sessions are
-never adopted or killed, and Codex retains the configured sandbox rather than
-enabling unrestricted/yolo mode.
+never adopted or killed, and the console retains the agent's configured
+permission mode.
 
 Project-creation requests may explicitly name `codex` or `claude`. The
 controller validates that provider and shows it in the existing confirmation
@@ -485,6 +492,18 @@ continuity:
   delivery or terminal failure. Stale cleanup consults queued and leased
   outbox references before removing completed audio.
 
+Managed Codex and Claude turns can also send an update before their final
+answer through the installed `telegram-agent-updates` skill. The
+provider-neutral `agent_telegram.py` helper accepts concise text or voice on
+standard input, verifies the caller's active mailbox lease, resolves that
+turn's owning Telegram topic, and writes to the durable outbox. It does not
+receive the Telegram bot token. Stable caller-provided keys and a content hash
+make retries idempotent. The canonical skill definition lives under
+`skills/telegram-agent-updates` and is installed in both the Codex and Claude
+user skill directories. Voice updates send their bounded text to Microsoft
+Edge TTS, so agents should use them only when requested or for a genuinely
+useful milestone, blocker, or completion.
+
 ## Live Codex worker control
 
 Schema v17 persists the provider turn ID separately from the provider session
@@ -522,12 +541,14 @@ transport accepts an update only when:
 
 Messages from other group members, non-forum groups, public groups, channels,
 and unrelated private chats are discarded before their content enters SQLite.
-A first text or voice message in a new private forum produces one
-owner/topic-bound **Authorize forum** button and does not reach Control. After
-that explicit confirmation, resend the request: its topic becomes a
-Control-bound surface under the authorized forum using the existing
-`(chat_id, message_thread_id)` key. Consequential workspace or agent creation
-remains separately confirmation-gated. Multiple bot tokens are not required.
+A first text or voice message in a new private forum normally produces one
+owner/topic-bound **Authorize forum** button and does not reach Control. A
+first text message that explicitly asks to set up or bind the forum and
+includes a discoverable local path instead offers one combined
+**Authorize and bind** confirmation. The callback revalidates the path and
+atomically creates both the Control surface and forum workspace; there is no
+resend between those steps. Consequential topic-agent creation remains lazy
+and separately bounded. Multiple bot tokens are not required.
 
 An authorized forum can then be bound conversationally to one existing local
 workspace, including a non-Git notes tree. Control resolves the user-stated
@@ -555,11 +576,11 @@ Live setup:
 1. Create a private Telegram group and enable Topics.
 2. Add Slam Paws and promote it to administrator so Group Privacy does not
    suppress ordinary text and voice.
-3. Send any harmless text or voice request in a topic.
-4. Tap **Authorize forum**, then resend the request.
-5. Ask Control to bind the forum to an existing absolute workspace path and
-   tap **Bind forum workspace**.
-6. Send an ordinary request in any topic. Its first request creates the
+3. In General, send `Set up this group for /absolute/workspace/path using
+   Codex` (or `Claude`) and tap **Authorize and bind**. If the first message
+   does not include an explicit setup request and path, use the existing
+   authorize-then-bind flow instead.
+4. Send an ordinary request in any topic. Its first request creates the
    subject; later requests continue the same Codex session. Send `/status` in
    that topic to inspect or control its managed agent.
 
