@@ -272,6 +272,15 @@ The live catalog test passed on July 23, 2026. Control listed the enrolled
 `telegram-control` slug without its path, and the topic creation command
 recognized the existing matching agent without creating a duplicate.
 
+## Stage 4 router contract
+
+The main-router boundary begins with a strict three-action contract:
+`route`, `clarify`, or `reject`. The prompt includes only active project slugs,
+display names, and providers—never local paths. Model output must be one plain
+JSON object with the exact fields for its action. Unknown projects, extra
+fields, markdown fences, invalid confidence values, duplicate clarification
+options, and oversized messages fail closed before any dispatch is possible.
+
 For controlled debugging, each loop can run separately:
 
 ```sh

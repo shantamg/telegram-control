@@ -865,6 +865,18 @@ to enrolled Git projects; repeated turns, restart resume, voice input, explicit
 tmux disposal/recreation, pause/resume, inspection, and guarded session
 replacement all operate through durable logical agent state.
 
+The first Stage 4 router-contract slice passed 67 offline tests:
+
+- router prompts contain only path-safe active catalog metadata;
+- normalized output is limited to exact `route`, `clarify`, and `reject`
+  schemas with bounded confidence and message lengths;
+- route targets and clarification choices must reference enrolled project
+  slugs;
+- unknown targets, extra fields, markdown wrappers, malformed confidence, and
+  duplicate choices fail closed;
+- no Telegram dispatch is enabled in this slice; the next checkpoint adds a
+  durable router mailbox and preview-only live evaluation before real routing.
+
 ## References
 
 - [Telegram Bot API — getting updates](https://core.telegram.org/bots/api#getting-updates)
