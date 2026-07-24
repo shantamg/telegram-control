@@ -1,0 +1,4 @@
+interface:
+  display_name: "Telegram Session Control"
+  short_description: "Show controls for the current Telegram agent"
+  default_prompt: "Use $telegram-session-control to show this topic’s agent and session controls."
