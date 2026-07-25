@@ -22,6 +22,25 @@ SCHEMA_VERSION = 20
 CONTROL_SPEAKER = "🎛 Control"
 
 
+def context_usage_summary(usage: Optional[dict[str, Any]]) -> Optional[str]:
+    """Format provider-reported occupied context and effective window."""
+
+    if not isinstance(usage, dict):
+        return None
+    try:
+        context_tokens = int(usage.get("context_tokens", 0))
+        context_window = int(usage.get("context_window_tokens", 0))
+    except (TypeError, ValueError):
+        return None
+    if context_tokens <= 0 or context_window <= 0:
+        return None
+    percent_used = 100 * context_tokens / context_window
+    return (
+        f"{percent_used:.0f}% used · "
+        f"{context_tokens:,} / {context_window:,} tokens"
+    )
+
+
 class StoreError(RuntimeError):
     """Base error for durable-store failures."""
 
@@ -5710,6 +5729,17 @@ class DurableStore:
                 agent = self.resolve_agent(dispatch_agent_id)
                 if agent is None or agent.role != "project":
                     raise StoreError("Router dispatch target is not a project agent.")
+                context_snapshot = self.agent_context_snapshot(agent.agent_id)
+                if context_snapshot is not None:
+                    provider_name = (
+                        "Claude" if agent.provider == "claude" else "Codex"
+                    )
+                    context_line = (
+                        f"\n\n📊 {provider_name} context before this turn: "
+                        f"{context_snapshot}"
+                    )
+                    if len(preview_text) + len(context_line) <= 3800:
+                        preview_text += context_line
                 dispatch_mailbox_id = self.enqueue_agent_message(
                     agent_id=dispatch_agent_id,
                     source_inbox_job_id=int(row["source_inbox_job_id"]),
@@ -6401,6 +6431,35 @@ class DurableStore:
         if not isinstance(usage, dict):
             raise StoreError("Stored agent usage metadata is invalid.")
         return usage
+
+    def current_agent_usage(self, agent_id: str) -> Optional[dict[str, Any]]:
+        """Return usage only from the agent's currently attached session."""
+
+        row = self.connection.execute(
+            """
+            SELECT m.usage_json
+            FROM agent_mailbox AS m
+            JOIN agents AS a ON a.agent_id = m.agent_id
+            WHERE m.agent_id = ? AND m.state = 'succeeded'
+                AND m.usage_json IS NOT NULL
+                AND a.provider_session_id IS NOT NULL
+                AND m.provider_session_id = a.provider_session_id
+            ORDER BY m.mailbox_id DESC
+            LIMIT 1
+            """,
+            (agent_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        usage = json.loads(row["usage_json"])
+        if not isinstance(usage, dict):
+            raise StoreError("Stored agent usage metadata is invalid.")
+        return usage
+
+    def agent_context_snapshot(self, agent_id: str) -> Optional[str]:
+        """Describe context at the end of the current session's latest turn."""
+
+        return context_usage_summary(self.current_agent_usage(agent_id))
 
     def pause_agent(self, agent_id: str, now: Optional[float] = None) -> ManagedAgent:
         timestamp = time.time() if now is None else float(now)
@@ -7800,13 +7859,22 @@ class DurableStore:
             )
             speaker = self.agent_speaker_header(str(row["agent_id"]))
             provider_name = "Claude" if str(row["provider"]) == "claude" else "Codex"
+            context_snapshot = self.agent_context_snapshot(str(row["agent_id"]))
+            context_line = (
+                f"\n\n📊 Context before this turn: {context_snapshot}"
+                if context_snapshot is not None
+                else ""
+            )
             self._enqueue_agent_status_edit(
                 mailbox_id,
                 self._agent_attempt_operation_suffix(
                     "turn-started",
                     int(row["attempts"]),
                 ),
-                f"{speaker}\n\n🧠 {provider_name} is working…",
+                (
+                    f"{speaker}\n\n🧠 {provider_name} is working…"
+                    f"{context_line}"
+                ),
                 timestamp,
             )
             self.connection.execute("COMMIT")
@@ -7887,13 +7955,19 @@ class DurableStore:
                 ),
                 "cancelling": f"⏹ Stopping {provider_name}…",
             }
+            context_snapshot = self.agent_context_snapshot(str(row["agent_id"]))
+            context_line = (
+                f"\n\n📊 Context before this turn: {context_snapshot}"
+                if context_snapshot is not None
+                else ""
+            )
             self._enqueue_agent_status_edit(
                 mailbox_id,
                 self._agent_attempt_operation_suffix(
                     f"progress-{stage}",
                     int(row["attempts"]),
                 ),
-                f"{speaker}\n\n{labels[stage]}",
+                f"{speaker}\n\n{labels[stage]}{context_line}",
                 timestamp,
             )
             self.connection.execute("COMMIT")

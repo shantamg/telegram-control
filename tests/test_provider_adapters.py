@@ -361,6 +361,7 @@ class LiveControlContractTests(unittest.TestCase):
                             "totalTokens": 16,
                         },
                         "total": {},
+                        "modelContextWindow": 200,
                     },
                 },
             }
@@ -543,6 +544,8 @@ class LiveControlContractTests(unittest.TestCase):
         self.assertEqual(result.provider_session_id, "thread-1")
         self.assertEqual(result.final_text, "Codex final")
         self.assertEqual(result.usage["cached_input_tokens"], 7)
+        self.assertEqual(result.usage["context_tokens"], 16)
+        self.assertEqual(result.usage["context_window_tokens"], 200)
         rendered_progress = repr(progress)
         self.assertNotIn("SECRET", rendered_progress)
         self.assertNotIn("/private/project", rendered_progress)
@@ -795,7 +798,17 @@ class LiveControlContractTests(unittest.TestCase):
                 "type": "assistant",
                 "session_id": session_id,
                 "uuid": str(uuid.uuid4()),
-                "message": {"content": [{"type": "text", "text": text}]},
+                "parent_tool_use_id": None,
+                "message": {
+                    "model": "claude-sonnet-test",
+                    "content": [{"type": "text", "text": text}],
+                    "usage": {
+                        "input_tokens": 2,
+                        "cache_creation_input_tokens": 3,
+                        "cache_read_input_tokens": 40,
+                        "output_tokens": 5,
+                    },
+                },
             }
         )
         process.stdout.emit(
@@ -807,6 +820,11 @@ class LiveControlContractTests(unittest.TestCase):
                 "uuid": str(uuid.uuid4()),
                 "result": text,
                 "usage": {"input_tokens": 8, "output_tokens": 2},
+                "modelUsage": {
+                    "claude-sonnet-test": {
+                        "contextWindow": 200,
+                    }
+                },
             }
         )
 
@@ -878,6 +896,9 @@ class LiveControlContractTests(unittest.TestCase):
             self.assertIsNone(message["parent_tool_use_id"])
         self.assertEqual(outcomes[0][0:2], (41, "applied"))
         self.assertEqual(result.final_text, "Claude final")
+        self.assertEqual(result.usage["context_tokens"], 50)
+        self.assertEqual(result.usage["context_window_tokens"], 200)
+        self.assertEqual(result.usage["context_model"], "claude-sonnet-test")
         self.assertNotIn("SECRET", repr(progress))
         self.assertNotIn("/private/project", repr(progress))
 

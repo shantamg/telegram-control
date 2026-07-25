@@ -335,6 +335,8 @@ def consume_claude_events(
     usage: dict[str, Any] = {}
     failure: Optional[str] = None
     notified_session = False
+    latest_context_usage: dict[str, Any] = {}
+    latest_context_model = ""
     for event in events:
         candidate_value = event.get("session_id")
         if candidate_value is not None:
@@ -352,6 +354,15 @@ def consume_claude_events(
         if event_type == "assistant":
             message = event.get("message")
             content = message.get("content") if isinstance(message, dict) else None
+            message_usage = (
+                message.get("usage") if isinstance(message, dict) else None
+            )
+            if (
+                event.get("parent_tool_use_id") in {None, ""}
+                and isinstance(message_usage, dict)
+            ):
+                latest_context_usage = message_usage
+                latest_context_model = str(message.get("model", ""))
             if isinstance(content, list):
                 text_parts = [
                     str(item["text"])
@@ -375,6 +386,43 @@ def consume_claude_events(
             raw_usage = event.get("usage")
             if isinstance(raw_usage, dict):
                 usage = raw_usage
+            raw_model_usage = event.get("modelUsage", event.get("model_usage"))
+            model_usage: Optional[dict[str, Any]] = None
+            context_model = latest_context_model
+            if isinstance(raw_model_usage, dict):
+                candidate = raw_model_usage.get(context_model)
+                if isinstance(candidate, dict):
+                    model_usage = candidate
+                elif len(raw_model_usage) == 1:
+                    only_model, only_usage = next(iter(raw_model_usage.items()))
+                    if isinstance(only_usage, dict):
+                        context_model = str(only_model)
+                        model_usage = only_usage
+            context_window = (
+                model_usage.get("contextWindow")
+                if model_usage is not None
+                else None
+            )
+            if (
+                type(context_window) is int
+                and context_window > 0
+                and latest_context_usage
+            ):
+                context_tokens = sum(
+                    int(latest_context_usage.get(key, 0))
+                    for key in (
+                        "input_tokens",
+                        "cache_creation_input_tokens",
+                        "cache_read_input_tokens",
+                        "output_tokens",
+                    )
+                )
+                if context_tokens > 0:
+                    usage = dict(usage)
+                    usage["context_tokens"] = context_tokens
+                    usage["context_window_tokens"] = context_window
+                    if context_model:
+                        usage["context_model"] = context_model
     if failure:
         raise ProviderAdapterError(failure)
     if not session_id:
@@ -475,7 +523,7 @@ class CodexExecAdapter:
         last = payload.get("last")
         if not isinstance(last, dict):
             return {}
-        return {
+        usage = {
             "input_tokens": int(last.get("inputTokens", 0)),
             "cached_input_tokens": int(last.get("cachedInputTokens", 0)),
             "output_tokens": int(last.get("outputTokens", 0)),
@@ -484,6 +532,15 @@ class CodexExecAdapter:
             ),
             "total_tokens": int(last.get("totalTokens", 0)),
         }
+        context_window = payload.get("modelContextWindow")
+        if (
+            type(context_window) is int
+            and context_window > 0
+            and usage["total_tokens"] > 0
+        ):
+            usage["context_tokens"] = usage["total_tokens"]
+            usage["context_window_tokens"] = context_window
+        return usage
 
     def _wait_for_rpc(
         self,

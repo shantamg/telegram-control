@@ -839,9 +839,12 @@ on July 23, 2026:
   controller queued it in 0.46 seconds.
 
 `/agent` also reports the normalized input, cached-input, and output token
-counts from the latest successful provider turn. It intentionally does not
-claim a context-window percentage until the adapter can identify the effective
-model and its limit reliably.
+counts from the latest successful provider turn. The provider adapters now
+capture the effective context window directly from Codex app-server or Claude
+Agent SDK events, so `/agent`, the initial queued receipt, and generic working
+states can show a trustworthy occupied-context percentage without hard-coded
+model limits. The queued and working cards label it as the snapshot before the
+new turn; a new session or provider switch suppresses stale metadata.
 
 The managed voice-input slice passed 58 offline tests and its live test on
 July 23, 2026:

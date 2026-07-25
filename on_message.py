@@ -26,6 +26,7 @@ from durable_store import (
     DurableStore,
     StoreError,
     chunk_telegram_text,
+    context_usage_summary,
 )
 
 
@@ -378,6 +379,19 @@ def enqueue_agent_reply_input(route, text: str) -> None:
     chat_id, thread_id = surface_coordinates()
     with DurableStore(Path(database_path)) as store:
         speaker = store.agent_speaker_header(route.target_id)
+        agent = store.resolve_agent(route.target_id)
+        provider_name = (
+            "Claude"
+            if agent is not None and agent.provider == "claude"
+            else "Codex"
+        )
+        context_snapshot = store.agent_context_snapshot(route.target_id)
+        context_line = (
+            f"\n📊 <b>{provider_name} context before this turn:</b> "
+            f"{context_snapshot}"
+            if context_snapshot is not None
+            else ""
+        )
         store.enqueue_agent_reply_message_with_receipt(
             agent_id=route.target_id,
             source_inbox_job_id=int(job_id),
@@ -385,7 +399,10 @@ def enqueue_agent_reply_input(route, text: str) -> None:
             chat_id=chat_id,
             message_thread_id=thread_id,
             replied_message_id=route.telegram_message_id,
-            receipt_text=f"📨 <b>Queued for {html.escape(speaker)}</b>",
+            receipt_text=(
+                f"📨 <b>Queued for {html.escape(speaker)}</b>"
+                f"{context_line}"
+            ),
             receipt_parse_mode="HTML",
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
         )
@@ -426,7 +443,7 @@ def send_agent_status() -> None:
             else None
         )
         usage = (
-            store.latest_agent_usage(agent.agent_id)
+            store.current_agent_usage(agent.agent_id)
             if agent is not None
             else None
         )
@@ -565,6 +582,7 @@ def send_agent_status() -> None:
         agent.project_path,
     )
     usage_line = ""
+    context_line = ""
     if usage is not None:
         input_tokens = int(usage.get("input_tokens", 0))
         cached_tokens = int(
@@ -579,6 +597,9 @@ def send_agent_status() -> None:
             f"{input_tokens:,} input ({cached_tokens:,} cached) · "
             f"{output_tokens:,} output"
         )
+        context_summary = context_usage_summary(usage)
+        if context_summary is not None:
+            context_line = f"\nContext: {context_summary}"
     send_message(
         "Managed agent\n\n"
         f"Name: {agent.hierarchical_name}\n"
@@ -591,6 +612,7 @@ def send_agent_status() -> None:
         f"State: {agent.lifecycle_state}\n"
         f"Session: {session}\n"
         f"Console: {console_state}"
+        f"{context_line}"
         f"{usage_line}",
         reply_markup=keyboard,
     )
@@ -658,7 +680,15 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
             raise StoreError("Managed agent route is no longer valid.")
         chat_id, thread_id = surface_coordinates()
         speaker = html.escape(store.agent_speaker_header(agent.agent_id))
-        receipt = f"📨 <b>Queued for {speaker}</b>"
+        provider_name = "Claude" if agent.provider == "claude" else "Codex"
+        context_snapshot = store.agent_context_snapshot(agent.agent_id)
+        context_line = (
+            f"\n📊 <b>{provider_name} context before this turn:</b> "
+            f"{context_snapshot}"
+            if context_snapshot is not None
+            else ""
+        )
+        receipt = f"📨 <b>Queued for {speaker}</b>{context_line}"
         store.enqueue_agent_message_with_receipt(
             agent_id=agent.agent_id,
             source_inbox_job_id=int(job_id),

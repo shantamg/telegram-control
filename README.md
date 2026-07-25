@@ -204,13 +204,16 @@ work at once without allowing two processes to mutate the same persisted
 conversation concurrently. The foreground `run --agent-workers` option accepts
 1 through 16 when a different local resource limit is appropriate.
 
-Each accepted agent turn immediately sends a compact `⏳ Working…` receipt.
-Progress edits that same Telegram message while the provider runs. Completion
-sends the final answer as a new routed message so Telegram can notify the user,
-then durably queues deletion of the progress receipt only after Telegram
-acknowledges the last final-response chunk. The receipt and completion paths are
-race-safe if the provider finishes first, and a failed final send retains the
-progress card while the response retries.
+Each accepted agent turn immediately sends a compact queued receipt. When the
+current provider session has reported context metadata, that first receipt and
+the generic working states include a `Context before this turn` snapshot with
+the percentage used and token/window counts. Progress edits that same Telegram
+message while the provider runs. Completion sends the final answer as a new
+routed message so Telegram can notify the user, then durably queues deletion of
+the progress receipt only after Telegram acknowledges the last final-response
+chunk. The receipt and completion paths are race-safe if the provider finishes
+first, and a failed final send retains the progress card while the response
+retries.
 
 The live adapter test passed on July 23, 2026. Two read-only Telegram turns
 completed through the serialized mailbox on their first attempts. The
@@ -253,6 +256,13 @@ be explicit, lets the installed harness reject unavailable models, carries the
 settings through structured and tmux turns, and displays them in `/agent`.
 Subjective requests such as “use the best model” are routed to clarification
 instead of silently choosing a potentially expensive model.
+
+`/agent` also displays the current session's latest occupied-context percentage
+and token/window counts. Codex supplies both values through app-server token
+usage notifications; Claude supplies its model context window and the latest
+main-message usage through Agent SDK events. The controller does not hard-code
+model limits, and it suppresses old context metadata after a new session or
+provider switch until the replacement session completes a turn.
 
 The live console test passed on July 23, 2026. The real Codex TUI resumed the
 same conversation in tmux, `/agent` reported `Console: running`, and a Telegram

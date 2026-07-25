@@ -41,6 +41,7 @@ from durable_store import (
     LeaseLostError,
     SCHEMA_VERSION,
     StoreError,
+    context_usage_summary,
 )
 
 
@@ -218,6 +219,47 @@ class DurableStoreTests(unittest.TestCase):
             self.store.connection.execute("PRAGMA journal_mode").fetchone()[0],
             "wal",
         )
+
+    def test_context_usage_summary_requires_provider_reported_window(self):
+        self.assertEqual(
+            context_usage_summary(
+                {
+                    "context_tokens": 82_500,
+                    "context_window_tokens": 200_000,
+                }
+            ),
+            "41% used · 82,500 / 200,000 tokens",
+        )
+        self.assertIsNone(context_usage_summary({"input_tokens": 82_500}))
+
+    def test_context_snapshot_does_not_cross_session_reset(self):
+        agent, mailbox_id, _response = (
+            self._completed_agent_response_with_voice_button()
+        )
+        self.store.connection.execute(
+            """
+            UPDATE agent_mailbox
+            SET usage_json = ?
+            WHERE mailbox_id = ?
+            """,
+            (
+                json.dumps(
+                    {
+                        "context_tokens": 82_500,
+                        "context_window_tokens": 200_000,
+                    }
+                ),
+                mailbox_id,
+            ),
+        )
+        self.assertEqual(
+            self.store.agent_context_snapshot(agent.agent_id),
+            "41% used · 82,500 / 200,000 tokens",
+        )
+
+        self.store.reset_agent_session(agent.agent_id, now=2_000_000_002)
+
+        self.assertIsNone(self.store.agent_context_snapshot(agent.agent_id))
 
     def test_managed_skill_install_uses_shared_real_directory_and_claude_link(self):
         root = Path(self.temporary_directory.name)
@@ -9752,7 +9794,12 @@ class DurableIntegrationTests(unittest.TestCase):
                 return provider_adapters.ProviderTurnResult(
                     provider_session_id="session-123",
                     final_text="Codex adapter response",
-                    usage={"input_tokens": 50, "output_tokens": 5},
+                    usage={
+                        "input_tokens": 50,
+                        "output_tokens": 5,
+                        "context_tokens": 82_500,
+                        "context_window_tokens": 200_000,
+                    },
                 )
 
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -9851,6 +9898,55 @@ class DurableIntegrationTests(unittest.TestCase):
                 usage = store.latest_agent_usage(agent.agent_id)
                 self.assertEqual(usage["input_tokens"], 50)
                 self.assertEqual(usage["output_tokens"], 5)
+                self.assertEqual(
+                    store.agent_context_snapshot(agent.agent_id),
+                    "41% used · 82,500 / 200,000 tokens",
+                )
+
+                store.ingest_update(
+                    topic_message_update(11, "/agent"),
+                    now=10**12 + 1,
+                )
+                status_job = store.claim_job("inbox-worker", now=10**12 + 1)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    status_job,
+                    "inbox-worker",
+                )
+                status = store.claim_outbox("sender-3", now=10**12 + 2)
+                self.assertIn(
+                    "Context: 41% used · 82,500 / 200,000 tokens",
+                    status.params["text"],
+                )
+                store.complete_outbox(
+                    status.message_id,
+                    "sender-3",
+                    {"message_id": 502, "chat": {"id": 123}},
+                    now=10**12 + 2,
+                )
+
+                store.ingest_update(
+                    topic_message_update(12, "continue the inspection"),
+                    now=10**12 + 3,
+                )
+                next_job = store.claim_job("inbox-worker", now=10**12 + 3)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    next_job,
+                    "inbox-worker",
+                )
+                next_receipt = store.claim_outbox(
+                    "sender-4",
+                    now=10**12 + 4,
+                )
+                self.assertEqual(
+                    next_receipt.params["text"],
+                    "📨 <b>Queued for telegram-control</b>\n"
+                    "📊 <b>Codex context before this turn:</b> "
+                    "41% used · 82,500 / 200,000 tokens",
+                )
 
     def test_root_voice_transcript_routes_through_main_router_turn_card(self):
         class FakeRouterAdapter:
