@@ -2509,7 +2509,7 @@ class DurableStoreTests(unittest.TestCase):
         self.store.complete_outbox(
             acknowledgement.message_id,
             "sender",
-            {"message_id": 800, "chat": {"id": 123}},
+            {"edited": "not_modified"},
             now=119,
         )
         self.store.finish_agent_turn_control(

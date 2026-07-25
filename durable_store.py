@@ -2884,10 +2884,10 @@ class DurableStore:
                                 "control receipt."
                             )
                         try:
-                            int(result["message_id"])
+                            int(json.loads(row["params_json"])["message_id"])
                         except (KeyError, TypeError, ValueError):
                             raise StoreError(
-                                "Telegram result cannot identify its voice "
+                                "Telegram parameters cannot identify their voice "
                                 "control receipt."
                             ) from None
                         self._enqueue_agent_control_result_edit(
@@ -8210,7 +8210,7 @@ class DurableStore:
     ) -> bool:
         row = self.connection.execute(
             """
-            SELECT c.*, o.params_json, o.telegram_result_json
+            SELECT c.*, o.method, o.params_json, o.telegram_result_json
             FROM agent_turn_controls AS c
             JOIN outbox_messages AS o
                 ON o.operation_id IN (
@@ -8234,7 +8234,11 @@ class DurableStore:
         result = json.loads(row["telegram_result_json"])
         try:
             chat_id = int(params["chat_id"])
-            message_id = int(result["message_id"])
+            message_id = int(
+                params["message_id"]
+                if str(row["method"]) == "editMessageText"
+                else result["message_id"]
+            )
         except (KeyError, TypeError, ValueError):
             raise StoreError(
                 "Stored Telegram steering receipt is invalid."
