@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Literal, Optional, Protocol
 
 from durable_store import ManagedAgent, StoreError
+from turn_guidance import TURN_GUIDANCE
 
 
 class ProviderAdapterError(StoreError):
@@ -45,6 +46,11 @@ class ProviderCapabilities:
     interrupt: bool
     structured_events: bool
     interactive_console: bool
+    # Whether this adapter can deliver turn_guidance.TURN_GUIDANCE to its
+    # model. Deliberately required rather than defaulted: a new adapter must
+    # answer it, so unsupported reads as an explicit "no" instead of a silent
+    # omission nobody notices until an agent backgrounds a job and loses work.
+    turn_guidance: bool
 
 
 @dataclass(frozen=True)
@@ -470,6 +476,11 @@ class CodexExecAdapter:
             interrupt=True,
             structured_events=True,
             interactive_console=True,
+            # Not yet wired. Codex is driven over the app-server protocol
+            # rather than a plain command line, so appending guidance means
+            # a config override or a session-start field, not an extra flag.
+            # Declared false so the gap is visible instead of assumed.
+            turn_guidance=False,
         )
 
     @staticmethod
@@ -1161,6 +1172,8 @@ class ClaudePrintAdapter:
             interrupt=True,
             structured_events=True,
             interactive_console=True,
+            # Delivered as an appended system prompt in command() below.
+            turn_guidance=True,
         )
 
     def command(
@@ -1189,6 +1202,9 @@ class ClaudePrintAdapter:
         ]
         if permission_mode == "bypassPermissions":
             command.append("--dangerously-skip-permissions")
+        # Appended rather than replacing the system prompt: this adds one
+        # standing constraint and leaves Claude Code's own instructions intact.
+        command.extend(["--append-system-prompt", TURN_GUIDANCE])
         model = agent.provider_config.get("model")
         if model:
             command.extend(["--model", str(model)])

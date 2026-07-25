@@ -5,6 +5,7 @@ import unittest
 import uuid
 
 import provider_adapters
+import turn_guidance
 from durable_store import ManagedAgent
 
 
@@ -327,6 +328,45 @@ class ClaudeEventTests(unittest.TestCase):
             "permission mode",
         ):
             adapter.command(invalid, None)
+
+    def test_turn_guidance_is_appended_for_every_permission_mode(self):
+        adapter = provider_adapters.ClaudePrintAdapter(binary="/bin/claude")
+
+        for permission_mode in ("bypassPermissions", "acceptEdits"):
+            agent = ManagedAgent(
+                **{
+                    **self.agent.__dict__,
+                    "provider_config": {"permission_mode": permission_mode},
+                }
+            )
+            command = adapter.command(agent, None)
+            self.assertIn("--append-system-prompt", command)
+            index = command.index("--append-system-prompt")
+            self.assertEqual(command[index + 1], turn_guidance.TURN_GUIDANCE)
+
+        self.assertTrue(adapter.capabilities().turn_guidance)
+
+    def test_turn_guidance_warns_against_background_work(self):
+        # The whole point of the guidance: agents kept backgrounding work that
+        # died with the turn. If this text stops saying so, it stops helping.
+        text = turn_guidance.TURN_GUIDANCE.lower()
+        self.assertIn("background", text)
+        self.assertIn("tmux", text)
+
+
+class TurnGuidanceCapabilityTests(unittest.TestCase):
+    def test_every_adapter_declares_whether_it_delivers_guidance(self):
+        # ProviderCapabilities.turn_guidance is required, so a new adapter
+        # cannot omit it by accident — unsupported has to be stated.
+        for adapter in (
+            provider_adapters.ClaudePrintAdapter(binary="/bin/claude"),
+            provider_adapters.CodexExecAdapter(binary="/bin/codex"),
+        ):
+            self.assertIsInstance(adapter.capabilities().turn_guidance, bool)
+
+    def test_codex_reports_guidance_unsupported_until_wired(self):
+        adapter = provider_adapters.CodexExecAdapter(binary="/bin/codex")
+        self.assertFalse(adapter.capabilities().turn_guidance)
 
 
 class LiveControlContractTests(unittest.TestCase):
