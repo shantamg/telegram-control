@@ -1,0 +1,6 @@
+interface:
+  display_name: "Telegram Group Icon"
+  short_description: "Create and set the current Telegram group icon"
+  default_prompt: "Use $telegram-group-icon to create and apply a new icon for this Telegram group."
+policy:
+  allow_implicit_invocation: true

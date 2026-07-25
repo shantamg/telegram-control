@@ -104,6 +104,7 @@ API_BASE_URL = "https://api.telegram.org"
 API_SOCKET_TIMEOUT_SECONDS = 70.0
 API_TOTAL_DEADLINE_SECONDS = 180.0
 API_MAX_RESPONSE_BYTES = 8_000_000
+MAX_CHAT_PHOTO_BYTES = 10_000_000
 
 
 def _read_capped(response: Any, max_bytes: Optional[int] = None) -> bytes:
@@ -137,26 +138,63 @@ def perform_api_call(
     """
     request_params = dict(params)
     voice_file_path = request_params.pop("__voice_file_path", None)
+    photo_file_path = request_params.pop("__photo_file_path", None)
+    if voice_file_path is not None and photo_file_path is not None:
+        raise BridgeError("A Telegram request can upload only one local file.")
     encoded_params: dict[str, str] = {}
     for key, value in request_params.items():
         if value is None:
             continue
         encoded_params[key] = json.dumps(value) if isinstance(value, (list, dict)) else str(value)
     headers: dict[str, str] = {}
-    if voice_file_path is None:
+    if voice_file_path is None and photo_file_path is None:
         request_data = urllib.parse.urlencode(encoded_params).encode("utf-8")
     else:
-        if method != "sendVoice":
-            raise BridgeError("A voice file can only be used with sendVoice.")
-        try:
-            voice_path = voice_responses.validate_voice_path(
-                str(voice_file_path)
-            )
-            voice_bytes = voice_path.read_bytes()
-        except OSError:
-            raise BridgeError("The queued voice file is unavailable.") from None
-        except voice_responses.VoiceResponseError as exc:
-            raise BridgeError(str(exc)) from None
+        if voice_file_path is not None:
+            if method != "sendVoice":
+                raise BridgeError("A voice file can only be used with sendVoice.")
+            try:
+                upload_path = voice_responses.validate_voice_path(
+                    str(voice_file_path)
+                )
+                upload_bytes = upload_path.read_bytes()
+            except OSError:
+                raise BridgeError("The queued voice file is unavailable.") from None
+            except voice_responses.VoiceResponseError as exc:
+                raise BridgeError(str(exc)) from None
+            upload_field = "voice"
+            upload_filename = "voice.ogg"
+            upload_content_type = "audio/ogg"
+        else:
+            if method != "setChatPhoto":
+                raise BridgeError(
+                    "A chat photo file can only be used with setChatPhoto."
+                )
+            try:
+                upload_path = Path(str(photo_file_path)).expanduser().resolve(
+                    strict=True
+                )
+                if not upload_path.is_file():
+                    raise OSError
+                photo_size = upload_path.stat().st_size
+                if photo_size <= 0 or photo_size > MAX_CHAT_PHOTO_BYTES:
+                    raise BridgeError(
+                        "The chat photo must be between 1 byte and 10 MB."
+                    )
+                upload_bytes = upload_path.read_bytes()
+            except BridgeError:
+                raise
+            except OSError:
+                raise BridgeError("The chat photo file is unavailable.") from None
+            if upload_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+                upload_content_type = "image/png"
+                upload_filename = "chat-photo.png"
+            elif upload_bytes.startswith(b"\xff\xd8"):
+                upload_content_type = "image/jpeg"
+                upload_filename = "chat-photo.jpg"
+            else:
+                raise BridgeError("The chat photo must be a PNG or JPEG image.")
+            upload_field = "photo"
         boundary = f"telegram-control-{uuid.uuid4().hex}"
         body = bytearray()
         for key, value in encoded_params.items():
@@ -170,11 +208,13 @@ def perform_api_call(
             body.extend(b"\r\n")
         body.extend(f"--{boundary}\r\n".encode("ascii"))
         body.extend(
-            b'Content-Disposition: form-data; name="voice"; '
-            b'filename="voice.ogg"\r\n'
+            (
+                f'Content-Disposition: form-data; name="{upload_field}"; '
+                f'filename="{upload_filename}"\r\n'
+            ).encode("ascii")
         )
-        body.extend(b"Content-Type: audio/ogg\r\n\r\n")
-        body.extend(voice_bytes)
+        body.extend(f"Content-Type: {upload_content_type}\r\n\r\n".encode("ascii"))
+        body.extend(upload_bytes)
         body.extend(b"\r\n")
         body.extend(f"--{boundary}--\r\n".encode("ascii"))
         request_data = bytes(body)

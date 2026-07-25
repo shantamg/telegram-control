@@ -2661,59 +2661,18 @@ class DurableStore:
                         ):
                             params = json.loads(row["params_json"])
                             mailbox_id = int(mailbox["mailbox_id"])
-                            labeled = self.labeled_agent_chunks(
-                                str(mailbox["agent_id"]),
-                                str(mailbox["response_text"]),
-                            )
-                            if len(labeled) == 1:
-                                edit_text = labeled[0]
-                            else:
-                                # The chunked response was already delivered
-                                # as separate messages; resolve the receipt
-                                # instead of leaving it stuck on Working.
-                                edit_text = (
-                                    self.agent_speaker_header(
-                                        str(mailbox["agent_id"])
-                                    )
-                                    + "\n\n✅ Done — the full response is "
-                                    "below."
-                                )
-                            self.enqueue_api_call(
-                                operation_id=(
-                                    f"agent-mailbox:{mailbox_id}:final-edit"
+                            self._enqueue_agent_final_messages(
+                                mailbox_id=mailbox_id,
+                                agent_id=str(mailbox["agent_id"]),
+                                source_inbox_job_id=int(
+                                    mailbox["source_inbox_job_id"]
                                 ),
-                                method="editMessageText",
-                                params={
-                                    "chat_id": int(params["chat_id"]),
-                                    "message_id": telegram_message_id,
-                                    "text": edit_text,
-                                    "reply_markup": (
-                                        self._agent_voice_button_markup(
-                                            mailbox_id,
-                                            str(mailbox["agent_id"]),
-                                            int(
-                                                mailbox[
-                                                    "source_inbox_job_id"
-                                                ]
-                                            ),
-                                            int(params["chat_id"]),
-                                            int(
-                                                params.get(
-                                                    "message_thread_id"
-                                                )
-                                                or 0
-                                            ),
-                                            timestamp,
-                                        )
-                                        or {"inline_keyboard": []}
-                                    ),
-                                },
-                                card={
-                                    "kind": "agent_turn",
-                                    "mailbox_id": mailbox_id,
-                                    "mode": "final_edit",
-                                },
-                                now=timestamp,
+                                response_text=str(mailbox["response_text"]),
+                                chat_id=int(params["chat_id"]),
+                                message_thread_id=int(
+                                    params.get("message_thread_id") or 0
+                                ),
+                                timestamp=timestamp,
                             )
                         elif (
                             mailbox is not None
@@ -2766,6 +2725,71 @@ class DurableStore:
                                 stage,
                                 str(mailbox["input_text"]),
                                 now=timestamp,
+                            )
+                    elif mode == "final_message":
+                        try:
+                            final_mailbox_id = int(card_spec["mailbox_id"])
+                            int(result["message_id"])
+                        except (KeyError, TypeError, ValueError):
+                            raise StoreError(
+                                "Telegram result cannot identify its final "
+                                "agent message."
+                            ) from None
+                        if row["method"] != "sendMessage":
+                            raise StoreError(
+                                "Only sendMessage can finish an agent turn."
+                            )
+                        self._enqueue_agent_progress_cleanup_if_complete(
+                            final_mailbox_id,
+                            timestamp,
+                        )
+                    elif mode == "progress_delete":
+                        try:
+                            cleanup_mailbox_id = int(card_spec["mailbox_id"])
+                            cleanup_chat_id = int(card_spec["chat_id"])
+                            cleanup_thread_id = int(
+                                card_spec["message_thread_id"]
+                            )
+                            cleanup_message_id = int(
+                                card_spec["telegram_message_id"]
+                            )
+                        except (KeyError, TypeError, ValueError):
+                            raise StoreError(
+                                "Outbox agent progress cleanup metadata is "
+                                "invalid."
+                            ) from None
+                        params = json.loads(row["params_json"])
+                        if (
+                            row["method"] != "deleteMessage"
+                            or result is not True
+                            or int(params.get("chat_id", 0))
+                            != cleanup_chat_id
+                            or int(params.get("message_id", 0))
+                            != cleanup_message_id
+                        ):
+                            raise StoreError(
+                                "Only deleteMessage can remove an agent "
+                                "progress card."
+                            )
+                        self.connection.execute(
+                            """
+                            UPDATE telegram_message_routes
+                            SET state = 'revoked', updated_at = ?
+                            WHERE chat_id = ? AND message_thread_id = ?
+                                AND telegram_message_id = ?
+                                AND state = 'active'
+                            """,
+                            (
+                                timestamp,
+                                cleanup_chat_id,
+                                cleanup_thread_id,
+                                cleanup_message_id,
+                            ),
+                        )
+                        if cleanup_mailbox_id <= 0:
+                            raise StoreError(
+                                "Outbox agent progress cleanup mailbox is "
+                                "invalid."
                             )
                     elif mode == "final_edit":
                         try:
@@ -7514,6 +7538,110 @@ class DurableStore:
         )
         return True
 
+    def _enqueue_agent_final_messages(
+        self,
+        *,
+        mailbox_id: int,
+        agent_id: str,
+        source_inbox_job_id: int,
+        response_text: str,
+        chat_id: int,
+        message_thread_id: int,
+        timestamp: float,
+    ) -> None:
+        """Queue a new final response instead of overwriting its progress card."""
+        chunks = self.labeled_agent_chunks(agent_id, response_text)
+        reply_markup = self._agent_voice_button_markup(
+            mailbox_id,
+            agent_id,
+            source_inbox_job_id,
+            chat_id,
+            message_thread_id,
+            timestamp,
+        )
+        serialize_key = f"agent-turn:{int(mailbox_id)}"
+        for index, chunk in enumerate(chunks, start=1):
+            params: dict[str, Any] = {
+                "chat_id": int(chat_id),
+                "message_thread_id": (
+                    int(message_thread_id)
+                    if int(message_thread_id) != 0
+                    else None
+                ),
+                "text": chunk,
+            }
+            card = None
+            if index == len(chunks):
+                if reply_markup is not None:
+                    params["reply_markup"] = reply_markup
+                card = {
+                    "kind": "agent_turn",
+                    "mailbox_id": int(mailbox_id),
+                    "mode": "final_message",
+                }
+            self.enqueue_api_call(
+                operation_id=(
+                    f"agent-mailbox:{int(mailbox_id)}:response:{index}"
+                ),
+                method="sendMessage",
+                params=params,
+                route={
+                    "target_type": "agent",
+                    "target_id": str(agent_id),
+                    "policy": "reply",
+                    "ttl_seconds": 30 * 24 * 60 * 60,
+                },
+                card=card,
+                serialize_key=serialize_key,
+                now=timestamp,
+            )
+
+    def _enqueue_agent_progress_cleanup_if_complete(
+        self,
+        mailbox_id: int,
+        timestamp: float,
+    ) -> bool:
+        """Delete progress only after Telegram accepted the last final chunk."""
+        rows = self.connection.execute(
+            """
+            SELECT card_json
+            FROM outbox_messages
+            WHERE operation_id GLOB ? AND state = 'sent'
+                AND card_json IS NOT NULL
+            """,
+            (f"agent-mailbox:{int(mailbox_id)}:response:*",),
+        ).fetchall()
+        final_delivered = any(
+            json.loads(row["card_json"]).get("mode") == "final_message"
+            for row in rows
+        )
+        if not final_delivered:
+            return False
+        target = self._agent_receipt_target(mailbox_id)
+        if target is None:
+            return False
+        self.enqueue_api_call(
+            operation_id=(
+                f"agent-mailbox:{int(mailbox_id)}:progress-delete"
+            ),
+            method="deleteMessage",
+            params={
+                "chat_id": int(target["chat_id"]),
+                "message_id": int(target["telegram_message_id"]),
+            },
+            card={
+                "kind": "agent_turn",
+                "mailbox_id": int(mailbox_id),
+                "mode": "progress_delete",
+                "chat_id": int(target["chat_id"]),
+                "message_thread_id": int(target["message_thread_id"]),
+                "telegram_message_id": int(target["telegram_message_id"]),
+            },
+            serialize_key=str(target["serialize_key"]),
+            now=timestamp,
+        )
+        return True
+
     def attach_agent_mailbox_turn(
         self,
         mailbox_id: int,
@@ -9146,14 +9274,6 @@ class DurableStore:
                     )
                 self.connection.execute("COMMIT")
                 return
-            voice_reply_markup = self._agent_voice_button_markup(
-                int(mailbox_id),
-                str(row["agent_id"]),
-                int(row["source_inbox_job_id"]),
-                delivery_chat_id,
-                delivery_thread_id,
-                timestamp,
-            )
             receipt = self.connection.execute(
                 """
                 SELECT state, params_json, telegram_result_json
@@ -9171,81 +9291,19 @@ class DurableStore:
                     """,
                     (f"agent-mailbox:{mailbox_id}:receipt",),
                 ).fetchone()
-            receipt_sent = (
-                receipt is not None
-                and str(receipt["state"]) == "sent"
-                and receipt["telegram_result_json"] is not None
-            )
-            # A sent receipt is always finished by editing in the first chunk;
-            # a single-chunk result whose receipt is still in flight defers
-            # that edit to the receipt's own completion.
-            replaces_receipt = receipt_sent or (
-                receipt is not None and len(labeled_chunks) == 1
-            )
-            if receipt_sent:
-                receipt_result = json.loads(receipt["telegram_result_json"])
-                try:
-                    receipt_message_id = int(receipt_result["message_id"])
-                except (KeyError, TypeError, ValueError):
-                    raise StoreError(
-                        "Stored Telegram receipt result is invalid."
-                    ) from None
-                final_text = labeled_chunks[0]
-                self.enqueue_api_call(
-                    operation_id=f"agent-mailbox:{mailbox_id}:final-edit",
-                    method="editMessageText",
-                    params={
-                        "chat_id": delivery_chat_id,
-                        "message_id": receipt_message_id,
-                        "text": final_text,
-                        "reply_markup": (
-                            voice_reply_markup
-                            if voice_reply_markup is not None
-                            else {"inline_keyboard": []}
-                        ),
-                    },
-                    card={
-                        "kind": "agent_turn",
-                        "mailbox_id": mailbox_id,
-                        "mode": "final_edit",
-                    },
-                    serialize_key=f"agent-turn:{int(mailbox_id)}",
-                    now=timestamp,
-                )
-            chunks_to_send = (
-                labeled_chunks[1:] if receipt_sent
-                else ([] if replaces_receipt else labeled_chunks)
-            )
-            receipt_will_host_button = (
-                receipt is not None and str(receipt["state"]) != "dead"
-            )
-            for index, chunk in enumerate(chunks_to_send, start=1):
-                response_params: dict[str, Any] = {
-                    "chat_id": delivery_chat_id,
-                    "message_thread_id": (
-                        delivery_thread_id
-                        if delivery_thread_id != 0
-                        else None
-                    ),
-                    "text": chunk,
-                }
-                if (
-                    not receipt_will_host_button
-                    and index == len(chunks_to_send)
-                    and voice_reply_markup is not None
-                ):
-                    response_params["reply_markup"] = voice_reply_markup
-                self.enqueue_api_call(
-                    operation_id=f"agent-mailbox:{mailbox_id}:response:{index}",
-                    method="sendMessage",
-                    params=response_params,
-                    route={
-                        "target_type": "agent",
-                        "target_id": str(row["agent_id"]),
-                        "policy": "reply",
-                        "ttl_seconds": 30 * 24 * 60 * 60,
-                    },
-                    now=timestamp,
+            # If the progress receipt is still in flight, its successful
+            # completion will enqueue the response. Otherwise queue the final
+            # message now. In every case the response is a new message; the
+            # last chunk's successful delivery schedules receipt deletion.
+            if receipt is None or str(receipt["state"]) in {"sent", "dead"}:
+                self._enqueue_agent_final_messages(
+                    mailbox_id=int(mailbox_id),
+                    agent_id=str(row["agent_id"]),
+                    source_inbox_job_id=int(row["source_inbox_job_id"]),
+                    response_text=response_text,
+                    chat_id=delivery_chat_id,
+                    message_thread_id=delivery_thread_id,
+                    timestamp=timestamp,
                 )
             self.connection.execute("COMMIT")
         except BaseException:

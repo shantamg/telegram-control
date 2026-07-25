@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import subprocess
@@ -63,6 +64,75 @@ class DiscoveryBoundRegressionTests(unittest.TestCase):
                 discovery.find_directory("target", [root], deadline=deadline)
             self.assertTrue(observed)
             self.assertTrue(all(0 < value <= 2.0 for value in observed))
+
+
+class ControllerRestartRegressionTests(unittest.TestCase):
+    def test_cleanup_removes_legacy_and_guarded_reload_jobs(self):
+        listing = subprocess.CompletedProcess(
+            ["/bin/launchctl", "list"],
+            0,
+            (
+                "1\t0\tlocal.telegram-control.reload\n"
+                "2\t0\tlocal.telegram-control.reload.1234.abcdef12\n"
+                "3\t0\tlocal.telegram-bridge\n"
+            ),
+            "",
+        )
+        removed = []
+
+        def fake_launchctl(*arguments, check=True):
+            if arguments == ("list",):
+                return listing
+            if arguments[0] == "remove":
+                removed.append(arguments[1])
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+            raise AssertionError(arguments)
+
+        with mock.patch.object(
+            telegram_control.bridge,
+            "launchctl",
+            side_effect=fake_launchctl,
+        ):
+            result = telegram_control.cleanup_reload_jobs()
+
+        self.assertEqual(
+            result,
+            [
+                "local.telegram-control.reload",
+                "local.telegram-control.reload.1234.abcdef12",
+            ],
+        )
+        self.assertEqual(result, removed)
+
+    def test_restart_job_self_removes_after_single_kickstart(self):
+        calls = []
+
+        def fake_launchctl(*arguments, check=True):
+            calls.append(arguments)
+            if arguments[0] == "print":
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+            if arguments[0] == "list":
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+            if arguments[0] == "submit":
+                return subprocess.CompletedProcess(arguments, 0, "", "")
+            raise AssertionError(arguments)
+
+        args = argparse.Namespace(delay_seconds=20)
+        with mock.patch.object(
+            telegram_control.bridge,
+            "launchctl",
+            side_effect=fake_launchctl,
+        ), mock.patch.object(telegram_control.os, "getuid", return_value=501):
+            telegram_control.restart_command(args)
+
+        submit = next(call for call in calls if call[0] == "submit")
+        shell_script = submit[-1]
+        label = submit[submit.index("-l") + 1]
+        self.assertIn(
+            "kickstart -k gui/501/local.telegram-bridge",
+            shell_script,
+        )
+        self.assertIn(f"launchctl remove {label}", shell_script)
 
 
 class PathAuthorizationRegressionTests(unittest.TestCase):

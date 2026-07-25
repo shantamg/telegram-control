@@ -10,6 +10,7 @@ import json
 import os
 import plistlib
 import re
+import shutil
 import signal
 import socket
 import sqlite3
@@ -43,6 +44,10 @@ from durable_store import (
 
 DATABASE_PATH = bridge.CONFIG_DIR / "controller.sqlite3"
 SCRIPT_PATH = Path(__file__).resolve()
+SKILLS_SOURCE_DIR = SCRIPT_PATH.parent / "skills"
+SHARED_SKILLS_DIR = Path.home() / ".agents" / "skills"
+CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
+MANAGED_SHARED_SKILLS = ("telegram-group-icon",)
 DEFAULT_AGENT_WORKERS = 8
 MAX_AGENT_WORKERS = 16
 TOPIC_PROBE_INTERVAL_SECONDS = 24 * 60 * 60
@@ -59,6 +64,9 @@ MISSING_TOPIC_ERROR_MARKERS = (
     "topic_id_invalid",
     "topic id invalid",
 )
+RELOAD_JOB_PREFIX = "local.telegram-control.reload"
+DEFAULT_RESTART_DELAY_SECONDS = 20.0
+MAX_RESTART_DELAY_SECONDS = 5 * 60.0
 
 
 def control_message(text: str) -> str:
@@ -1780,7 +1788,10 @@ def send_outbox_message(
             return
         if (
             store.router_final_edit_superseded(message.operation_id)
-            or store.agent_status_edit_superseded(message.operation_id)
+            or (
+                message.method == "editMessageText"
+                and store.agent_status_edit_superseded(message.operation_id)
+            )
         ):
             # A newer agent-outcome edit for the same routing receipt exists,
             # so delivering this stale preview edit would overwrite the final
@@ -2121,6 +2132,29 @@ def supervisor_commands(
     return commands
 
 
+def cleanup_reload_jobs() -> list[str]:
+    """Remove stale one-shot reload jobs before controller workers start."""
+    result = bridge.launchctl("list", check=False)
+    if result.returncode != 0:
+        return []
+    labels = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        label = fields[-1]
+        if label == RELOAD_JOB_PREFIX or label.startswith(
+            f"{RELOAD_JOB_PREFIX}."
+        ):
+            labels.append(label)
+    removed = []
+    for label in sorted(set(labels)):
+        removal = bridge.launchctl("remove", label, check=False)
+        if removal.returncode == 0:
+            removed.append(label)
+    return removed
+
+
 def run_command(args: argparse.Namespace) -> None:
     """Run the independently restartable controller loops under a supervisor."""
     previous_sigterm = signal.getsignal(signal.SIGTERM)
@@ -2131,6 +2165,12 @@ def run_command(args: argparse.Namespace) -> None:
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop_on_sigterm)
+    removed_reload_jobs = cleanup_reload_jobs()
+    if removed_reload_jobs:
+        log_event(
+            "stale_reload_jobs_removed",
+            labels=removed_reload_jobs,
+        )
     commands = supervisor_commands(args.db, args.agent_workers)
     processes: list[subprocess.Popen[Any]] = []
     try:
@@ -2207,6 +2247,52 @@ def configured_launch_agent_mode() -> str:
     return "unknown"
 
 
+def install_managed_skills(
+    source_directory: Path = SKILLS_SOURCE_DIR,
+    shared_directory: Path = SHARED_SKILLS_DIR,
+    claude_directory: Path = CLAUDE_SKILLS_DIR,
+) -> list[str]:
+    """Install repo-owned shared skills and expose them to Claude Code."""
+    shared_directory.mkdir(parents=True, exist_ok=True)
+    claude_directory.mkdir(parents=True, exist_ok=True)
+    installed = []
+    for name in MANAGED_SHARED_SKILLS:
+        source = source_directory / name
+        if not (source / "SKILL.md").is_file():
+            raise StoreError(f"Managed skill source is incomplete: {source}")
+        destination = shared_directory / name
+        if destination.is_symlink():
+            raise StoreError(
+                f"Shared skill destination must be a real directory: {destination}"
+            )
+        shutil.copytree(source, destination, dirs_exist_ok=True)
+
+        claude_link = claude_directory / name
+        relative_target = Path(
+            os.path.relpath(destination, start=claude_directory)
+        )
+        if claude_link.is_symlink():
+            if Path(os.readlink(claude_link)) != relative_target:
+                raise StoreError(
+                    f"Claude skill link points somewhere else: {claude_link}"
+                )
+        elif claude_link.exists():
+            raise StoreError(
+                f"Claude skill path already exists and was not replaced: {claude_link}"
+            )
+        else:
+            claude_link.symlink_to(relative_target, target_is_directory=True)
+        installed.append(name)
+    return installed
+
+
+def install_skills_command(_: argparse.Namespace) -> None:
+    installed = install_managed_skills()
+    print("Installed shared Telegram Control skills:")
+    for name in installed:
+        print(f"- {name}")
+
+
 def install_command(args: argparse.Namespace) -> None:
     config = bridge.load_config()
     bridge.read_token()
@@ -2216,6 +2302,7 @@ def install_command(args: argparse.Namespace) -> None:
     bridge.handler_command(handler_path)
     with open_store(args.db):
         pass
+    install_managed_skills()
 
     bridge.LOG_DIR.mkdir(parents=True, exist_ok=True)
     bridge.PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -2277,6 +2364,59 @@ def install_command(args: argparse.Namespace) -> None:
         "Rollback: "
         f"{bridge.SCRIPT_PATH} install --handler {handler_path}"
     )
+
+
+def restart_command(args: argparse.Namespace) -> None:
+    """Schedule exactly one controller restart from a self-cleaning job."""
+    delay = float(args.delay_seconds)
+    if delay < 1.0 or delay > MAX_RESTART_DELAY_SECONDS:
+        raise StoreError(
+            "Restart delay must be between 1 and "
+            f"{int(MAX_RESTART_DELAY_SECONDS)} seconds."
+        )
+    domain = f"gui/{os.getuid()}"
+    service = f"{domain}/{bridge.LAUNCH_AGENT_LABEL}"
+    loaded = bridge.launchctl("print", service, check=False)
+    if loaded.returncode != 0:
+        raise StoreError("The durable Telegram controller is not loaded.")
+
+    cleanup_reload_jobs()
+    label = f"{RELOAD_JOB_PREFIX}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    log_path = Path("/tmp") / f"{label}.log"
+    # launchctl-submitted jobs may be inferred as KeepAlive jobs. The helper
+    # removes itself after its first kickstart, while run_command() also
+    # removes any matching helper as the replacement supervisor starts.
+    script = (
+        f"sleep {delay:.3f}; "
+        f"/bin/launchctl kickstart -k {service}; "
+        "status=$?; "
+        f"/bin/launchctl remove {label}; "
+        "exit $status"
+    )
+    submitted = bridge.launchctl(
+        "submit",
+        "-l",
+        label,
+        "-o",
+        str(log_path),
+        "-e",
+        str(log_path),
+        "--",
+        "/bin/sh",
+        "-c",
+        script,
+        check=False,
+    )
+    if submitted.returncode != 0:
+        raise StoreError(
+            submitted.stderr.strip()
+            or "launchctl could not schedule the controller restart."
+        )
+    print(
+        "Scheduled one Telegram controller restart in "
+        f"{delay:g} seconds."
+    )
+    print(f"Reload job: {label}")
 
 
 def init_command(args: argparse.Namespace) -> None:
@@ -2640,6 +2780,27 @@ def build_parser() -> argparse.ArgumentParser:
         "install", help="Replace Stage 0 with the durable background controller."
     )
     install_parser.set_defaults(function=install_command)
+
+    restart_parser = subparsers.add_parser(
+        "restart",
+        help="Schedule one guarded background-controller restart.",
+    )
+    restart_parser.add_argument(
+        "--delay-seconds",
+        type=float,
+        default=DEFAULT_RESTART_DELAY_SECONDS,
+        help=(
+            "Seconds to wait before restarting, allowing the current response "
+            f"to finish (default: {DEFAULT_RESTART_DELAY_SECONDS:g})."
+        ),
+    )
+    restart_parser.set_defaults(function=restart_command)
+
+    install_skills_parser = subparsers.add_parser(
+        "install-skills",
+        help="Install repo-owned skills for Codex and Claude discovery.",
+    )
+    install_skills_parser.set_defaults(function=install_skills_command)
 
     status_parser = subparsers.add_parser("status", help="Show durable queue status.")
     status_parser.set_defaults(function=status_command)

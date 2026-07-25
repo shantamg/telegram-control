@@ -210,6 +210,38 @@ class DurableStoreTests(unittest.TestCase):
             "wal",
         )
 
+    def test_managed_skill_install_uses_shared_real_directory_and_claude_link(self):
+        root = Path(self.temporary_directory.name)
+        source_directory = root / "repo-skills"
+        source_skill = source_directory / "telegram-group-icon"
+        (source_skill / "agents").mkdir(parents=True)
+        (source_skill / "SKILL.md").write_text(
+            "---\nname: telegram-group-icon\n"
+            "description: Test skill.\n---\n",
+            encoding="utf-8",
+        )
+        (source_skill / "agents" / "openai.yaml").write_text(
+            'interface:\n  display_name: "Telegram Group Icon"\n',
+            encoding="utf-8",
+        )
+        shared_directory = root / ".agents" / "skills"
+        claude_directory = root / ".claude" / "skills"
+
+        self.assertEqual(
+            telegram_control.install_managed_skills(
+                source_directory,
+                shared_directory,
+                claude_directory,
+            ),
+            ["telegram-group-icon"],
+        )
+        shared_skill = shared_directory / "telegram-group-icon"
+        claude_skill = claude_directory / "telegram-group-icon"
+        self.assertTrue(shared_skill.is_dir())
+        self.assertFalse(shared_skill.is_symlink())
+        self.assertTrue(claude_skill.is_symlink())
+        self.assertEqual(claude_skill.resolve(), shared_skill.resolve())
+
     def test_duplicate_update_has_one_job_and_never_moves_offset_backwards(self):
         self.assertTrue(self.store.ingest_update(message_update(10), now=100))
         self.assertFalse(
@@ -1578,7 +1610,7 @@ class DurableStoreTests(unittest.TestCase):
         )
         self.assertEqual(self.store.pending_voice_file_paths(), set())
 
-    def test_fast_agent_completion_edits_receipt_after_it_is_sent(self):
+    def test_fast_agent_completion_sends_new_message_then_deletes_receipt(self):
         self.store.ensure_surface_binding(
             chat_id=123,
             message_thread_id=62,
@@ -1630,13 +1662,54 @@ class DurableStoreTests(unittest.TestCase):
             {"message_id": 700, "chat": {"id": 123}},
             now=105,
         )
-        final_edit = self.store.claim_outbox("sender", now=106)
-        self.assertEqual(final_edit.method, "editMessageText")
-        self.assertEqual(final_edit.params["message_id"], 700)
+        final_message = self.store.claim_outbox("sender", now=106)
+        self.assertEqual(final_message.method, "sendMessage")
+        self.assertEqual(final_message.params["message_thread_id"], 62)
         self.assertEqual(
-            final_edit.params["text"],
+            final_message.params["text"],
             "telegram-control\n\nfast result",
         )
+        self.assertIsNone(self.store.claim_outbox("other-sender", now=106))
+        self.store.complete_outbox(
+            final_message.message_id,
+            "sender",
+            {"message_id": 701, "chat": {"id": 123}},
+            now=107,
+        )
+        cleanup = self.store.claim_outbox("sender", now=108)
+        self.assertEqual(cleanup.method, "deleteMessage")
+        self.assertEqual(
+            cleanup.params,
+            {"chat_id": 123, "message_id": 700},
+        )
+        with mock.patch.object(
+            telegram_control.bridge,
+            "api_call",
+            return_value=True,
+        ) as api_call:
+            telegram_control.send_outbox_message(
+                self.store,
+                "token",
+                cleanup,
+                "sender",
+            )
+        api_call.assert_called_once()
+        self.assertEqual(api_call.call_args.args[1], "deleteMessage")
+        self.assertIsNone(
+            self.store.resolve_message_route(
+                123,
+                700,
+                message_thread_id=62,
+                now=110,
+            )
+        )
+        final_route = self.store.resolve_message_route(
+            123,
+            701,
+            message_thread_id=62,
+            now=110,
+        )
+        self.assertEqual(final_route.target_id, agent.agent_id)
 
     def test_active_agent_turn_can_enqueue_scoped_telegram_update(self):
         self.store.ensure_surface_binding(
@@ -1789,6 +1862,103 @@ class DurableStoreTests(unittest.TestCase):
                 text="This must not send.",
                 now=105,
             )
+
+    def test_active_agent_turn_can_set_only_its_current_group_icon(self):
+        chat_id = -100123
+        self.store.ensure_surface_binding(
+            chat_id=chat_id,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Project Group",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=chat_id,
+            surface_name="Project Group",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        update = topic_message_update(10, "change the group icon")
+        update["message"]["chat"]["id"] = chat_id
+        update["message"]["chat"]["type"] = "supergroup"
+        update["message"]["reply_to_message"]["chat"]["id"] = chat_id
+        update["message"]["reply_to_message"]["chat"]["type"] = "supergroup"
+        self.store.ingest_update(update, now=100)
+        inbox = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+        ).fetchone()
+        mailbox_id = self.store.enqueue_agent_message(
+            agent.agent_id,
+            int(inbox["job_id"]),
+            "change the group icon",
+            now=101,
+        )
+        self.store.claim_agent_mailbox(
+            "agent-worker",
+            now=102,
+            lease_seconds=10**12,
+        )
+        icon_path = Path(self.temporary_directory.name) / "icon.png"
+        icon_path.write_bytes(b"\x89PNG\r\n\x1a\nimage")
+        environment = {
+            "TELEGRAM_CONTROL_DB": str(self.database_path),
+            "TELEGRAM_CONTROL_AGENT_ID": agent.agent_id,
+            "TELEGRAM_CONTROL_MAILBOX_ID": str(mailbox_id),
+            "TELEGRAM_CONTROL_WORKER_ID": "agent-worker",
+        }
+        calls = []
+
+        def api_call(_token, method, **params):
+            calls.append((method, params))
+            if method == "getMe":
+                return {"id": 77}
+            if method == "getChatMember":
+                return {
+                    "status": "administrator",
+                    "can_change_info": True,
+                }
+            if method == "setChatPhoto":
+                return True
+            self.fail(f"Unexpected Telegram method: {method}")
+
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with mock.patch.object(
+                agent_telegram.sys,
+                "argv",
+                [
+                    "agent_telegram.py",
+                    "group-icon",
+                    "--image",
+                    str(icon_path),
+                ],
+            ):
+                with mock.patch.object(
+                    agent_telegram.telegram_bridge,
+                    "read_token",
+                    return_value="token",
+                ):
+                    with mock.patch.object(
+                        agent_telegram.telegram_bridge,
+                        "api_call",
+                        side_effect=api_call,
+                    ):
+                        with redirect_stdout(StringIO()):
+                            self.assertEqual(agent_telegram.main(), 0)
+
+        self.assertEqual(
+            calls[-1],
+            (
+                "setChatPhoto",
+                {
+                    "chat_id": chat_id,
+                    "__photo_file_path": str(icon_path.resolve()),
+                },
+            ),
+        )
 
     def test_failed_agent_turn_edit_falls_back_to_routed_message(self):
         self.store.ensure_surface_binding(
@@ -2690,22 +2860,31 @@ class DurableStoreTests(unittest.TestCase):
             {"message_id": 800, "chat": {"id": 123}},
             now=126,
         )
-        final_edit = self.store.claim_outbox("sender", now=127)
-        self.assertEqual(final_edit.method, "editMessageText")
-        self.assertEqual(final_edit.params["chat_id"], 123)
-        self.assertEqual(final_edit.params["message_id"], 800)
+        final_message = self.store.claim_outbox("sender", now=127)
+        self.assertEqual(final_message.method, "sendMessage")
+        self.assertEqual(final_message.params["chat_id"], 123)
+        self.assertIsNone(final_message.params["message_thread_id"])
         self.assertEqual(
-            final_edit.params["text"],
+            final_message.params["text"],
             "telegram-control\n\ntests are green",
         )
         self.store.complete_outbox(
-            final_edit.message_id,
+            final_message.message_id,
             "sender",
-            {"message_id": 800, "chat": {"id": 123}},
+            {"message_id": 801, "chat": {"id": 123}},
             now=128,
         )
+        cleanup = self.store.claim_outbox("sender", now=129)
+        self.assertEqual(cleanup.method, "deleteMessage")
+        self.assertEqual(cleanup.params["message_id"], 800)
+        self.store.complete_outbox(
+            cleanup.message_id,
+            "sender",
+            True,
+            now=130,
+        )
         # The reply's own final message continues to route to the same agent.
-        chained = self._resolve_route(800, 129)
+        chained = self._resolve_route(801, 131)
         self.assertEqual(chained.target_type, "agent")
         self.assertEqual(chained.target_id, agent.agent_id)
 
@@ -3057,16 +3236,12 @@ class DurableStoreTests(unittest.TestCase):
             {"message_id": 802, "chat": {"id": 123}},
             now=129,
         )
-        # The receipt is resolved instead of staying on Working forever.
-        resolve_edit = self.store.claim_outbox("sender", now=130)
-        self.assertEqual(resolve_edit.method, "editMessageText")
-        self.assertEqual(resolve_edit.params["message_id"], 800)
-        self.assertEqual(
-            resolve_edit.params["text"],
-            "telegram-control\n\n✅ Done — the full response is below.",
-        )
+        # Cleanup is queued only after Telegram accepts the last final chunk.
+        cleanup = self.store.claim_outbox("sender", now=130)
+        self.assertEqual(cleanup.method, "deleteMessage")
+        self.assertEqual(cleanup.params["message_id"], 800)
 
-    def test_whitespace_padded_single_chunk_response_edits_real_content(self):
+    def test_whitespace_padded_response_sends_real_content_before_cleanup(self):
         agent = self._retargeted_final_message()
         self.store.ingest_update(
             message_update(11, "padded", reply_to_message_id=700),
@@ -3105,18 +3280,30 @@ class DurableStoreTests(unittest.TestCase):
             now=125,
         )
         first_response = self.store.claim_outbox("sender", now=126)
-        second_response = self.store.claim_outbox("sender", now=127)
-        final_edit = self.store.claim_outbox("sender", now=128)
         self.assertEqual(first_response.method, "sendMessage")
+        self.assertIsNone(self.store.claim_outbox("other-sender", now=126))
+        self.store.complete_outbox(
+            first_response.message_id,
+            "sender",
+            {"message_id": 801, "chat": {"id": 123}},
+            now=127,
+        )
+        second_response = self.store.claim_outbox("sender", now=128)
         self.assertEqual(second_response.method, "sendMessage")
         delivered = (
             first_response.params["text"].split("\n\n", 1)[1]
             + second_response.params["text"].split("\n\n", 1)[1]
         )
         self.assertEqual(delivered, padded_text)
-        self.assertEqual(final_edit.method, "editMessageText")
-        self.assertIn("full response is below", final_edit.params["text"])
-        self.assertIsNone(self.store.claim_outbox("sender", now=129))
+        self.store.complete_outbox(
+            second_response.message_id,
+            "sender",
+            {"message_id": 802, "chat": {"id": 123}},
+            now=129,
+        )
+        cleanup = self.store.claim_outbox("sender", now=130)
+        self.assertEqual(cleanup.method, "deleteMessage")
+        self.assertEqual(cleanup.params["message_id"], 800)
 
     def test_delivery_lock_serializes_and_blocks_second_acquirer(self):
         with telegram_control.outbox_delivery_lock(self.database_path):
@@ -3282,7 +3469,7 @@ class DurableStoreTests(unittest.TestCase):
             "router-mailbox:zz:agent-final-edit",
         )
 
-    def test_multi_chunk_failed_receipt_edit_falls_back_to_first_chunk(self):
+    def test_failed_final_send_keeps_progress_and_retries_response(self):
         agent = self._retargeted_final_message()
         self.store.ingest_update(
             message_update(11, "long question", reply_to_message_id=700),
@@ -3318,42 +3505,46 @@ class DurableStoreTests(unittest.TestCase):
             {},
             now=125,
         )
-        final_edit = self.store.claim_outbox("sender", now=126)
-        self.assertEqual(final_edit.method, "editMessageText")
+        final_message = self.store.claim_outbox("sender", now=126)
+        self.assertEqual(final_message.method, "sendMessage")
         self.assertEqual(
-            final_edit.params["text"],
+            final_message.params["text"],
             "telegram-control\n\n" + "A" * 3782,
         )
         with mock.patch.object(
             telegram_control.bridge,
             "api_call",
             side_effect=telegram_control.bridge.BridgeError(
-                "Bad Request: message to edit not found"
+                "Could not reach Telegram."
             ),
         ):
             telegram_control.send_outbox_message(
                 self.store,
                 "token",
-                final_edit,
+                final_message,
                 "sender",
             )
-        # Only the first chunk is re-sent; later chunks were queued already.
-        fallback = self.store.claim_outbox("sender", now=10**12)
-        while "final-fallback" not in fallback.operation_id:
-            self.store.complete_outbox(
-                fallback.message_id,
-                "sender",
-                {"message_id": 801, "chat": {"id": 123}},
-                now=10**12,
-            )
-            fallback = self.store.claim_outbox("sender", now=10**12)
-        self.assertEqual(fallback.method, "sendMessage")
         self.assertEqual(
-            fallback.params["text"],
+            self.store.connection.execute(
+                "SELECT state FROM outbox_messages WHERE message_id = ?",
+                (final_message.message_id,),
+            ).fetchone()["state"],
+            "queued",
+        )
+        self.assertIsNone(
+            self.store.connection.execute(
+                "SELECT 1 FROM outbox_messages WHERE method = 'deleteMessage'"
+            ).fetchone()
+        )
+        retry = self.store.claim_outbox("sender", now=10**12)
+        self.assertEqual(retry.operation_id, final_message.operation_id)
+        self.assertEqual(retry.method, "sendMessage")
+        self.assertEqual(
+            retry.params["text"],
             "telegram-control\n\n" + "A" * 3782,
         )
 
-    def test_multi_chunk_reply_response_still_edits_receipt(self):
+    def test_multi_chunk_reply_response_sends_then_deletes_receipt(self):
         agent = self._retargeted_final_message()
         self.store.ingest_update(
             message_update(11, "long follow up", reply_to_message_id=700),
@@ -3388,17 +3579,16 @@ class DurableStoreTests(unittest.TestCase):
             {},
             now=125,
         )
-        final_edit = self.store.claim_outbox("sender", now=126)
-        self.assertEqual(final_edit.method, "editMessageText")
-        self.assertEqual(final_edit.params["message_id"], 800)
+        first_chunk = self.store.claim_outbox("sender", now=126)
+        self.assertEqual(first_chunk.method, "sendMessage")
         self.assertEqual(
-            final_edit.params["text"],
+            first_chunk.params["text"],
             "telegram-control\n\n" + "A" * 3782,
         )
         self.store.complete_outbox(
-            final_edit.message_id,
+            first_chunk.message_id,
             "sender",
-            {"message_id": 800, "chat": {"id": 123}},
+            {"message_id": 801, "chat": {"id": 123}},
             now=127,
         )
         continuation = self.store.claim_outbox("sender", now=128)
@@ -3409,6 +3599,15 @@ class DurableStoreTests(unittest.TestCase):
             continuation.params["text"],
             "telegram-control\n\n" + "A" * 218,
         )
+        self.store.complete_outbox(
+            continuation.message_id,
+            "sender",
+            {"message_id": 802, "chat": {"id": 123}},
+            now=129,
+        )
+        cleanup = self.store.claim_outbox("sender", now=130)
+        self.assertEqual(cleanup.method, "deleteMessage")
+        self.assertEqual(cleanup.params["message_id"], 800)
 
     def test_route_provenance_labels_come_from_durable_operations(self):
         agent, _, router_mailbox_id = self._setup_routed_agent_turn()
@@ -6506,12 +6705,12 @@ class DurableIntegrationTests(unittest.TestCase):
                     {},
                     now=10**12 + 7,
                 )
-                final_edit = store.claim_outbox("sender", now=10**12 + 8)
-                self.assertEqual(final_edit.method, "editMessageText")
-                self.assertEqual(final_edit.params["chat_id"], 123)
-                self.assertEqual(final_edit.params["message_id"], 801)
+                final_message = store.claim_outbox("sender", now=10**12 + 8)
+                self.assertEqual(final_message.method, "sendMessage")
+                self.assertEqual(final_message.params["chat_id"], 123)
+                self.assertIsNone(final_message.params["message_thread_id"])
                 self.assertEqual(
-                    final_edit.params["text"],
+                    final_message.params["text"],
                     "telegram-control\n\nvoice reply done",
                 )
 
@@ -8682,8 +8881,8 @@ class DurableIntegrationTests(unittest.TestCase):
                     "session-123",
                 )
                 response = store.claim_outbox("sender-2", now=10**12)
-                self.assertEqual(response.method, "editMessageText")
-                self.assertEqual(response.params["message_id"], 500)
+                self.assertEqual(response.method, "sendMessage")
+                self.assertEqual(response.params["message_thread_id"], 62)
                 self.assertEqual(
                     response.params["text"],
                     "telegram-control\n\nCodex adapter response",
@@ -8925,11 +9124,11 @@ class DurableIntegrationTests(unittest.TestCase):
                     True,
                     now=105,
                 )
-                final_edit = store.claim_outbox("sender", now=10**12)
-                self.assertEqual(final_edit.method, "editMessageText")
-                self.assertEqual(final_edit.params["message_id"], 800)
+                final_message = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(final_message.method, "sendMessage")
+                self.assertEqual(final_message.params["message_thread_id"], 62)
                 self.assertEqual(
-                    final_edit.params["text"],
+                    final_message.params["text"],
                     "telegram-control\n\nvoice route complete",
                 )
 

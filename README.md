@@ -205,13 +205,12 @@ conversation concurrently. The foreground `run --agent-workers` option accepts
 1 through 16 when a different local resource limit is appropriate.
 
 Each accepted agent turn immediately sends a compact `⏳ Working…` receipt.
-For normal
-single-message responses, completion edits that same Telegram message into the
-final answer. The receipt and completion paths are race-safe: if the provider
-finishes first, the final edit is created when Telegram returns the receipt's
-message ID. If Telegram later rejects the edit, the answer falls back to a new
-routed message instead of being lost. Responses requiring multiple Telegram
-chunks retain the receipt and use separate final messages.
+Progress edits that same Telegram message while the provider runs. Completion
+sends the final answer as a new routed message so Telegram can notify the user,
+then durably queues deletion of the progress receipt only after Telegram
+acknowledges the last final-response chunk. The receipt and completion paths are
+race-safe if the provider finishes first, and a failed final send retains the
+progress card while the response retries.
 
 The live adapter test passed on July 23, 2026. Two read-only Telegram turns
 completed through the serialized mailbox on their first attempts. The
@@ -260,9 +259,10 @@ same conversation in tmux, `/agent` reported `Console: running`, and a Telegram
 turn remained queued until `console-close`. It then completed on its first
 mailbox attempt with the expected response.
 
-The live self-editing turn test passed on July 23, 2026. The durable receipt was
-delivered first and then replaced in place by the exact Codex response, with no
-second final message. One observed slow receipt was traced to an isolated
+The original live self-editing turn test passed on July 23, 2026. The completion
+policy now deliberately uses a new final message followed by acknowledged
+progress-card cleanup so completion can produce a Telegram notification without
+leaving status noise behind. One observed slow receipt was traced to an isolated
 8.9-second delay before the Telegram update reached the controller; the
 controller queued the receipt within 0.46 seconds of ingestion.
 
@@ -273,20 +273,20 @@ blocks are accumulated incrementally; reasoning, tool inputs, and other
 non-user-facing events remain generic status updates. Rapid deltas are bounded
 and coalesced in the durable outbox so they do not create a Telegram edit
 backlog. The completed answer then cleanly replaces the intermediate text on
-the original receipt.
+screen as a new message, after which the original receipt is deleted.
 
 Voice notes sent inside a managed agent topic use that same turn card. The
 `🎙️ Transcribing…` receipt is queued before local download, ffmpeg conversion,
 and Parakeet V3 transcription. The same message then shows `📤 Sending:` with
 the transcript, changes to `🧠 Codex is working…` or
-`🧠 Claude is working…`, and finally becomes the agent's response. Durable
-outbox ordering prevents a delayed progress edit from
-overwriting the final answer. Voice notes outside a managed agent surface
-retain the original transcript-only behavior.
+`🧠 Claude is working…`. The agent response is sent as a new message and the
+progress receipt is deleted after that send succeeds. Durable outbox ordering
+prevents a delayed progress edit from racing the final answer or its cleanup.
+Voice notes outside a managed agent surface retain the original transcript-only
+behavior.
 
 The live managed-voice test passed on July 23, 2026: one voice note progressed
-through every status stage and returned the requested exact Codex response in
-the same Telegram message.
+through every status stage and returned the requested exact Codex response.
 
 Controller-owned progress text uses Telegram HTML formatting with escaped
 dynamic content: stage labels are bold and voice transcripts are block quotes.
@@ -445,15 +445,15 @@ continuity:
 - Replying to that edited final message therefore continues the same managed
   agent conversation—using its persisted provider session—directly from the
   root Control chat. A new turn gets its own `📨 Queued…` receipt in the
-  Control chat, the response edits that receipt in place, and the new final
-  message routes back to the same agent, so follow-up replies chain
+  Control chat, the response arrives as a new routed message, and the receipt
+  is deleted only after that response succeeds, so follow-up replies chain
   indefinitely.
 - The reply route is revalidated durably at enqueue time: a reply from the
   wrong chat or topic, to the wrong message, after route expiry, or against a
   different agent fails closed.
-- If Telegram permanently rejects the final edit, the existing fallback sends
-  the response as a new agent-routed message. The acknowledged dispatch card
-  and fallback both continue to reach the same agent, so nothing is lost.
+- If Telegram rejects a direct agent final send, the response retries and its
+  progress receipt remains visible. The receipt cleanup is not created until
+  the last final chunk has been acknowledged, so nothing is lost.
 - Delivery order is enforced, not hoped for: every sender process wraps the
   actual Telegram call in one exclusive, non-reentrant kernel advisory lock
   (an owner-only flock file derived from the canonically resolved controller
@@ -483,16 +483,17 @@ continuity:
   reordering: a sender process dying — and the deadline expiring — at an
   instant when Telegram had accepted but not yet applied a request. Neither
   can be fenced without server-side compare-and-swap.
-- When a receipt was already delivered, a multi-chunk response edits the first
-  chunk into the receipt and sends the remaining chunks as follow-up messages,
-  so no `⏳ Working…` receipt is left behind.
+- Multi-chunk responses send every chunk as a routed final message in order.
+  Acknowledgment of the last chunk queues deletion of the `⏳ Working…`
+  receipt, so cleanup cannot run after only a partial response.
 - Voice replies follow the same durable routes as text replies. A voice note
   recorded as a reply to a retargeted agent answer continues that exact agent
   and persisted provider session: the reply surface gets the usual
   `🎙️ Transcribing…` receipt, the local transcript becomes the agent input,
-  and the one Telegram message progresses to the agent's final response. The
-  stored route is revalidated durably before any mailbox work is created, so
-  foreign, stale, or mismatched voice replies fail closed exactly like text.
+  the agent's final response arrives as a new message, and the receipt is then
+  removed. The stored route is revalidated durably before any mailbox work is
+  created, so foreign, stale, or mismatched voice replies fail closed exactly
+  like text.
 - Completed managed-agent answers include a one-time
   **🔊 Listen via Microsoft TTS** button.
   It synthesizes that already-stored answer on demand with `edge-tts`, encodes
@@ -518,6 +519,41 @@ caller-provided keys and a content hash make retries idempotent. Canonical
 skill definitions live under `skills/` and are installed in both the Codex and
 Claude user skill directories. Voice messages send their bounded text to
 Microsoft Edge TTS.
+
+The repo also owns the implicitly triggered `telegram-group-icon` skill.
+Inside an active managed turn it can create or select a square PNG/JPEG and
+apply it only to the group that owns that turn; the scoped helper accepts no
+chat ID, refuses private chats, revalidates the live mailbox lease, and checks
+the bot's **Change group info** administrator permission before changing the
+photo. The Telegram bot token remains in macOS Keychain.
+
+Install or refresh repo-owned shared skills without reinstalling the
+controller:
+
+```sh
+/Users/shantam/telegram-control/telegram_control.py install-skills
+```
+
+The version-controlled source remains under `skills/`. Installation copies
+the runtime skill into `~/.agents/skills/`, which Codex discovers directly,
+and creates the per-skill relative Claude link under `~/.claude/skills/`.
+Because skill metadata is loaded when a provider session starts, restart an
+existing Codex or Claude session before expecting a newly installed skill to
+appear.
+
+### Restarting the controller safely
+
+Use the controller's guarded restart command:
+
+```bash
+/usr/bin/python3 /Users/shantam/telegram-control/telegram_control.py restart
+```
+
+It schedules one delayed restart, removes its helper after the first
+`kickstart`, and the replacement supervisor removes any stale matching helper
+before starting workers. Do not use `launchctl submit` directly for controller
+reloads: macOS can infer submitted jobs as `KeepAlive`, turning a one-shot
+reload into a repeated restart loop.
 
 ## Live Codex worker control
 

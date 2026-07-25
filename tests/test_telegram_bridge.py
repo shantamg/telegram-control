@@ -257,6 +257,61 @@ class PerformApiCallTests(unittest.TestCase):
                 {"__voice_file_path": "/tmp/not-used.ogg"},
             )
 
+    def test_chat_photo_upload_uses_bounded_multipart_request(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            photo_path = Path(temporary_directory) / "icon.png"
+            photo_path.write_bytes(b"\x89PNG\r\n\x1a\nimage-bytes")
+            captured = {}
+
+            def urlopen(request, timeout):
+                captured["request"] = request
+                captured["timeout"] = timeout
+                return FakeHTTPBody(b'{"ok":true,"result":true}')
+
+            with mock.patch.object(
+                telegram_bridge.urllib.request,
+                "urlopen",
+                side_effect=urlopen,
+            ):
+                result = telegram_bridge.perform_api_call(
+                    "token",
+                    "setChatPhoto",
+                    {
+                        "chat_id": -100123,
+                        "__photo_file_path": str(photo_path),
+                    },
+                )
+
+        self.assertIs(result, True)
+        request = captured["request"]
+        self.assertTrue(
+            request.headers["Content-type"].startswith(
+                "multipart/form-data; boundary="
+            )
+        )
+        self.assertIn(b'name="chat_id"\r\n\r\n-100123\r\n', request.data)
+        self.assertIn(
+            b'name="photo"; filename="chat-photo.png"',
+            request.data,
+        )
+        self.assertIn(
+            b"Content-Type: image/png\r\n\r\n"
+            b"\x89PNG\r\n\x1a\nimage-bytes",
+            request.data,
+        )
+        self.assertNotIn(b"__photo_file_path", request.data)
+
+    def test_chat_photo_file_is_rejected_for_other_methods(self):
+        with self.assertRaisesRegex(
+            telegram_bridge.BridgeError,
+            "only be used with setChatPhoto",
+        ):
+            telegram_bridge.perform_api_call(
+                "token",
+                "sendPhoto",
+                {"__photo_file_path": "/tmp/not-used.png"},
+            )
+
 
 class ApiCallSubprocessTests(unittest.TestCase):
     """Parent-side helper-subprocess boundary."""
