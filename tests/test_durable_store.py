@@ -8249,6 +8249,122 @@ class DurableIntegrationTests(unittest.TestCase):
                     "Help me organize today's notes.",
                 )
 
+    def test_topic_default_selection_names_effective_claude_defaults(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home_directory = root / "home"
+            claude_settings = home_directory / ".claude" / "settings.json"
+            claude_settings.parent.mkdir(parents=True)
+            claude_settings.write_text(
+                json.dumps({"model": "opus"}),
+                encoding="utf-8",
+            )
+            workspace = root / "life"
+            workspace.mkdir()
+            database_path = root / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            forum_chat = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                store.ensure_surface_binding(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    surface_type="control",
+                    display_name="Journal",
+                    target_type="controller",
+                    target_id="control",
+                    now=91,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace),
+                    provider="codex",
+                    now=92,
+                )
+                action = store.create_callback_action(
+                    operation_id="test:forum-subject-defaults",
+                    action_type="forum_subject_effort_select",
+                    payload={
+                        "chat_id": -100777,
+                        "message_thread_id": 62,
+                        "display_name": "Journal",
+                        "provider": "claude",
+                        "model": None,
+                        "effort": None,
+                    },
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    authorized_user_id=123,
+                    now=10**12,
+                )
+                update = callback_update(
+                    10,
+                    f"a:{action.token}",
+                    message_id=700,
+                    message_thread_id=62,
+                )
+                update["callback_query"]["message"]["chat"] = dict(
+                    forum_chat
+                )
+                store.ingest_update(update, now=100)
+                job = store.claim_job("worker", now=100)
+                with mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(home_directory)},
+                    clear=False,
+                ):
+                    telegram_control.process_inbox_job(
+                        store,
+                        config,
+                        job,
+                        "worker",
+                    )
+
+                messages = [
+                    json.loads(row["params_json"])["text"]
+                    for row in store.connection.execute(
+                        """
+                        SELECT params_json
+                        FROM outbox_messages
+                        WHERE method = 'sendMessage'
+                        ORDER BY message_id
+                        """
+                    ).fetchall()
+                ]
+                confirmation = next(
+                    text
+                    for text in messages
+                    if "This topic will use Claude" in text
+                )
+                self.assertIn(
+                    "Model: Default (currently opus)",
+                    confirmation,
+                )
+                self.assertIn(
+                    "Effort: Default (currently high)",
+                    confirmation,
+                )
+                subject = store.resolve_forum_subject(-100777, 62)
+                agent = store.resolve_agent(subject.agent_id)
+                self.assertEqual(agent.provider_config, {})
+
     def test_bound_forum_status_is_read_only_and_does_not_create_subject(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory) / "life"
@@ -8974,6 +9090,14 @@ class DurableIntegrationTests(unittest.TestCase):
 
     def test_agent_status_command_reads_topic_registry(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
+            home_directory = Path(temporary_directory) / "home"
+            codex_config = home_directory / ".codex" / "config.toml"
+            codex_config.parent.mkdir(parents=True)
+            codex_config.write_text(
+                'model = "gpt-5.6-sol"\n'
+                'model_reasoning_effort = "high"\n',
+                encoding="utf-8",
+            )
             database_path = Path(temporary_directory) / "controller.sqlite3"
             config = {
                 "chat_id": 123,
@@ -8997,7 +9121,17 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 store.ingest_update(topic_message_update(10, "/agent"), now=100)
                 job = store.claim_job("worker", now=100)
-                telegram_control.process_inbox_job(store, config, job, "worker")
+                with mock.patch.dict(
+                    os.environ,
+                    {"HOME": str(home_directory)},
+                    clear=False,
+                ):
+                    telegram_control.process_inbox_job(
+                        store,
+                        config,
+                        job,
+                        "worker",
+                    )
                 response = store.claim_outbox("sender", now=10**12)
 
                 self.assertEqual(response.params["message_thread_id"], 62)
@@ -9006,6 +9140,14 @@ class DurableIntegrationTests(unittest.TestCase):
                     response.params["text"],
                 )
                 self.assertIn("State: registered", response.params["text"])
+                self.assertIn(
+                    "Model: Default (currently gpt-5.6-sol)",
+                    response.params["text"],
+                )
+                self.assertIn(
+                    "Effort: Default (currently high)",
+                    response.params["text"],
+                )
                 self.assertNotIn("Last turn:", response.params["text"])
                 labels = [
                     button["text"]

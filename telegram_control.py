@@ -25,9 +25,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 import discovery
-import telegram_bridge as bridge
 import provider_adapters
+import provider_defaults
 import router_contract
+import telegram_bridge as bridge
 import tmux_console
 import voice_responses
 from durable_store import (
@@ -891,8 +892,11 @@ def project_creation_proposal(
         "provider_config": provider_config,
         "provenance": provenance,
     }
-    model_text = str(provider_config.get("model", "provider default"))
-    effort_text = str(provider_config.get("effort", "provider default"))
+    model_text, effort_text = provider_defaults.describe_provider_config(
+        provider,
+        provider_config,
+        workspace_root,
+    )
     workdir_line = (
         f"Working directory: {working_directory}\n"
         if working_directory != workspace_root
@@ -1035,8 +1039,11 @@ def forum_workspace_proposal(
         if working_directory != workspace_root
         else ""
     )
-    model_text = str(provider_config.get("model", "provider default"))
-    effort_text = str(provider_config.get("effort", "provider default"))
+    model_text, effort_text = provider_defaults.describe_provider_config(
+        provider,
+        provider_config,
+        workspace_root,
+    )
     return (
         control_message(
             f"Bind the {forum_binding.display_name} forum to this workspace?\n\n"
@@ -1591,10 +1598,26 @@ def process_router_mailbox_job(
                 "project_slug": project.slug,
                 "updates": updates,
             }
+            planned_config = dict(target.provider_config)
+            for key, value in updates.items():
+                if value is None:
+                    planned_config.pop(key, None)
+                else:
+                    planned_config[key] = value
+            planned_model, planned_effort = (
+                provider_defaults.describe_provider_config(
+                    target.provider,
+                    planned_config,
+                    target.project_path,
+                )
+            )
+            planned_labels = {
+                "model": planned_model,
+                "effort": planned_effort,
+            }
             update_lines = "\n".join(
-                f"{key.title()}: "
-                + (str(value) if value is not None else "provider default")
-                for key, value in updates.items()
+                f"{key.title()}: {planned_labels[key]}"
+                for key in updates
             )
             response_text = control_message(
                 f"Change {project.display_name}'s configuration?\n\n"

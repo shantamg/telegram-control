@@ -16,6 +16,7 @@ from typing import Optional
 import claude_sessions
 import codex_sessions
 import discovery
+import provider_defaults
 import router_contract
 import telegram_bridge as bridge
 import tmux_console
@@ -558,6 +559,11 @@ def send_agent_status() -> None:
         )
     session = "not started" if not agent.provider_session_id else "persisted"
     console_state = console.state if console is not None else "stopped"
+    model_name, effort_name = provider_defaults.describe_provider_config(
+        agent.provider,
+        agent.provider_config,
+        agent.project_path,
+    )
     usage_line = ""
     if usage is not None:
         input_tokens = int(usage.get("input_tokens", 0))
@@ -578,8 +584,8 @@ def send_agent_status() -> None:
         f"Name: {agent.hierarchical_name}\n"
         f"Role: {agent.role}\n"
         f"Provider: {agent.provider}\n"
-        f"Model: {agent.provider_config.get('model', 'provider default')}\n"
-        f"Effort: {agent.provider_config.get('effort', 'provider default')}\n"
+        f"Model: {model_name}\n"
+        f"Effort: {effort_name}\n"
         f"Project: {project_name}"
         f"{workspace_lines}\n"
         f"State: {agent.lifecycle_state}\n"
@@ -1157,12 +1163,21 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     ttl_seconds=24 * 60 * 60,
                 )
                 effort_actions.append((label, effort_action))
+            forum_workspace = store.resolve_forum_workspace(chat_id)
             store.expire_forum_subject_setup_actions(
                 chat_id,
                 target_thread_id,
                 action_type="forum_subject_model_select",
             )
-        model_name = str(model) if model is not None else "provider default"
+        model_name, _ = provider_defaults.describe_provider_config(
+            provider,
+            {"model": str(model)} if model is not None else {},
+            (
+                forum_workspace.project_path
+                if forum_workspace is not None
+                else None
+            ),
+        )
         if callback_query_id:
             deliver_api_call(
                 "answerCallbackQuery",
@@ -1255,8 +1270,11 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 )
             return
         provider_name = "Claude" if provider == "claude" else "Codex"
-        model_name = str(model) if model is not None else "default"
-        effort_name = str(effort) if effort is not None else "default"
+        model_name, effort_name = provider_defaults.describe_provider_config(
+            provider,
+            provider_config,
+            agent.project_path,
+        )
         if callback_query_id:
             deliver_api_call(
                 "answerCallbackQuery",
@@ -1839,6 +1857,13 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     "callback-answer",
                 )
             return
+        configured_model_name, configured_effort_name = (
+            provider_defaults.describe_provider_config(
+                configured.provider,
+                configured.provider_config,
+                configured.project_path,
+            )
+        )
         if callback_query_id:
             deliver_api_call(
                 "answerCallbackQuery",
@@ -1852,10 +1877,8 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "🎛 Control\n\n"
             f"Updated {project.display_name}.\n"
             f"Provider: {configured.provider}\n"
-            "Model: "
-            f"{configured.provider_config.get('model', 'provider default')}\n"
-            "Effort: "
-            f"{configured.provider_config.get('effort', 'provider default')}"
+            f"Model: {configured_model_name}\n"
+            f"Effort: {configured_effort_name}"
         )
         return
     if action.action_type in {

@@ -615,16 +615,19 @@ rejected.
 
 After a forum is bound, Telegram's topic-creation service message prompts the
 owner to choose Codex or Claude, then a provider-specific model and effort.
-Each model and effort menu starts with **Default**. The final choice atomically
-creates one durable subject, one topic route, and one managed worker without
-starting a provider session; the first ordinary text or voice request starts
-that session. If the creation service update was missed, `/agent` or the first
-ordinary request presents the same chooser, and an already-sent request must be
-resent after setup. Later messages reuse that subject and its persisted
-provider session; topic renames update the user-facing subject label without
-changing its identity. The worker inherits the forum's exact workspace
-boundary, working directory, and optional Git metadata, plus the selected
-provider configuration. Existing managed agent mailboxes provide receipts,
+Each model and effort menu starts with **Default**. Setup confirmations and
+`/agent` status resolve a Default selection to the concrete value currently
+inherited from the local Codex or Claude configuration, while retaining the
+Default label. The final choice atomically creates one durable subject, one
+topic route, and one managed worker without starting a provider session; the
+first ordinary text or voice request starts that session. If the creation
+service update was missed, `/agent` or the first ordinary request presents the
+same chooser, and an already-sent request must be resent after setup. Later
+messages reuse that subject and its persisted provider session; topic renames
+update the user-facing subject label without changing its identity. The worker
+inherits the forum's exact workspace boundary, working directory, and optional
+Git metadata, plus the selected provider configuration. Existing managed agent
+mailboxes provide receipts,
 editable progress, provider-neutral text/voice reply-to-steer, Stop,
 pause/resume, and explicit new-session controls—no new daemon or actor runtime
 is introduced. Read-only commands such as `/status` do not create a subject,
