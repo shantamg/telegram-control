@@ -2875,6 +2875,25 @@ class DurableStore:
                             control_id,
                             timestamp,
                         )
+                    elif mode == "receipt_edit":
+                        if row["method"] != "editMessageText" or not isinstance(
+                            result, dict
+                        ):
+                            raise StoreError(
+                                "Only editMessageText can update a voice "
+                                "control receipt."
+                            )
+                        try:
+                            int(result["message_id"])
+                        except (KeyError, TypeError, ValueError):
+                            raise StoreError(
+                                "Telegram result cannot identify its voice "
+                                "control receipt."
+                            ) from None
+                        self._enqueue_agent_control_result_edit(
+                            control_id,
+                            timestamp,
+                        )
                     elif mode == "final_edit":
                         if row["method"] != "editMessageText":
                             raise StoreError(
@@ -8024,7 +8043,7 @@ class DurableStore:
                         card={
                             "kind": "agent_control",
                             "control_id": control.control_id,
-                            "mode": "receipt",
+                            "mode": "receipt_edit",
                         },
                         serialize_key=f"agent-control:{control.control_id}",
                         now=timestamp,
@@ -8194,10 +8213,18 @@ class DurableStore:
             SELECT c.*, o.params_json, o.telegram_result_json
             FROM agent_turn_controls AS c
             JOIN outbox_messages AS o
-                ON o.operation_id =
-                    'agent-control:' || c.control_id || ':receipt'
+                ON o.operation_id IN (
+                    'agent-control:' || c.control_id || ':receipt',
+                    'agent-control:' || c.control_id || ':receipt-edit'
+                )
             WHERE c.control_id = ? AND c.state IN ('applied', 'rejected')
                 AND o.state = 'sent' AND o.telegram_result_json IS NOT NULL
+            ORDER BY CASE
+                WHEN o.operation_id =
+                    'agent-control:' || c.control_id || ':receipt'
+                THEN 0 ELSE 1
+            END
+            LIMIT 1
             """,
             (int(control_id),),
         ).fetchone()

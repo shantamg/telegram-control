@@ -2505,6 +2505,25 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(acknowledgement.method, "editMessageText")
         self.assertEqual(acknowledgement.params["message_id"], 800)
         self.assertIn("voice guidance", acknowledgement.params["text"])
+        self.assertEqual(acknowledgement.card["mode"], "receipt_edit")
+        self.store.complete_outbox(
+            acknowledgement.message_id,
+            "sender",
+            {"message_id": 800, "chat": {"id": 123}},
+            now=119,
+        )
+        self.store.finish_agent_turn_control(
+            claimed.control_id,
+            mailbox.mailbox_id,
+            "agent",
+            "applied",
+            "Voice guidance accepted.",
+            now=120,
+        )
+        final_edit = self.store.claim_outbox("sender", now=121)
+        self.assertEqual(final_edit.method, "editMessageText")
+        self.assertEqual(final_edit.params["message_id"], 800)
+        self.assertIn("Voice guidance accepted.", final_edit.params["text"])
         mailbox_count = self.store.connection.execute(
             "SELECT COUNT(*) FROM agent_mailbox"
         ).fetchone()[0]
