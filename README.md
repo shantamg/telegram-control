@@ -563,9 +563,11 @@ ID and adds a durable control queue for active worker turns:
 - A turn card progresses from `📨 Queued` through bounded Codex-authored
   or Claude-authored user-facing updates and exposes a one-time `⏹ Stop`
   button while work is active.
-- Replying to the exact active turn card queues guidance for that exact Codex
-  turn through app-server `turn/steer`. Replying to any other agent message
-  starts an ordinary follow-up turn instead.
+- Replying to the exact active turn card queues guidance for that exact
+  provider turn. Text and transcribed voice replies use the same durable
+  control path; only the Codex or Claude adapter that transports the steer is
+  provider-specific. Replying to any other agent message starts an ordinary
+  follow-up turn instead.
 - Stop is durable before and after the provider turn ID becomes available. It
   is delivered through app-server `turn/interrupt`; a cancellation is terminal
   and is never retried as a failed turn.
@@ -623,11 +625,11 @@ provider session; topic renames update the user-facing subject label without
 changing its identity. The worker inherits the forum's exact workspace
 boundary, working directory, and optional Git metadata, plus the selected
 provider configuration. Existing managed agent mailboxes provide receipts,
-editable progress, reply-to-steer, Stop, pause/resume, and explicit new-session
-controls—no new daemon or actor runtime is introduced. Read-only commands such
-as `/status` do not create a subject, and exact replies to earlier Control
-messages keep their durable Control route for both text and voice even after
-the topic becomes a subject.
+editable progress, provider-neutral text/voice reply-to-steer, Stop,
+pause/resume, and explicit new-session controls—no new daemon or actor runtime
+is introduced. Read-only commands such as `/status` do not create a subject,
+and exact replies to earlier Control messages keep their durable Control route
+for both text and voice even after the topic becomes a subject.
 
 Live setup:
 

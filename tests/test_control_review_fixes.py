@@ -128,8 +128,9 @@ class ControllerRestartRegressionTests(unittest.TestCase):
         submit = next(call for call in calls if call[0] == "submit")
         shell_script = submit[-1]
         label = submit[submit.index("-l") + 1]
-        self.assertIn(
-            "kickstart -k gui/501/local.telegram-bridge",
+        self.assertIn("restart-if-idle", shell_script)
+        self.assertNotIn(
+            "launchctl kickstart -k gui/501/local.telegram-bridge",
             shell_script,
         )
         self.assertIn(f"launchctl remove {label}", shell_script)

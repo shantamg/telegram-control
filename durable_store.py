@@ -7616,6 +7616,18 @@ class DurableStore:
         )
         return True
 
+    @staticmethod
+    def _agent_attempt_operation_suffix(
+        operation_suffix: str,
+        attempts: int,
+    ) -> str:
+        """Keep first-attempt IDs stable and isolate replay status edits."""
+        return (
+            operation_suffix
+            if int(attempts) <= 1
+            else f"{operation_suffix}-attempt-{int(attempts)}"
+        )
+
     def _enqueue_agent_final_messages(
         self,
         *,
@@ -7735,7 +7747,7 @@ class DurableStore:
         try:
             row = self.connection.execute(
                 """
-                SELECT m.provider_turn_id, m.agent_id, a.provider
+                SELECT m.provider_turn_id, m.agent_id, m.attempts, a.provider
                 FROM agent_mailbox AS m
                 JOIN agents AS a ON a.agent_id = m.agent_id
                 WHERE m.mailbox_id = ? AND m.state = 'leased'
@@ -7771,7 +7783,10 @@ class DurableStore:
             provider_name = "Claude" if str(row["provider"]) == "claude" else "Codex"
             self._enqueue_agent_status_edit(
                 mailbox_id,
-                "turn-started",
+                self._agent_attempt_operation_suffix(
+                    "turn-started",
+                    int(row["attempts"]),
+                ),
                 f"{speaker}\n\n🧠 {provider_name} is working…",
                 timestamp,
             )
@@ -7804,7 +7819,7 @@ class DurableStore:
         try:
             row = self.connection.execute(
                 """
-                SELECT m.agent_id, a.provider
+                SELECT m.agent_id, m.attempts, a.provider
                 FROM agent_mailbox AS m
                 JOIN agents AS a ON a.agent_id = m.agent_id
                 WHERE m.mailbox_id = ? AND m.state = 'leased'
@@ -7831,7 +7846,10 @@ class DurableStore:
                     )
                 self._enqueue_agent_status_edit(
                     mailbox_id,
-                    "progress-output",
+                    self._agent_attempt_operation_suffix(
+                        "progress-output",
+                        int(row["attempts"]),
+                    ),
                     f"{speaker}\n\n{output}",
                     timestamp,
                     coalesce=True,
@@ -7852,7 +7870,10 @@ class DurableStore:
             }
             self._enqueue_agent_status_edit(
                 mailbox_id,
-                f"progress-{stage}",
+                self._agent_attempt_operation_suffix(
+                    f"progress-{stage}",
+                    int(row["attempts"]),
+                ),
                 f"{speaker}\n\n{labels[stage]}",
                 timestamp,
             )
@@ -7870,12 +7891,15 @@ class DurableStore:
         chat_id: int,
         message_thread_id: Optional[int],
         replied_message_id: int,
+        input_kind: str = "text",
         now: Optional[float] = None,
     ) -> Optional[AgentTurnControl]:
         """Create a steer only for the exact receipt of a live provider turn."""
         text = input_text.strip()
         if not text or len(text) > ROUTER_INPUT_LIMIT:
             raise StoreError("Agent steering input must contain 1 to 8000 characters.")
+        if input_kind not in {"text", "voice"}:
+            raise StoreError("Agent steering input kind is invalid.")
         timestamp = time.time() if now is None else float(now)
         thread_id = int(message_thread_id) if message_thread_id is not None else 0
         self.connection.execute("BEGIN IMMEDIATE")
@@ -7955,36 +7979,118 @@ class DurableStore:
             control = self._agent_control_from_row(row)
             speaker = html.escape(self.agent_speaker_header(agent_id))
             excerpt = html.escape(text[:1200])
-            self.enqueue_api_call(
-                operation_id=f"agent-control:{control.control_id}:receipt",
-                method="sendMessage",
-                params={
-                    "chat_id": int(chat_id),
-                    "message_thread_id": (
-                        int(message_thread_id)
-                        if message_thread_id is not None
-                        else None
-                    ),
-                    "text": (
-                        f"🧭 <b>Steering {speaker}…</b>\n"
-                        f"<blockquote>{excerpt}</blockquote>"
-                    ),
-                    "parse_mode": "HTML",
-                },
-                route={
-                    "target_type": "agent",
-                    "target_id": agent_id,
-                    "policy": "reply",
-                    "ttl_seconds": 30 * 24 * 60 * 60,
-                },
-                card={
-                    "kind": "agent_control",
-                    "control_id": control.control_id,
-                    "mode": "receipt",
-                },
-                serialize_key=f"agent-control:{control.control_id}",
-                now=timestamp,
+            receipt_text = (
+                f"🧭 <b>Steering {speaker}…</b>\n"
+                f"<blockquote>{excerpt}</blockquote>"
             )
+            if input_kind == "voice":
+                voice_receipt = self.connection.execute(
+                    """
+                    SELECT state, params_json, card_json,
+                        telegram_result_json
+                    FROM outbox_messages
+                    WHERE operation_id = ?
+                    """,
+                    (f"agent-input:{int(source_inbox_job_id)}:receipt",),
+                ).fetchone()
+                if voice_receipt is None:
+                    raise StoreError(
+                        "Managed voice steering receipt is unavailable."
+                    )
+                voice_card = json.loads(voice_receipt["card_json"])
+                voice_params = json.loads(voice_receipt["params_json"])
+                if voice_card.get("input_kind") != "voice":
+                    raise StoreError(
+                        "Managed voice steering receipt is invalid."
+                    )
+                if (
+                    str(voice_receipt["state"]) == "sent"
+                    and voice_receipt["telegram_result_json"] is not None
+                ):
+                    voice_result = json.loads(
+                        voice_receipt["telegram_result_json"]
+                    )
+                    self.enqueue_api_call(
+                        operation_id=(
+                            f"agent-control:{control.control_id}:receipt-edit"
+                        ),
+                        method="editMessageText",
+                        params={
+                            "chat_id": int(voice_params["chat_id"]),
+                            "message_id": int(voice_result["message_id"]),
+                            "text": receipt_text,
+                            "parse_mode": "HTML",
+                        },
+                        card={
+                            "kind": "agent_control",
+                            "control_id": control.control_id,
+                            "mode": "receipt",
+                        },
+                        serialize_key=f"agent-control:{control.control_id}",
+                        now=timestamp,
+                    )
+                else:
+                    # Transcription can finish before the async Telegram
+                    # sender delivers its receipt. Steering must not depend
+                    # on that presentation race, so send a separate durable
+                    # acknowledgement when there is not yet a message to edit.
+                    self.enqueue_api_call(
+                        operation_id=(
+                            f"agent-control:{control.control_id}:receipt"
+                        ),
+                        method="sendMessage",
+                        params={
+                            "chat_id": int(chat_id),
+                            "message_thread_id": (
+                                int(message_thread_id)
+                                if message_thread_id is not None
+                                else None
+                            ),
+                            "text": receipt_text,
+                            "parse_mode": "HTML",
+                        },
+                        route={
+                            "target_type": "agent",
+                            "target_id": agent_id,
+                            "policy": "reply",
+                            "ttl_seconds": 30 * 24 * 60 * 60,
+                        },
+                        card={
+                            "kind": "agent_control",
+                            "control_id": control.control_id,
+                            "mode": "receipt",
+                        },
+                        serialize_key=f"agent-control:{control.control_id}",
+                        now=timestamp,
+                    )
+            else:
+                self.enqueue_api_call(
+                    operation_id=f"agent-control:{control.control_id}:receipt",
+                    method="sendMessage",
+                    params={
+                        "chat_id": int(chat_id),
+                        "message_thread_id": (
+                            int(message_thread_id)
+                            if message_thread_id is not None
+                            else None
+                        ),
+                        "text": receipt_text,
+                        "parse_mode": "HTML",
+                    },
+                    route={
+                        "target_type": "agent",
+                        "target_id": agent_id,
+                        "policy": "reply",
+                        "ttl_seconds": 30 * 24 * 60 * 60,
+                    },
+                    card={
+                        "kind": "agent_control",
+                        "control_id": control.control_id,
+                        "mode": "receipt",
+                    },
+                    serialize_key=f"agent-control:{control.control_id}",
+                    now=timestamp,
+                )
             self.connection.execute("COMMIT")
             return control
         except BaseException:
@@ -8795,7 +8901,7 @@ class DurableStore:
             return None
         provider_row = self.connection.execute(
             """
-            SELECT a.provider, a.agent_id, m.mailbox_id
+            SELECT a.provider, a.agent_id, m.mailbox_id, m.attempts
             FROM agent_mailbox AS m
             JOIN agents AS a ON a.agent_id = m.agent_id
             WHERE m.source_inbox_job_id = ?
@@ -8813,9 +8919,16 @@ class DurableStore:
             chat_id = int(params["chat_id"])
         except (KeyError, TypeError, ValueError):
             raise StoreError("Stored Telegram voice receipt is invalid.") from None
+        operation_suffix = f"voice-{stage}"
+        if stage == "working":
+            operation_suffix = self._agent_attempt_operation_suffix(
+                operation_suffix,
+                int(provider_row["attempts"]),
+            )
         return self.enqueue_api_call(
             operation_id=(
-                f"agent-mailbox:{int(provider_row['mailbox_id'])}:voice-{stage}"
+                f"agent-mailbox:{int(provider_row['mailbox_id'])}:"
+                f"{operation_suffix}"
             ),
             method="editMessageText",
             params={
@@ -9937,6 +10050,13 @@ class DurableStore:
                 (timestamp, timestamp),
             )
         elif queue == "agent":
+            dead_mailboxes = self.connection.execute(
+                """
+                SELECT mailbox_id
+                FROM agent_mailbox
+                WHERE state = 'dead'
+                """
+            ).fetchall()
             cursor = self.connection.execute(
                 """
                 UPDATE agent_mailbox
@@ -9946,6 +10066,23 @@ class DurableStore:
                 """,
                 (timestamp, timestamp),
             )
+            for row in dead_mailboxes:
+                self.connection.execute(
+                    """
+                    UPDATE callback_actions
+                    SET state = 'active', consumed_at = NULL,
+                        consumed_by_update_id = NULL,
+                        expires_at = ?, updated_at = ?
+                    WHERE operation_id = ?
+                        AND action_type = 'agent_turn_stop'
+                        AND state = 'expired'
+                    """,
+                    (
+                        timestamp + 2 * 60 * 60,
+                        timestamp,
+                        f"agent-mailbox:{int(row['mailbox_id'])}:stop",
+                    ),
+                )
         elif queue == "router":
             cursor = self.connection.execute(
                 """

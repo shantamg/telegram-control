@@ -507,6 +507,76 @@ class DurableStoreTests(unittest.TestCase):
         retried = self.store.claim_job("worker", now=106)
         self.assertEqual(retried.attempts, 1)
 
+    def test_restart_waits_for_durable_leases_and_runs_when_idle(self):
+        self.store.ingest_update(message_update(), now=100)
+        leased = self.store.claim_job("worker", now=101)
+        args = argparse.Namespace(db=self.database_path)
+        with mock.patch.object(
+            telegram_control.bridge,
+            "launchctl",
+        ) as launchctl:
+            with self.assertRaisesRegex(StoreError, "active durable work"):
+                telegram_control.restart_if_idle_command(args)
+            launchctl.assert_not_called()
+
+            self.store.complete_job(leased.job_id, "worker", now=102)
+            launchctl.return_value = (
+                telegram_control.subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout="",
+                    stderr="",
+                )
+            )
+            telegram_control.restart_if_idle_command(args)
+            launchctl.assert_called_once_with(
+                "kickstart",
+                "-k",
+                (
+                    f"gui/{os.getuid()}/"
+                    f"{telegram_control.bridge.LAUNCH_AGENT_LABEL}"
+                ),
+                check=False,
+            )
+
+    def test_restart_recovers_dead_prestart_agent_worker(self):
+        _agent, _, _ = self._setup_routed_agent_turn()
+        dead_owner = (
+            f"{telegram_control.socket.gethostname()}:999999:"
+            "agent:deadbeef"
+        )
+        mailbox = self.store.claim_agent_mailbox(dead_owner, now=104)
+        args = argparse.Namespace(db=self.database_path)
+        completed = telegram_control.subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+        with mock.patch.object(
+            telegram_control.os,
+            "kill",
+            side_effect=ProcessLookupError,
+        ), mock.patch.object(
+            telegram_control.bridge,
+            "launchctl",
+            return_value=completed,
+        ) as launchctl:
+            telegram_control.restart_if_idle_command(args)
+
+        recovered = self.store.connection.execute(
+            """
+            SELECT state, lease_owner, provider_turn_id
+            FROM agent_mailbox
+            WHERE mailbox_id = ?
+            """,
+            (mailbox.mailbox_id,),
+        ).fetchone()
+        self.assertEqual(recovered["state"], "queued")
+        self.assertIsNone(recovered["lease_owner"])
+        self.assertIsNone(recovered["provider_turn_id"])
+        launchctl.assert_called_once()
+
     def test_outbox_operation_is_idempotent_and_recovers_expired_lease(self):
         first_id = self.store.enqueue_api_call(
             "job:1:reply:1",
@@ -2038,7 +2108,7 @@ class DurableStoreTests(unittest.TestCase):
         )
         self.assertEqual(fallback.params["message_thread_id"], 62)
 
-    def _setup_routed_agent_turn(self):
+    def _setup_routed_agent_turn(self, provider="codex"):
         """Create control + project surfaces and one dispatched router turn."""
         self.store.ensure_surface_binding(
             chat_id=123,
@@ -2062,7 +2132,7 @@ class DurableStoreTests(unittest.TestCase):
             chat_id=123,
             surface_name="Stage 2 Test",
             slug="telegram-control",
-            provider="codex",
+            provider=provider,
             project_path="/tmp/telegram-control",
             now=100,
         )
@@ -2350,6 +2420,341 @@ class DurableStoreTests(unittest.TestCase):
             (control.control_id,),
         ).fetchone()["state"]
         self.assertEqual(state, "applied")
+
+    def _assert_voice_reply_steers_live_turn(self, provider):
+        agent, _, _ = self._setup_routed_agent_turn(provider=provider)
+        receipt = self.store.claim_outbox("sender", now=104)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=105,
+        )
+        preview = self.store.claim_outbox("sender", now=106)
+        self.store.complete_outbox(
+            preview.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=107,
+        )
+        mailbox = self.store.claim_agent_mailbox("agent", now=108)
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            "agent",
+            f"{provider}-turn-live-voice",
+            now=109,
+        )
+        started = self.store.claim_outbox("sender", now=110)
+        self.store.complete_outbox(
+            started.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=111,
+        )
+        self.store.ingest_update(
+            voice_reply_update(11, 700, "agent progress"),
+            now=112,
+        )
+        source_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+            ).fetchone()["job_id"]
+        )
+        self.store.enqueue_agent_reply_receipt(
+            agent_id=agent.agent_id,
+            source_inbox_job_id=source_job_id,
+            chat_id=123,
+            message_thread_id=None,
+            replied_message_id=700,
+            receipt_text="voice is transcribing",
+            input_kind="voice",
+            now=113,
+        )
+        voice_receipt = self.store.claim_outbox("sender", now=114)
+        self.store.complete_outbox(
+            voice_receipt.message_id,
+            "sender",
+            {"message_id": 800, "chat": {"id": 123}},
+            now=115,
+        )
+
+        control = self.store.enqueue_agent_steer_from_receipt(
+            agent_id=agent.agent_id,
+            source_inbox_job_id=source_job_id,
+            input_text="voice guidance",
+            chat_id=123,
+            message_thread_id=None,
+            replied_message_id=700,
+            input_kind="voice",
+            now=116,
+        )
+
+        self.assertIsNotNone(control)
+        claimed = self.store.claim_agent_turn_control(
+            mailbox.mailbox_id,
+            "agent",
+            now=117,
+        )
+        self.assertEqual(claimed.control_id, control.control_id)
+        self.assertEqual(claimed.control_type, "steer")
+        self.assertEqual(
+            claimed.expected_turn_id,
+            f"{provider}-turn-live-voice",
+        )
+        acknowledgement = self.store.claim_outbox("sender", now=118)
+        self.assertEqual(acknowledgement.method, "editMessageText")
+        self.assertEqual(acknowledgement.params["message_id"], 800)
+        self.assertIn("voice guidance", acknowledgement.params["text"])
+        mailbox_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM agent_mailbox"
+        ).fetchone()[0]
+        self.assertEqual(mailbox_count, 1)
+
+    def test_codex_voice_reply_steers_live_turn(self):
+        self._assert_voice_reply_steers_live_turn("codex")
+
+    def test_claude_voice_reply_steers_live_turn(self):
+        self._assert_voice_reply_steers_live_turn("claude")
+
+    def test_voice_steer_does_not_wait_for_transcription_receipt_delivery(self):
+        agent, _, _ = self._setup_routed_agent_turn(provider="claude")
+        receipt = self.store.claim_outbox("sender", now=104)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=105,
+        )
+        preview = self.store.claim_outbox("sender", now=106)
+        self.store.complete_outbox(
+            preview.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=107,
+        )
+        mailbox = self.store.claim_agent_mailbox("agent", now=108)
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            "agent",
+            "claude-turn-fast-voice",
+            now=109,
+        )
+        started = self.store.claim_outbox("sender", now=110)
+        self.store.complete_outbox(
+            started.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=111,
+        )
+        self.store.ingest_update(voice_reply_update(11, 700), now=112)
+        source_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+            ).fetchone()["job_id"]
+        )
+        self.store.enqueue_agent_reply_receipt(
+            agent_id=agent.agent_id,
+            source_inbox_job_id=source_job_id,
+            chat_id=123,
+            message_thread_id=None,
+            replied_message_id=700,
+            receipt_text="voice is transcribing",
+            input_kind="voice",
+            now=113,
+        )
+
+        control = self.store.enqueue_agent_steer_from_receipt(
+            agent_id=agent.agent_id,
+            source_inbox_job_id=source_job_id,
+            input_text="fast voice guidance",
+            chat_id=123,
+            message_thread_id=None,
+            replied_message_id=700,
+            input_kind="voice",
+            now=114,
+        )
+
+        self.assertIsNotNone(control)
+        queued_methods = [
+            row["method"]
+            for row in self.store.connection.execute(
+                """
+                SELECT method
+                FROM outbox_messages
+                WHERE operation_id IN (?, ?)
+                ORDER BY message_id
+                """,
+                (
+                    f"agent-input:{source_job_id}:receipt",
+                    f"agent-control:{control.control_id}:receipt",
+                ),
+            ).fetchall()
+        ]
+        self.assertEqual(queued_methods, ["sendMessage", "sendMessage"])
+
+    def test_recovered_agent_attempt_uses_distinct_status_operations(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Retry Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Retry Test",
+            slug="retry-test",
+            provider="claude",
+            project_path="/tmp/retry-test",
+            now=100,
+        )
+        self.store.ingest_update(topic_voice_update(10), now=101)
+        source_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+            ).fetchone()["job_id"]
+        )
+        self.store.enqueue_agent_receipt(
+            agent_id=agent.agent_id,
+            source_inbox_job_id=source_job_id,
+            chat_id=123,
+            message_thread_id=62,
+            receipt_text="voice is transcribing",
+            input_kind="voice",
+            now=102,
+        )
+        receipt = self.store.claim_outbox("sender", now=103)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 800, "chat": {"id": 123}},
+            now=104,
+        )
+        mailbox_id = self.store.enqueue_agent_voice_message(
+            agent_id=agent.agent_id,
+            source_inbox_job_id=source_job_id,
+            input_text="retry this voice turn",
+            authorized_user_id=123,
+            now=105,
+        )
+        first = self.store.claim_agent_mailbox(
+            "first-worker",
+            now=106,
+            lease_seconds=10,
+        )
+        self.assertEqual(first.attempts, 1)
+        self.store.enqueue_agent_voice_status(
+            source_job_id,
+            "working",
+            first.input_text,
+            now=107,
+        )
+        self.store.attach_agent_mailbox_turn(
+            mailbox_id,
+            "first-worker",
+            "claude-first-turn",
+            now=108,
+        )
+        self.store.update_agent_mailbox_progress(
+            mailbox_id,
+            "first-worker",
+            "starting",
+            now=109,
+        )
+
+        second = self.store.claim_agent_mailbox(
+            "replacement-worker",
+            now=117,
+            lease_seconds=10,
+        )
+        self.assertEqual(second.mailbox_id, mailbox_id)
+        self.assertEqual(second.attempts, 2)
+        self.store.enqueue_agent_voice_status(
+            source_job_id,
+            "working",
+            second.input_text,
+            now=118,
+        )
+        self.store.attach_agent_mailbox_turn(
+            mailbox_id,
+            "replacement-worker",
+            "claude-second-turn",
+            now=119,
+        )
+        self.store.update_agent_mailbox_progress(
+            mailbox_id,
+            "replacement-worker",
+            "starting",
+            now=120,
+        )
+
+        operation_ids = {
+            str(row["operation_id"])
+            for row in self.store.connection.execute(
+                """
+                SELECT operation_id
+                FROM outbox_messages
+                WHERE operation_id LIKE ?
+                """,
+                (f"agent-mailbox:{mailbox_id}:%",),
+            ).fetchall()
+        }
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:voice-working",
+            operation_ids,
+        )
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:voice-working-attempt-2",
+            operation_ids,
+        )
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:turn-started",
+            operation_ids,
+        )
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:turn-started-attempt-2",
+            operation_ids,
+        )
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:progress-starting",
+            operation_ids,
+        )
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:progress-starting-attempt-2",
+            operation_ids,
+        )
+        self.assertEqual(
+            self.store.fail_agent_mailbox(
+                mailbox_id,
+                "replacement-worker",
+                "second attempt failed",
+                now=121,
+                max_attempts=2,
+            ),
+            "dead",
+        )
+        action_state = self.store.connection.execute(
+            """
+            SELECT state
+            FROM callback_actions
+            WHERE operation_id = ?
+            """,
+            (f"agent-mailbox:{mailbox_id}:stop",),
+        ).fetchone()["state"]
+        self.assertEqual(action_state, "expired")
+        self.assertEqual(self.store.retry_dead("agent", now=122), 1)
+        reactivated = self.store.connection.execute(
+            """
+            SELECT state, expires_at
+            FROM callback_actions
+            WHERE operation_id = ?
+            """,
+            (f"agent-mailbox:{mailbox_id}:stop",),
+        ).fetchone()
+        self.assertEqual(reactivated["state"], "active")
+        self.assertGreater(float(reactivated["expires_at"]), 122)
 
     def test_stop_queued_during_start_attaches_to_exact_turn_and_cancels(self):
         agent, source_job_id, _ = self._setup_routed_agent_turn()
@@ -6722,6 +7127,162 @@ class DurableIntegrationTests(unittest.TestCase):
                     final_message.params["text"],
                     "telegram-control\n\nvoice reply done",
                 )
+
+    def test_same_topic_voice_reply_steers_for_both_providers(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    database_path = (
+                        Path(temporary_directory) / "controller.sqlite3"
+                    )
+                    with DurableStore(database_path) as store:
+                        store.ensure_surface_binding(
+                            chat_id=123,
+                            message_thread_id=62,
+                            surface_type="project",
+                            display_name="Stage 2 Test",
+                            target_type="controller",
+                            target_id="control",
+                        )
+                        agent, _ = store.register_project_agent(
+                            chat_id=123,
+                            surface_name="Stage 2 Test",
+                            slug="telegram-control",
+                            provider=provider,
+                            project_path="/tmp/telegram-control",
+                        )
+                        store.ingest_update(
+                            topic_message_update(10, "initial request"),
+                            now=10**12,
+                        )
+                        first_job_id = int(
+                            store.connection.execute(
+                                """
+                                SELECT job_id
+                                FROM inbox_jobs
+                                WHERE update_id = 10
+                                """
+                            ).fetchone()["job_id"]
+                        )
+                        store.enqueue_agent_message_with_receipt(
+                            agent_id=agent.agent_id,
+                            source_inbox_job_id=first_job_id,
+                            input_text="initial request",
+                            chat_id=123,
+                            message_thread_id=62,
+                            receipt_text="queued",
+                            authorized_user_id=123,
+                            now=10**12 + 1,
+                        )
+                        initial_receipt = store.claim_outbox(
+                            "sender",
+                            now=10**12 + 2,
+                        )
+                        store.complete_outbox(
+                            initial_receipt.message_id,
+                            "sender",
+                            {"message_id": 700, "chat": {"id": 123}},
+                            now=10**12 + 3,
+                        )
+                        mailbox = store.claim_agent_mailbox(
+                            "agent",
+                            now=10**12 + 4,
+                        )
+                        store.attach_agent_mailbox_turn(
+                            mailbox.mailbox_id,
+                            "agent",
+                            f"{provider}-active-turn",
+                            now=10**12 + 5,
+                        )
+                        started = store.claim_outbox(
+                            "sender",
+                            now=10**12 + 6,
+                        )
+                        store.complete_outbox(
+                            started.message_id,
+                            "sender",
+                            {"message_id": 700, "chat": {"id": 123}},
+                            now=10**12 + 7,
+                        )
+                        update = topic_voice_update(11)
+                        update["message"]["reply_to_message"] = {
+                            "message_id": 700,
+                            "message_thread_id": 62,
+                            "chat": {"id": 123, "type": "private"},
+                        }
+                        store.ingest_update(update, now=10**12 + 8)
+                        voice_job_id = int(
+                            store.connection.execute(
+                                """
+                                SELECT job_id
+                                FROM inbox_jobs
+                                WHERE update_id = 11
+                                """
+                            ).fetchone()["job_id"]
+                        )
+
+                    environment = {
+                        "TELEGRAM_CONTROL_DB": str(database_path),
+                        "TELEGRAM_CONTROL_JOB_ID": str(voice_job_id),
+                        "TELEGRAM_CHAT_ID": "123",
+                        "TELEGRAM_MESSAGE_THREAD_ID": "62",
+                        "TELEGRAM_REPLY_TO_MESSAGE_ID": "700",
+                        "TELEGRAM_FROM_ID": "123",
+                    }
+                    with mock.patch.dict(
+                        os.environ,
+                        environment,
+                        clear=False,
+                    ):
+                        with mock.patch.object(
+                            on_message.bridge,
+                            "download_telegram_file",
+                        ):
+                            with mock.patch.object(
+                                on_message,
+                                "convert_to_wav",
+                            ):
+                                with mock.patch.object(
+                                    on_message,
+                                    "transcribe_wav",
+                                    return_value="steer from voice",
+                                ):
+                                    on_message.handle_voice(
+                                        update,
+                                        update["message"]["voice"],
+                                    )
+
+                    with DurableStore(database_path) as store:
+                        controls = store.connection.execute(
+                            """
+                            SELECT mailbox_id, control_type, input_text,
+                                expected_turn_id
+                            FROM agent_turn_controls
+                            """
+                        ).fetchall()
+                        self.assertEqual(len(controls), 1)
+                        self.assertEqual(
+                            int(controls[0]["mailbox_id"]),
+                            mailbox.mailbox_id,
+                        )
+                        self.assertEqual(
+                            controls[0]["control_type"],
+                            "steer",
+                        )
+                        self.assertEqual(
+                            controls[0]["input_text"],
+                            "steer from voice",
+                        )
+                        self.assertEqual(
+                            controls[0]["expected_turn_id"],
+                            f"{provider}-active-turn",
+                        )
+                        self.assertEqual(
+                            store.connection.execute(
+                                "SELECT COUNT(*) FROM agent_mailbox"
+                            ).fetchone()[0],
+                            1,
+                        )
 
     def test_voice_reply_to_router_message_carries_reply_context(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

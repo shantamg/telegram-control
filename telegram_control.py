@@ -10,6 +10,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -2369,6 +2370,7 @@ def install_command(args: argparse.Namespace) -> None:
 def restart_command(args: argparse.Namespace) -> None:
     """Schedule exactly one controller restart from a self-cleaning job."""
     delay = float(args.delay_seconds)
+    database_path = Path(getattr(args, "db", DATABASE_PATH))
     if delay < 1.0 or delay > MAX_RESTART_DELAY_SECONDS:
         raise StoreError(
             "Restart delay must be between 1 and "
@@ -2383,12 +2385,23 @@ def restart_command(args: argparse.Namespace) -> None:
     cleanup_reload_jobs()
     label = f"{RELOAD_JOB_PREFIX}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
     log_path = Path("/tmp") / f"{label}.log"
-    # launchctl-submitted jobs may be inferred as KeepAlive jobs. The helper
-    # removes itself after its first kickstart, while run_command() also
-    # removes any matching helper as the replacement supervisor starts.
+    restart_if_idle = " ".join(
+        shlex.quote(part)
+        for part in (
+            sys.executable,
+            str(SCRIPT_PATH),
+            "--db",
+            str(database_path),
+            "restart-if-idle",
+        )
+    )
+    # The helper waits until every durable worker lease is idle. The hidden
+    # command holds SQLite's write lock while it kickstarts launchd, closing
+    # the race where a worker could claim a turn between an idle check and
+    # the restart. run_command() removes the one-shot helper after replacement.
     script = (
         f"sleep {delay:.3f}; "
-        f"/bin/launchctl kickstart -k {service}; "
+        f"until {restart_if_idle}; do sleep 1; done; "
         "status=$?; "
         f"/bin/launchctl remove {label}; "
         "exit $status"
@@ -2414,9 +2427,111 @@ def restart_command(args: argparse.Namespace) -> None:
         )
     print(
         "Scheduled one Telegram controller restart in "
-        f"{delay:g} seconds."
+        f"{delay:g} seconds; active durable work will finish first."
     )
     print(f"Reload job: {label}")
+
+
+def restart_if_idle_command(args: argparse.Namespace) -> None:
+    """Atomically restart launchd only when no durable worker owns a lease."""
+    domain = f"gui/{os.getuid()}"
+    service = f"{domain}/{bridge.LAUNCH_AGENT_LABEL}"
+    with DurableStore(args.db) as store:
+        store.connection.execute("BEGIN IMMEDIATE")
+        try:
+            timestamp = time.time()
+            orphaned_agent_ids = set()
+            orphaned_mailbox_ids = []
+            local_host = socket.gethostname()
+            leased_agents = store.connection.execute(
+                """
+                SELECT mailbox_id, agent_id, lease_owner, provider_turn_id
+                FROM agent_mailbox
+                WHERE state = 'leased'
+                """
+            ).fetchall()
+            for row in leased_agents:
+                if row["provider_turn_id"] is not None:
+                    continue
+                owner = str(row["lease_owner"] or "")
+                match = re.fullmatch(
+                    r"(.+):([1-9][0-9]*):agent:[A-Za-z0-9_-]+",
+                    owner,
+                )
+                if match is None or match.group(1) != local_host:
+                    continue
+                owner_pid = int(match.group(2))
+                try:
+                    os.kill(owner_pid, 0)
+                except ProcessLookupError:
+                    orphaned_mailbox_ids.append(int(row["mailbox_id"]))
+                    orphaned_agent_ids.add(str(row["agent_id"]))
+                except PermissionError:
+                    pass
+            for mailbox_id in orphaned_mailbox_ids:
+                store.connection.execute(
+                    """
+                    UPDATE agent_mailbox
+                    SET state = 'queued', available_at = ?,
+                        lease_owner = NULL, lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE mailbox_id = ? AND state = 'leased'
+                        AND provider_turn_id IS NULL
+                    """,
+                    (timestamp, timestamp, mailbox_id),
+                )
+            for agent_id in orphaned_agent_ids:
+                store.connection.execute(
+                    """
+                    UPDATE agents
+                    SET lifecycle_state = 'registered', updated_at = ?
+                    WHERE agent_id = ? AND lifecycle_state = 'running'
+                    """,
+                    (timestamp, agent_id),
+                )
+            active = {}
+            for table in (
+                "inbox_jobs",
+                "router_mailbox",
+                "agent_mailbox",
+                "outbox_messages",
+            ):
+                count = int(
+                    store.connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE state = 'leased'"
+                    ).fetchone()[0]
+                )
+                if count:
+                    active[table] = count
+            if active:
+                raise StoreError(
+                    "Controller restart is waiting for active durable work: "
+                    + ", ".join(
+                        f"{table}={count}"
+                        for table, count in sorted(active.items())
+                    )
+                )
+            if orphaned_mailbox_ids:
+                log_event(
+                    "restart_recovered_prestart_agent_leases",
+                    mailbox_ids=orphaned_mailbox_ids,
+                )
+            restarted = bridge.launchctl(
+                "kickstart",
+                "-k",
+                service,
+                check=False,
+            )
+            if restarted.returncode != 0:
+                raise StoreError(
+                    restarted.stderr.strip()
+                    or "launchctl could not restart the durable controller."
+                )
+            store.connection.execute("COMMIT")
+        except BaseException:
+            if store.connection.in_transaction:
+                store.connection.execute("ROLLBACK")
+            raise
 
 
 def init_command(args: argparse.Namespace) -> None:
@@ -2795,6 +2910,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     restart_parser.set_defaults(function=restart_command)
+
+    restart_if_idle_parser = subparsers.add_parser(
+        "restart-if-idle",
+        help=argparse.SUPPRESS,
+    )
+    restart_if_idle_parser.set_defaults(function=restart_if_idle_command)
 
     install_skills_parser = subparsers.add_parser(
         "install-skills",

@@ -3079,6 +3079,22 @@ def handle_voice(update: dict, voice: dict) -> None:
         )
         chat_id, thread_id = surface_coordinates()
         with DurableStore(Path(database_path)) as store:
+            if (
+                reply_route is not None
+                and reply_route.target_type == "agent"
+                and reply_route.target_id == managed_agent.agent_id
+            ):
+                control = store.enqueue_agent_steer_from_receipt(
+                    agent_id=managed_agent.agent_id,
+                    source_inbox_job_id=int(job_id),
+                    input_text=agent_input,
+                    chat_id=chat_id,
+                    message_thread_id=thread_id,
+                    replied_message_id=reply_route.telegram_message_id,
+                    input_kind="voice",
+                )
+                if control is not None:
+                    return
             if agent_reply_route is not None:
                 store.enqueue_agent_reply_voice_message(
                     agent_id=managed_agent.agent_id,
