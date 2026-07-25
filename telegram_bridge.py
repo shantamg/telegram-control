@@ -731,11 +731,13 @@ def process_update(
     )
     environment = os.environ.copy()
     topic_service_message = message.get("reply_to_message") or {}
-    topic_created = (
-        topic_service_message.get("forum_topic_created")
-        if isinstance(topic_service_message, dict)
-        else None
-    )
+    topic_created = message.get("forum_topic_created")
+    if not isinstance(topic_created, dict):
+        topic_created = (
+            topic_service_message.get("forum_topic_created")
+            if isinstance(topic_service_message, dict)
+            else None
+        )
     topic_name = (
         str(topic_created.get("name", ""))
         if isinstance(topic_created, dict)

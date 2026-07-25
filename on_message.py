@@ -37,6 +37,38 @@ TRANSCRIPTION_TIMEOUT_SECONDS = 15 * 60
 TELEGRAM_TEXT_CHUNK = 3_800
 OUTPUT_SEQUENCE = 0
 CONTROL_SPEAKER = "🎛 Control"
+FORUM_SUBJECT_MODELS = {
+    "codex": [
+        ("Default", None),
+        ("GPT-5.6 Sol", "gpt-5.6-sol"),
+        ("GPT-5.6 Terra", "gpt-5.6-terra"),
+    ],
+    "claude": [
+        ("Default", None),
+        ("Opus", "opus"),
+        ("Sonnet", "sonnet"),
+        ("Fable", "fable"),
+    ],
+}
+FORUM_SUBJECT_EFFORTS = {
+    "codex": [
+        ("Default", None),
+        ("Low", "low"),
+        ("Medium", "medium"),
+        ("High", "high"),
+        ("XHigh", "xhigh"),
+        ("Max", "max"),
+        ("Ultra", "ultra"),
+    ],
+    "claude": [
+        ("Default", None),
+        ("Low", "low"),
+        ("Medium", "medium"),
+        ("High", "high"),
+        ("XHigh", "xhigh"),
+        ("Max", "max"),
+    ],
+}
 
 
 def deliver_api_call(
@@ -872,6 +904,107 @@ def ensure_bound_forum_subject():
         )
 
 
+def prompt_forum_subject_provider_selection(
+    request_was_already_sent: bool = False,
+) -> bool:
+    """Offer a provider before a bound forum topic receives its first turn."""
+    if os.environ.get("TELEGRAM_CHAT_TYPE") != "supergroup":
+        return False
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    user_id_text = os.environ.get("TELEGRAM_FROM_ID")
+    if not all(
+        (
+            database_path,
+            job_id,
+            chat_id_text,
+            thread_id_text,
+            user_id_text,
+        )
+    ):
+        raise StoreError(
+            "Forum subject provider selection requires the durable controller."
+        )
+    chat_id = int(chat_id_text)
+    thread_id = int(thread_id_text)
+    display_name = " ".join(surface_display_name().strip().split())
+    if not display_name or len(display_name) > 128:
+        raise StoreError("Forum topic display name is invalid.")
+
+    with DurableStore(Path(database_path)) as store:
+        workspace = store.resolve_forum_workspace(chat_id)
+        if workspace is None:
+            return False
+        subject = store.resolve_forum_subject(chat_id, thread_id)
+        if subject is not None:
+            return False
+        binding = store.resolve_surface_binding(chat_id, thread_id)
+        if binding is not None and binding.target_type == "agent":
+            return False
+        actions = {}
+        for provider in ("codex", "claude"):
+            actions[provider] = store.create_callback_action(
+                operation_id=(
+                    f"inbox:{job_id}:forum-subject-provider:{provider}"
+                ),
+                action_type="forum_subject_provider_select",
+                payload={
+                    "chat_id": chat_id,
+                    "message_thread_id": thread_id,
+                    "display_name": display_name,
+                    "provider": provider,
+                },
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=int(user_id_text),
+                one_time=True,
+                ttl_seconds=24 * 60 * 60,
+            )
+
+    instruction = (
+        "Choose an agent, then send your request again."
+        if request_was_already_sent
+        else (
+            "Your first message will start a new session with the selected "
+            "agent."
+        )
+    )
+    send_message(
+        f"Choose an agent for “{display_name}”.\n\n{instruction}",
+        reply_markup={
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "Codex",
+                        "callback_data": f"a:{actions['codex'].token}",
+                    },
+                    {
+                        "text": "Claude",
+                        "callback_data": f"a:{actions['claude'].token}",
+                    },
+                ]
+            ]
+        },
+    )
+    return True
+
+
+def option_button_rows(actions, width: int = 3) -> list[list[dict]]:
+    buttons = [
+        {
+            "text": label,
+            "callback_data": f"a:{action.token}",
+        }
+        for label, action in actions
+    ]
+    return [
+        buttons[index : index + width]
+        for index in range(0, len(buttons), width)
+    ]
+
+
 def handle_callback(update: dict, callback_query: dict) -> None:
     callback_query_id = str(callback_query.get("id", ""))
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
@@ -911,6 +1044,243 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 },
                 "callback-answer",
             )
+        return
+
+    if action.action_type == "forum_subject_provider_select":
+        target_chat_id = int(action.payload.get("chat_id", 0))
+        target_thread_id = int(action.payload.get("message_thread_id", 0))
+        display_name = str(action.payload.get("display_name", "")).strip()
+        provider = str(action.payload.get("provider", ""))
+        if (
+            target_chat_id != chat_id
+            or target_thread_id != thread_id
+            or provider not in {"codex", "claude"}
+            or not display_name
+            or len(display_name) > 128
+        ):
+            raise StoreError("Stored forum agent selection is invalid.")
+        provider_name = "Claude" if provider == "claude" else "Codex"
+        with DurableStore(Path(database_path)) as store:
+            model_actions = []
+            for label, model in FORUM_SUBJECT_MODELS[provider]:
+                model_action = store.create_callback_action(
+                    operation_id=(
+                        f"callback:{update['update_id']}:"
+                        f"forum-subject-model:{model or 'default'}"
+                    ),
+                    action_type="forum_subject_model_select",
+                    payload={
+                        "chat_id": chat_id,
+                        "message_thread_id": target_thread_id,
+                        "display_name": display_name,
+                        "provider": provider,
+                        "model": model,
+                    },
+                    chat_id=chat_id,
+                    message_thread_id=target_thread_id,
+                    authorized_user_id=user_id,
+                    one_time=True,
+                    ttl_seconds=24 * 60 * 60,
+                )
+                model_actions.append((label, model_action))
+            store.expire_forum_subject_setup_actions(
+                chat_id,
+                target_thread_id,
+                action_type="forum_subject_provider_select",
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": f"{provider_name} selected. Choose a model.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "forum-subject-provider-clear",
+        )
+        send_message(
+            f"{provider_name} selected. Choose a model.",
+            reply_markup={
+                "inline_keyboard": option_button_rows(model_actions),
+            },
+        )
+        return
+
+    if action.action_type == "forum_subject_model_select":
+        target_chat_id = int(action.payload.get("chat_id", 0))
+        target_thread_id = int(action.payload.get("message_thread_id", 0))
+        display_name = str(action.payload.get("display_name", "")).strip()
+        provider = str(action.payload.get("provider", ""))
+        model = action.payload.get("model")
+        allowed_models = (
+            {value for _, value in FORUM_SUBJECT_MODELS.get(provider, [])}
+            if provider in {"codex", "claude"}
+            else set()
+        )
+        if (
+            target_chat_id != chat_id
+            or target_thread_id != thread_id
+            or not display_name
+            or len(display_name) > 128
+            or model not in allowed_models
+        ):
+            raise StoreError("Stored forum model selection is invalid.")
+        with DurableStore(Path(database_path)) as store:
+            effort_actions = []
+            for label, effort in FORUM_SUBJECT_EFFORTS[provider]:
+                effort_action = store.create_callback_action(
+                    operation_id=(
+                        f"callback:{update['update_id']}:"
+                        f"forum-subject-effort:{effort or 'default'}"
+                    ),
+                    action_type="forum_subject_effort_select",
+                    payload={
+                        "chat_id": chat_id,
+                        "message_thread_id": target_thread_id,
+                        "display_name": display_name,
+                        "provider": provider,
+                        "model": model,
+                        "effort": effort,
+                    },
+                    chat_id=chat_id,
+                    message_thread_id=target_thread_id,
+                    authorized_user_id=user_id,
+                    one_time=True,
+                    ttl_seconds=24 * 60 * 60,
+                )
+                effort_actions.append((label, effort_action))
+            store.expire_forum_subject_setup_actions(
+                chat_id,
+                target_thread_id,
+                action_type="forum_subject_model_select",
+            )
+        model_name = str(model) if model is not None else "provider default"
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Model selected. Choose effort.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "forum-subject-model-clear",
+        )
+        send_message(
+            f"Model: {model_name}\n\nChoose effort.",
+            reply_markup={
+                "inline_keyboard": option_button_rows(effort_actions),
+            },
+        )
+        return
+
+    if action.action_type == "forum_subject_effort_select":
+        target_chat_id = int(action.payload.get("chat_id", 0))
+        target_thread_id = int(action.payload.get("message_thread_id", 0))
+        display_name = str(action.payload.get("display_name", "")).strip()
+        provider = str(action.payload.get("provider", ""))
+        model = action.payload.get("model")
+        effort = action.payload.get("effort")
+        allowed_models = (
+            {value for _, value in FORUM_SUBJECT_MODELS.get(provider, [])}
+            if provider in {"codex", "claude"}
+            else set()
+        )
+        allowed_efforts = (
+            {value for _, value in FORUM_SUBJECT_EFFORTS.get(provider, [])}
+            if provider in {"codex", "claude"}
+            else set()
+        )
+        if (
+            target_chat_id != chat_id
+            or target_thread_id != thread_id
+            or not display_name
+            or len(display_name) > 128
+            or model not in allowed_models
+            or effort not in allowed_efforts
+        ):
+            raise StoreError("Stored forum effort selection is invalid.")
+        provider_config = {}
+        if model is not None:
+            provider_config["model"] = str(model)
+        if effort is not None:
+            provider_config["effort"] = str(effort)
+        try:
+            with DurableStore(Path(database_path)) as store:
+                subject, _ = store.ensure_forum_subject(
+                    chat_id=chat_id,
+                    message_thread_id=target_thread_id,
+                    display_name=display_name,
+                    provider=provider,
+                    provider_config=provider_config,
+                )
+                agent = store.resolve_agent(subject.agent_id)
+                if (
+                    agent is None
+                    or agent.provider != provider
+                    or agent.provider_config != provider_config
+                ):
+                    raise StoreError(
+                        "The selected forum agent could not be verified."
+                    )
+                store.expire_forum_subject_setup_actions(
+                    chat_id,
+                    target_thread_id,
+                )
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        provider_name = "Claude" if provider == "claude" else "Codex"
+        model_name = str(model) if model is not None else "default"
+        effort_name = str(effort) if effort is not None else "default"
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": f"{provider_name} configured.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "forum-subject-effort-clear",
+        )
+        send_message(
+            f"✅ This topic will use {provider_name}.\n"
+            f"Model: {model_name}\n"
+            f"Effort: {effort_name}\n\n"
+            "Send the first message to start a new session."
+        )
         return
 
     if action.action_type == "authorize_forum":
@@ -2768,11 +3138,21 @@ def main() -> int:
         message = update.get("message")
         if callback_query:
             handle_callback(update, callback_query)
+        elif message and isinstance(message.get("forum_topic_created"), dict):
+            topic_name = str(message["forum_topic_created"].get("name", ""))
+            print(f"Received new forum topic: {topic_name}", flush=True)
+            if forum_is_authorized_or_prompt():
+                prompt_forum_subject_provider_selection()
         elif message and "voice" in message:
             print(f"Received voice message from @{username}.", flush=True)
             if forum_is_authorized_or_prompt():
-                if not os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID"):
-                    ensure_bound_forum_subject()
+                if (
+                    not os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
+                    and prompt_forum_subject_provider_selection(
+                        request_was_already_sent=True,
+                    )
+                ):
+                    return 0
                 handle_voice(update, message["voice"])
         elif message and "text" in message:
             text = str(message["text"])
@@ -2795,7 +3175,8 @@ def main() -> int:
             elif agent_create is not None:
                 create_agent_from_catalog(agent_create.group(1))
             elif text.strip().lower() in {"/agent", "/agent status"}:
-                send_agent_status()
+                if not prompt_forum_subject_provider_selection():
+                    send_agent_status()
             elif replied_message_id:
                 route = resolve_replied_message_route()
                 if (
@@ -2823,6 +3204,10 @@ def main() -> int:
                         "That replied-to message has no active durable route."
                     )
             else:
+                if prompt_forum_subject_provider_selection(
+                    request_was_already_sent=True,
+                ):
+                    return 0
                 ensure_bound_forum_subject()
                 binding = current_surface_binding()
                 thread_id = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID")

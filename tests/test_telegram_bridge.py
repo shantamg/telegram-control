@@ -806,6 +806,28 @@ class ProcessUpdateAuthorizationTests(unittest.TestCase):
         self.assertEqual(environment["TELEGRAM_CHAT_TITLE"], "Life")
         self.assertEqual(environment["TELEGRAM_FROM_ID"], "123")
 
+    def test_topic_creation_service_message_exposes_topic_name(self):
+        update = self.update(
+            {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+        )
+        update["message"].pop("text")
+        update["message"]["forum_topic_created"] = {"name": "Journal"}
+        completed = mock.Mock(returncode=0)
+        with mock.patch.object(
+            telegram_bridge.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            telegram_bridge.process_update(self.config, update)
+
+        environment = run.call_args.kwargs["env"]
+        self.assertEqual(environment["TELEGRAM_TOPIC_NAME"], "Journal")
+
     def test_other_users_are_ignored_in_an_authorized_private_group(self):
         update = self.update(
             {

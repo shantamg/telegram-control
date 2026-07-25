@@ -611,17 +611,23 @@ root, and Codex model/effort defaults. Repeating the same confirmation is
 idempotent; silently rebinding an active forum to another directory is
 rejected.
 
-After a forum is bound, the first ordinary text or voice message in each topic
-atomically creates one durable subject, one topic route, and one managed Codex
-worker. Later messages reuse that subject and its persisted provider session;
-topic renames update the user-facing subject label without changing its
-identity. The worker inherits the forum's exact workspace boundary, working
-directory, optional Git metadata, and model/effort defaults. Existing managed
-agent mailboxes provide receipts, editable progress, reply-to-steer, Stop,
-pause/resume, and explicit new-session controls—no new daemon or actor runtime
-is introduced. Read-only commands such as `/status` do not create a subject,
-and exact replies to earlier Control messages keep their durable Control route
-for both text and voice even after the topic becomes a subject.
+After a forum is bound, Telegram's topic-creation service message prompts the
+owner to choose Codex or Claude, then a provider-specific model and effort.
+Each model and effort menu starts with **Default**. The final choice atomically
+creates one durable subject, one topic route, and one managed worker without
+starting a provider session; the first ordinary text or voice request starts
+that session. If the creation service update was missed, `/agent` or the first
+ordinary request presents the same chooser, and an already-sent request must be
+resent after setup. Later messages reuse that subject and its persisted
+provider session; topic renames update the user-facing subject label without
+changing its identity. The worker inherits the forum's exact workspace
+boundary, working directory, and optional Git metadata, plus the selected
+provider configuration. Existing managed agent mailboxes provide receipts,
+editable progress, reply-to-steer, Stop, pause/resume, and explicit new-session
+controls—no new daemon or actor runtime is introduced. Read-only commands such
+as `/status` do not create a subject, and exact replies to earlier Control
+messages keep their durable Control route for both text and voice even after
+the topic becomes a subject.
 
 Live setup:
 
@@ -632,9 +638,10 @@ Live setup:
    Codex` (or `Claude`) and tap **Authorize and bind**. If the first message
    does not include an explicit setup request and path, use the existing
    authorize-then-bind flow instead.
-4. Send an ordinary request in any topic. Its first request creates the
-   subject; later requests continue the same Codex session. Send `/status` in
-   that topic to inspect or control its managed agent.
+4. Create a topic and use its automatic buttons to choose the provider, model,
+   and effort. Then send an ordinary request to start the selected provider
+   session; later requests continue it. Send `/status` in that topic to inspect
+   or control its managed agent.
 
 Topics may be deleted normally in Telegram; no controller-specific delete
 command is required. The durable supervisor includes a `maintain-topics` loop

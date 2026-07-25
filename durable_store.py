@@ -2296,6 +2296,45 @@ class DurableStore:
             self.connection.execute("ROLLBACK")
             raise
 
+    def expire_forum_subject_setup_actions(
+        self,
+        chat_id: int,
+        message_thread_id: int,
+        action_type: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> int:
+        """Expire unused provider/model/effort choices for one topic."""
+        setup_action_types = {
+            "forum_subject_provider_select",
+            "forum_subject_model_select",
+            "forum_subject_effort_select",
+        }
+        if action_type is not None and action_type not in setup_action_types:
+            raise StoreError("Forum subject setup action type is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        selected_types = (
+            [action_type]
+            if action_type is not None
+            else sorted(setup_action_types)
+        )
+        placeholders = ",".join("?" for _ in selected_types)
+        updated = self.connection.execute(
+            f"""
+            UPDATE callback_actions
+            SET state = 'expired', updated_at = ?
+            WHERE chat_id = ? AND message_thread_id = ?
+                AND action_type IN ({placeholders})
+                AND state = 'active'
+            """,
+            (
+                timestamp,
+                int(chat_id),
+                int(message_thread_id),
+                *selected_types,
+            ),
+        )
+        return int(updated.rowcount)
+
     def claim_outbox(
         self,
         worker_id: str,
@@ -3439,6 +3478,8 @@ class DurableStore:
         message_thread_id: int,
         display_name: str,
         purpose_text: Optional[str] = None,
+        provider: Optional[str] = None,
+        provider_config: Optional[dict[str, Any]] = None,
         now: Optional[float] = None,
     ) -> tuple[ForumSubject, bool]:
         """Provision one durable conversational subject for a bound topic.
@@ -3449,6 +3490,17 @@ class DurableStore:
         """
         forum_chat_id = int(chat_id)
         thread_id = int(message_thread_id)
+        if provider is not None and provider not in {"codex", "claude"}:
+            raise StoreError("Forum subject provider is invalid.")
+        if provider_config is not None and provider is None:
+            raise StoreError(
+                "Forum subject provider is required with model settings."
+            )
+        requested_provider_config = (
+            validate_provider_config(provider, provider_config)
+            if provider is not None and provider_config is not None
+            else None
+        )
         if forum_chat_id >= 0:
             raise StoreError("A forum subject requires a supergroup chat.")
         if thread_id <= 0:
@@ -3555,6 +3607,22 @@ class DurableStore:
                     raise StoreError(
                         "The forum subject has an inconsistent durable route."
                     )
+                if (
+                    provider is not None
+                    and str(agent_row["provider"]) != provider
+                ):
+                    raise StoreError(
+                        "This topic already uses "
+                        f"{str(agent_row['provider']).title()}."
+                    )
+                if (
+                    requested_provider_config is not None
+                    and json.loads(agent_row["provider_config_json"])
+                    != requested_provider_config
+                ):
+                    raise StoreError(
+                        "This topic already uses different model settings."
+                    )
                 desired_purpose = (
                     existing.purpose_text
                     if requested_purpose is None
@@ -3643,6 +3711,16 @@ class DurableStore:
                 )
 
             agent_id = f"agent_{secrets.token_urlsafe(12)}"
+            selected_provider = provider or workspace.provider
+            selected_provider_config = (
+                requested_provider_config
+                if requested_provider_config is not None
+                else (
+                    workspace.provider_config
+                    if selected_provider == workspace.provider
+                    else {}
+                )
+            )
             self.connection.execute(
                 """
                 INSERT INTO agents(
@@ -3661,13 +3739,13 @@ class DurableStore:
                     root.agent_id,
                     agent_slug,
                     hierarchical_name,
-                    workspace.provider,
+                    selected_provider,
                     workspace.project_path,
                     workspace.working_directory,
                     workspace.git_repository_root,
                     binding_id,
                     json.dumps(
-                        workspace.provider_config,
+                        selected_provider_config,
                         separators=(",", ":"),
                         sort_keys=True,
                     ),

@@ -110,6 +110,15 @@ def topic_message_update(update_id=10, text="hello", thread_id=62):
     return update
 
 
+def topic_created_update(update_id=10, name="Stage 2 Test", thread_id=62):
+    update = topic_message_update(update_id, thread_id=thread_id)
+    message = update["message"]
+    message.pop("text")
+    message.pop("reply_to_message")
+    message["forum_topic_created"] = {"name": name}
+    return update
+
+
 def topic_voice_update(update_id=10, thread_id=62):
     update = topic_message_update(update_id, thread_id=thread_id)
     message = update["message"]
@@ -7326,7 +7335,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     {"queued": 1},
                 )
 
-    def test_bound_forum_topic_auto_provisions_and_reuses_subject_agent(self):
+    def test_bound_forum_topic_reuses_preselected_subject_agent(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory) / "life"
             workspace.mkdir()
@@ -7377,6 +7386,26 @@ class DurableIntegrationTests(unittest.TestCase):
                     project_path=str(workspace),
                     provider="codex",
                     now=92,
+                )
+                selected_subject, created = store.ensure_forum_subject(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    display_name="Journal",
+                    provider="claude",
+                    provider_config={
+                        "model": "sonnet",
+                        "effort": "high",
+                    },
+                    now=93,
+                )
+                self.assertTrue(created)
+                selected_agent = store.resolve_agent(
+                    selected_subject.agent_id
+                )
+                self.assertEqual(selected_agent.provider, "claude")
+                self.assertEqual(
+                    selected_agent.provider_config,
+                    {"model": "sonnet", "effort": "high"},
                 )
 
                 store.ingest_update(
@@ -7463,6 +7492,200 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     str(second_mailbox["input_text"]),
                     "Add groceries as a separate section.",
+                )
+
+    def test_topic_creation_prompts_for_provider_model_and_effort(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            forum_chat = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            service_update = topic_created_update(10, "Journal")
+            service_update["message"]["chat"] = dict(forum_chat)
+
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace),
+                    provider="codex",
+                    provider_config={"model": "gpt-5.6-sol"},
+                    now=91,
+                )
+
+                def process(update, worker, now):
+                    store.ingest_update(update, now=now)
+                    job = store.claim_job(worker, now=now)
+                    telegram_control.process_inbox_job(
+                        store,
+                        config,
+                        job,
+                        worker,
+                    )
+                    return job
+
+                process(service_update, "worker-1", 100)
+                self.assertIsNone(
+                    store.resolve_forum_subject(-100777, 62)
+                )
+                chooser = store.claim_outbox("sender", now=10**12)
+                self.assertIn(
+                    "Choose an agent for “Journal”",
+                    chooser.params["text"],
+                )
+                provider_buttons = chooser.params["reply_markup"][
+                    "inline_keyboard"
+                ][0]
+                self.assertEqual(
+                    [button["text"] for button in provider_buttons],
+                    ["Codex", "Claude"],
+                )
+
+                def callback(update_id, data):
+                    selection = callback_update(
+                        update_id,
+                        data,
+                        message_id=700 + update_id,
+                        message_thread_id=62,
+                    )
+                    selection["callback_query"]["message"]["chat"] = dict(
+                        forum_chat
+                    )
+                    return selection
+
+                process(
+                    callback(11, provider_buttons[1]["callback_data"]),
+                    "worker-2",
+                    101,
+                )
+                self.assertIsNone(
+                    store.resolve_forum_subject(-100777, 62)
+                )
+                model_rows = store.connection.execute(
+                    """
+                    SELECT token, payload_json FROM callback_actions
+                    WHERE action_type = 'forum_subject_model_select'
+                        AND state = 'active'
+                    ORDER BY action_id
+                    """
+                ).fetchall()
+                self.assertEqual(
+                    [
+                        json.loads(row["payload_json"])["model"]
+                        for row in model_rows
+                    ],
+                    [None, "opus", "sonnet", "fable"],
+                )
+                sonnet = next(
+                    row
+                    for row in model_rows
+                    if json.loads(row["payload_json"])["model"] == "sonnet"
+                )
+
+                process(
+                    callback(12, f"a:{sonnet['token']}"),
+                    "worker-3",
+                    102,
+                )
+                self.assertIsNone(
+                    store.resolve_forum_subject(-100777, 62)
+                )
+                effort_rows = store.connection.execute(
+                    """
+                    SELECT token, payload_json FROM callback_actions
+                    WHERE action_type = 'forum_subject_effort_select'
+                        AND state = 'active'
+                    ORDER BY action_id
+                    """
+                ).fetchall()
+                self.assertEqual(
+                    [
+                        json.loads(row["payload_json"])["effort"]
+                        for row in effort_rows
+                    ],
+                    [None, "low", "medium", "high", "xhigh", "max"],
+                )
+                high = next(
+                    row
+                    for row in effort_rows
+                    if json.loads(row["payload_json"])["effort"] == "high"
+                )
+
+                process(
+                    callback(13, f"a:{high['token']}"),
+                    "worker-4",
+                    103,
+                )
+                subject = store.resolve_forum_subject(-100777, 62)
+                self.assertIsNotNone(subject)
+                agent = store.resolve_agent(subject.agent_id)
+                self.assertEqual(agent.provider, "claude")
+                self.assertEqual(
+                    agent.provider_config,
+                    {"model": "sonnet", "effort": "high"},
+                )
+                self.assertIsNone(agent.provider_session_id)
+                self.assertEqual(
+                    store.status_counts().get("agent_mailbox", {}),
+                    {},
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """
+                        SELECT COUNT(*) FROM callback_actions
+                        WHERE chat_id = -100777 AND message_thread_id = 62
+                            AND action_type IN (
+                                'forum_subject_provider_select',
+                                'forum_subject_model_select',
+                                'forum_subject_effort_select'
+                            )
+                            AND state = 'active'
+                        """
+                    ).fetchone()[0],
+                    0,
+                )
+
+                first_request = topic_message_update(
+                    14,
+                    "Help me organize today's notes.",
+                )
+                first_request["message"]["chat"] = dict(forum_chat)
+                first_request["message"]["reply_to_message"]["chat"] = dict(
+                    forum_chat
+                )
+                first_request["message"]["reply_to_message"][
+                    "forum_topic_created"
+                ]["name"] = "Journal"
+                first_job = process(first_request, "worker-5", 104)
+                mailbox = store.connection.execute(
+                    """
+                    SELECT agent_id, input_text FROM agent_mailbox
+                    WHERE source_inbox_job_id = ?
+                    """,
+                    (first_job.job_id,),
+                ).fetchone()
+                self.assertEqual(str(mailbox["agent_id"]), subject.agent_id)
+                self.assertEqual(
+                    str(mailbox["input_text"]),
+                    "Help me organize today's notes.",
                 )
 
     def test_bound_forum_status_is_read_only_and_does_not_create_subject(self):
@@ -7704,6 +7927,14 @@ class DurableIntegrationTests(unittest.TestCase):
                     },
                     now=10**12,
                 )
+                store.ensure_forum_subject(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    display_name="Journal",
+                    provider="codex",
+                    provider_config={},
+                    now=99,
+                )
 
                 store.ingest_update(
                     forum_update(10, "Start a journal for me."),
@@ -7822,7 +8053,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     subject.subject_id,
                 )
 
-    def test_bound_forum_voice_auto_provisions_subject_before_transcription(self):
+    def test_bound_forum_voice_uses_preselected_subject(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory) / "life"
             workspace.mkdir()
@@ -7855,6 +8086,14 @@ class DurableIntegrationTests(unittest.TestCase):
                     project_path=str(workspace),
                     provider="codex",
                     now=91,
+                )
+                store.ensure_forum_subject(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    display_name="Journal",
+                    provider="codex",
+                    provider_config={},
+                    now=92,
                 )
                 store.ingest_update(update, now=100)
                 job = store.connection.execute(
