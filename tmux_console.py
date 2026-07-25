@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 
 import discovery
+import provider_adapters
 from durable_store import AgentConsole, DurableStore, ManagedAgent, StoreError
 
 
@@ -19,31 +20,24 @@ def tmux_binary() -> str:
     return binary
 
 
-def codex_binary() -> str:
-    binary = shutil.which("codex")
-    if binary:
-        return binary
-    for candidate in (
-        Path("/opt/homebrew/bin/codex"),
-        Path("/usr/local/bin/codex"),
-    ):
-        if candidate.is_file():
-            return str(candidate)
-    raise StoreError("Codex CLI is not installed.")
+def console_command_for(agent: ManagedAgent) -> list[str]:
+    """Ask the agent's adapter how to resume it as an interactive console.
 
-
-def claude_binary() -> str:
-    binary = shutil.which("claude")
-    if binary:
-        return binary
-    for candidate in (
-        Path.home() / ".local" / "bin" / "claude",
-        Path("/opt/homebrew/bin/claude"),
-        Path("/usr/local/bin/claude"),
-    ):
-        if candidate.is_file():
-            return str(candidate)
-    raise StoreError("Claude Code CLI is not installed.")
+    Kept adapter-blind on purpose: which binary, which resume flag and which
+    permission or sandbox vocabulary a provider uses are all adapter details.
+    A provider that cannot offer a console says so through its capabilities,
+    so adding one is a matter of implementing the protocol rather than
+    editing a branch in here.
+    """
+    adapter = provider_adapters.adapter_for(agent)
+    if not adapter.capabilities().interactive_console:
+        raise StoreError(
+            f"Interactive console is not implemented for provider: {agent.provider}"
+        )
+    try:
+        return adapter.console_command(agent)
+    except provider_adapters.ProviderAdapterError as error:
+        raise StoreError(str(error)) from error
 
 
 def has_tmux_session(session_name: str) -> bool:
@@ -77,7 +71,8 @@ def open_agent_console(
     store: DurableStore,
     agent: ManagedAgent,
 ) -> AgentConsole:
-    if agent.provider not in {"codex", "claude"}:
+    adapter = provider_adapters.adapter_for(agent)
+    if not adapter.capabilities().interactive_console:
         raise StoreError(
             f"Interactive console is not implemented for provider: {agent.provider}"
         )
@@ -112,56 +107,11 @@ def open_agent_console(
             f"An unmanaged tmux session already uses the name {session_name}."
         )
 
+    # Built before the console row is reserved, so a provider that cannot
+    # produce a command leaves no half-reserved console behind.
+    command = console_command_for(agent)
+
     store.reserve_agent_console(agent.agent_id, session_name)
-    if agent.provider == "codex":
-        sandbox = str(
-            agent.provider_config.get("sandbox", "danger-full-access")
-        )
-        command = [
-            codex_binary(),
-            "resume",
-            "--include-non-interactive",
-            "--sandbox",
-            sandbox,
-            "--cd",
-            launch_directory,
-        ]
-        model = agent.provider_config.get("model")
-        if model:
-            command.extend(["--model", str(model)])
-        effort = agent.provider_config.get("effort")
-        if effort:
-            command.extend(
-                ["--config", f'model_reasoning_effort="{effort}"']
-            )
-        command.append(agent.provider_session_id)
-    else:
-        permission_mode = str(
-            agent.provider_config.get("permission_mode", "bypassPermissions")
-        )
-        if permission_mode not in {
-            "acceptEdits",
-            "auto",
-            "bypassPermissions",
-            "dontAsk",
-            "plan",
-        }:
-            raise StoreError("Claude permission mode is invalid.")
-        command = [
-            claude_binary(),
-            "--resume",
-            agent.provider_session_id,
-            "--permission-mode",
-            permission_mode,
-        ]
-        if permission_mode == "bypassPermissions":
-            command.append("--dangerously-skip-permissions")
-        model = agent.provider_config.get("model")
-        if model:
-            command.extend(["--model", str(model)])
-        effort = agent.provider_config.get("effort")
-        if effort:
-            command.extend(["--effort", str(effort)])
     try:
         result = subprocess.run(
             [

@@ -369,6 +369,71 @@ class TurnGuidanceCapabilityTests(unittest.TestCase):
         self.assertFalse(adapter.capabilities().turn_guidance)
 
 
+class ConsoleCommandTests(unittest.TestCase):
+    """The console argv is an adapter concern, not tmux_console's."""
+
+    SESSION = "0e6cd6ab-1d0a-4f0e-9f5f-4b1a1f4b8e21"
+
+    def test_codex_console_resumes_the_persisted_session(self):
+        adapter = provider_adapters.CodexExecAdapter(binary="/bin/codex")
+        agent = codex_agent(
+            provider_session_id=self.SESSION,
+            provider_config={"model": "gpt-5.6-sol", "effort": "high"},
+        )
+        command = adapter.console_command(agent)
+
+        self.assertEqual(command[0], "/bin/codex")
+        self.assertIn("resume", command)
+        self.assertIn("--include-non-interactive", command)
+        self.assertIn("--sandbox", command)
+        # Codex spells effort as a config override, Claude as a flag; that
+        # divergence is exactly what belongs behind the adapter.
+        self.assertIn('model_reasoning_effort="high"', command)
+        self.assertEqual(command[-1], self.SESSION)
+
+    def test_claude_console_resumes_the_persisted_session(self):
+        adapter = provider_adapters.ClaudePrintAdapter(binary="/bin/claude")
+        agent = claude_agent(
+            provider_session_id=self.SESSION,
+            provider_config={"model": "sonnet", "effort": "high"},
+        )
+        command = adapter.console_command(agent)
+
+        self.assertEqual(command[0], "/bin/claude")
+        self.assertEqual(command[1:3], ["--resume", self.SESSION])
+        self.assertIn("--effort", command)
+        self.assertIn("--dangerously-skip-permissions", command)
+
+    def test_claude_console_rejects_an_invalid_permission_mode(self):
+        adapter = provider_adapters.ClaudePrintAdapter(binary="/bin/claude")
+        agent = claude_agent(
+            provider_session_id=self.SESSION,
+            provider_config={"permission_mode": "invented"},
+        )
+        with self.assertRaisesRegex(
+            provider_adapters.ProviderAdapterError,
+            "permission mode",
+        ):
+            adapter.console_command(agent)
+
+    def test_console_requires_a_session_to_resume(self):
+        for adapter, agent in (
+            (
+                provider_adapters.CodexExecAdapter(binary="/bin/codex"),
+                codex_agent(provider_session_id=None),
+            ),
+            (
+                provider_adapters.ClaudePrintAdapter(binary="/bin/claude"),
+                claude_agent(provider_session_id=None),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                provider_adapters.ProviderAdapterError,
+                "no persisted provider session",
+            ):
+                adapter.console_command(agent)
+
+
 class LiveControlContractTests(unittest.TestCase):
     @staticmethod
     def emit_codex_completion(process, text="Codex final"):

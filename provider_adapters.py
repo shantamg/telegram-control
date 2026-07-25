@@ -64,6 +64,15 @@ class ProviderAdapter(Protocol):
     def capabilities(self) -> ProviderCapabilities:
         ...
 
+    def console_command(self, agent: ManagedAgent) -> list[str]:
+        """Argv that resumes this agent's session as an interactive console.
+
+        Callers run it under tmux; how the provider is told to resume, and
+        which binary to resume it with, are the adapter's business. Adapters
+        reporting `interactive_console=False` may raise instead.
+        """
+        ...
+
     def run_turn(
         self,
         agent: ManagedAgent,
@@ -482,6 +491,32 @@ class CodexExecAdapter:
             # Declared false so the gap is visible instead of assumed.
             turn_guidance=False,
         )
+
+    def console_command(self, agent: ManagedAgent) -> list[str]:
+        if not self.binary:
+            raise ProviderAdapterError("Codex CLI is not installed.")
+        if not agent.provider_session_id:
+            raise ProviderAdapterError(
+                "Managed agent has no persisted provider session to resume."
+            )
+        launch_directory = agent.working_directory or agent.project_path
+        command = [
+            self.binary,
+            "resume",
+            "--include-non-interactive",
+            "--sandbox",
+            self._sandbox_mode(agent),
+            "--cd",
+            launch_directory,
+        ]
+        model = agent.provider_config.get("model")
+        if model:
+            command.extend(["--model", str(model)])
+        effort = agent.provider_config.get("effort")
+        if effort:
+            command.extend(["--config", f'model_reasoning_effort="{effort}"'])
+        command.append(agent.provider_session_id)
+        return command
 
     @staticmethod
     def _sandbox_mode(agent: ManagedAgent) -> str:
@@ -1175,6 +1210,35 @@ class ClaudePrintAdapter:
             # Delivered as an appended system prompt in command() below.
             turn_guidance=True,
         )
+
+    def console_command(self, agent: ManagedAgent) -> list[str]:
+        if not self.binary:
+            raise ProviderAdapterError("Claude Code CLI is not installed.")
+        if not agent.provider_session_id:
+            raise ProviderAdapterError(
+                "Managed agent has no persisted provider session to resume."
+            )
+        permission_mode = str(
+            agent.provider_config.get("permission_mode", "bypassPermissions")
+        )
+        if permission_mode not in self.PERMISSION_MODES:
+            raise ProviderAdapterError("Claude permission mode is invalid.")
+        command = [
+            self.binary,
+            "--resume",
+            agent.provider_session_id,
+            "--permission-mode",
+            permission_mode,
+        ]
+        if permission_mode == "bypassPermissions":
+            command.append("--dangerously-skip-permissions")
+        model = agent.provider_config.get("model")
+        if model:
+            command.extend(["--model", str(model)])
+        effort = agent.provider_config.get("effort")
+        if effort:
+            command.extend(["--effort", str(effort)])
+        return command
 
     def command(
         self,

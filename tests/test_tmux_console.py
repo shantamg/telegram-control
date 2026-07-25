@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+import provider_adapters
 import tmux_console
 from durable_store import DurableStore, StoreError
 
@@ -62,14 +63,18 @@ class TmuxConsoleTests(unittest.TestCase):
         ),
     )
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=False)
-    @mock.patch.object(tmux_console, "codex_binary", return_value="/bin/codex")
+    @mock.patch.object(
+        tmux_console.provider_adapters,
+        "adapter_for",
+        side_effect=lambda agent: provider_adapters.CodexExecAdapter(binary="/bin/codex"),
+    )
     @mock.patch.object(tmux_console, "tmux_binary", return_value="/bin/tmux")
     @mock.patch.object(tmux_console.subprocess, "run")
     def test_open_uses_direct_tmux_argv_and_reserves_console(
         self,
         run,
         _tmux_binary,
-        _codex_binary,
+        _adapter_for,
         _has_session,
         _validate,
     ):
@@ -100,14 +105,18 @@ class TmuxConsoleTests(unittest.TestCase):
         ),
     )
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=False)
-    @mock.patch.object(tmux_console, "codex_binary", return_value="/bin/codex")
+    @mock.patch.object(
+        tmux_console.provider_adapters,
+        "adapter_for",
+        side_effect=lambda agent: provider_adapters.CodexExecAdapter(binary="/bin/codex"),
+    )
     @mock.patch.object(tmux_console, "tmux_binary", return_value="/bin/tmux")
     @mock.patch.object(tmux_console.subprocess, "run")
     def test_failed_start_releases_console_reservation(
         self,
         run,
         _tmux_binary,
-        _codex_binary,
+        _adapter_for,
         _has_session,
         _validate,
     ):
@@ -131,14 +140,18 @@ class TmuxConsoleTests(unittest.TestCase):
         ),
     )
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=False)
-    @mock.patch.object(tmux_console, "claude_binary", return_value="/bin/claude")
+    @mock.patch.object(
+        tmux_console.provider_adapters,
+        "adapter_for",
+        side_effect=lambda agent: provider_adapters.ClaudePrintAdapter(binary="/bin/claude"),
+    )
     @mock.patch.object(tmux_console, "tmux_binary", return_value="/bin/tmux")
     @mock.patch.object(tmux_console.subprocess, "run")
     def test_claude_console_resumes_same_session(
         self,
         run,
         _tmux_binary,
-        _claude_binary,
+        _adapter_for,
         _has_session,
         _validate,
     ):
