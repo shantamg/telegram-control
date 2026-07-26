@@ -612,6 +612,139 @@ class DurableStoreTests(unittest.TestCase):
         retried = self.store.claim_job("worker", now=106)
         self.assertEqual(retried.attempts, 1)
 
+    def test_retryable_voice_failure_stays_silent_when_retry_succeeds(self):
+        self.store.ingest_update(voice_update(), now=100)
+        first = self.store.claim_job("worker", now=100)
+        with mock.patch.object(
+            telegram_control.bridge,
+            "process_update",
+            side_effect=telegram_control.bridge.RetryableHandlerError(
+                "temporary Telegram transport failure"
+            ),
+        ):
+            telegram_control.process_inbox_job(
+                self.store,
+                {},
+                first,
+                "worker",
+            )
+
+        self.assertEqual(self.store.status_counts()["inbox"], {"queued": 1})
+        self.assertEqual(self.store.status_counts()["outbox"], {})
+        second = self.store.claim_job("worker", now=10**12)
+        with mock.patch.object(
+            telegram_control.bridge,
+            "process_update",
+        ):
+            telegram_control.process_inbox_job(
+                self.store,
+                {},
+                second,
+                "worker",
+            )
+
+        self.assertEqual(self.store.status_counts()["inbox"], {"succeeded": 1})
+        self.assertEqual(self.store.status_counts()["outbox"], {})
+
+    def test_retryable_voice_failure_edits_receipt_only_after_attempts_die(self):
+        self.store.ingest_update(voice_update(), now=100)
+        first = self.store.claim_job("worker", now=100)
+        self.store.enqueue_api_call(
+            operation_id=f"agent-input:{first.job_id}:receipt",
+            method="sendMessage",
+            params={
+                "chat_id": 123,
+                "message_thread_id": None,
+                "text": "🎙️ <b>Transcribing…</b>",
+            },
+            now=100,
+        )
+        receipt = self.store.claim_outbox("sender", now=100)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=101,
+        )
+
+        job = first
+        with mock.patch.object(
+            telegram_control.bridge,
+            "process_update",
+            side_effect=telegram_control.bridge.RetryableHandlerError(
+                "temporary Telegram transport failure"
+            ),
+        ):
+            for attempt in range(1, 6):
+                telegram_control.process_inbox_job(
+                    self.store,
+                    {},
+                    job,
+                    "worker",
+                )
+                if attempt < 5:
+                    self.assertIsNone(
+                        self.store.connection.execute(
+                            """
+                            SELECT 1 FROM outbox_messages
+                            WHERE operation_id = ?
+                            """,
+                            (
+                                f"inbox:{first.job_id}:"
+                                "voice-terminal-failure",
+                            ),
+                        ).fetchone()
+                    )
+                    job = self.store.claim_job(
+                        "worker",
+                        now=10**12 + attempt,
+                    )
+
+        self.assertEqual(self.store.status_counts()["inbox"], {"dead": 1})
+        terminal = self.store.claim_outbox("sender", now=10**12 + 10)
+        self.assertEqual(terminal.method, "editMessageText")
+        self.assertEqual(terminal.params["message_id"], 700)
+        self.assertIn("after several attempts", terminal.params["text"])
+        self.assertNotIn("internet connection", terminal.params["text"])
+
+    def test_voice_transport_error_exits_for_silent_durable_retry(self):
+        update = voice_update()
+        environment = {
+            "TELEGRAM_CHAT_ID": "123",
+            "TELEGRAM_CHAT_TYPE": "private",
+            "TELEGRAM_MESSAGE_THREAD_ID": "",
+            "TELEGRAM_FROM_ID": "123",
+            "TELEGRAM_FROM_USERNAME": "tester",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with mock.patch.object(
+                on_message.sys,
+                "stdin",
+                StringIO(json.dumps(update)),
+            ):
+                with mock.patch.object(
+                    on_message,
+                    "forum_is_authorized_or_prompt",
+                    return_value=True,
+                ):
+                    with mock.patch.object(
+                        on_message,
+                        "handle_voice",
+                        side_effect=on_message.bridge.BridgeError(
+                            "Could not reach Telegram. Check this Mac's "
+                            "internet connection."
+                        ),
+                    ):
+                        with mock.patch.object(
+                            on_message,
+                            "send_message",
+                        ) as send_message:
+                            self.assertEqual(
+                                on_message.main(),
+                                on_message.bridge.RETRYABLE_HANDLER_EXIT,
+                            )
+        send_message.assert_not_called()
+
     def test_restart_waits_for_durable_leases_and_runs_when_idle(self):
         self.store.ingest_update(message_update(), now=100)
         leased = self.store.claim_job("worker", now=101)

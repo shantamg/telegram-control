@@ -210,6 +210,24 @@ def process_inbox_job(
             update_id=job.update_id,
             attempts=job.attempts,
         )
+    except bridge.RetryableHandlerError as exc:
+        state = store.fail_job(
+            job.job_id,
+            worker_id,
+            str(exc),
+            terminal_failure_text=control_message(
+                "❌ I couldn’t download that voice message after several "
+                "attempts. Please send it again."
+            ),
+        )
+        log_event(
+            "inbox_retryable_failure",
+            job_id=job.job_id,
+            update_id=job.update_id,
+            attempts=job.attempts,
+            state=state,
+            error=str(exc),
+        )
     except (bridge.BridgeError, OSError) as exc:
         state = store.fail_job(job.job_id, worker_id, str(exc))
         log_event(

@@ -24,7 +24,9 @@ transcription runs on-device; only optional spoken replies leave the machine.
 - **Text, attachments, and voice in; text and voice out.** Photos and arbitrary
   Telegram documents are saved to private durable paths that Codex and Claude
   can inspect. Voice notes are transcribed on-device with Handy's Parakeet V3
-  model. Answers can be read aloud on demand via a **🔊 Listen** button.
+  model. Transient Telegram voice-download failures retry behind the existing
+  receipt and become visible errors only if every durable attempt fails.
+  Answers can be read aloud on demand via a **🔊 Listen** button.
 - **One bot, many workspaces.** A private Telegram group per project, a topic
   per agent. Each topic is durably bound to a workspace directory and a
   persisted Codex or Claude session, so conversations survive restarts.

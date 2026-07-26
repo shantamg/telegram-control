@@ -40,10 +40,31 @@ DEFAULT_HANDLER_PATH = SCRIPT_PATH.with_name("on_message.py")
 # requires change_info, retiring progress cards requires delete_messages, and
 # managed/worker topics require manage_topics.
 GROUP_ADMIN_RIGHTS = ("change_info", "delete_messages", "manage_topics")
+RETRYABLE_HANDLER_EXIT = 75
 
 
 class BridgeError(RuntimeError):
     pass
+
+
+class RetryableHandlerError(BridgeError):
+    """A handler failure that the durable inbox should retry silently."""
+
+
+_RETRYABLE_TELEGRAM_ERRORS = (
+    "Could not reach Telegram.",
+    "Could not download the Telegram file.",
+    "Could not start the Telegram API helper.",
+    "Telegram call exceeded the total deadline.",
+    "The Telegram API helper exited unexpectedly.",
+)
+
+
+def is_retryable_telegram_error(error: Any) -> bool:
+    """Recognize transport failures that should use the durable retry path."""
+
+    text = str(error)
+    return any(marker in text for marker in _RETRYABLE_TELEGRAM_ERRORS)
 
 
 def clean_and_validate_token(raw_token: str) -> str:
@@ -796,6 +817,10 @@ def process_update(
         env=environment,
     )
     if result.returncode != 0:
+        if result.returncode == RETRYABLE_HANDLER_EXIT:
+            raise RetryableHandlerError(
+                "Handler reported a retryable Telegram transport failure."
+            )
         raise BridgeError(f"Handler exited with status {result.returncode}.")
 
 

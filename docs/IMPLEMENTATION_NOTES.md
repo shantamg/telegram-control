@@ -320,6 +320,18 @@ behavior.
 The live managed-voice test passed on July 23, 2026: one voice note progressed
 through every status stage and returned the requested exact Codex response.
 
+Transient Telegram transport failures during voice download use a dedicated
+handler exit status rather than publishing `❌` from an attempt that the inbox
+will retry. Nonterminal failures leave the idempotent transcribing receipt in
+place. If all five durable inbox attempts fail, the same receipt is edited to a
+terminal request to resend the voice note (or a new terminal message follows it
+if Telegram never acknowledged the receipt). This prevents a recovered retry
+from leaving a contradictory internet-connection warning above successful
+agent work. Verified on July 26, 2026 with tests for silent failure followed by
+success, receipt editing only after dead-lettering, transport-error
+classification in the handler, and preservation of the retryable subprocess
+exit across the bridge.
+
 Controller-owned progress text uses Telegram HTML formatting with escaped
 dynamic content: stage labels are bold and voice transcripts are block quotes.
 Provider output remains plain text until a tested renderer can safely support a

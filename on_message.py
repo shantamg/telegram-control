@@ -4524,6 +4524,15 @@ def main() -> int:
         return 1
     except (bridge.BridgeError, KeyError, ValueError) as exc:
         print(f"Voice handler error: {exc}", file=sys.stderr, flush=True)
+        if (
+            isinstance(exc, bridge.BridgeError)
+            and message
+            and "voice" in message
+            and bridge.is_retryable_telegram_error(exc)
+        ):
+            # The durable inbox owns retries. Do not publish a terminal-looking
+            # failure while another attempt is already scheduled.
+            return bridge.RETRYABLE_HANDLER_EXIT
         send_message(f"❌ {exc}")
         return 1
     except StoreError as exc:

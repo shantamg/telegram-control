@@ -77,7 +77,7 @@ After confirmation, Telegram Control clears the provider-session pointer, archiv
 
 Send a Telegram photo or any document normally, with an optional caption. Attachments up to 20 MB are saved privately and routed to Codex or Claude by local path.
 
-Send a Telegram voice note normally; it is transcribed locally and routed like text.
+Send a Telegram voice note normally; it is transcribed locally and routed like text. If Telegram briefly fails to provide the audio file, Control retries behind the same transcribing receipt and shows an error only after every durable attempt fails.
 
 Reply to an exact Control or agent message to continue that routed conversation. During an active turn, a reply to its progress card can steer the work, and its Stop button interrupts the provider. If the owning worker has already exited, Stop clears the orphaned turn immediately so the next queued message can start. Agents can also send requested voice or text progress updates through scoped Telegram skills.""",
     ),

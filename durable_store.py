@@ -1797,6 +1797,7 @@ class DurableStore:
         max_attempts: int = 5,
         base_delay: float = 2.0,
         max_delay: float = 300.0,
+        terminal_failure_text: Optional[str] = None,
     ) -> str:
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
@@ -1834,11 +1835,97 @@ class DurableStore:
                 raise LeaseLostError(
                     f"Inbox lease for job {job_id} is no longer owned."
                 )
+            if new_state == "dead" and terminal_failure_text is not None:
+                self._enqueue_terminal_voice_input_failure(
+                    int(job_id),
+                    str(terminal_failure_text),
+                    timestamp,
+                )
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
             raise
         return new_state
+
+    def _enqueue_terminal_voice_input_failure(
+        self,
+        source_inbox_job_id: int,
+        text: str,
+        timestamp: float,
+    ) -> int:
+        """Replace a voice receipt, or follow it, only after retries are dead."""
+
+        job = self.connection.execute(
+            "SELECT payload_json FROM inbox_jobs WHERE job_id = ?",
+            (int(source_inbox_job_id),),
+        ).fetchone()
+        if job is None:
+            raise StoreError("Terminal inbox failure has no durable job.")
+        payload = json.loads(job["payload_json"])
+        message = payload.get("message") or {}
+        if not isinstance(message.get("voice"), dict):
+            raise StoreError("Terminal voice failure requires a voice inbox job.")
+        chat = message.get("chat") or {}
+        try:
+            chat_id = int(chat["id"])
+        except (KeyError, TypeError, ValueError):
+            raise StoreError("Terminal voice failure has no Telegram chat.") from None
+        message_thread_id = message.get("message_thread_id")
+        if message_thread_id is not None:
+            message_thread_id = int(message_thread_id)
+
+        receipt = self.connection.execute(
+            """
+            SELECT params_json, telegram_result_json
+            FROM outbox_messages
+            WHERE operation_id IN (?, ?) AND state = 'sent'
+                AND telegram_result_json IS NOT NULL
+            ORDER BY CASE
+                WHEN operation_id = ? THEN 0
+                ELSE 1
+            END
+            LIMIT 1
+            """,
+            (
+                f"agent-input:{int(source_inbox_job_id)}:receipt",
+                f"router-input:{int(source_inbox_job_id)}:receipt",
+                f"agent-input:{int(source_inbox_job_id)}:receipt",
+            ),
+        ).fetchone()
+        operation_id = (
+            f"inbox:{int(source_inbox_job_id)}:voice-terminal-failure"
+        )
+        if receipt is not None:
+            params = json.loads(receipt["params_json"])
+            result = json.loads(receipt["telegram_result_json"])
+            try:
+                receipt_chat_id = int(params["chat_id"])
+                receipt_message_id = int(result["message_id"])
+            except (KeyError, TypeError, ValueError):
+                raise StoreError(
+                    "Stored Telegram voice receipt is invalid."
+                ) from None
+            return self.enqueue_api_call(
+                operation_id=operation_id,
+                method="editMessageText",
+                params={
+                    "chat_id": receipt_chat_id,
+                    "message_id": receipt_message_id,
+                    "text": text,
+                    "reply_markup": {"inline_keyboard": []},
+                },
+                now=timestamp,
+            )
+        return self.enqueue_api_call(
+            operation_id=operation_id,
+            method="sendMessage",
+            params={
+                "chat_id": chat_id,
+                "message_thread_id": message_thread_id,
+                "text": text,
+            },
+            now=timestamp,
+        )
 
     def enqueue_api_call(
         self,

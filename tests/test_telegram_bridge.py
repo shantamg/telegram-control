@@ -783,6 +783,19 @@ class ProcessUpdateAuthorizationTests(unittest.TestCase):
         self.assertEqual(environment["TELEGRAM_CHAT_ID"], "123")
         self.assertEqual(environment["TELEGRAM_CHAT_TYPE"], "private")
 
+    def test_retryable_handler_exit_is_preserved_for_durable_worker(self):
+        update = self.update({"id": 123, "type": "private"})
+        completed = mock.Mock(
+            returncode=telegram_bridge.RETRYABLE_HANDLER_EXIT
+        )
+        with mock.patch.object(
+            telegram_bridge.subprocess,
+            "run",
+            return_value=completed,
+        ):
+            with self.assertRaises(telegram_bridge.RetryableHandlerError):
+                telegram_bridge.process_update(self.config, update)
+
     def test_owner_is_accepted_in_a_private_forum_group(self):
         update = self.update(
             {
