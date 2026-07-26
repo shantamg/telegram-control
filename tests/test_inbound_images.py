@@ -1,3 +1,4 @@
+import inspect
 import os
 import tempfile
 import unittest
@@ -82,6 +83,17 @@ class InboundImageTests(unittest.TestCase):
         self.assertIn("Telegram document", prompt)
         self.assertIn("/private/report.pdf", prompt)
         self.assertIn("User caption:\nSummarize this", prompt)
+
+    def test_acknowledgement_is_queued_before_attachment_download(self):
+        source = inspect.getsource(on_message.main)
+        acknowledgement = source.index(
+            'send_message("📎 Attachment received. Downloading securely…")'
+        )
+        download = source.index("path = persist_inbound_attachment(attachment)")
+        route = source.index("route_user_input(", download)
+
+        self.assertLess(acknowledgement, download)
+        self.assertLess(download, route)
 
 
 if __name__ == "__main__":

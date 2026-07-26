@@ -3881,6 +3881,9 @@ def main() -> int:
                 raise bridge.BridgeError(
                     "Telegram attachment metadata is unavailable."
                 )
+            # Queue this durable outbox operation before getFile or the content
+            # download so a slow transfer never delays user feedback.
+            send_message("📎 Attachment received. Downloading securely…")
             path = persist_inbound_attachment(attachment)
             route_user_input(
                 update,

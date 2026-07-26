@@ -798,9 +798,15 @@ inspect with their built-in filesystem/image tools. The full Telegram update
 was already persisted before the download, so this feature requires no schema
 migration.
 
+Before making Telegram's `getFile` request or downloading any bytes, the inbox
+handler queues a durable `📎 Attachment received. Downloading securely…`
+outbox message. The independent sender can therefore acknowledge a slow
+attachment immediately instead of waiting for the download and agent receipt.
+
 Verified with unit coverage for Telegram rendition selection, arbitrary
 documents and safe filename retention, deterministic private persistence,
-retry reuse, prompt construction, and the existing full suite.
+retry reuse, acknowledgement-before-download ordering, prompt construction,
+and the focused attachment suite.
 
 ## Stage 0 legacy bridge commands
 
