@@ -59,7 +59,7 @@ After confirmation, Telegram Control clears the provider-session pointer, archiv
         "Voice & replies",
         """Voice messages and replies
 
-Send a Telegram image normally, with an optional caption. JPEG, PNG, WebP, and GIF images up to 20 MB are saved privately and routed to Codex or Claude by local path.
+Send a Telegram photo or any document normally, with an optional caption. Attachments up to 20 MB are saved privately and routed to Codex or Claude by local path.
 
 Send a Telegram voice note normally; it is transcribed locally and routed like text.
 

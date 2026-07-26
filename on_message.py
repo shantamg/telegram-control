@@ -48,7 +48,7 @@ FFMPEG_BINARY = helper_paths.resolve_binary(
 )
 MAX_VOICE_BYTES = 20_000_000
 MAX_VOICE_SECONDS = 30 * 60
-MAX_IMAGE_BYTES = 20_000_000
+MAX_ATTACHMENT_BYTES = 20_000_000
 TRANSCRIPTION_TIMEOUT_SECONDS = 15 * 60
 TELEGRAM_TEXT_CHUNK = 3_800
 OUTPUT_SEQUENCE = 0
@@ -3485,8 +3485,8 @@ def transcribe_wav(wav_path: Path) -> str:
         raise bridge.BridgeError("Handy returned an unreadable transcription result.") from None
 
 
-def inbound_image(message: dict) -> Optional[dict]:
-    """Return the best supported Telegram image descriptor, if present."""
+def inbound_attachment(message: dict) -> Optional[dict]:
+    """Return the best Telegram photo or document descriptor, if present."""
     photos = message.get("photo")
     if isinstance(photos, list):
         candidates = [item for item in photos if isinstance(item, dict)]
@@ -3498,41 +3498,35 @@ def inbound_image(message: dict) -> Optional[dict]:
                     int(item.get("width", 0)) * int(item.get("height", 0)),
                 ),
             )
-            return {**selected, "extension": ".jpg"}
+            return {**selected, "safe_filename": "photo.jpg", "kind": "image"}
     document = message.get("document")
     if not isinstance(document, dict):
         return None
-    mime_type = str(document.get("mime_type", "")).lower()
-    extensions = {
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
-        "image/gif": ".gif",
-    }
-    extension = extensions.get(mime_type)
-    if extension is None:
-        return None
-    return {**document, "extension": extension}
+    original_name = Path(str(document.get("file_name") or "document")).name
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", original_name).strip("._")
+    if not safe_name:
+        safe_name = "document"
+    return {**document, "safe_filename": safe_name[:180], "kind": "document"}
 
 
-def persist_inbound_image(image: dict) -> Path:
-    """Download an image once to a private path stable across inbox retries."""
+def persist_inbound_attachment(attachment: dict) -> Path:
+    """Download an attachment once to a private path stable across retries."""
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
     if not database_path or not job_id:
-        raise StoreError("Image input requires the durable controller.")
-    file_id = str(image.get("file_id", ""))
+        raise StoreError("Attachment input requires the durable controller.")
+    file_id = str(attachment.get("file_id", ""))
     if not file_id:
-        raise bridge.BridgeError("Telegram image has no downloadable file ID.")
-    file_size = int(image.get("file_size", 0))
-    if file_size > MAX_IMAGE_BYTES:
-        raise bridge.BridgeError("Image exceeds the configured 20 MB limit.")
+        raise bridge.BridgeError("Telegram attachment has no downloadable file ID.")
+    file_size = int(attachment.get("file_size", 0))
+    if file_size > MAX_ATTACHMENT_BYTES:
+        raise bridge.BridgeError("Attachment exceeds the configured 20 MB limit.")
     unique_id = re.sub(
         r"[^A-Za-z0-9_-]",
         "_",
-        str(image.get("file_unique_id") or file_id),
+        str(attachment.get("file_unique_id") or file_id),
     )[:128]
-    extension = str(image["extension"])
+    safe_filename = str(attachment["safe_filename"])
     attachment_dir = (
         Path(database_path).expanduser().resolve().parent
         / "attachments"
@@ -3540,15 +3534,19 @@ def persist_inbound_image(image: dict) -> Path:
     )
     attachment_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     attachment_dir.chmod(0o700)
-    destination = attachment_dir / f"{unique_id}{extension}"
+    destination = attachment_dir / f"{unique_id}--{safe_filename}"
     if destination.is_file() and destination.stat().st_size > 0:
         return destination
-    partial = attachment_dir / f".{unique_id}{extension}.part"
+    partial = attachment_dir / f".{unique_id}--{safe_filename}.part"
     partial.unlink(missing_ok=True)
     try:
-        bridge.download_telegram_file(file_id, partial, max_bytes=MAX_IMAGE_BYTES)
+        bridge.download_telegram_file(
+            file_id,
+            partial,
+            max_bytes=MAX_ATTACHMENT_BYTES,
+        )
         if not partial.is_file() or partial.stat().st_size <= 0:
-            raise bridge.BridgeError("Telegram image download was empty.")
+            raise bridge.BridgeError("Telegram attachment download was empty.")
         bridge.ensure_private_file(partial)
         os.replace(partial, destination)
         bridge.ensure_private_file(destination)
@@ -3557,16 +3555,18 @@ def persist_inbound_image(image: dict) -> Path:
     return destination
 
 
-def image_prompt(path: Path, caption: str) -> str:
+def attachment_prompt(path: Path, caption: str, kind: str) -> str:
     prompt = (
-        "The user sent an image. Inspect the local image file at this absolute "
+        f"The user sent a Telegram {kind}. Inspect the local file at this absolute "
         f"path and use it as part of their request:\n{path}"
     )
     caption = caption.strip()
     if caption:
         prompt += f"\n\nUser caption:\n{caption}"
     else:
-        prompt += "\n\nThe image had no caption. Respond based on its contents."
+        prompt += (
+            "\n\nThe attachment had no caption. Respond based on its contents."
+        )
     return prompt
 
 
@@ -3871,16 +3871,21 @@ def main() -> int:
                 ):
                     return 0
                 handle_voice(update, message["voice"])
-        elif message and inbound_image(message) is not None:
-            print(f"Received image message from @{username}.", flush=True)
+        elif message and inbound_attachment(message) is not None:
+            print(f"Received attachment from @{username}.", flush=True)
             caption = str(message.get("caption", ""))
             if not forum_is_authorized_or_prompt(caption):
                 return 0
-            image = inbound_image(message)
-            if image is None:
-                raise bridge.BridgeError("Telegram image metadata is unavailable.")
-            path = persist_inbound_image(image)
-            route_user_input(update, image_prompt(path, caption))
+            attachment = inbound_attachment(message)
+            if attachment is None:
+                raise bridge.BridgeError(
+                    "Telegram attachment metadata is unavailable."
+                )
+            path = persist_inbound_attachment(attachment)
+            route_user_input(
+                update,
+                attachment_prompt(path, caption, str(attachment["kind"])),
+            )
         elif message and "text" in message:
             text = str(message["text"])
             print(f"Received text message from @{username}: {text}", flush=True)
