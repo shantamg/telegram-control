@@ -51,6 +51,7 @@ RESTART_BACKOFF_SECONDS = 30
 RECOVERY_CONFIRM_TIMEOUT_SECONDS = 30 * 60
 SESSION_DISCOVERY_TIMEOUT_SECONDS = 15
 SESSION_DISCOVERY_POLL_SECONDS = 0.25
+BRIEF_SUBMIT_DELAY_SECONDS = 0.2
 
 DEFAULT_RECOVERY_PROMPT = """You have been automatically resumed after the host or detached session stopped unexpectedly.
 
@@ -416,6 +417,10 @@ def send_brief(name: str, brief: str) -> None:
         text=True,
         check=False,
     )
+    # Interactive providers process bracketed paste asynchronously. Without a
+    # small gap, Enter can arrive before the pasted brief becomes submit-ready
+    # and leave the entire task sitting unsent in the prompt.
+    time.sleep(BRIEF_SUBMIT_DELAY_SECONDS)
     subprocess.run(
         [tmux, "send-keys", "-t", session, "Enter"],
         capture_output=True,

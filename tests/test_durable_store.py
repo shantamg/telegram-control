@@ -36,6 +36,10 @@ from durable_store import (
     MIGRATION_16,
     MIGRATION_17,
     MIGRATION_18,
+    MIGRATION_19,
+    MIGRATION_20,
+    MIGRATION_21,
+    MIGRATION_22,
     CallbackActionError,
     DurableStore,
     FORUM_SETUP_PREFIX,
@@ -5127,6 +5131,57 @@ class DurableStoreTests(unittest.TestCase):
 
 
 class SchemaCompatibilityTests(unittest.TestCase):
+    def test_schema_twenty_two_repairs_missing_recovery_file_column(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "schema-twenty-two.sqlite3"
+            connection = sqlite3.connect(str(path), isolation_level=None)
+            connection.execute("BEGIN")
+            for migration in (
+                MIGRATION_1,
+                MIGRATION_2,
+                MIGRATION_3,
+                MIGRATION_4,
+                MIGRATION_5,
+                MIGRATION_6,
+                MIGRATION_7,
+                MIGRATION_8,
+                MIGRATION_9,
+                MIGRATION_10,
+                MIGRATION_11,
+                MIGRATION_12,
+                MIGRATION_13,
+                MIGRATION_14,
+                MIGRATION_15,
+                MIGRATION_16,
+                MIGRATION_17,
+                MIGRATION_18,
+                MIGRATION_19,
+                MIGRATION_20,
+                MIGRATION_21,
+            ):
+                for statement in migration:
+                    connection.execute(statement)
+            for statement in MIGRATION_22:
+                if "recovery_file_path" not in statement:
+                    connection.execute(statement)
+            connection.execute("PRAGMA user_version = 22")
+            connection.execute("COMMIT")
+            connection.close()
+
+            with DurableStore(path) as store:
+                self.assertEqual(
+                    store.connection.execute("PRAGMA user_version").fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+                columns = {
+                    row["name"]
+                    for row in store.connection.execute(
+                        "PRAGMA table_info(detached_workers)"
+                    ).fetchall()
+                }
+                self.assertIn("recovery_file_path", columns)
+                self.assertEqual(store.quick_check(), "ok")
+
     def test_schema_one_database_migrates_to_current_schema(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "schema-one.sqlite3"

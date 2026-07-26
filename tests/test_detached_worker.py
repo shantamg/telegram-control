@@ -216,6 +216,28 @@ class DetachedWorkerLaunchTests(unittest.TestCase):
             detached_worker.launch_command_for("someone-else", "/tmp/project", {})
         self.assertIn("someone-else", str(caught.exception))
 
+    def test_brief_waits_for_bracketed_paste_before_submitting(self):
+        with (
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "has_tmux_session",
+                return_value=True,
+            ),
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "tmux_binary",
+                return_value="/bin/tmux",
+            ),
+            mock.patch.object(detached_worker.subprocess, "run") as run,
+            mock.patch.object(detached_worker.time, "sleep") as sleep,
+        ):
+            detached_worker.send_brief("rails-fix", "Do the work.")
+        self.assertEqual(run.call_count, 2)
+        sleep.assert_called_once_with(
+            detached_worker.BRIEF_SUBMIT_DELAY_SECONDS
+        )
+        self.assertEqual(run.call_args_list[1].args[0][-1], "Enter")
+
 
 class ReportOnlyNoticeTests(unittest.TestCase):
     def test_notice_names_the_worker_and_points_at_the_main_agent(self):

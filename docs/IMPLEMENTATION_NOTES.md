@@ -866,7 +866,7 @@ owner's sentence, the full 331-test suite, and the offline router eval gate at
 
 ## Reboot recovery for detached workers
 
-Schema v22 turns a detached worker into a durable logical session rather than
+Schemas v22–23 turn a detached worker into a durable logical session rather than
 equating it with its tmux process. The worker row now stores the exact provider
 session ID, provider configuration, working directory, durable recovery-file
 path, recovery prompt, generation, handshake state, timestamps, and last
@@ -903,12 +903,32 @@ removes the exact harness-owned `RECOVERY.md` along with the worker row, but
 will not recursively delete unexpected companion files; the report topic still
 follows the existing explicit `--delete-topic` choice.
 
+The live controller opened schema v22 during the mixed-version development
+window before `recovery_file_path` had landed in that migration. Schema v23 is
+a conditional additive repair: it inspects `detached_workers`, adds only the
+missing column, and is a no-op for clean v22 databases that already have it.
+This exact partial-v22 shape has a migration regression test.
+
 Verified with store tests for recovery metadata and stale-generation rejection,
 provider launch tests for Claude's preassigned session identity, recovery-file
-contract tests, and lifecycle tests covering exact-session relaunch, explicit
-agent confirmation, durable success/start reporting, and safe refusal when no
-session ID exists. The full suite passed at 342 tests and the offline router
-gate passed at 14/14 before live activation.
+contract and teardown tests, and lifecycle tests covering exact-session
+relaunch, explicit agent confirmation, durable success/start reporting, brief
+submission ordering, and safe refusal when no session ID exists. The final full
+suite passed at 345 tests and the offline router gate passed at 14/14.
+
+Live activation adopted the existing reservations `release-monitor` Claude
+conversation, created its durable recovery directory, and had the worker write
+and reread a 250-plus-line inventory covering its two native wakeups, independent
+backstop, runbook and analyzer copies, completed side effects, time-dependent
+recovery rules, and verification criteria. The original tmux session was then
+killed while its independent backstop remained alive. One reconciliation cycle
+resumed the exact Claude session and delivered the recovery prompt. Claude read
+the inventory, found both original wakeup IDs still present, avoided duplicates,
+verified scheduler liveness with a disposable native wakeup, checked the
+backstop, Git, production revision, and artifacts, updated the inventory with
+what the test proved, and invoked the generation-1 success handshake. SQLite
+ended at `recovery_state=succeeded`, `observed_state=running`, and retry count
+zero; both the started and verified-success outbox messages reached `sent`.
 
 ## Agent-authored questions with buttons
 

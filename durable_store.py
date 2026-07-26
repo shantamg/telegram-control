@@ -19,7 +19,7 @@ from typing import Any, Optional, Sequence
 import provider_defaults
 
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 CONTROL_SPEAKER = "🎛 Control"
 
@@ -1076,6 +1076,13 @@ MIGRATION_22 = (
     """,
 )
 
+# Schema v22 was first applied on a live controller while the additive
+# recovery-file column was still being developed. Some databases can
+# therefore already report v22 without that one column, while clean v22
+# databases have it. Migration 23 repairs that mixed-version window
+# conditionally in _run_migrations().
+MIGRATION_23: tuple[str, ...] = ()
+
 
 ROUTER_INPUT_LIMIT = 8_000
 AGENT_CHOICE_LIMIT = 5
@@ -1518,6 +1525,29 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 22
                 self.connection.execute("PRAGMA user_version = 22")
+            if current < 23:
+                detached_columns = {
+                    str(row["name"])
+                    for row in self.connection.execute(
+                        "PRAGMA table_info(detached_workers)"
+                    ).fetchall()
+                }
+                if "recovery_file_path" not in detached_columns:
+                    self.connection.execute(
+                        "ALTER TABLE detached_workers "
+                        "ADD COLUMN recovery_file_path TEXT"
+                    )
+                self.connection.execute(
+                    """
+                    UPDATE detached_workers
+                    SET recovery_file_path = ''
+                    WHERE recovery_file_path IS NULL
+                    """
+                )
+                for statement in MIGRATION_23:
+                    self.connection.execute(statement)
+                current = 23
+                self.connection.execute("PRAGMA user_version = 23")
             # Referential integrity is audited before the commit so a failed
             # check rolls the whole migration back instead of stranding an
             # upgraded-but-broken database.
