@@ -121,6 +121,28 @@ def ensure_recovery_file(store: DurableStore, name: str) -> Path:
     return path
 
 
+def remove_recovery_file(store: DurableStore, worker: DetachedWorker) -> bool:
+    """Remove only the exact harness-owned recovery file at worker teardown."""
+    expected = recovery_file_path(store, worker.name)
+    if worker.recovery_file_path and Path(worker.recovery_file_path) != expected:
+        raise StoreError(
+            "Detached worker recovery path does not match its managed location."
+        )
+    removed = False
+    try:
+        expected.unlink()
+        removed = True
+    except FileNotFoundError:
+        pass
+    try:
+        expected.parent.rmdir()
+    except OSError:
+        # Preserve unexpected companion files instead of recursively deleting
+        # a directory whose contents the controller does not own.
+        pass
+    return removed
+
+
 def recovery_file_contract(name: str, path: Path | str) -> str:
     return f"""Telegram Control detached-worker recovery contract
 

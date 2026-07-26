@@ -105,8 +105,9 @@ When the user says the work is finished:
 
 **Ask the user whether to delete the topic** before passing `--delete-topic`.
 Stopping always kills the session; deleting the topic also removes the history,
-which they may want to keep. Without the flag the topic stays and the worker
-row is removed.
+which they may want to keep. Without the flag the topic stays. In both cases,
+the worker row and its exact controller-managed `RECOVERY.md` are removed; an
+unexpected companion file is preserved rather than recursively deleted.
 
 ## Rules
 

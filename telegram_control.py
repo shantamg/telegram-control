@@ -2656,6 +2656,7 @@ def maintain_workers_command(args: argparse.Namespace) -> None:
 def worker_stop_command(args: argparse.Namespace) -> None:
     with open_store(args.db) as store:
         worker = detached_worker.stop_worker(store, args.name)
+        recovery_file_deleted = detached_worker.remove_recovery_file(store, worker)
         deleted_topic = False
         if args.delete_topic:
             chat_id, thread_id = detached_worker.resolve_destination(store, args.name)
@@ -2677,6 +2678,7 @@ def worker_stop_command(args: argparse.Namespace) -> None:
             {
                 "name": worker.name,
                 "stopped": True,
+                "recovery_file_deleted": recovery_file_deleted,
                 "topic_deleted": deleted_topic,
             },
             indent=2,

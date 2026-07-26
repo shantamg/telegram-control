@@ -168,7 +168,7 @@ CLI (`./telegram_control.py <command>`, `--help` on any of them):
 | `retry inbox\|router\|agent\|outbox` | Requeue dead-lettered items. |
 | `enroll-project`, `provision-topic`, `register-agent` | Terminal-side workspace and topic wiring. |
 | `console-open` / `console-status` / `console-close` | Explicit tmux takeover of a persisted agent session. |
-| `worker-start` / `worker-status` / `worker-report` / `worker-stop` | Start, inspect, report from, and stop recoverable detached workers. |
+| `worker-start` / `worker-status` / `worker-report` / `worker-stop` | Start, inspect, report from, and stop recoverable detached workers; stopping removes their managed recovery file. |
 | `install-skills` | Install or refresh the repo-owned agent skills. |
 
 Prefer `restart` over `launchctl` for reloads: it schedules exactly one guarded

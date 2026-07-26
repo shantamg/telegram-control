@@ -299,6 +299,14 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
         self.assertIn("provider's native teamwork", contract)
         self.assertIn(str(self.recovery_file), contract)
 
+    def test_worker_teardown_removes_only_its_managed_recovery_file(self):
+        companion = self.recovery_file.parent / "operator-note.txt"
+        companion.write_text("preserve me", encoding="utf-8")
+        removed = detached_worker.remove_recovery_file(self.store, self.worker)
+        self.assertTrue(removed)
+        self.assertFalse(self.recovery_file.exists())
+        self.assertTrue(companion.exists())
+
     def test_stopped_worker_resumes_exact_session_and_waits_for_confirmation(self):
         with (
             mock.patch.object(

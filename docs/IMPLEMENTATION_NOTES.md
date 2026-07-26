@@ -898,7 +898,10 @@ launches while preserving the session record for manual repair.
 Existing pre-v22 workers can be attached to a known exact-directory provider
 conversation with `worker-adopt-session`; ordinary new workers persist the ID
 automatically. `worker-status` exposes whether the session ID and recovery file
-are present, the handshake state, and the last recovery error.
+are present, the handshake state, and the last recovery error. `worker-stop`
+removes the exact harness-owned `RECOVERY.md` along with the worker row, but
+will not recursively delete unexpected companion files; the report topic still
+follows the existing explicit `--delete-topic` choice.
 
 Verified with store tests for recovery metadata and stale-generation rejection,
 provider launch tests for Claude's preassigned session identity, recovery-file
