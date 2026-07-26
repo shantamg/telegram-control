@@ -39,8 +39,9 @@ transcription runs on-device; only optional spoken replies leave the machine.
   committed to SQLite before it is acted on, with leases, retries, dead-letter
   states, and a single ordered delivery lock. Killing any process mid-turn
   loses nothing.
-- **Detached workers** for jobs that must outlive a one-shot turn, each
-  reporting into its own Telegram topic.
+- **Recoverable detached workers** for jobs that must outlive a one-shot turn.
+  Each keeps a durable recovery inventory, reports into its own Telegram
+  topic, and resumes the exact Codex or Claude conversation after a reboot.
 - **`/help` in Telegram**, a button-driven guide to the commands, agents,
   skills, and teardown flows.
 
@@ -167,7 +168,7 @@ CLI (`./telegram_control.py <command>`, `--help` on any of them):
 | `retry inbox\|router\|agent\|outbox` | Requeue dead-lettered items. |
 | `enroll-project`, `provision-topic`, `register-agent` | Terminal-side workspace and topic wiring. |
 | `console-open` / `console-status` / `console-close` | Explicit tmux takeover of a persisted agent session. |
-| `worker-start` / `worker-status` / `worker-report` / `worker-stop` | Detached workers. |
+| `worker-start` / `worker-status` / `worker-report` / `worker-stop` | Start, inspect, report from, and stop recoverable detached workers. |
 | `install-skills` | Install or refresh the repo-owned agent skills. |
 
 Prefer `restart` over `launchctl` for reloads: it schedules exactly one guarded

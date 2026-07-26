@@ -9,7 +9,8 @@ A managed turn is one-shot: this process is torn down as soon as you reply, and
 anything you started in the background dies with it. Work that must keep going —
 a long refactor, a review loop, a migration — belongs in a detached worker. The
 tmux server is a daemon rather than a child of this turn, so the session
-survives.
+survives. Across a reboot, Telegram Control recreates tmux and resumes the exact
+provider conversation.
 
 Each worker gets its own Telegram topic in the same group, and that topic is
 **report-only**: the worker posts progress there, and the project's main topic
@@ -30,7 +31,11 @@ names both the tmux session and the topic.
 - `--provider` takes `claude` or `codex`. Ask the user if they have not said.
 - `--model` and `--effort` are optional; omit them to inherit local defaults.
 - The command creates the topic (idempotent), starts the tmux session, and
-  prints the session name and topic.
+  prints the session name, topic, and durable recovery-file path.
+- The harness automatically gives the worker its recovery-file contract before
+  the task brief. Do not replace that contract with a scheduler: the provider
+  continues to use its own native teamwork, wakeup, background, and scheduling
+  features.
 
 Then give the worker its task. **Write the brief to a file first** and point the
 worker at it — briefs are long, and typing one through `send-keys` is fragile:
@@ -44,6 +49,15 @@ A good brief states the goal, the constraints, what "done" looks like, and
 explicitly tells the worker to report at milestones (see below). Include
 anything the worker cannot discover for itself — it does not inherit your
 conversation.
+
+The harness prepends a standing instruction that the worker must update its
+durable `RECOVERY.md` whenever it creates, changes, completes, or cancels state
+that matters after process loss. This includes goals, native scheduled tasks
+and wakeups, background agents, monitors, exact restart commands, durable
+artifacts and identifiers, verification steps, and idempotency warnings. On
+recovery the same provider conversation reads that file, reactivates its own
+native work, and explicitly confirms success or failure; the controller sends
+the result through its durable Telegram outbox.
 
 ## Making the worker report
 
@@ -67,7 +81,9 @@ paths, no line numbers, no code.
 ```
 
 Reports each worker's intended and observed state. `intended running` with
-`observed stopped` means it died rather than being shut down.
+`observed stopped` means it died rather than being shut down. Recovery status
+also shows whether the provider session is persisted, the recovery-file path,
+and the last recovery error.
 
 To read what a worker is actually doing, capture its pane:
 

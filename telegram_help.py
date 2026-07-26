@@ -44,6 +44,8 @@ The /agent controls can change the current model and effort while preserving the
 
 Ask the main topic agent to start long-running work in a detached session. The worker receives its own report-only topic in the same group and can post text or voice milestones there.
 
+Telegram Control gives the worker a durable recovery file and requires it to keep that file current whenever it creates goals, native wakeups, scheduled tasks, background agents, monitors, or processes that would need to be restored. After a reboot and graphical login, Control recreates tmux, resumes the exact provider conversation, asks it to read that file and reactivate its own native work, then reports whether the agent verified recovery.
+
 Messages in a report-only topic do not steer the worker. Return to the main agent topic to guide or stop it.""",
     ),
     HelpTopic(

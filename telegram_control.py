@@ -2213,6 +2213,7 @@ def supervisor_commands(
         [*base, "work-router"],
     ]
     commands.extend([*base, "work-agents"] for _ in range(count))
+    commands.append([*base, "maintain-workers"])
     commands.append([*base, "maintain-topics"])
     commands.append([*base, "send-outbox"])
     return commands
@@ -2469,6 +2470,10 @@ def worker_start_command(args: argparse.Namespace) -> None:
                 "tmux_session": worker.tmux_session_name,
                 "topic": detached_worker.topic_name(worker.name),
                 "message_thread_id": binding.message_thread_id,
+                "provider_session_persisted": (
+                    worker.provider_session_id is not None
+                ),
+                "recovery_file": worker.recovery_file_path,
                 "attach": f"tmux attach-session -t '={worker.tmux_session_name}'",
             },
             indent=2,
@@ -2481,7 +2486,24 @@ def worker_brief_command(args: argparse.Namespace) -> None:
     brief = Path(args.file).expanduser().read_text(encoding="utf-8").strip()
     if not brief:
         raise StoreError("Brief file is empty.")
-    detached_worker.send_brief(args.name, brief)
+    with open_store(args.db) as store:
+        worker = store.resolve_detached_worker(args.name)
+        if worker is None:
+            raise StoreError("Detached worker was not found.")
+        recovery_file = detached_worker.ensure_recovery_file(store, worker.name)
+        if worker.recovery_file_path != str(recovery_file):
+            worker = store.configure_detached_worker_recovery(
+                worker.name,
+                provider_session_id=worker.provider_session_id,
+                recovery_file_path=str(recovery_file),
+                recovery_prompt=detached_worker.DEFAULT_RECOVERY_PROMPT,
+            )
+        delivered = (
+            detached_worker.recovery_file_contract(worker.name, recovery_file)
+            + "\n\nTask brief:\n\n"
+            + brief
+        )
+    detached_worker.send_brief(args.name, delivered)
     print(f"Brief delivered to {detached_worker.tmux_session_name(args.name)}")
 
 
@@ -2511,11 +2533,124 @@ def worker_status_command(args: argparse.Namespace) -> None:
                     "observed": current.observed_state,
                     "needs_restart": current.needs_restart,
                     "restart_count": current.restart_count,
+                    "provider_session_persisted": (
+                        current.provider_session_id is not None
+                    ),
+                    "recovery_file": current.recovery_file_path,
+                    "recovery_state": current.recovery_state,
+                    "last_recovery_error": current.last_recovery_error,
                     "tmux_session": current.tmux_session_name,
                     "project_path": current.project_path,
                 }
             )
     print(json.dumps(rows, indent=2, sort_keys=True))
+
+
+def worker_adopt_session_command(args: argparse.Namespace) -> None:
+    with open_store(args.db) as store:
+        worker = store.resolve_detached_worker(args.name)
+        if worker is None:
+            raise StoreError("Detached worker was not found.")
+        candidate = replace(worker, provider_session_id=args.session_id)
+        if not detached_worker.validate_provider_session(candidate):
+            raise StoreError(
+                "That provider session was not found for the worker's exact "
+                "working directory."
+            )
+        config = dict(worker.provider_config)
+        if args.model:
+            config["model"] = args.model
+        if args.effort:
+            config["effort"] = args.effort
+        recovery_file = detached_worker.ensure_recovery_file(store, worker.name)
+        updated = store.configure_detached_worker_recovery(
+            worker.name,
+            provider_session_id=args.session_id,
+            provider_config=config,
+            recovery_file_path=str(recovery_file),
+            recovery_prompt=detached_worker.DEFAULT_RECOVERY_PROMPT,
+        )
+    print(
+        json.dumps(
+            {
+                "name": updated.name,
+                "provider": updated.provider,
+                "provider_session_persisted": True,
+                "recovery_file": updated.recovery_file_path,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def worker_recovery_confirm_command(args: argparse.Namespace) -> None:
+    summary = sys.stdin.read().strip()
+    with open_store(args.db) as store:
+        worker = detached_worker.confirm_recovery(
+            store,
+            args.name,
+            args.generation,
+            summary,
+        )
+    print(
+        f"Recovery generation {worker.recovery_generation} confirmed for "
+        f"{worker.name}."
+    )
+
+
+def worker_recovery_fail_command(args: argparse.Namespace) -> None:
+    reason = sys.stdin.read().strip()
+    with open_store(args.db) as store:
+        worker = detached_worker.fail_recovery(
+            store,
+            args.name,
+            args.generation,
+            reason,
+        )
+    print(
+        f"Recovery generation {worker.recovery_generation} failed for "
+        f"{worker.name}."
+    )
+
+
+def maintain_workers_once(
+    store: DurableStore,
+    *,
+    now: Optional[float] = None,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for worker in store.list_detached_workers():
+        try:
+            result, _ = detached_worker.recover_worker(
+                store,
+                worker.name,
+                now=now,
+            )
+        except Exception as error:
+            result = "error"
+            log_event(
+                "detached_worker_recovery_error",
+                worker=worker.name,
+                error=str(error),
+            )
+        counts[result] = counts.get(result, 0) + 1
+    return counts
+
+
+def maintain_workers_command(args: argparse.Namespace) -> None:
+    """Recreate intended-running detached sessions after process loss."""
+    with open_store(args.db) as store:
+        while True:
+            counts = maintain_workers_once(store)
+            if counts and any(
+                state not in {"running", "stopped", "awaiting_confirmation"}
+                for state in counts
+            ):
+                log_event("detached_worker_maintenance_cycle", **counts)
+            if args.once:
+                return
+            time.sleep(args.idle_sleep)
 
 
 def worker_stop_command(args: argparse.Namespace) -> None:
@@ -3139,6 +3274,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     topic_maintenance_parser.set_defaults(function=maintain_topics_command)
 
+    worker_maintenance_parser = subparsers.add_parser(
+        "maintain-workers",
+        help="Reconcile and recover intended-running detached workers.",
+    )
+    worker_maintenance_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one detached-worker reconciliation cycle and exit.",
+    )
+    worker_maintenance_parser.add_argument(
+        "--idle-sleep",
+        type=float,
+        default=15,
+        help="Seconds between detached-worker reconciliation cycles.",
+    )
+    worker_maintenance_parser.set_defaults(function=maintain_workers_command)
+
     run_parser = subparsers.add_parser(
         "run", help="Run collector, inbox worker, and outbox sender."
     )
@@ -3214,6 +3366,42 @@ def build_parser() -> argparse.ArgumentParser:
         "worker-status", help="Show detached worker intent versus reality."
     )
     worker_status_parser.set_defaults(function=worker_status_command)
+
+    worker_adopt_parser = subparsers.add_parser(
+        "worker-adopt-session",
+        help="Attach an existing provider session to a detached worker.",
+    )
+    worker_adopt_parser.add_argument("name")
+    worker_adopt_parser.add_argument("--session-id", required=True)
+    worker_adopt_parser.add_argument("--model", default=None)
+    worker_adopt_parser.add_argument("--effort", default=None)
+    worker_adopt_parser.set_defaults(function=worker_adopt_session_command)
+
+    worker_recovery_confirm_parser = subparsers.add_parser(
+        "worker-recovery-confirm",
+        help="Confirm that a recovered worker restored its state (stdin summary).",
+    )
+    worker_recovery_confirm_parser.add_argument("name")
+    worker_recovery_confirm_parser.add_argument(
+        "--generation",
+        type=int,
+        required=True,
+    )
+    worker_recovery_confirm_parser.set_defaults(
+        function=worker_recovery_confirm_command
+    )
+
+    worker_recovery_fail_parser = subparsers.add_parser(
+        "worker-recovery-fail",
+        help="Report that a recovered worker could not restore state (stdin reason).",
+    )
+    worker_recovery_fail_parser.add_argument("name")
+    worker_recovery_fail_parser.add_argument(
+        "--generation",
+        type=int,
+        required=True,
+    )
+    worker_recovery_fail_parser.set_defaults(function=worker_recovery_fail_command)
 
     worker_stop_parser = subparsers.add_parser(
         "worker-stop", help="Stop a detached worker and optionally delete its topic."

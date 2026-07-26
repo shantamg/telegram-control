@@ -88,6 +88,7 @@ class ProviderAdapter(Protocol):
         self,
         working_directory: str,
         provider_config: dict[str, Any],
+        provider_session_id: Optional[str] = None,
     ) -> list[str]:
         """Argv that starts a FRESH interactive session in a directory.
 
@@ -564,6 +565,7 @@ class CodexExecAdapter:
         self,
         working_directory: str,
         provider_config: dict[str, Any],
+        provider_session_id: Optional[str] = None,
     ) -> list[str]:
         if not self.binary:
             raise ProviderAdapterError("Codex CLI is not installed.")
@@ -580,6 +582,10 @@ class CodexExecAdapter:
         effort = provider_config.get("effort")
         if effort:
             command.extend(["--config", f'model_reasoning_effort="{effort}"'])
+        # Codex currently chooses the interactive session ID itself. The
+        # detached-worker launcher discovers and persists it immediately after
+        # startup; accepting the common argument keeps this protocol
+        # provider-neutral.
         return command
 
     @staticmethod
@@ -1329,6 +1335,7 @@ class ClaudePrintAdapter:
         self,
         working_directory: str,
         provider_config: dict[str, Any],
+        provider_session_id: Optional[str] = None,
     ) -> list[str]:
         if not self.binary:
             raise ProviderAdapterError("Claude Code CLI is not installed.")
@@ -1346,6 +1353,8 @@ class ClaudePrintAdapter:
         effort = provider_config.get("effort")
         if effort:
             command.extend(["--effort", str(effort)])
+        if provider_session_id:
+            command.extend(["--session-id", str(provider_session_id)])
         # Claude Code has no "start in this directory" flag; the caller runs
         # it with tmux's own -c, so working_directory is intentionally unused
         # here rather than smuggled in as an argument.

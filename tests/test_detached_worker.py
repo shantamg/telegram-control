@@ -118,6 +118,39 @@ class DetachedWorkerStoreTests(unittest.TestCase):
         )
         self.assertEqual(bumped.restart_count, 1)
 
+    def test_recovery_metadata_and_handshake_are_durable(self):
+        worker = self._create(
+            provider_session_id="session-123",
+            provider_config={"model": "opus", "effort": "high"},
+            working_directory="/tmp/project/worktree",
+            recovery_file_path="/tmp/recovery.md",
+            recovery_prompt="Read the recovery file.",
+        )
+        self.assertEqual(worker.provider_session_id, "session-123")
+        self.assertEqual(worker.provider_config["model"], "opus")
+        self.assertEqual(worker.working_directory, "/tmp/project/worktree")
+        self.assertEqual(worker.recovery_file_path, "/tmp/recovery.md")
+
+        recovering = self.store.begin_detached_worker_recovery(
+            worker.name,
+            now=1_700_000_100,
+        )
+        self.assertEqual(recovering.recovery_generation, 1)
+        self.assertEqual(recovering.recovery_state, "recovering")
+        self.assertEqual(recovering.observed_state, "starting")
+        self.assertEqual(recovering.restart_count, 1)
+
+        recovered = self.store.complete_detached_worker_recovery(
+            worker.name,
+            1,
+            now=1_700_000_200,
+        )
+        self.assertEqual(recovered.recovery_state, "succeeded")
+        self.assertEqual(recovered.observed_state, "running")
+        self.assertEqual(recovered.last_recovered_at, 1_700_000_200)
+        with self.assertRaisesRegex(StoreError, "stale"):
+            self.store.complete_detached_worker_recovery(worker.name, 1)
+
     def test_delete_removes_the_worker(self):
         self._create()
         self.store.delete_detached_worker("rails-fix")
@@ -155,6 +188,18 @@ class DetachedWorkerLaunchTests(unittest.TestCase):
         self.assertNotIn("--resume", command)
         self.assertIn("--model", command)
         self.assertIn("--effort", command)
+
+    def test_claude_launch_uses_the_preassigned_recovery_session(self):
+        adapter = provider_adapters.ClaudePrintAdapter(binary="/bin/claude")
+        command = adapter.detached_launch_command(
+            "/tmp/project",
+            {},
+            "a8813c38-8a89-49de-ab5e-003e48a1814c",
+        )
+        self.assertEqual(
+            command[-2:],
+            ["--session-id", "a8813c38-8a89-49de-ab5e-003e48a1814c"],
+        )
 
     def test_codex_launch_starts_a_fresh_session_not_a_resume(self):
         adapter = provider_adapters.CodexExecAdapter(binary="/bin/codex")
@@ -197,6 +242,160 @@ class ReportOnlyNoticeTests(unittest.TestCase):
         notice = detached_worker.report_only_notice(worker, None)
         self.assertIn("report-only", notice)
         self.assertNotIn("None", notice)
+
+
+class DetachedWorkerRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.database_path = Path(self.directory.name) / "controller.sqlite3"
+        self.store = DurableStore(self.database_path)
+        self.store.__enter__()
+        self.addCleanup(lambda: self.store.__exit__(None, None, None))
+        self.binding = self.store.ensure_surface_binding(
+            chat_id=-1004472153577,
+            message_thread_id=220,
+            surface_type="task",
+            display_name="recover-me updates",
+            target_type="detached_worker",
+            target_id="recover-me",
+        )
+        self.recovery_file = detached_worker.ensure_recovery_file(
+            self.store,
+            "recover-me",
+        )
+        self.worker = self.store.create_detached_worker(
+            name="recover-me",
+            binding_id=self.binding.binding_id,
+            project_path=self.directory.name,
+            provider="claude",
+            provider_session_id="a8813c38-8a89-49de-ab5e-003e48a1814c",
+            provider_config={"model": "opus"},
+            tmux_session_name="detached--recover-me",
+            working_directory=self.directory.name,
+            recovery_file_path=str(self.recovery_file),
+            recovery_prompt=detached_worker.DEFAULT_RECOVERY_PROMPT,
+        )
+        self.store.set_detached_worker_states(
+            self.worker.name,
+            observed_state="stopped",
+        )
+
+    def test_recovery_file_contract_is_created_outside_tmp(self):
+        self.assertTrue(self.recovery_file.is_file())
+        self.assertEqual(
+            self.recovery_file,
+            Path(self.directory.name)
+            / "detached-workers"
+            / "recover-me"
+            / "RECOVERY.md",
+        )
+        text = self.recovery_file.read_text(encoding="utf-8")
+        self.assertIn("Native wakeups and scheduled tasks", text)
+        contract = detached_worker.recovery_file_contract(
+            self.worker.name,
+            self.recovery_file,
+        )
+        self.assertIn("provider's native teamwork", contract)
+        self.assertIn(str(self.recovery_file), contract)
+
+    def test_stopped_worker_resumes_exact_session_and_waits_for_confirmation(self):
+        with (
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "has_tmux_session",
+                return_value=False,
+            ),
+            mock.patch.object(
+                detached_worker,
+                "validate_provider_session",
+                return_value=True,
+            ),
+            mock.patch.object(
+                detached_worker,
+                "resume_command_for",
+                return_value=["claude", "--resume", "session", "prompt"],
+            ) as resume_command,
+            mock.patch.object(detached_worker, "_start_session") as start_session,
+        ):
+            result, worker = detached_worker.recover_worker(
+                self.store,
+                self.worker.name,
+                now=1_700_000_100,
+            )
+
+        self.assertEqual(result, "started")
+        self.assertEqual(worker.recovery_state, "recovering")
+        self.assertEqual(worker.recovery_generation, 1)
+        self.assertEqual(worker.restart_count, 1)
+        recovery_prompt = resume_command.call_args.args[1]
+        self.assertIn(str(self.recovery_file), recovery_prompt)
+        self.assertIn("worker-recovery-confirm recover-me", recovery_prompt)
+        start_session.assert_called_once_with(
+            "detached--recover-me",
+            self.directory.name,
+            ["claude", "--resume", "session", "prompt"],
+        )
+        report = self.store.connection.execute(
+            """
+            SELECT method, params_json
+            FROM outbox_messages
+            WHERE operation_id =
+                'detached-worker:1:recovery:1:started'
+            """
+        ).fetchone()
+        self.assertEqual(report["method"], "sendMessage")
+        self.assertIn("waiting for the agent to verify success", report["params_json"])
+
+    def test_agent_confirmation_marks_success_and_queues_verified_report(self):
+        self.store.begin_detached_worker_recovery(
+            self.worker.name,
+            now=1_700_000_100,
+        )
+        with mock.patch.object(
+            detached_worker.tmux_console,
+            "has_tmux_session",
+            return_value=True,
+        ):
+            recovered = detached_worker.confirm_recovery(
+                self.store,
+                self.worker.name,
+                1,
+                "Restored the native Monday wakeup and verified the monitor.",
+            )
+        self.assertEqual(recovered.recovery_state, "succeeded")
+        report = self.store.connection.execute(
+            """
+            SELECT params_json
+            FROM outbox_messages
+            WHERE operation_id =
+                'detached-worker:1:recovery:1:succeeded'
+            """
+        ).fetchone()
+        self.assertIn("recovered successfully", report["params_json"])
+        self.assertIn("native Monday wakeup", report["params_json"])
+
+    def test_missing_session_is_reported_without_starting_a_replacement(self):
+        self.store.connection.execute(
+            """
+            UPDATE detached_workers
+            SET provider_session_id = NULL
+            WHERE name = 'recover-me'
+            """
+        )
+        with mock.patch.object(
+            detached_worker.tmux_console,
+            "has_tmux_session",
+            return_value=False,
+        ):
+            result, worker = detached_worker.recover_worker(
+                self.store,
+                self.worker.name,
+                now=1_700_000_100,
+            )
+        self.assertEqual(result, "unavailable")
+        self.assertEqual(worker.restart_count, 0)
+        self.assertIn("No provider session ID", worker.last_recovery_error)
 
 
 class DetachedWorkerTopicTests(unittest.TestCase):
@@ -249,6 +448,8 @@ class DetachedWorkerTopicTests(unittest.TestCase):
             provider="claude",
             project_path=self.directory.name,
             tmux_session_name="detached--haiku-poems",
+            provider_session_id="session-123",
+            recovery_file_path="/tmp/RECOVERY.md",
         )
         args = SimpleNamespace(
             name="haiku-poems",

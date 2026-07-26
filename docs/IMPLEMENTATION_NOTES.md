@@ -864,6 +864,49 @@ starts with the controller note while `extract_user_request` returns only the
 owner's sentence, the full 331-test suite, and the offline router eval gate at
 14/14.
 
+## Reboot recovery for detached workers
+
+Schema v22 turns a detached worker into a durable logical session rather than
+equating it with its tmux process. The worker row now stores the exact provider
+session ID, provider configuration, working directory, durable recovery-file
+path, recovery prompt, generation, handshake state, timestamps, and last
+failure. Claude sessions receive a harness-assigned UUID at launch. Codex
+sessions choose their own ID, so startup snapshots the exact-directory session
+set and persists the one new ID before `worker-start` succeeds.
+
+Every worker receives a private
+`<database directory>/detached-workers/<name>/RECOVERY.md` and a standing
+provider prompt before its task brief. The prompt requires the worker to keep
+that file sufficient to restore active goals, provider-native wakeups and
+scheduled tasks, background agents, monitors, processes, durable identifiers,
+verification steps, and idempotency constraints. It explicitly preserves the
+provider's native scheduling and teamwork mechanisms; Telegram Control does not
+become a task scheduler.
+
+The supervised `maintain-workers` loop compares durable intent with exact tmux
+existence. An intended-running worker whose tmux session vanished is resumed
+with the provider adapter's ordinary persisted-session command. The injected
+recovery turn tells the same conversation to read its recovery inventory,
+reconcile current external state, reactivate its own native background work,
+and call a generation-bound success or failure command. Recovery remains
+`starting` until that explicit confirmation. Started, verified, failed,
+timed-out, missing-session, and exhausted-retry messages are written through
+the durable outbox and serialized per worker. Attempts back off, time out after
+30 minutes without confirmation, and stop automatically after three failed
+launches while preserving the session record for manual repair.
+
+Existing pre-v22 workers can be attached to a known exact-directory provider
+conversation with `worker-adopt-session`; ordinary new workers persist the ID
+automatically. `worker-status` exposes whether the session ID and recovery file
+are present, the handshake state, and the last recovery error.
+
+Verified with store tests for recovery metadata and stale-generation rejection,
+provider launch tests for Claude's preassigned session identity, recovery-file
+contract tests, and lifecycle tests covering exact-session relaunch, explicit
+agent confirmation, durable success/start reporting, and safe refusal when no
+session ID exists. The full suite passed at 342 tests and the offline router
+gate passed at 14/14 before live activation.
+
 ## Agent-authored questions with buttons
 
 Agents could send text, voice, group icons, detached workers, and teardown

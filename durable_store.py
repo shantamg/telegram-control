@@ -19,7 +19,7 @@ from typing import Any, Optional, Sequence
 import provider_defaults
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 CONTROL_SPEAKER = "🎛 Control"
 
@@ -223,10 +223,21 @@ class DetachedWorker:
     origin_agent_id: Optional[str]
     project_path: str
     provider: str
+    provider_session_id: Optional[str]
+    provider_config: dict[str, Any]
     tmux_session_name: str
+    working_directory: str
+    recovery_file_path: str
+    recovery_prompt: str
     intended_state: str
     observed_state: str
     restart_count: int
+    last_restart_at: Optional[float]
+    recovery_generation: int
+    recovery_state: str
+    recovery_started_at: Optional[float]
+    last_recovered_at: Optional[float]
+    last_recovery_error: Optional[str]
 
     @property
     def needs_restart(self) -> bool:
@@ -1010,6 +1021,61 @@ MIGRATION_21 = (
     """,
 )
 
+MIGRATION_22 = (
+    # Detached tmux processes disappear across reboot, but their provider
+    # conversations are already durable. Persist the exact resume inputs and
+    # a recovery handshake so startup reconciliation can recreate the tmux
+    # shell, ask the provider to restore its own native background work, and
+    # report whether the provider confirmed that restoration.
+    """
+    ALTER TABLE detached_workers
+    ADD COLUMN provider_session_id TEXT
+    """,
+    """
+    ALTER TABLE detached_workers
+    ADD COLUMN provider_config_json TEXT NOT NULL DEFAULT '{}'
+    """,
+    """
+    ALTER TABLE detached_workers
+    ADD COLUMN working_directory TEXT
+    """,
+    """
+    ALTER TABLE detached_workers
+    ADD COLUMN recovery_prompt TEXT NOT NULL DEFAULT ''
+    """,
+    """
+    ALTER TABLE detached_workers
+    ADD COLUMN recovery_file_path TEXT
+    """,
+    """
+    ALTER TABLE detached_workers
+    ADD COLUMN recovery_generation INTEGER NOT NULL DEFAULT 0
+    """,
+    """
+    ALTER TABLE detached_workers
+    ADD COLUMN recovery_state TEXT NOT NULL DEFAULT 'idle'
+        CHECK (recovery_state IN ('idle', 'recovering', 'succeeded', 'failed'))
+    """,
+    """
+    ALTER TABLE detached_workers
+    ADD COLUMN recovery_started_at REAL
+    """,
+    """
+    ALTER TABLE detached_workers
+    ADD COLUMN last_recovered_at REAL
+    """,
+    """
+    ALTER TABLE detached_workers
+    ADD COLUMN last_recovery_error TEXT
+    """,
+    """
+    UPDATE detached_workers
+    SET working_directory = project_path,
+        recovery_file_path = ''
+    WHERE working_directory IS NULL OR recovery_file_path IS NULL
+    """,
+)
+
 
 ROUTER_INPUT_LIMIT = 8_000
 AGENT_CHOICE_LIMIT = 5
@@ -1447,6 +1513,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 21
                 self.connection.execute("PRAGMA user_version = 21")
+            if current < 22:
+                for statement in MIGRATION_22:
+                    self.connection.execute(statement)
+                current = 22
+                self.connection.execute("PRAGMA user_version = 22")
             # Referential integrity is audited before the commit so a failed
             # check rolls the whole migration back instead of stranding an
             # upgraded-but-broken database.
@@ -7103,10 +7174,33 @@ class DurableStore:
             origin_agent_id=row["origin_agent_id"],
             project_path=str(row["project_path"]),
             provider=str(row["provider"]),
+            provider_session_id=row["provider_session_id"],
+            provider_config=json.loads(row["provider_config_json"]),
             tmux_session_name=str(row["tmux_session_name"]),
+            working_directory=str(row["working_directory"] or row["project_path"]),
+            recovery_file_path=str(row["recovery_file_path"] or ""),
+            recovery_prompt=str(row["recovery_prompt"] or ""),
             intended_state=str(row["intended_state"]),
             observed_state=str(row["observed_state"]),
             restart_count=int(row["restart_count"]),
+            last_restart_at=(
+                float(row["last_restart_at"])
+                if row["last_restart_at"] is not None
+                else None
+            ),
+            recovery_generation=int(row["recovery_generation"]),
+            recovery_state=str(row["recovery_state"]),
+            recovery_started_at=(
+                float(row["recovery_started_at"])
+                if row["recovery_started_at"] is not None
+                else None
+            ),
+            last_recovered_at=(
+                float(row["last_recovered_at"])
+                if row["last_recovered_at"] is not None
+                else None
+            ),
+            last_recovery_error=row["last_recovery_error"],
         )
 
     def create_detached_worker(
@@ -7117,6 +7211,11 @@ class DurableStore:
         project_path: str,
         provider: str,
         tmux_session_name: str,
+        provider_session_id: Optional[str] = None,
+        provider_config: Optional[dict[str, Any]] = None,
+        working_directory: Optional[str] = None,
+        recovery_file_path: str = "",
+        recovery_prompt: str = "",
         origin_agent_id: Optional[str] = None,
         now: Optional[float] = None,
     ) -> DetachedWorker:
@@ -7139,10 +7238,14 @@ class DurableStore:
                 """
                 INSERT INTO detached_workers (
                     name, binding_id, origin_agent_id, project_path, provider,
-                    tmux_session_name, intended_state, observed_state,
+                    provider_session_id, provider_config_json,
+                    tmux_session_name, working_directory, recovery_file_path,
+                    recovery_prompt,
+                    intended_state, observed_state,
                     restart_count, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 'running', 'starting', 0, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        'running', 'starting', 0, ?, ?)
                 """,
                 (
                     str(name),
@@ -7150,7 +7253,16 @@ class DurableStore:
                     origin_agent_id,
                     str(project_path),
                     str(provider),
+                    provider_session_id,
+                    json.dumps(
+                        provider_config or {},
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
                     str(tmux_session_name),
+                    str(working_directory or project_path),
+                    str(recovery_file_path),
+                    str(recovery_prompt),
                     timestamp,
                     timestamp,
                 ),
@@ -7254,6 +7366,212 @@ class DurableStore:
                     timestamp,
                     str(name),
                 ),
+            )
+            updated = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self._detached_worker(updated)
+
+    def configure_detached_worker_recovery(
+        self,
+        name: str,
+        *,
+        provider_session_id: Optional[str] = None,
+        provider_config: Optional[dict[str, Any]] = None,
+        working_directory: Optional[str] = None,
+        recovery_file_path: Optional[str] = None,
+        recovery_prompt: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> DetachedWorker:
+        """Record the exact provider conversation and resume configuration."""
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Detached worker was not found.")
+            session_id = (
+                str(provider_session_id).strip()
+                if provider_session_id is not None
+                else row["provider_session_id"]
+            )
+            if provider_session_id is not None and not session_id:
+                raise StoreError("Detached worker provider session ID is required.")
+            config_json = (
+                json.dumps(
+                    provider_config,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                if provider_config is not None
+                else str(row["provider_config_json"])
+            )
+            self.connection.execute(
+                """
+                UPDATE detached_workers
+                SET provider_session_id = ?,
+                    provider_config_json = ?,
+                    working_directory = ?,
+                    recovery_file_path = ?,
+                    recovery_prompt = ?,
+                    updated_at = ?
+                WHERE name = ?
+                """,
+                (
+                    session_id,
+                    config_json,
+                    str(working_directory or row["working_directory"] or row["project_path"]),
+                    (
+                        str(recovery_file_path)
+                        if recovery_file_path is not None
+                        else str(row["recovery_file_path"] or "")
+                    ),
+                    (
+                        str(recovery_prompt)
+                        if recovery_prompt is not None
+                        else str(row["recovery_prompt"] or "")
+                    ),
+                    timestamp,
+                    str(name),
+                ),
+            )
+            updated = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self._detached_worker(updated)
+
+    def begin_detached_worker_recovery(
+        self,
+        name: str,
+        *,
+        now: Optional[float] = None,
+    ) -> DetachedWorker:
+        """Start one bounded recovery generation and return its durable identity."""
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Detached worker was not found.")
+            if str(row["intended_state"]) != "running":
+                raise StoreError("Detached worker is not intended to be running.")
+            self.connection.execute(
+                """
+                UPDATE detached_workers
+                SET observed_state = 'starting',
+                    restart_count = restart_count + 1,
+                    last_restart_at = ?,
+                    recovery_generation = recovery_generation + 1,
+                    recovery_state = 'recovering',
+                    recovery_started_at = ?,
+                    last_recovery_error = NULL,
+                    updated_at = ?
+                WHERE name = ?
+                """,
+                (timestamp, timestamp, timestamp, str(name)),
+            )
+            updated = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self._detached_worker(updated)
+
+    def complete_detached_worker_recovery(
+        self,
+        name: str,
+        generation: int,
+        *,
+        now: Optional[float] = None,
+    ) -> DetachedWorker:
+        """Accept confirmation only from the currently recovering generation."""
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Detached worker was not found.")
+            if (
+                int(row["recovery_generation"]) != int(generation)
+                or str(row["recovery_state"]) != "recovering"
+            ):
+                raise StoreError("Detached worker recovery confirmation is stale.")
+            self.connection.execute(
+                """
+                UPDATE detached_workers
+                SET observed_state = 'running',
+                    restart_count = 0,
+                    recovery_state = 'succeeded',
+                    last_recovered_at = ?,
+                    last_recovery_error = NULL,
+                    updated_at = ?
+                WHERE name = ?
+                """,
+                (timestamp, timestamp, str(name)),
+            )
+            updated = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self._detached_worker(updated)
+
+    def fail_detached_worker_recovery(
+        self,
+        name: str,
+        generation: int,
+        error: str,
+        *,
+        now: Optional[float] = None,
+    ) -> DetachedWorker:
+        """Record a failed generation without changing the operator's intent."""
+        timestamp = time.time() if now is None else float(now)
+        message = str(error).strip()[:2_000] or "Recovery failed."
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Detached worker was not found.")
+            if int(row["recovery_generation"]) != int(generation):
+                raise StoreError("Detached worker recovery failure is stale.")
+            self.connection.execute(
+                """
+                UPDATE detached_workers
+                SET observed_state = 'stopped',
+                    recovery_state = 'failed',
+                    last_recovery_error = ?,
+                    updated_at = ?
+                WHERE name = ?
+                """,
+                (message, timestamp, str(name)),
             )
             updated = self.connection.execute(
                 "SELECT * FROM detached_workers WHERE name = ?",
