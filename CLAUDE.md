@@ -63,19 +63,28 @@ not a checkout.
 
 Two consequences:
 
-**Never restart the service to "apply" your change.** `install`, `restart`, and
-killing the background processes all abort whatever turns are in flight —
-including other agents' work, which simply dies mid-task. Before anything that
-restarts the controller, check for live turns and wait until it is quiet:
+**Never restart the service directly to "apply" your change.** `install`,
+`restart`, and killing the background processes all abort whatever turns are in
+flight — including other agents' work, and including your own turn, which dies
+before it can reply.
+
+When a change genuinely needs the long-running workers to reload, queue it:
 
 ```bash
-sqlite3 -readonly "$HOME/Library/Application Support/telegram-bridge/controller.sqlite3" \
-  "SELECT mailbox_id, agent_id, state FROM agent_mailbox WHERE state IN ('queued','leased');"
+./telegram_control.py request-restart --reason "why"
 ```
 
-Committing and pushing is safe. Restarting is not, and is rarely necessary: the
-message handler runs as a fresh process per turn, so handler-side changes take
-effect on their own.
+That writes the intention into `controller_state`. The supervisor checks every
+few seconds and applies it by exiting — launchd's `KeepAlive` starts a fresh one
+— but only while nothing is leased in the inbox, router, agent, or outbox
+queues. Claiming and clearing happen in one transaction, so a turn starting a
+moment later is never caught by it, and `status` shows a pending request with
+whatever is blocking it. Queue it and move on; do not wait for it.
+
+Committing and pushing is safe. Most changes need no restart at all: the message
+handler runs as a fresh process per turn, so handler-side edits take effect on
+their own. Only worker-side code — anything in `durable_store.py` reached from
+`work`, `work-agents`, `work-router`, or `send-outbox` — needs the reload.
 
 **A schema bump goes live the moment any new process opens the database.** It
 does not wait for a deploy. `SCHEMA_VERSION` is compared on every store open,

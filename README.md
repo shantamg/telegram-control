@@ -165,7 +165,7 @@ CLI (`./telegram_control.py <command>`, `--help` on any of them):
 | Command | Effect |
 | --- | --- |
 | `init` / `doctor` / `status` | Create the database, check prerequisites, show queue state. |
-| `install` / `restart` / `restart-if-idle` | Manage the LaunchAgent-backed controller. |
+| `install` / `request-restart` | Install or reload the LaunchAgent-backed controller. `request-restart` queues a reload the supervisor applies once nothing is leased. |
 | `run` | Run everything in the foreground for debugging. |
 | `collect`, `work`, `work-router`, `work-agents`, `send-outbox`, `maintain-topics` | Run one loop at a time; add `--once` to handle a single item. |
 | `retry inbox\|router\|agent\|outbox` | Requeue dead-lettered items. |
@@ -175,8 +175,10 @@ CLI (`./telegram_control.py <command>`, `--help` on any of them):
 | `install-skills` | Install or refresh the repo-owned agent skills. |
 | `sync-commands` | Publish the Telegram command menu from the help copy (`install` does this too). |
 
-Prefer `restart` over `launchctl` for reloads: it schedules exactly one guarded
-restart. Note that any restart aborts in-flight turns.
+Prefer `request-restart` for reloads: it records the intention and the
+supervisor applies it at the next idle moment, so no turn is aborted. `restart`
+still exists for an immediate guarded restart, and `launchctl` should not be
+used directly — macOS can turn a submitted reload job into a restart loop.
 
 ## Repository map
 

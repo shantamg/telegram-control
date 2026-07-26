@@ -2564,6 +2564,58 @@ class DurableStoreTests(unittest.TestCase):
         )
         self.assertEqual(fallback.params["message_thread_id"], 62)
 
+    def test_queued_restart_waits_for_leased_work_then_is_claimed_once(self):
+        agent, mailbox_id = self._leased_topic_agent()
+        self.store.request_controller_restart("pick up new worker code", now=200)
+
+        pending = self.store.pending_restart_request()
+        self.assertEqual(pending["reason"], "pick up new worker code")
+        self.assertEqual(pending["requested_at"], 200)
+        self.assertEqual(
+            self.store.leased_work_counts(),
+            {"agent_mailbox": 1},
+        )
+        # A turn is running, so the restart must not be claimable — this is the
+        # case that used to mean aborting live work.
+        self.assertIsNone(self.store.claim_idle_restart(now=201))
+        self.assertIsNotNone(self.store.pending_restart_request())
+
+        self.store.complete_agent_mailbox(
+            mailbox_id,
+            "agent-worker",
+            "session-1",
+            "done",
+            {},
+            now=202,
+        )
+        while self.store.claim_outbox("sender", now=203) is not None:
+            pass
+        for row in self.store.connection.execute(
+            "SELECT message_id FROM outbox_messages WHERE state = 'leased'"
+        ).fetchall():
+            self.store.complete_outbox(
+                int(row["message_id"]),
+                "sender",
+                {"message_id": 900, "chat": {"id": -100777}},
+                now=204,
+            )
+        self.assertEqual(self.store.leased_work_counts(), {})
+
+        claimed = self.store.claim_idle_restart(now=205)
+        self.assertEqual(claimed["reason"], "pick up new worker code")
+        # Claiming clears it, so a relaunched supervisor does not loop.
+        self.assertIsNone(self.store.pending_restart_request())
+        self.assertIsNone(self.store.claim_idle_restart(now=206))
+        self.assertEqual(
+            self.store.connection.execute(
+                """
+                SELECT COUNT(*) FROM events
+                WHERE kind = 'controller_restart_claimed'
+                """
+            ).fetchone()[0],
+            1,
+        )
+
     def test_registered_commands_match_the_help_copy_and_telegram_limits(self):
         commands = telegram_control.registered_bot_commands()
 

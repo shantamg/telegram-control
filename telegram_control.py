@@ -2269,6 +2269,7 @@ def run_command(args: argparse.Namespace) -> None:
             child_pids=[process.pid for process in processes],
             agent_workers=int(args.agent_workers),
         )
+        next_restart_check = time.time()
         while True:
             for process in processes:
                 return_code = process.poll()
@@ -2276,6 +2277,21 @@ def run_command(args: argparse.Namespace) -> None:
                     raise StoreError(
                         f"Controller child {process.pid} exited with status {return_code}."
                     )
+            if time.time() >= next_restart_check:
+                next_restart_check = time.time() + 5
+                # A queued restart is applied by exiting: launchd's KeepAlive
+                # starts a fresh supervisor, which is a full reload onto current
+                # code. The claim only succeeds while nothing is leased, so this
+                # never interrupts a turn — including the turn that asked.
+                with open_store(args.db) as store:
+                    claimed = store.claim_idle_restart()
+                if claimed is not None:
+                    log_event(
+                        "controller_restart_applied",
+                        reason=str(claimed.get("reason", "")),
+                        requested_at=claimed.get("requested_at"),
+                    )
+                    raise SystemExit(0)
             time.sleep(1)
     finally:
         for process in processes:
@@ -2695,6 +2711,24 @@ def install_skills_command(_: argparse.Namespace) -> None:
         print(f"- {name}")
 
 
+def request_restart_command(args: argparse.Namespace) -> None:
+    """Queue a restart for the supervisor to apply once the queues are quiet."""
+    with open_store(args.db) as store:
+        request = store.request_controller_restart(args.reason or "")
+        busy = store.leased_work_counts()
+    print("Restart queued.")
+    if request["reason"]:
+        print(f"Reason: {request['reason']}")
+    if busy:
+        print(
+            "Waiting for active work: "
+            + ", ".join(f"{table}={count}" for table, count in sorted(busy.items()))
+        )
+        print("The supervisor applies it as soon as nothing is leased.")
+    else:
+        print("Nothing is leased; the supervisor applies it within seconds.")
+
+
 def registered_bot_commands() -> list[dict[str, str]]:
     """Render the help copy's command list for Telegram's own command menu."""
     commands = []
@@ -2999,6 +3033,12 @@ def status_command(args: argparse.Namespace) -> None:
             },
             "queues": store.status_counts(),
         }
+        pending_restart = store.pending_restart_request()
+        if pending_restart is not None:
+            status["pending_restart"] = {
+                **pending_restart,
+                "blocked_by": store.leased_work_counts(),
+            }
     print(json.dumps(status, indent=2, sort_keys=True))
 
 
@@ -3358,6 +3398,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     restart_parser.set_defaults(function=restart_command)
+
+    request_restart_parser = subparsers.add_parser(
+        "request-restart",
+        help="Queue a restart the supervisor applies once nothing is leased.",
+    )
+    request_restart_parser.add_argument(
+        "--reason",
+        default="",
+        help="Short note recorded with the request, shown in status and logs.",
+    )
+    request_restart_parser.set_defaults(function=request_restart_command)
 
     restart_if_idle_parser = subparsers.add_parser(
         "restart-if-idle",

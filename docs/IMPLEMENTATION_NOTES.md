@@ -1147,6 +1147,35 @@ is published, not derived, so an unregistered command is effectively hidden.
 
 Full suite green at 349 tests.
 
+### Restarts are queued, not timed
+
+Applying worker-side code meant a choice between aborting live turns and
+babysitting a retry loop: `restart-if-idle` refuses while anything is leased, and
+the turn asking for the restart is itself a leased row, so it can never succeed
+from inside that turn. On July 26, 2026 the only way through was a detached tmux
+watcher polling every fifteen seconds; it worked — the restart landed on attempt
+four, once the asking turn had replied — but nothing about it belonged in a
+durable system.
+
+`request-restart` writes the intention into `controller_state` instead. The
+supervisor checks every five seconds and applies it by exiting, which launchd's
+`KeepAlive` turns into a full reload onto current code. `claim_idle_restart`
+takes and clears the request in one transaction, and only while
+`leased_work_counts()` is empty across the inbox, router, agent, and outbox
+queues — so a turn beginning a moment later is never caught by a restart that had
+already decided the system was quiet, and a relaunched supervisor cannot loop on
+a request it already consumed. Claims are recorded as
+`controller_restart_claimed` events, and `status` reports a pending request
+alongside whatever is currently blocking it.
+
+The asking turn no longer has to wait, watch, or hand the job to tmux: it queues
+and finishes, and its own completion is what unblocks the restart.
+
+Verified with a test that queues a restart while a turn holds a lease, asserts it
+cannot be claimed, drains the turn and its outbox, then asserts a single claim
+succeeds, clears the request, records one event, and cannot be claimed twice.
+Full suite green at 351 tests.
+
 ### Menu taps in a group carry the bot's username
 
 Registering the menu exposed a second bug immediately: in a group, tapping a

@@ -11870,6 +11870,112 @@ class DurableStore:
             )
         return int(cursor.rowcount)
 
+    RESTART_REQUEST_KEY = "restart_requested"
+
+    def request_controller_restart(
+        self,
+        reason: str = "",
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Record that the controller should restart at its next idle moment.
+
+        Restarting by hand means either aborting live turns or babysitting a
+        retry loop until the queues go quiet. Writing the intention down instead
+        lets the supervisor pick its own moment, which is the only process that
+        can restart without killing the work it is waiting for.
+        """
+        timestamp = time.time() if now is None else float(now)
+        request = {
+            "reason": str(reason).strip()[:500],
+            "requested_at": timestamp,
+        }
+        self.connection.execute(
+            """
+            INSERT INTO controller_state(key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (
+                self.RESTART_REQUEST_KEY,
+                json.dumps(request, separators=(",", ":"), sort_keys=True),
+                timestamp,
+            ),
+        )
+        return request
+
+    def pending_restart_request(self) -> Optional[dict[str, Any]]:
+        row = self.connection.execute(
+            "SELECT value FROM controller_state WHERE key = ?",
+            (self.RESTART_REQUEST_KEY,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            request = json.loads(str(row["value"]))
+        except ValueError:
+            return None
+        return request if isinstance(request, dict) else None
+
+    def leased_work_counts(self) -> dict[str, int]:
+        """Count the durable rows a restart would interrupt."""
+        active: dict[str, int] = {}
+        for table in (
+            "inbox_jobs",
+            "router_mailbox",
+            "agent_mailbox",
+            "outbox_messages",
+        ):
+            count = int(
+                self.connection.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE state = 'leased'"
+                ).fetchone()[0]
+            )
+            if count:
+                active[table] = count
+        return active
+
+    def claim_idle_restart(
+        self,
+        now: Optional[float] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Take a queued restart, but only while nothing is mid-flight.
+
+        Claiming and clearing happen in one transaction, so a turn that starts
+        immediately afterwards is never caught by a restart that had already
+        decided the system was quiet.
+        """
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            request = self.pending_restart_request()
+            if request is None or self.leased_work_counts():
+                self.connection.execute("COMMIT")
+                return None
+            self.connection.execute(
+                "DELETE FROM controller_state WHERE key = ?",
+                (self.RESTART_REQUEST_KEY,),
+            )
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('controller_restart_claimed', 'controller', 'control',
+                    ?, ?)
+                """,
+                (
+                    json.dumps(request, separators=(",", ":"), sort_keys=True),
+                    timestamp,
+                ),
+            )
+            self.connection.execute("COMMIT")
+            return request
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
     def status_counts(self) -> dict[str, dict[str, int]]:
         result: dict[str, dict[str, int]] = {}
         for label, table in (
