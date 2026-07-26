@@ -2,3 +2,42 @@
 
 After completing changes in this repository, always commit the completed work
 and push the commit to the configured remote before reporting completion.
+
+## This repository is live while you edit it
+
+The controller is running the whole time you work on it, and other agents are
+usually mid-turn in other topics. Assume you are changing a system under load,
+not a checkout.
+
+Two consequences:
+
+**Never restart the service to "apply" your change.** `install`, `restart`, and
+killing the background processes all abort whatever turns are in flight —
+including other agents' work, which simply dies mid-task. Before anything that
+restarts the controller, check for live turns and wait until it is quiet:
+
+```bash
+sqlite3 -readonly "$HOME/Library/Application Support/telegram-bridge/controller.sqlite3" \
+  "SELECT mailbox_id, agent_id, state FROM agent_mailbox WHERE state IN ('queued','leased');"
+```
+
+Committing and pushing is safe. Restarting is not, and is rarely necessary: the
+message handler runs as a fresh process per turn, so handler-side changes take
+effect on their own.
+
+**A schema bump goes live the moment any new process opens the database.** It
+does not wait for a deploy. `SCHEMA_VERSION` is compared on every store open,
+and `_run_migrations` raises `IncompatibleSchemaError` when the database is
+newer than the code — so the long-running `collect` / `work` / `work-agents`
+processes, which still hold the previous version in memory, fail if they open a
+store after your migration lands. This has already caused real damage once:
+`telegram-control.log` records router turns abandoned four times over with
+"Database schema 17 is newer than supported schema 16".
+
+When adding a migration, know that you are changing shared state for every
+agent on the machine, and that the gap between the migration landing and the
+daemons picking up matching code is a genuinely mixed-version period. Prefer
+migrations older code can tolerate — a new table or a nullable column is safe
+to ignore, whereas renaming or dropping something the running version still
+reads is not. Say plainly in your report that a migration has been applied and
+that the daemons run older code until their next restart.
