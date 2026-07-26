@@ -780,11 +780,11 @@ a bounded, durable multi-step investigation:
   exactly what was done or found, and topics still bound to the controller
   converse with Control directly.
 
-## Durable inbound images
+## Durable inbound attachments
 
-Authorized Telegram photos and image documents (JPEG, PNG, WebP, or GIF, up
-to 20 MB) are now valid agent input. The inbox handler selects Telegram's
-largest photo rendition or accepts a supported image document, downloads it
+Authorized Telegram photos and arbitrary documents up to 20 MB are valid
+agent input. The inbox handler selects Telegram's largest photo rendition or
+accepts any document regardless of MIME type, downloads it
 through the token-isolating bridge, and atomically publishes it at a private
 mode-0600 path under the database sibling `attachments/inbox-<job-id>/`
 directory. The job ID and Telegram `file_unique_id` make the path stable across
@@ -798,9 +798,9 @@ inspect with their built-in filesystem/image tools. The full Telegram update
 was already persisted before the download, so this feature requires no schema
 migration.
 
-Verified with unit coverage for Telegram rendition selection, supported image
-documents, deterministic private persistence and retry reuse, prompt
-construction, and the existing full suite.
+Verified with unit coverage for Telegram rendition selection, arbitrary
+documents and safe filename retention, deterministic private persistence,
+retry reuse, prompt construction, and the existing full suite.
 
 ## Stage 0 legacy bridge commands
 

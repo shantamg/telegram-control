@@ -2,8 +2,8 @@
 
 Run local Codex and Claude Code agents from your phone, over Telegram.
 
-Send text, an image, or a voice note to your own Telegram bot; a durable
-controller on your Mac saves images privately, transcribes voice locally,
+Send text, an attachment, or a voice note to your own Telegram bot; a durable
+controller on your Mac saves attachments privately, transcribes voice locally,
 routes the request to the right agent, runs the turn in the real working
 directory, and streams the answer back with buttons you can tap to steer,
 stop, or continue the conversation.
@@ -21,10 +21,10 @@ transcription runs on-device; only optional spoken replies leave the machine.
 
 ## What it does
 
-- **Text, images, and voice in; text and voice out.** Images are saved to
-  private durable attachment paths that Codex and Claude can inspect. Voice
-  notes are transcribed on-device with Handy's Parakeet V3 model. Answers can
-  be read aloud on demand via a **🔊 Listen** button.
+- **Text, attachments, and voice in; text and voice out.** Photos and arbitrary
+  Telegram documents are saved to private durable paths that Codex and Claude
+  can inspect. Voice notes are transcribed on-device with Handy's Parakeet V3
+  model. Answers can be read aloud on demand via a **🔊 Listen** button.
 - **One bot, many workspaces.** A private Telegram group per project, a topic
   per agent. Each topic is durably bound to a workspace directory and a
   persisted Codex or Claude session, so conversations survive restarts.
@@ -209,7 +209,7 @@ live run that uses isolated provider sessions:
 Deliberately outside Git:
 
 - Bot token: macOS Keychain, service `telegram-bridge-bot-token`
-- Incoming images:
+- Incoming attachments:
   `~/Library/Application Support/telegram-bridge/attachments/inbox-<job-id>/`
 - Pairing and configuration:
   `~/Library/Application Support/telegram-bridge/config.json`
