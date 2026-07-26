@@ -59,6 +59,8 @@ After confirmation, Telegram Control clears the provider-session pointer, archiv
         "Voice & replies",
         """Voice messages and replies
 
+Send a Telegram image normally, with an optional caption. JPEG, PNG, WebP, and GIF images up to 20 MB are saved privately and routed to Codex or Claude by local path.
+
 Send a Telegram voice note normally; it is transcribed locally and routed like text.
 
 Reply to an exact Control or agent message to continue that routed conversation. During an active turn, a reply to its progress card can steer or stop the work. Agents can also send requested voice or text progress updates through scoped Telegram skills.""",

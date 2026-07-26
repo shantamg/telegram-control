@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Handle authorized Telegram text and voice messages."""
+"""Handle authorized Telegram text, image, and voice messages."""
 
 import html
 import json
@@ -38,6 +38,7 @@ PARAKEET_MODEL_ID = "parakeet-tdt-0.6b-v3"
 FFMPEG_BINARY = Path("/opt/homebrew/bin/ffmpeg")
 MAX_VOICE_BYTES = 20_000_000
 MAX_VOICE_SECONDS = 30 * 60
+MAX_IMAGE_BYTES = 20_000_000
 TRANSCRIPTION_TIMEOUT_SECONDS = 15 * 60
 TELEGRAM_TEXT_CHUNK = 3_800
 OUTPUT_SEQUENCE = 0
@@ -3465,6 +3466,91 @@ def transcribe_wav(wav_path: Path) -> str:
         raise bridge.BridgeError("Handy returned an unreadable transcription result.") from None
 
 
+def inbound_image(message: dict) -> Optional[dict]:
+    """Return the best supported Telegram image descriptor, if present."""
+    photos = message.get("photo")
+    if isinstance(photos, list):
+        candidates = [item for item in photos if isinstance(item, dict)]
+        if candidates:
+            selected = max(
+                candidates,
+                key=lambda item: (
+                    int(item.get("file_size", 0)),
+                    int(item.get("width", 0)) * int(item.get("height", 0)),
+                ),
+            )
+            return {**selected, "extension": ".jpg"}
+    document = message.get("document")
+    if not isinstance(document, dict):
+        return None
+    mime_type = str(document.get("mime_type", "")).lower()
+    extensions = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }
+    extension = extensions.get(mime_type)
+    if extension is None:
+        return None
+    return {**document, "extension": extension}
+
+
+def persist_inbound_image(image: dict) -> Path:
+    """Download an image once to a private path stable across inbox retries."""
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    if not database_path or not job_id:
+        raise StoreError("Image input requires the durable controller.")
+    file_id = str(image.get("file_id", ""))
+    if not file_id:
+        raise bridge.BridgeError("Telegram image has no downloadable file ID.")
+    file_size = int(image.get("file_size", 0))
+    if file_size > MAX_IMAGE_BYTES:
+        raise bridge.BridgeError("Image exceeds the configured 20 MB limit.")
+    unique_id = re.sub(
+        r"[^A-Za-z0-9_-]",
+        "_",
+        str(image.get("file_unique_id") or file_id),
+    )[:128]
+    extension = str(image["extension"])
+    attachment_dir = (
+        Path(database_path).expanduser().resolve().parent
+        / "attachments"
+        / f"inbox-{int(job_id)}"
+    )
+    attachment_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    attachment_dir.chmod(0o700)
+    destination = attachment_dir / f"{unique_id}{extension}"
+    if destination.is_file() and destination.stat().st_size > 0:
+        return destination
+    partial = attachment_dir / f".{unique_id}{extension}.part"
+    partial.unlink(missing_ok=True)
+    try:
+        bridge.download_telegram_file(file_id, partial, max_bytes=MAX_IMAGE_BYTES)
+        if not partial.is_file() or partial.stat().st_size <= 0:
+            raise bridge.BridgeError("Telegram image download was empty.")
+        bridge.ensure_private_file(partial)
+        os.replace(partial, destination)
+        bridge.ensure_private_file(destination)
+    finally:
+        partial.unlink(missing_ok=True)
+    return destination
+
+
+def image_prompt(path: Path, caption: str) -> str:
+    prompt = (
+        "The user sent an image. Inspect the local image file at this absolute "
+        f"path and use it as part of their request:\n{path}"
+    )
+    caption = caption.strip()
+    if caption:
+        prompt += f"\n\nUser caption:\n{caption}"
+    else:
+        prompt += "\n\nThe image had no caption. Respond based on its contents."
+    return prompt
+
+
 def handle_voice(update: dict, voice: dict) -> None:
     file_size = int(voice.get("file_size", 0))
     duration = int(voice.get("duration", 0))
@@ -3683,6 +3769,58 @@ def handle_voice(update: dict, voice: dict) -> None:
         send_message("📝 Parakeet did not detect any speech in that voice message.")
 
 
+def route_user_input(update: dict, text: str) -> None:
+    """Route normalized text, including prompts that reference attachments."""
+    replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
+    if replied_message_id:
+        route = resolve_replied_message_route()
+        if (
+            route is not None
+            and route.target_type == "controller"
+            and route.target_id == "control"
+        ):
+            enqueue_router_input(
+                build_router_reply_input(update, route, text),
+                replied_message_id=route.telegram_message_id,
+            )
+        elif route is not None and route.target_type == "agent":
+            if not try_enqueue_agent_steer(route, text):
+                binding = current_surface_binding()
+                if (
+                    binding is not None
+                    and binding.target_type == "agent"
+                    and binding.target_id == route.target_id
+                ):
+                    enqueue_agent_input(route.target_id, text)
+                else:
+                    enqueue_agent_reply_input(route, text)
+        else:
+            send_message("That replied-to message has no active durable route.")
+        return
+
+    if prompt_forum_subject_provider_selection(request_was_already_sent=True):
+        return
+    ensure_bound_forum_subject()
+    binding = current_surface_binding()
+    thread_id = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID")
+    if thread_id and binding is None:
+        enqueue_router_input(text)
+    elif thread_id and binding is not None:
+        if binding.target_type == "agent":
+            enqueue_agent_input(binding.target_id, text)
+        elif (
+            binding.target_type == "controller"
+            and binding.target_id == "control"
+        ):
+            enqueue_router_input(text)
+        else:
+            send_message(
+                "This topic's controller binding does not accept messages yet."
+            )
+    else:
+        enqueue_router_input(text)
+
+
 def main() -> int:
     update = json.load(sys.stdin)
     username = os.environ.get("TELEGRAM_FROM_USERNAME") or "unknown"
@@ -3714,6 +3852,16 @@ def main() -> int:
                 ):
                     return 0
                 handle_voice(update, message["voice"])
+        elif message and inbound_image(message) is not None:
+            print(f"Received image message from @{username}.", flush=True)
+            caption = str(message.get("caption", ""))
+            if not forum_is_authorized_or_prompt(caption):
+                return 0
+            image = inbound_image(message)
+            if image is None:
+                raise bridge.BridgeError("Telegram image metadata is unavailable.")
+            path = persist_inbound_image(image)
+            route_user_input(update, image_prompt(path, caption))
         elif message and "text" in message:
             text = str(message["text"])
             print(f"Received text message from @{username}: {text}", flush=True)
@@ -3741,65 +3889,11 @@ def main() -> int:
             elif text.strip().lower() in {"/agent", "/agent status"}:
                 if not prompt_forum_subject_provider_selection():
                     send_agent_status()
-            elif replied_message_id:
-                route = resolve_replied_message_route()
-                if (
-                    route is not None
-                    and route.target_type == "controller"
-                    and route.target_id == "control"
-                ):
-                    enqueue_router_input(
-                        build_router_reply_input(update, route, text),
-                        replied_message_id=route.telegram_message_id,
-                    )
-                elif route is not None and route.target_type == "agent":
-                    if not try_enqueue_agent_steer(route, text):
-                        binding = current_surface_binding()
-                        if (
-                            binding is not None
-                            and binding.target_type == "agent"
-                            and binding.target_id == route.target_id
-                        ):
-                            enqueue_agent_input(route.target_id, text)
-                        else:
-                            enqueue_agent_reply_input(route, text)
-                else:
-                    send_message(
-                        "That replied-to message has no active durable route."
-                    )
             else:
-                if prompt_forum_subject_provider_selection(
-                    request_was_already_sent=True,
-                ):
-                    return 0
-                ensure_bound_forum_subject()
-                binding = current_surface_binding()
-                thread_id = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID")
-                if thread_id and binding is None:
-                    # A newly created private-forum topic begins as a Control
-                    # surface. The router can then enroll or attach its
-                    # workspace conversationally; no command is required.
-                    enqueue_router_input(text)
-                elif thread_id and binding is not None:
-                    if binding.target_type == "agent":
-                        enqueue_agent_input(binding.target_id, text)
-                    elif (
-                        binding.target_type == "controller"
-                        and binding.target_id == "control"
-                    ):
-                        # A Control-bound topic converses with the main
-                        # router, exactly like the root Control chat.
-                        enqueue_router_input(text)
-                    else:
-                        send_message(
-                            "This topic's controller binding does not accept "
-                            "messages yet."
-                        )
-                else:
-                    enqueue_router_input(text)
+                route_user_input(update, text)
         else:
             send_message(
-                "Send me a text or Telegram voice message.\n\n"
+                "Send me text, an image, or a Telegram voice message.\n\n"
                 f"{telegram_help.HELP_HINT}"
             )
         return 0
