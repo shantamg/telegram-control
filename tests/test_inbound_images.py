@@ -86,9 +86,7 @@ class InboundImageTests(unittest.TestCase):
 
     def test_acknowledgement_is_queued_before_attachment_download(self):
         source = inspect.getsource(on_message.main)
-        acknowledgement = source.index(
-            'send_message("📎 Attachment received. Downloading securely…")'
-        )
+        acknowledgement = source.index("enqueue_attachment_receipt()")
         download = source.index("path = persist_inbound_attachment(attachment)")
         route = source.index("route_user_input(", download)
 
