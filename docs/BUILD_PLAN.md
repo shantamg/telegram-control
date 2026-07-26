@@ -994,6 +994,9 @@ The first Stage 5 provider-adapter slice passes 94 offline tests:
 - model and effort are durable per-agent configuration, can be supplied during
   conversational creation or changed later through `configure_agent`, flow
   through structured and tmux sessions, and appear in `/agent`;
+- `/agent` also exposes the active adapter's model and effort catalogs as
+  owner-scoped buttons; applying a selection waits for an active turn or
+  console to become idle and preserves the current provider-session pointer;
 - exact model and effort values must be explicit in the current request;
   subjective choices cause clarification instead of controller invention;
 - a live adapter-level Claude probe completed two turns using the same session
@@ -1251,9 +1254,11 @@ Remaining release work:
    and confirmation revalidation use capped directory traversal, file counts,
    metadata bytes, index bytes/lines, and wall time so accumulated provider
    history cannot monopolize the Telegram inbox worker. `/agent` also supports
-   a confirmation-gated switch between Codex and Claude for an idle topic.
-   The old conversation remains persisted locally, while the new provider
-   starts fresh unless the user explicitly adopts one of its existing
+   in-place model and effort changes sourced from the active Codex or Claude
+   adapter, plus a confirmation-gated switch between providers for an idle
+   topic. In-place configuration preserves the active conversation; switching
+   providers leaves the old conversation persisted locally while the new
+   provider starts fresh unless the user explicitly adopts one of its existing
    sessions. Dormant Codex-session adoption has passed a live
    context-continuity test; Claude parity is implemented and awaiting the same
    live acceptance check. The first voice-output

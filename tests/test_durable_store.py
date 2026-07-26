@@ -9725,6 +9725,7 @@ class DurableIntegrationTests(unittest.TestCase):
                         "⏸ Pause",
                         "New session…",
                         "Resume another session…",
+                        "Change model / effort…",
                         "Switch to Claude…",
                     ],
                 )
@@ -9733,6 +9734,205 @@ class DurableIntegrationTests(unittest.TestCase):
                     (response.message_id,),
                 ).fetchone()["route_json"]
                 self.assertEqual(json.loads(route_json)["target_id"], agent.agent_id)
+
+    def test_agent_can_reconfigure_existing_codex_and_claude_sessions(self):
+        cases = (
+            (
+                "codex",
+                {"model": "gpt-5.6-sol", "effort": "low"},
+                "GPT-5.6 Terra",
+                "gpt-5.6-terra",
+                "Ultra",
+                "ultra",
+            ),
+            (
+                "claude",
+                {"model": "sonnet", "effort": "high"},
+                "Opus",
+                "opus",
+                "Max",
+                "max",
+            ),
+        )
+        for (
+            provider,
+            initial_config,
+            model_label,
+            model_value,
+            effort_label,
+            effort_value,
+        ) in cases:
+            with self.subTest(provider=provider):
+                with tempfile.TemporaryDirectory() as temporary_directory:
+                    database_path = (
+                        Path(temporary_directory) / "controller.sqlite3"
+                    )
+                    config = {
+                        "chat_id": 123,
+                        "owner_user_id": 123,
+                        "handler_path": str(Path(on_message.__file__).resolve()),
+                    }
+                    session_id = f"existing-{provider}-session"
+                    with DurableStore(database_path) as store:
+                        store.ensure_surface_binding(
+                            chat_id=123,
+                            message_thread_id=62,
+                            surface_type="project",
+                            display_name="Planning",
+                            target_type="controller",
+                            target_id="control",
+                        )
+                        agent, _ = store.register_project_agent(
+                            chat_id=123,
+                            surface_name="Planning",
+                            slug=f"{provider}-planning",
+                            provider=provider,
+                            project_path="/tmp/planning",
+                            provider_config=initial_config,
+                        )
+                        store.connection.execute(
+                            """
+                            UPDATE agents
+                            SET provider_session_id = ?
+                            WHERE agent_id = ?
+                            """,
+                            (session_id, agent.agent_id),
+                        )
+                        store.ingest_update(
+                            topic_message_update(10, "/agent"),
+                            now=100,
+                        )
+                        job = store.claim_job("worker", now=100)
+                        telegram_control.process_inbox_job(
+                            store,
+                            config,
+                            job,
+                            "worker",
+                        )
+                        status = store.claim_outbox("sender", now=10**12)
+                        configure_data = next(
+                            button["callback_data"]
+                            for row in status.params["reply_markup"][
+                                "inline_keyboard"
+                            ]
+                            for button in row
+                            if button["text"] == "Change model / effort…"
+                        )
+
+                        def invoke_callback(
+                            update_id: int,
+                            callback_data: str,
+                        ) -> list[dict]:
+                            callback = callback_update(
+                                update_id,
+                                callback_data,
+                                message_id=800 + update_id,
+                                message_thread_id=62,
+                            )
+                            store.ingest_update(callback, now=100 + update_id)
+                            callback_job = store.connection.execute(
+                                """
+                                SELECT job_id FROM inbox_jobs
+                                WHERE update_id = ?
+                                """,
+                                (update_id,),
+                            ).fetchone()
+                            callback_job_id = int(callback_job["job_id"])
+                            environment = {
+                                "TELEGRAM_CONTROL_DB": str(database_path),
+                                "TELEGRAM_CONTROL_JOB_ID": str(
+                                    callback_job_id
+                                ),
+                                "TELEGRAM_CHAT_ID": "123",
+                                "TELEGRAM_FROM_ID": "123",
+                                "TELEGRAM_MESSAGE_ID": str(800 + update_id),
+                                "TELEGRAM_MESSAGE_THREAD_ID": "62",
+                            }
+                            with mock.patch.dict(
+                                os.environ,
+                                environment,
+                                clear=False,
+                            ):
+                                on_message.handle_callback(
+                                    callback,
+                                    callback["callback_query"],
+                                )
+                            rows = store.connection.execute(
+                                """
+                                SELECT params_json FROM outbox_messages
+                                WHERE operation_id LIKE ?
+                                ORDER BY message_id
+                                """,
+                                (f"inbox:{callback_job_id}:%",),
+                            ).fetchall()
+                            return [
+                                json.loads(row["params_json"]) for row in rows
+                            ]
+
+                        model_messages = invoke_callback(11, configure_data)
+                        model_prompt = next(
+                            params
+                            for params in model_messages
+                            if "Change " in str(params.get("text", ""))
+                            and " model" in str(params.get("text", ""))
+                        )
+                        model_data = next(
+                            button["callback_data"]
+                            for row in model_prompt["reply_markup"][
+                                "inline_keyboard"
+                            ]
+                            for button in row
+                            if button["text"] == model_label
+                        )
+
+                        effort_messages = invoke_callback(12, model_data)
+                        effort_prompt = next(
+                            params
+                            for params in effort_messages
+                            if "Choose effort" in str(params.get("text", ""))
+                        )
+                        effort_data = next(
+                            button["callback_data"]
+                            for row in effort_prompt["reply_markup"][
+                                "inline_keyboard"
+                            ]
+                            for button in row
+                            if button["text"] == effort_label
+                        )
+
+                        result_messages = invoke_callback(13, effort_data)
+                        configured = store.resolve_agent(agent.agent_id)
+                        self.assertEqual(
+                            configured.provider_config["model"],
+                            model_value,
+                        )
+                        self.assertEqual(
+                            configured.provider_config["effort"],
+                            effort_value,
+                        )
+                        self.assertEqual(
+                            configured.provider_session_id,
+                            session_id,
+                        )
+                        self.assertTrue(
+                            any(
+                                "current conversation is preserved"
+                                in str(params.get("text", ""))
+                                for params in result_messages
+                            )
+                        )
+                        self.assertEqual(
+                            store.connection.execute(
+                                "SELECT COUNT(*) FROM agent_mailbox"
+                            ).fetchone()[0],
+                            0,
+                        )
+                        self.assertEqual(
+                            store.connection.execute(
+                                "SELECT COUNT(*) FROM router_mailbox"
+                            ).fetchone()[0],
+                            0,
+                        )
 
     def test_agent_can_confirm_switching_from_codex_to_claude(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

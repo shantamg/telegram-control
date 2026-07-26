@@ -54,6 +54,14 @@ class ProviderCapabilities:
 
 
 @dataclass(frozen=True)
+class ProviderConfigurationOptions:
+    """Harness-owned model and effort choices exposed to controller UIs."""
+
+    models: tuple[tuple[str, Optional[str]], ...]
+    efforts: tuple[tuple[str, Optional[str]], ...]
+
+
+@dataclass(frozen=True)
 class ProviderTurnResult:
     provider_session_id: str
     final_text: str
@@ -62,6 +70,9 @@ class ProviderTurnResult:
 
 class ProviderAdapter(Protocol):
     def capabilities(self) -> ProviderCapabilities:
+        ...
+
+    def configuration_options(self) -> ProviderConfigurationOptions:
         ...
 
     def console_command(self, agent: ManagedAgent) -> list[str]:
@@ -467,6 +478,23 @@ def consume_claude_events(
 class CodexExecAdapter:
     """Codex app-server adapter with native same-turn steering and interrupt."""
 
+    CONFIGURATION_OPTIONS = ProviderConfigurationOptions(
+        models=(
+            ("Default", None),
+            ("GPT-5.6 Sol", "gpt-5.6-sol"),
+            ("GPT-5.6 Terra", "gpt-5.6-terra"),
+        ),
+        efforts=(
+            ("Default", None),
+            ("Low", "low"),
+            ("Medium", "medium"),
+            ("High", "high"),
+            ("XHigh", "xhigh"),
+            ("Max", "max"),
+            ("Ultra", "ultra"),
+        ),
+    )
+
     def __init__(
         self,
         binary: Optional[str] = None,
@@ -501,6 +529,10 @@ class CodexExecAdapter:
             # Delivered as developer instructions in _thread_request().
             turn_guidance=True,
         )
+
+    @classmethod
+    def configuration_options(cls) -> ProviderConfigurationOptions:
+        return cls.CONFIGURATION_OPTIONS
 
     def console_command(self, agent: ManagedAgent) -> list[str]:
         if not self.binary:
@@ -1200,6 +1232,22 @@ class CodexExecAdapter:
 class ClaudePrintAdapter:
     """Bidirectional Claude stream-JSON adapter with SDK live control."""
 
+    CONFIGURATION_OPTIONS = ProviderConfigurationOptions(
+        models=(
+            ("Default", None),
+            ("Opus", "opus"),
+            ("Sonnet", "sonnet"),
+            ("Fable", "fable"),
+        ),
+        efforts=(
+            ("Default", None),
+            ("Low", "low"),
+            ("Medium", "medium"),
+            ("High", "high"),
+            ("XHigh", "xhigh"),
+            ("Max", "max"),
+        ),
+    )
     PERMISSION_MODES = {
         "acceptEdits",
         "auto",
@@ -1243,6 +1291,10 @@ class ClaudePrintAdapter:
             # Delivered as an appended system prompt in command() below.
             turn_guidance=True,
         )
+
+    @classmethod
+    def configuration_options(cls) -> ProviderConfigurationOptions:
+        return cls.CONFIGURATION_OPTIONS
 
     def console_command(self, agent: ManagedAgent) -> list[str]:
         if not self.binary:
@@ -1835,4 +1887,15 @@ def adapter_for(agent: ManagedAgent) -> ProviderAdapter:
         return ClaudePrintAdapter()
     raise ProviderAdapterError(
         f"Provider adapter is not implemented: {agent.provider}"
+    )
+
+
+def configuration_options(provider: str) -> ProviderConfigurationOptions:
+    """Return selectable settings without constructing a provider process."""
+    if provider == "codex":
+        return CodexExecAdapter.configuration_options()
+    if provider == "claude":
+        return ClaudePrintAdapter.configuration_options()
+    raise ProviderAdapterError(
+        f"Provider adapter is not implemented: {provider}"
     )

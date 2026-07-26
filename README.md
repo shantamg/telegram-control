@@ -198,10 +198,14 @@ turns cannot answer permission prompts; set `provider_config.permission_mode`
 to `acceptEdits`, `auto`, `dontAsk`, or `plan` for a more restrictive agent.
 The explicit tmux console can resume either a Codex or Claude session without
 changing its logical agent identity. The `/agent` card also exposes the same
-provider-neutral lifecycle directly in Telegram: an idle topic can switch
-between Codex and Claude after confirmation, start a fresh conversation, or
-choose a recent dormant session from its exact working directory. Switching
-providers does not delete the previous local session.
+provider-neutral lifecycle directly in Telegram. **Change model / effort**
+uses choices owned by the active Codex or Claude adapter and applies them to
+subsequent turns while preserving the current provider session. Reconfiguration
+waits for any active structured turn or tmux console to become idle. The topic
+can also switch between Codex and Claude after confirmation, start a fresh
+conversation, or choose a recent dormant session from its exact working
+directory. Switching providers starts a fresh conversation but does not delete
+the previous local session.
 
 Eight supervised agent workers may lease different agents concurrently. The
 mailbox still serializes turns for each individual agent, so two topics can

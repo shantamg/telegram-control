@@ -382,6 +382,17 @@ class TurnGuidanceCapabilityTests(unittest.TestCase):
         ):
             self.assertIsInstance(adapter.capabilities().turn_guidance, bool)
 
+    def test_each_adapter_exposes_its_configuration_choices(self):
+        codex = provider_adapters.configuration_options("codex")
+        claude = provider_adapters.configuration_options("claude")
+
+        self.assertIn(("GPT-5.6 Terra", "gpt-5.6-terra"), codex.models)
+        self.assertIn(("Ultra", "ultra"), codex.efforts)
+        self.assertIn(("Opus", "opus"), claude.models)
+        self.assertIn(("Max", "max"), claude.efforts)
+        self.assertEqual(codex.models[0], ("Default", None))
+        self.assertEqual(claude.models[0], ("Default", None))
+
     def test_codex_delivers_guidance_on_new_and_resumed_threads(self):
         adapter = provider_adapters.CodexExecAdapter(binary="/bin/codex")
         self.assertTrue(adapter.capabilities().turn_guidance)

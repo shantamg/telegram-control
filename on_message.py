@@ -17,6 +17,7 @@ import claude_sessions
 import codex_sessions
 import detached_worker
 import discovery
+import provider_adapters
 import provider_defaults
 import router_contract
 import telegram_bridge as bridge
@@ -41,40 +42,6 @@ TRANSCRIPTION_TIMEOUT_SECONDS = 15 * 60
 TELEGRAM_TEXT_CHUNK = 3_800
 OUTPUT_SEQUENCE = 0
 CONTROL_SPEAKER = "🎛 Control"
-FORUM_SUBJECT_MODELS = {
-    "codex": [
-        ("Default", None),
-        ("GPT-5.6 Sol", "gpt-5.6-sol"),
-        ("GPT-5.6 Terra", "gpt-5.6-terra"),
-    ],
-    "claude": [
-        ("Default", None),
-        ("Opus", "opus"),
-        ("Sonnet", "sonnet"),
-        ("Fable", "fable"),
-    ],
-}
-FORUM_SUBJECT_EFFORTS = {
-    "codex": [
-        ("Default", None),
-        ("Low", "low"),
-        ("Medium", "medium"),
-        ("High", "high"),
-        ("XHigh", "xhigh"),
-        ("Max", "max"),
-        ("Ultra", "ultra"),
-    ],
-    "claude": [
-        ("Default", None),
-        ("Low", "low"),
-        ("Medium", "medium"),
-        ("High", "high"),
-        ("XHigh", "xhigh"),
-        ("Max", "max"),
-    ],
-}
-
-
 def deliver_api_call(
     method: str,
     params: dict,
@@ -630,6 +597,19 @@ def send_agent_status() -> None:
                 one_time=True,
                 ttl_seconds=15 * 60,
             )
+            configure_action = store.create_callback_action(
+                operation_id=f"inbox:{job_id}:agent-configure-picker",
+                action_type="agent_configure_picker",
+                payload={
+                    "agent_id": agent.agent_id,
+                    "provider": agent.provider,
+                },
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=int(user_id),
+                one_time=True,
+                ttl_seconds=15 * 60,
+            )
             keyboard = {
                 "inline_keyboard": [
                     [
@@ -656,6 +636,12 @@ def send_agent_status() -> None:
                         if resume_session_action is not None
                         else []
                     ),
+                    [
+                        {
+                            "text": "Change model / effort…",
+                            "callback_data": f"a:{configure_action.token}",
+                        }
+                    ],
                     [
                         {
                             "text": f"Switch to {other_provider_name}…",
@@ -1353,9 +1339,10 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         ):
             raise StoreError("Stored forum agent selection is invalid.")
         provider_name = "Claude" if provider == "claude" else "Codex"
+        provider_options = provider_adapters.configuration_options(provider)
         with DurableStore(Path(database_path)) as store:
             model_actions = []
-            for label, model in FORUM_SUBJECT_MODELS[provider]:
+            for label, model in provider_options.models:
                 model_action = store.create_callback_action(
                     operation_id=(
                         f"callback:{update['update_id']}:"
@@ -1414,7 +1401,12 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         provider = str(action.payload.get("provider", ""))
         model = action.payload.get("model")
         allowed_models = (
-            {value for _, value in FORUM_SUBJECT_MODELS.get(provider, [])}
+            {
+                value
+                for _, value in provider_adapters.configuration_options(
+                    provider
+                ).models
+            }
             if provider in {"codex", "claude"}
             else set()
         )
@@ -1426,9 +1418,10 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             or model not in allowed_models
         ):
             raise StoreError("Stored forum model selection is invalid.")
+        provider_options = provider_adapters.configuration_options(provider)
         with DurableStore(Path(database_path)) as store:
             effort_actions = []
-            for label, effort in FORUM_SUBJECT_EFFORTS[provider]:
+            for label, effort in provider_options.efforts:
                 effort_action = store.create_callback_action(
                     operation_id=(
                         f"callback:{update['update_id']}:"
@@ -1499,12 +1492,22 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         model = action.payload.get("model")
         effort = action.payload.get("effort")
         allowed_models = (
-            {value for _, value in FORUM_SUBJECT_MODELS.get(provider, [])}
+            {
+                value
+                for _, value in provider_adapters.configuration_options(
+                    provider
+                ).models
+            }
             if provider in {"codex", "claude"}
             else set()
         )
         allowed_efforts = (
-            {value for _, value in FORUM_SUBJECT_EFFORTS.get(provider, [])}
+            {
+                value
+                for _, value in provider_adapters.configuration_options(
+                    provider
+                ).efforts
+            }
             if provider in {"codex", "claude"}
             else set()
         )
@@ -2597,6 +2600,228 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 "callback-answer",
             )
         send_message(result_text + " Send /agent to inspect or change it.")
+        return
+    if action.action_type == "agent_configure_picker":
+        agent_id = str(action.payload.get("agent_id", ""))
+        provider = str(action.payload.get("provider", ""))
+        if provider not in {"codex", "claude"}:
+            raise StoreError("Agent configuration provider is invalid.")
+        try:
+            options = provider_adapters.configuration_options(provider)
+            with DurableStore(Path(database_path)) as store:
+                bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+                if bound_agent is None or bound_agent.agent_id != agent_id:
+                    raise StoreError("Managed agent surface changed.")
+                if bound_agent.provider != provider:
+                    raise StoreError("Managed agent provider changed.")
+                selected_model = bound_agent.provider_config.get("model")
+                model_actions = []
+                for label, model in options.models:
+                    select = store.create_callback_action(
+                        operation_id=(
+                            f"callback:{update['update_id']}:"
+                            f"agent-configure-model:{model or 'default'}"
+                        ),
+                        action_type="agent_configure_model_select",
+                        payload={
+                            "agent_id": agent_id,
+                            "provider": provider,
+                            "model": model,
+                        },
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        authorized_user_id=user_id,
+                        one_time=True,
+                        ttl_seconds=15 * 60,
+                    )
+                    display_label = (
+                        f"✓ {label}" if model == selected_model else label
+                    )
+                    model_actions.append((display_label, select))
+                current_model, current_effort = (
+                    provider_defaults.describe_provider_config(
+                        provider,
+                        bound_agent.provider_config,
+                        bound_agent.project_path,
+                    )
+                )
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        provider_name = "Claude" if provider == "claude" else "Codex"
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Choose a model.",
+                },
+                "callback-answer",
+            )
+        send_message(
+            f"Change {provider_name} model\n\n"
+            f"Current model: {current_model}\n"
+            f"Current effort: {current_effort}\n\n"
+            "The current conversation will be preserved.",
+            reply_markup={
+                "inline_keyboard": option_button_rows(model_actions),
+            },
+        )
+        return
+    if action.action_type == "agent_configure_model_select":
+        agent_id = str(action.payload.get("agent_id", ""))
+        provider = str(action.payload.get("provider", ""))
+        model = action.payload.get("model")
+        if provider not in {"codex", "claude"}:
+            raise StoreError("Agent configuration provider is invalid.")
+        options = provider_adapters.configuration_options(provider)
+        model_labels = {value: label for label, value in options.models}
+        if model not in model_labels:
+            raise StoreError("Stored agent model selection is invalid.")
+        try:
+            with DurableStore(Path(database_path)) as store:
+                bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+                if bound_agent is None or bound_agent.agent_id != agent_id:
+                    raise StoreError("Managed agent surface changed.")
+                if bound_agent.provider != provider:
+                    raise StoreError("Managed agent provider changed.")
+                selected_effort = bound_agent.provider_config.get("effort")
+                effort_actions = []
+                for label, effort in options.efforts:
+                    select = store.create_callback_action(
+                        operation_id=(
+                            f"callback:{update['update_id']}:"
+                            f"agent-configure-effort:{effort or 'default'}"
+                        ),
+                        action_type="agent_configure_effort_select",
+                        payload={
+                            "agent_id": agent_id,
+                            "provider": provider,
+                            "model": model,
+                            "effort": effort,
+                        },
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        authorized_user_id=user_id,
+                        one_time=True,
+                        ttl_seconds=15 * 60,
+                    )
+                    display_label = (
+                        f"✓ {label}" if effort == selected_effort else label
+                    )
+                    effort_actions.append((display_label, select))
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        model_config = {"model": str(model)} if model is not None else {}
+        model_name, _ = provider_defaults.describe_provider_config(
+            provider,
+            model_config,
+            bound_agent.project_path,
+        )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Choose an effort level.",
+                },
+                "callback-answer",
+            )
+        send_message(
+            f"Model: {model_name}\n\nChoose effort.\n\n"
+            "The current conversation will be preserved.",
+            reply_markup={
+                "inline_keyboard": option_button_rows(effort_actions),
+            },
+        )
+        return
+    if action.action_type == "agent_configure_effort_select":
+        agent_id = str(action.payload.get("agent_id", ""))
+        provider = str(action.payload.get("provider", ""))
+        model = action.payload.get("model")
+        effort = action.payload.get("effort")
+        if provider not in {"codex", "claude"}:
+            raise StoreError("Agent configuration provider is invalid.")
+        options = provider_adapters.configuration_options(provider)
+        if model not in {value for _, value in options.models}:
+            raise StoreError("Stored agent model selection is invalid.")
+        if effort not in {value for _, value in options.efforts}:
+            raise StoreError("Stored agent effort selection is invalid.")
+        try:
+            with DurableStore(Path(database_path)) as store:
+                bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+                if bound_agent is None or bound_agent.agent_id != agent_id:
+                    raise StoreError("Managed agent surface changed.")
+                if bound_agent.provider != provider:
+                    raise StoreError("Managed agent provider changed.")
+                previous_session_id = bound_agent.provider_session_id
+                configured = store.configure_agent_provider(
+                    agent_id,
+                    {
+                        "model": str(model) if model is not None else None,
+                        "effort": str(effort) if effort is not None else None,
+                    },
+                )
+                session_preserved = (
+                    configured.provider_session_id == previous_session_id
+                )
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        model_name, effort_name = provider_defaults.describe_provider_config(
+            configured.provider,
+            configured.provider_config,
+            configured.project_path,
+        )
+        provider_name = "Claude" if provider == "claude" else "Codex"
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Model and effort updated.",
+                },
+                "callback-answer",
+            )
+        session_note = (
+            "The current conversation is preserved."
+            if configured.provider_session_id and session_preserved
+            else "The next message will use these settings."
+        )
+        send_message(
+            f"✅ Updated {provider_name} settings.\n"
+            f"Model: {model_name}\n"
+            f"Effort: {effort_name}\n\n"
+            f"{session_note}"
+        )
         return
     if action.action_type == "agent_switch_provider_prompt":
         agent_id = str(action.payload.get("agent_id", ""))
