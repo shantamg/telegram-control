@@ -1147,6 +1147,29 @@ is published, not derived, so an unregistered command is effectively hidden.
 
 Full suite green at 349 tests.
 
+### Menu taps in a group carry the bot's username
+
+Registering the menu exposed a second bug immediately: in a group, tapping a
+command inserts `/agent@yourbot`, because a group can hold several bots and
+Telegram disambiguates. Every command comparison in the handler was against the
+bare string, so a tapped command missed all of them, fell through to
+`route_user_input`, and the agent answered a message that was meant for the
+controller. In the private bot chat there is no suffix, which is why this only
+showed up once the menu existed.
+
+`addressed_command(text)` now strips a trailing `@<bot_username>` from the first
+token — case-insensitively, preserving arguments, so `/agent@bot create foo`
+becomes `/agent create foo` — and the whole dispatch chain matches on its result.
+A command addressed to a *different* bot is returned untouched, so it is not
+claimed as ours. The bot's own username comes from `TELEGRAM_BOT_USERNAME` in the
+handler environment, with `config.json` as the fallback.
+
+Verified with an integration test that sends `/projects@example_bot` into a group
+topic and asserts the catalog reply with no router turn, then sends
+`/projects@someone_else` and asserts it is routed as ordinary text instead.
+Because `on_message.py` is re-read per turn, this fix was live without a restart.
+Full suite green at 350 tests.
+
 ## Stage 0 legacy bridge commands
 
 The original non-durable bridge remains in `telegram_bridge.py` and is still

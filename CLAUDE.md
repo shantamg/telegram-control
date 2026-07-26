@@ -43,6 +43,11 @@ command that exists in the handler but not in `COMMANDS` is effectively hidden.
 `tests/test_durable_store.py` asserts the two lists agree and that every entry
 fits Telegram's name and description limits.
 
+Match commands through `addressed_command(text)`, never against the raw text. In
+a group, Telegram appends the bot's username to a command tapped from the menu
+(`/agent@yourbot`), and a comparison against `"/agent"` silently misses it — the
+message then reaches the agent as ordinary text instead of being handled.
+
 Nothing here should hardcode a personal path, username, or bot name: this repo
 is meant to be usable by someone else's setup. Resolve paths from the script
 location, `Path.home()`, or config.

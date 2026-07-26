@@ -9612,6 +9612,72 @@ class DurableIntegrationTests(unittest.TestCase):
                 agent = store.resolve_agent(subject.agent_id)
                 self.assertEqual(agent.provider_config, {})
 
+    def test_menu_tapped_command_with_bot_mention_is_handled(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "bot_username": "example_bot",
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            forum_chat = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+
+                def process(update, worker, now):
+                    store.ingest_update(update, now=now)
+                    job = store.claim_job(worker, now=now)
+                    telegram_control.process_inbox_job(store, config, job, worker)
+
+                # Tapping /projects from a group's command menu sends
+                # "/projects@example_bot"; it must still reach the handler.
+                tapped = topic_message_update(10, "/projects@example_bot", 62)
+                tapped["message"]["chat"] = dict(forum_chat)
+                tapped["message"]["reply_to_message"]["chat"] = dict(forum_chat)
+                process(tapped, "worker-1", 100)
+
+                texts = [
+                    json.loads(row["params_json"])["text"]
+                    for row in store.connection.execute(
+                        """
+                        SELECT params_json FROM outbox_messages
+                        WHERE method = 'sendMessage'
+                        """
+                    ).fetchall()
+                ]
+                self.assertTrue(
+                    any("No local projects are enrolled." in text for text in texts),
+                    texts,
+                )
+                # It is controller work, so it never reaches an agent or router.
+                self.assertEqual(
+                    store.status_counts().get("router_mailbox", {}),
+                    {},
+                )
+
+                # A command addressed to another bot is not ours to handle.
+                other = topic_message_update(11, "/projects@someone_else", 62)
+                other["message"]["chat"] = dict(forum_chat)
+                other["message"]["reply_to_message"]["chat"] = dict(forum_chat)
+                process(other, "worker-2", 101)
+                self.assertEqual(
+                    store.status_counts().get("router_mailbox", {}),
+                    {"queued": 1},
+                )
+
     def test_newgroup_offers_the_one_tap_link_and_start_only_authorizes(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"

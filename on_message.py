@@ -323,6 +323,28 @@ def bot_username() -> str:
         return ""
 
 
+def addressed_command(text: str) -> str:
+    """Strip Telegram's @botname suffix from a command addressed to this bot.
+
+    Tapping a command in a group from the registered menu inserts
+    `/agent@yourbot`, because a group can hold several bots. Without this the
+    text misses every command comparison and is handled as an ordinary message —
+    the agent answers instead of the controller acting. A command addressed to a
+    different bot is left untouched so it is not treated as ours.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return stripped
+    head, _, rest = stripped.partition(" ")
+    command, mention_marker, mention = head.partition("@")
+    if mention_marker:
+        username = bot_username()
+        if not username or mention.casefold() != username.casefold():
+            return stripped
+    rest = rest.strip()
+    return f"{command} {rest}" if rest else command
+
+
 def bot_label() -> str:
     """Name this bot the way the owner sees it, without hardcoding an identity."""
     username = bot_username()
@@ -4424,25 +4446,26 @@ def main() -> int:
             if not forum_is_authorized_or_prompt(text):
                 return 0
             replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
+            command = addressed_command(text)
             agent_create = re.fullmatch(
                 r"/agent\s+create\s+([a-z0-9]+(?:-[a-z0-9]+)*)",
-                text.strip().lower(),
+                command.lower(),
             )
-            if text.strip().lower() == "/status":
+            if command.lower() == "/status":
                 binding = current_surface_binding()
                 if binding is not None and binding.target_type == "agent":
                     send_agent_status()
                 else:
                     send_status_card(update)
-            elif text.strip().lower() == "/help":
+            elif command.lower() == "/help":
                 send_help_menu()
-            elif text.strip().lower() == "/teardown":
+            elif command.lower() == "/teardown":
                 request_topic_teardown()
-            elif text.strip().lower() == "/projects":
+            elif command.lower() == "/projects":
                 send_project_catalog()
-            elif text.strip().lower() == "/newgroup":
+            elif command.lower() == "/newgroup":
                 send_group_setup_card()
-            elif re.fullmatch(r"/start(?:\s.*)?", text.strip(), re.DOTALL):
+            elif re.fullmatch(r"/start(?:\s.*)?", command, re.DOTALL):
                 # The startgroup deep link delivers /start with a payload once
                 # Telegram finishes adding the bot. That is an arrival, not a
                 # request, so it only ever offers authorization.
@@ -4456,7 +4479,7 @@ def main() -> int:
                     )
             elif agent_create is not None:
                 create_agent_from_catalog(agent_create.group(1))
-            elif text.strip().lower() in {"/agent", "/agent status"}:
+            elif command.lower() in {"/agent", "/agent status"}:
                 if not prompt_forum_subject_provider_selection():
                     send_agent_status()
             else:
