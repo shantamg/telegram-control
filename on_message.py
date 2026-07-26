@@ -431,6 +431,25 @@ def send_help_menu() -> None:
     send_message(telegram_help.HOME_TEXT, reply_markup=reply_markup)
 
 
+def request_topic_teardown() -> None:
+    """Queue the direct /teardown confirmation without starting an LLM turn."""
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    user_id_text = os.environ.get("TELEGRAM_FROM_ID")
+    if not database_path or not job_id or not user_id_text:
+        raise StoreError("The /teardown command requires a managed Telegram turn.")
+    chat_id, thread_id = surface_coordinates()
+    if thread_id is None:
+        raise StoreError("/teardown only works inside a managed topic.")
+    with DurableStore(Path(database_path)) as store:
+        store.enqueue_topic_teardown_prompt_for_surface(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            authorized_user_id=int(user_id_text),
+            source_inbox_job_id=int(job_id),
+        )
+
+
 def resolve_replied_message_route():
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
@@ -1232,9 +1251,12 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         return
 
     if action.action_type == "agent_topic_teardown_cancel":
-        confirm_operation_id = action.operation_id.replace(
-            "topic-teardown-cancel",
-            "topic-teardown-confirm",
+        confirm_operation_id = str(
+            action.payload.get("confirm_operation_id")
+            or action.operation_id.replace(
+                "topic-teardown-cancel",
+                "topic-teardown-confirm",
+            )
         )
         with DurableStore(Path(database_path)) as store:
             store.retire_callback_action_operation(
@@ -3485,6 +3507,8 @@ def main() -> int:
                     send_status_card(update)
             elif text.strip().lower() == "/help":
                 send_help_menu()
+            elif text.strip().lower() == "/teardown":
+                request_topic_teardown()
             elif text.strip().lower() == "/projects":
                 send_project_catalog()
             elif agent_create is not None:

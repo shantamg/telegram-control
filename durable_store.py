@@ -7838,6 +7838,149 @@ class DurableStore:
                 self.connection.execute("ROLLBACK")
             raise
 
+    def _enqueue_topic_teardown_prompt(
+        self,
+        *,
+        row: sqlite3.Row,
+        authorized_user_id: int,
+        confirm_operation_id: str,
+        cancel_operation_id: str,
+        prompt_operation_id: str,
+        serialize_key: str,
+        timestamp: float,
+    ) -> int:
+        """Create the shared confirmation card inside an open transaction."""
+        if (
+            str(row["role"]) not in {"project", "worker"}
+            or int(row["message_thread_id"]) <= 0
+        ):
+            raise StoreError("Managed topic teardown is unavailable here.")
+        payload = {
+            "agent_id": str(row["agent_id"]),
+            "binding_id": int(row["surface_binding_id"]),
+            "chat_id": int(row["chat_id"]),
+            "message_thread_id": int(row["message_thread_id"]),
+            "display_name": str(row["display_name"]),
+        }
+        confirm = self.create_callback_action(
+            operation_id=str(confirm_operation_id),
+            action_type="agent_topic_teardown_confirm",
+            payload=payload,
+            chat_id=int(row["chat_id"]),
+            message_thread_id=int(row["message_thread_id"]),
+            authorized_user_id=int(authorized_user_id),
+            one_time=False,
+            ttl_seconds=30 * 60,
+            now=timestamp,
+        )
+        cancel_payload = dict(payload)
+        cancel_payload["confirm_operation_id"] = str(confirm_operation_id)
+        cancel = self.create_callback_action(
+            operation_id=str(cancel_operation_id),
+            action_type="agent_topic_teardown_cancel",
+            payload=cancel_payload,
+            chat_id=int(row["chat_id"]),
+            message_thread_id=int(row["message_thread_id"]),
+            authorized_user_id=int(authorized_user_id),
+            one_time=True,
+            ttl_seconds=30 * 60,
+            now=timestamp,
+        )
+        return self.enqueue_api_call(
+            operation_id=str(prompt_operation_id),
+            method="sendMessage",
+            params={
+                "chat_id": int(row["chat_id"]),
+                "message_thread_id": int(row["message_thread_id"]),
+                "text": (
+                    "🎛 Control\n\n"
+                    "Tear down this managed topic and its session?\n\n"
+                    f"Topic: {str(row['display_name'])}\n\n"
+                    "This permanently deletes the Telegram topic and its "
+                    "message history. Telegram Control will archive the "
+                    "agent, clear its provider session, and revoke its "
+                    "routes, buttons, and cards."
+                ),
+                "reply_markup": {
+                    "inline_keyboard": [
+                        [
+                            {
+                                "text": "Delete topic & session",
+                                "callback_data": f"a:{confirm.token}",
+                            }
+                        ],
+                        [
+                            {
+                                "text": "Cancel",
+                                "callback_data": f"a:{cancel.token}",
+                            }
+                        ],
+                    ]
+                },
+            },
+            route={
+                "target_type": "agent",
+                "target_id": str(row["agent_id"]),
+                "policy": "reply",
+                "ttl_seconds": 30 * 60,
+            },
+            serialize_key=str(serialize_key),
+            now=timestamp,
+        )
+
+    def enqueue_topic_teardown_prompt_for_surface(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int,
+        authorized_user_id: int,
+        source_inbox_job_id: int,
+        now: Optional[float] = None,
+    ) -> int:
+        """Post a confirmation card for a direct /teardown command."""
+        timestamp = time.time() if now is None else float(now)
+        if int(message_thread_id) <= 0:
+            raise StoreError("/teardown only works inside a managed topic.")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT a.agent_id, a.surface_binding_id, a.role,
+                    b.chat_id, b.message_thread_id, b.display_name
+                FROM surface_bindings AS b
+                JOIN agents AS a
+                    ON a.surface_binding_id = b.binding_id
+                    AND b.target_type = 'agent'
+                    AND b.target_id = a.agent_id
+                WHERE b.chat_id = ? AND b.message_thread_id = ?
+                    AND b.state = 'active'
+                """,
+                (int(chat_id), int(message_thread_id)),
+            ).fetchone()
+            if row is None:
+                raise StoreError(
+                    "/teardown only works inside an active managed agent topic."
+                )
+            prefix = f"inbox:{int(source_inbox_job_id)}:topic-teardown"
+            message_id = self._enqueue_topic_teardown_prompt(
+                row=row,
+                authorized_user_id=int(authorized_user_id),
+                confirm_operation_id=f"{prefix}-confirm",
+                cancel_operation_id=f"{prefix}-cancel",
+                prompt_operation_id=f"{prefix}-prompt",
+                serialize_key=(
+                    f"topic-teardown-prompt:{int(chat_id)}:"
+                    f"{int(message_thread_id)}"
+                ),
+                timestamp=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return message_id
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
     def enqueue_agent_topic_teardown_prompt(
         self,
         *,
@@ -7858,8 +8001,9 @@ class DurableStore:
             )
             row = self.connection.execute(
                 """
-                SELECT a.surface_binding_id, a.role, m.source_inbox_job_id,
-                    b.chat_id, b.message_thread_id, b.display_name
+                SELECT a.agent_id, a.surface_binding_id, a.role,
+                    m.source_inbox_job_id, b.chat_id, b.message_thread_id,
+                    b.display_name
                 FROM agent_mailbox AS m
                 JOIN agents AS a ON a.agent_id = m.agent_id
                 JOIN surface_bindings AS b
@@ -7878,11 +8022,7 @@ class DurableStore:
                     timestamp,
                 ),
             ).fetchone()
-            if (
-                row is None
-                or str(row["role"]) not in {"project", "worker"}
-                or int(row["message_thread_id"]) <= 0
-            ):
+            if row is None:
                 raise StoreError("Managed topic teardown is unavailable here.")
             if (
                 target.chat_id != int(row["chat_id"])
@@ -7897,84 +8037,23 @@ class DurableStore:
             )
             if authorized_user_id is None:
                 raise StoreError("The teardown requester could not be authorized.")
-            payload = {
-                "agent_id": str(agent_id),
-                "binding_id": int(row["surface_binding_id"]),
-                "chat_id": int(row["chat_id"]),
-                "message_thread_id": int(row["message_thread_id"]),
-                "display_name": str(row["display_name"]),
-            }
-            confirm = self.create_callback_action(
-                operation_id=(
+            message_id = self._enqueue_topic_teardown_prompt(
+                row=row,
+                authorized_user_id=authorized_user_id,
+                confirm_operation_id=(
                     f"agent-mailbox:{int(mailbox_id)}:"
                     "topic-teardown-confirm"
                 ),
-                action_type="agent_topic_teardown_confirm",
-                payload=payload,
-                chat_id=int(row["chat_id"]),
-                message_thread_id=int(row["message_thread_id"]),
-                authorized_user_id=authorized_user_id,
-                one_time=False,
-                ttl_seconds=30 * 60,
-                now=timestamp,
-            )
-            cancel = self.create_callback_action(
-                operation_id=(
+                cancel_operation_id=(
                     f"agent-mailbox:{int(mailbox_id)}:"
                     "topic-teardown-cancel"
                 ),
-                action_type="agent_topic_teardown_cancel",
-                payload=payload,
-                chat_id=int(row["chat_id"]),
-                message_thread_id=int(row["message_thread_id"]),
-                authorized_user_id=authorized_user_id,
-                one_time=True,
-                ttl_seconds=30 * 60,
-                now=timestamp,
-            )
-            message_id = self.enqueue_api_call(
-                operation_id=(
+                prompt_operation_id=(
                     f"agent-mailbox:{int(mailbox_id)}:"
                     "topic-teardown-prompt"
                 ),
-                method="sendMessage",
-                params={
-                    "chat_id": int(row["chat_id"]),
-                    "message_thread_id": int(row["message_thread_id"]),
-                    "text": (
-                        "🎛 Control\n\n"
-                        "Tear down this managed topic and its session?\n\n"
-                        f"Topic: {str(row['display_name'])}\n\n"
-                        "This permanently deletes the Telegram topic and its "
-                        "message history. Telegram Control will archive the "
-                        "agent, clear its provider session, and revoke its "
-                        "routes, buttons, and cards."
-                    ),
-                    "reply_markup": {
-                        "inline_keyboard": [
-                            [
-                                {
-                                    "text": "Delete topic & session",
-                                    "callback_data": f"a:{confirm.token}",
-                                }
-                            ],
-                            [
-                                {
-                                    "text": "Cancel",
-                                    "callback_data": f"a:{cancel.token}",
-                                }
-                            ],
-                        ]
-                    },
-                },
-                route={
-                    "target_type": "agent",
-                    "target_id": str(agent_id),
-                    "policy": "reply",
-                    "ttl_seconds": 30 * 60,
-                },
                 serialize_key=f"agent-notification:{int(mailbox_id)}",
-                now=timestamp,
+                timestamp=timestamp,
             )
             self.connection.execute("COMMIT")
             return message_id

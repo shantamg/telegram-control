@@ -8322,6 +8322,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 menu = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(menu.method, "sendMessage")
                 self.assertIn("Telegram Control help", menu.params["text"])
+                self.assertIn("/teardown", menu.params["text"])
                 buttons = menu.params["reply_markup"]["inline_keyboard"]
                 labels = {
                     button["text"]
@@ -8336,15 +8337,15 @@ class DurableIntegrationTests(unittest.TestCase):
                     ).fetchone()[0],
                     0,
                 )
-                agent_button = next(
+                teardown_button = next(
                     button
                     for row in buttons
                     for button in row
-                    if button["text"] == "Agents & sessions"
+                    if button["text"] == "Topic teardown"
                 )
                 callback = callback_update(
                     11,
-                    agent_button["callback_data"],
+                    teardown_button["callback_data"],
                     message_id=700,
                     message_thread_id=62,
                 )
@@ -8368,13 +8369,91 @@ class DurableIntegrationTests(unittest.TestCase):
                 page = next(
                     item for item in outbound if item.method == "editMessageText"
                 )
-                self.assertIn("Agents and sessions", page.params["text"])
+                self.assertIn("Safe topic teardown", page.params["text"])
+                self.assertIn("/teardown", page.params["text"])
                 page_labels = {
                     button["text"]
                     for row in page.params["reply_markup"]["inline_keyboard"]
                     for button in row
                 }
                 self.assertIn("← Help menu", page_labels)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM router_mailbox"
+                    ).fetchone()[0],
+                    0,
+                )
+
+    def test_teardown_command_opens_confirmation_without_an_agent_turn(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Stage 2 Test",
+                    target_type="controller",
+                    target_id="control",
+                )
+                agent, _ = store.register_project_agent(
+                    chat_id=123,
+                    surface_name="Stage 2 Test",
+                    slug="telegram-control",
+                    provider="codex",
+                    project_path="/tmp/telegram-control",
+                )
+                store.ingest_update(
+                    topic_message_update(10, "/teardown"),
+                    now=100,
+                )
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    job,
+                    "worker",
+                )
+
+                prompt = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(prompt.method, "sendMessage")
+                self.assertEqual(prompt.params["message_thread_id"], 62)
+                self.assertIn(
+                    "Tear down this managed topic",
+                    prompt.params["text"],
+                )
+                labels = [
+                    button["text"]
+                    for row in prompt.params["reply_markup"]["inline_keyboard"]
+                    for button in row
+                ]
+                self.assertEqual(
+                    labels,
+                    ["Delete topic & session", "Cancel"],
+                )
+                confirm = store.connection.execute(
+                    """
+                    SELECT authorized_user_id, payload_json
+                    FROM callback_actions
+                    WHERE action_type = 'agent_topic_teardown_confirm'
+                    """
+                ).fetchone()
+                self.assertEqual(int(confirm["authorized_user_id"]), 123)
+                self.assertEqual(
+                    json.loads(confirm["payload_json"])["agent_id"],
+                    agent.agent_id,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM agent_mailbox"
+                    ).fetchone()[0],
+                    0,
+                )
                 self.assertEqual(
                     store.connection.execute(
                         "SELECT COUNT(*) FROM router_mailbox"

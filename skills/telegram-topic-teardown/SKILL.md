@@ -5,15 +5,22 @@ description: Safely tear down, delete, remove, archive, or close the current man
 
 # Managed Telegram Topic Teardown
 
-Request the confirmation card from the active managed turn:
+Prefer the deterministic Telegram command:
 
-```bash
-/usr/bin/python3 /Users/shantam/telegram-control/agent_telegram.py \
-  topic-teardown
+```text
+/teardown
 ```
 
-Run the command only from the managed topic being removed. It is scoped by the
-active mailbox lease and does not accept a chat ID, topic ID, or agent ID.
+It opens the confirmation card directly without invoking an LLM. If already
+handling a natural-language teardown request inside an active managed turn,
+request the same card with:
+
+```bash
+/usr/bin/python3 /Users/shantam/telegram-control/agent_telegram.py topic-teardown
+```
+
+Use either path only from the managed topic being removed. Neither accepts a
+chat ID, topic ID, or agent ID.
 
 Tell the user to use the Telegram confirmation card. Do not claim the topic was
 removed merely because the card was posted.

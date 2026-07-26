@@ -21,6 +21,7 @@ Choose a topic below.
 Quick commands:
 /help — browse this guide
 /agent — inspect or manage this topic's agent
+/teardown — safely remove this managed topic and session
 /status — inspect this Telegram surface
 /projects — list enrolled projects"""
 
@@ -49,7 +50,7 @@ Messages in a report-only topic do not steer the worker. Return to the main agen
         "Topic teardown",
         """Safe topic teardown
 
-Ask the current managed agent to tear down this topic. It will post a confirmation card before anything destructive happens.
+Type /teardown inside an active managed agent topic. Control opens the confirmation card directly without invoking Codex or Claude.
 
 After confirmation, Telegram Control clears the provider-session pointer, archives the agent binding, revokes routes and buttons, and removes the Telegram topic. Running detached workers that originated here must be stopped first.""",
     ),
