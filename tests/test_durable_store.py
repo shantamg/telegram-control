@@ -314,7 +314,8 @@ class DurableStoreTests(unittest.TestCase):
             source_skill = source_directory / name
             (source_skill / "agents").mkdir(parents=True)
             (source_skill / "SKILL.md").write_text(
-                f"---\nname: {name}\ndescription: Test skill.\n---\n",
+                f"---\nname: {name}\ndescription: Test skill.\n---\n"
+                f"Run {telegram_control.SKILL_ROOT_PLACEHOLDER}/agent_telegram.py\n",
                 encoding="utf-8",
             )
             (source_skill / "agents" / "openai.yaml").write_text(
@@ -339,6 +340,14 @@ class DurableStoreTests(unittest.TestCase):
             self.assertFalse(shared_skill.is_symlink())
             self.assertTrue(claude_skill.is_symlink())
             self.assertEqual(claude_skill.resolve(), shared_skill.resolve())
+            # The installed copy must point at this checkout, not at whatever
+            # absolute path the skill was authored against.
+            installed = (shared_skill / "SKILL.md").read_text(encoding="utf-8")
+            self.assertNotIn(telegram_control.SKILL_ROOT_PLACEHOLDER, installed)
+            self.assertIn(
+                f"Run {source_directory.parent.resolve()}/agent_telegram.py",
+                installed,
+            )
 
     def test_duplicate_update_has_one_job_and_never_moves_offset_backwards(self):
         self.assertTrue(self.store.ingest_update(message_update(10), now=100))

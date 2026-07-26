@@ -23,7 +23,7 @@ Pick a short lowercase slug for the worker (`rails-fix`, `inbox-triage`). It
 names both the tmux session and the topic.
 
 ```bash
-/usr/bin/python3 /Users/shantam/telegram-control/telegram_control.py \
+/usr/bin/python3 {{TELEGRAM_CONTROL_ROOT}}/telegram_control.py \
   worker-start <name> --provider claude --model opus --effort high
 ```
 
@@ -36,7 +36,7 @@ Then give the worker its task. **Write the brief to a file first** and point the
 worker at it — briefs are long, and typing one through `send-keys` is fragile:
 
 ```bash
-/usr/bin/python3 /Users/shantam/telegram-control/telegram_control.py \
+/usr/bin/python3 {{TELEGRAM_CONTROL_ROOT}}/telegram_control.py \
   worker-brief <name> --file /absolute/path/to/BRIEF.md
 ```
 
@@ -50,7 +50,7 @@ conversation.
 Tell the worker, in its brief, to run this whenever it reaches a milestone:
 
 ```bash
-/usr/bin/python3 /Users/shantam/telegram-control/telegram_control.py \
+/usr/bin/python3 {{TELEGRAM_CONTROL_ROOT}}/telegram_control.py \
   worker-report <name> --key <unique-slug> <<'EOF'
 Spoken-style progress update.
 EOF
@@ -63,7 +63,7 @@ paths, no line numbers, no code.
 ## Checking on a worker
 
 ```bash
-/usr/bin/python3 /Users/shantam/telegram-control/telegram_control.py worker-status
+/usr/bin/python3 {{TELEGRAM_CONTROL_ROOT}}/telegram_control.py worker-status
 ```
 
 Reports each worker's intended and observed state. `intended running` with
@@ -83,7 +83,7 @@ is in the buffer and will match. Check for a real artifact instead.
 When the user says the work is finished:
 
 ```bash
-/usr/bin/python3 /Users/shantam/telegram-control/telegram_control.py \
+/usr/bin/python3 {{TELEGRAM_CONTROL_ROOT}}/telegram_control.py \
   worker-stop <name> [--delete-topic]
 ```
 

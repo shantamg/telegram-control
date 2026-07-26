@@ -8,7 +8,7 @@ description: Send a separate Telegram text progress or status update to the curr
 Send a concise update to the topic that owns the current managed turn:
 
 ```bash
-/usr/bin/python3 /Users/shantam/telegram-control/agent_telegram.py text --key milestone-tests <<'EOF'
+/usr/bin/python3 {{TELEGRAM_CONTROL_ROOT}}/agent_telegram.py text --key milestone-tests <<'EOF'
 The implementation is complete. I am running the final test suite now.
 EOF
 ```

@@ -10,6 +10,8 @@ import time
 from pathlib import Path
 from typing import AbstractSet, Optional
 
+import helper_paths
+
 
 SPEECH_DIR = (
     Path.home()
@@ -18,8 +20,17 @@ SPEECH_DIR = (
     / "telegram-bridge"
     / "speech-outbox"
 )
-EDGE_TTS_BINARY = Path.home() / ".local" / "bin" / "edge-tts"
-FFMPEG_BINARY = Path("/opt/homebrew/bin/ffmpeg")
+EDGE_TTS_BINARY = helper_paths.resolve_binary(
+    "edge_tts_binary",
+    Path.home() / ".local" / "bin" / "edge-tts",
+    command_name="edge-tts",
+)
+FFMPEG_BINARY = helper_paths.resolve_binary(
+    "ffmpeg_binary",
+    Path("/opt/homebrew/bin/ffmpeg"),
+    Path("/usr/local/bin/ffmpeg"),
+    command_name="ffmpeg",
+)
 VOICE_NAME = "en-GB-SoniaNeural"
 VOICE_RATE = "+10%"
 MAX_SPEECH_CHARACTERS = 3_500

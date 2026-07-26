@@ -8,7 +8,7 @@ description: Send a Telegram voice message or voice note to the current topic fr
 Send a concise voice note to the topic that owns the current managed turn:
 
 ```bash
-/usr/bin/python3 /Users/shantam/telegram-control/agent_telegram.py voice --key completion <<'EOF'
+/usr/bin/python3 {{TELEGRAM_CONTROL_ROOT}}/agent_telegram.py voice --key completion <<'EOF'
 The requested work is finished and verified.
 EOF
 ```

@@ -1,7 +1,7 @@
 #!/bin/zsh
 
 set -e
-cd "/Users/shantam/telegram-control"
+cd "${0:A:h}"
 
 ./telegram_bridge.py setup
 ./telegram_bridge.py send "✅ Telegram bridge paired with this Mac."

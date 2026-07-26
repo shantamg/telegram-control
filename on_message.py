@@ -17,6 +17,7 @@ import claude_sessions
 import codex_sessions
 import detached_worker
 import discovery
+import helper_paths
 import provider_adapters
 import provider_defaults
 import router_contract
@@ -33,9 +34,18 @@ from durable_store import (
 )
 
 
-HANDY_BINARY = Path("/Applications/Handy.app/Contents/MacOS/handy")
+HANDY_BINARY = helper_paths.resolve_binary(
+    "handy_binary",
+    Path("/Applications/Handy.app/Contents/MacOS/handy"),
+    command_name="handy",
+)
 PARAKEET_MODEL_ID = "parakeet-tdt-0.6b-v3"
-FFMPEG_BINARY = Path("/opt/homebrew/bin/ffmpeg")
+FFMPEG_BINARY = helper_paths.resolve_binary(
+    "ffmpeg_binary",
+    Path("/opt/homebrew/bin/ffmpeg"),
+    Path("/usr/local/bin/ffmpeg"),
+    command_name="ffmpeg",
+)
 MAX_VOICE_BYTES = 20_000_000
 MAX_VOICE_SECONDS = 30 * 60
 MAX_IMAGE_BYTES = 20_000_000
@@ -292,6 +302,15 @@ def inspect_keyboard() -> Optional[dict]:
             ]
         ]
     }
+
+
+def bot_label() -> str:
+    """Name this bot the way the owner sees it, without hardcoding an identity."""
+    try:
+        username = str(bridge.load_config().get("bot_username", "")).strip()
+    except bridge.BridgeError:
+        username = ""
+    return f"@{username}" if username else "this bot"
 
 
 def send_message(
@@ -995,9 +1014,9 @@ def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
             ttl_seconds=60 * 60,
         )
     send_message(
-        "Authorize this private forum for Slam Paws?\n\n"
+        f"Authorize this private forum for {bot_label()}?\n\n"
         f"Forum: {display_name}\n\n"
-        "Only your paired Telegram account will be accepted. Add Slam Paws "
+        f"Only your paired Telegram account will be accepted. Add {bot_label()} "
         "as a forum administrator so ordinary text and voice messages reach "
         "the controller. After authorizing, send your request again.\n\n"
         f"{telegram_help.HELP_HINT}",

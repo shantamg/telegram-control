@@ -48,12 +48,17 @@ from durable_store import (
 DATABASE_PATH = bridge.CONFIG_DIR / "controller.sqlite3"
 SCRIPT_PATH = Path(__file__).resolve()
 SKILLS_SOURCE_DIR = SCRIPT_PATH.parent / "skills"
+# Skill sources are checkout-relative: they refer to this repository through a
+# placeholder that installation resolves to wherever the checkout actually is.
+SKILL_ROOT_PLACEHOLDER = "{{TELEGRAM_CONTROL_ROOT}}"
 SHARED_SKILLS_DIR = Path.home() / ".agents" / "skills"
 CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
 MANAGED_SHARED_SKILLS = (
     "telegram-group-icon",
     "telegram-detached-worker",
     "telegram-topic-teardown",
+    "telegram-text-update",
+    "telegram-voice-message",
 )
 DEFAULT_AGENT_WORKERS = 8
 MAX_AGENT_WORKERS = 16
@@ -2327,6 +2332,21 @@ def configured_launch_agent_mode() -> str:
     return "unknown"
 
 
+def _resolve_skill_placeholders(destination: Path, repository_root: Path) -> None:
+    """Point an installed skill's commands at this checkout."""
+    root = str(repository_root.resolve())
+    for path in sorted(destination.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            text = path.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if SKILL_ROOT_PLACEHOLDER not in text:
+            continue
+        path.write_text(text.replace(SKILL_ROOT_PLACEHOLDER, root))
+
+
 def install_managed_skills(
     source_directory: Path = SKILLS_SOURCE_DIR,
     shared_directory: Path = SHARED_SKILLS_DIR,
@@ -2346,6 +2366,7 @@ def install_managed_skills(
                 f"Shared skill destination must be a real directory: {destination}"
             )
         shutil.copytree(source, destination, dirs_exist_ok=True)
+        _resolve_skill_placeholders(destination, source_directory.parent)
 
         claude_link = claude_directory / name
         relative_target = Path(

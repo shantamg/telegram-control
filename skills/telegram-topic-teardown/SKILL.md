@@ -16,7 +16,7 @@ handling a natural-language teardown request inside an active managed turn,
 request the same card with:
 
 ```bash
-/usr/bin/python3 /Users/shantam/telegram-control/agent_telegram.py topic-teardown
+/usr/bin/python3 {{TELEGRAM_CONTROL_ROOT}}/agent_telegram.py topic-teardown
 ```
 
 Use either path only from the managed topic being removed. Neither accepts a

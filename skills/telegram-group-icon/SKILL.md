@@ -20,7 +20,7 @@ does not accept a chat ID and refuses private chats.
 3. Apply it to the current group:
 
 ```bash
-/usr/bin/python3 /Users/shantam/telegram-control/agent_telegram.py \
+/usr/bin/python3 {{TELEGRAM_CONTROL_ROOT}}/agent_telegram.py \
   group-icon --image /absolute/path/to/icon.png
 ```
 

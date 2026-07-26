@@ -1,5 +1,35 @@
 # Repository Instructions
 
+Telegram Control runs local Codex and Claude agents from Telegram. Start with
+[README.md](README.md) for what it is and how it is set up.
+
+## Where to look things up
+
+| If you need | Read |
+| --- | --- |
+| Orientation, setup, commands, repository map | [README.md](README.md) |
+| Exact behavior, invariants, and failure semantics of a mechanism | [docs/IMPLEMENTATION_NOTES.md](docs/IMPLEMENTATION_NOTES.md) |
+| Original design, principles, stages, acceptance gates | [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) |
+| What the user sees in Telegram (`/help` copy) | [telegram_help.py](telegram_help.py) |
+| What agents may do from inside a turn | [skills/](skills/) |
+| Persistence, schema, migrations, queues, routes | `durable_store.py` |
+| Per-turn handling, commands, cards, confirmations | `on_message.py` |
+| Turn execution for Codex and Claude | `provider_adapters.py` |
+| The Control agent's tool vocabulary and its eval gate | `router_contract.py`, `router_eval.py` |
+
+`AGENTS.md` is a symlink to this file; edit this one.
+
+## Keep the docs in step with the code
+
+When you change or add a user-facing feature, update the in-Telegram help copy
+in `telegram_help.py` in the same change, and the README if the setup path,
+commands, or repository map moved. Record new behavior and what you verified in
+`docs/IMPLEMENTATION_NOTES.md`.
+
+Nothing here should hardcode a personal path, username, or bot name: this repo
+is meant to be usable by someone else's setup. Resolve paths from the script
+location, `Path.home()`, or config.
+
 After completing changes in this repository, always commit the completed work
 and push the commit to the configured remote before reporting completion.
 
