@@ -345,6 +345,30 @@ def addressed_command(text: str) -> str:
     return f"{command} {rest}" if rest else command
 
 
+def remove_addressed_command_message(text: str, command: str) -> None:
+    """Delete a command message that only Telegram's client made ugly.
+
+    Tapping a command from a group's menu inserts `/status@yourbot`. Nothing in
+    the Bot API can stop the client from writing that, but the message itself is
+    disposable once the command has been handled: the reply says what happened.
+    A command the owner typed is left alone — it already reads cleanly — so this
+    only ever removes the mention-suffixed form.
+    """
+    if text.strip() == command:
+        return
+    if os.environ.get("TELEGRAM_CHAT_TYPE") not in {"group", "supergroup"}:
+        return
+    message_id = os.environ.get("TELEGRAM_MESSAGE_ID")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not message_id or not chat_id:
+        return
+    deliver_api_call(
+        "deleteMessage",
+        {"chat_id": int(chat_id), "message_id": int(message_id)},
+        "addressed-command-cleanup",
+    )
+
+
 def bot_label() -> str:
     """Name this bot the way the owner sees it, without hardcoding an identity."""
     username = bot_username()
@@ -4447,6 +4471,7 @@ def main() -> int:
                 return 0
             replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
             command = addressed_command(text)
+            handled_command = True
             agent_create = re.fullmatch(
                 r"/agent\s+create\s+([a-z0-9]+(?:-[a-z0-9]+)*)",
                 command.lower(),
@@ -4484,6 +4509,9 @@ def main() -> int:
                     send_agent_status()
             else:
                 route_user_input(update, text)
+                handled_command = False
+            if handled_command:
+                remove_addressed_command_message(text, command)
         else:
             send_message(
                 "Send me text, an image, or a Telegram voice message.\n\n"

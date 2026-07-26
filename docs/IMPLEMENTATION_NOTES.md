@@ -1197,7 +1197,23 @@ Verified with an integration test that sends `/projects@example_bot` into a grou
 topic and asserts the catalog reply with no router turn, then sends
 `/projects@someone_else` and asserts it is routed as ordinary text instead.
 Because `on_message.py` is re-read per turn, this fix was live without a restart.
-Full suite green at 350 tests.
+
+Handling it correctly still left the suffix on screen, which is Telegram's client
+writing into the input field — no Bot API call influences that, and
+`setMyCommands` has no flag for it. The one real lever is BotFather's Group
+Privacy setting: `getMe` reports `can_read_all_group_messages: false`, meaning
+privacy mode is on, so a bare `/status` would not be delivered to this bot in a
+group and the client addresses it explicitly to compensate. Turning Group Privacy
+off is the owner's call in BotFather; nothing here changes behavior when it does,
+because promoting the bot to administrator already gives it the same visibility
+and the transport still discards every message that is not from the paired owner.
+
+Independently of that setting, `remove_addressed_command_message` deletes the
+command message once the command has been handled, but only when the text
+actually carried the mention — a command the owner typed reads cleanly and is
+left in place. The reply is what conveys the outcome, so the disposable half is
+the request. Its test asserts the tapped form queues exactly one `deleteMessage`
+for that message and the typed form queues none. Full suite green at 351 tests.
 
 ## Stage 0 legacy bridge commands
 

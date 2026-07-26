@@ -9719,6 +9719,33 @@ class DurableIntegrationTests(unittest.TestCase):
                     store.status_counts().get("router_mailbox", {}),
                     {},
                 )
+                # The client wrote the @mention, so the message itself is
+                # cleaned up once the command has been handled.
+                cleanup = store.connection.execute(
+                    """
+                    SELECT params_json FROM outbox_messages
+                    WHERE method = 'deleteMessage'
+                    """
+                ).fetchall()
+                self.assertEqual(
+                    [json.loads(row["params_json"]) for row in cleanup],
+                    [{"chat_id": -100777, "message_id": 99}],
+                )
+
+                # A command the owner typed reads cleanly and is left alone.
+                typed = topic_message_update(12, "/projects", 62)
+                typed["message"]["chat"] = dict(forum_chat)
+                typed["message"]["reply_to_message"]["chat"] = dict(forum_chat)
+                process(typed, "worker-typed", 102)
+                self.assertEqual(
+                    store.connection.execute(
+                        """
+                        SELECT COUNT(*) FROM outbox_messages
+                        WHERE method = 'deleteMessage'
+                        """
+                    ).fetchone()[0],
+                    1,
+                )
 
                 # A command addressed to another bot is not ours to handle.
                 other = topic_message_update(11, "/projects@someone_else", 62)
