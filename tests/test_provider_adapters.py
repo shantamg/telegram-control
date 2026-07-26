@@ -150,6 +150,7 @@ class CodexEventTests(unittest.TestCase):
                 "cwd": "/tmp/project",
                 "sandbox": "danger-full-access",
                 "approvalPolicy": "never",
+                "developerInstructions": turn_guidance.TURN_GUIDANCE,
             },
         )
 
@@ -329,7 +330,7 @@ class ClaudeEventTests(unittest.TestCase):
         ):
             adapter.command(invalid, None)
 
-    def test_turn_guidance_is_appended_for_every_permission_mode(self):
+    def test_turn_guidance_is_appended_for_new_and_resumed_sessions(self):
         adapter = provider_adapters.ClaudePrintAdapter(binary="/bin/claude")
 
         for permission_mode in ("bypassPermissions", "acceptEdits"):
@@ -339,10 +340,19 @@ class ClaudeEventTests(unittest.TestCase):
                     "provider_config": {"permission_mode": permission_mode},
                 }
             )
-            command = adapter.command(agent, None)
-            self.assertIn("--append-system-prompt", command)
-            index = command.index("--append-system-prompt")
-            self.assertEqual(command[index + 1], turn_guidance.TURN_GUIDANCE)
+            for session_id in (None, "desktop-session"):
+                command = adapter.command(agent, session_id)
+                self.assertIn("--append-system-prompt", command)
+                index = command.index("--append-system-prompt")
+                self.assertEqual(
+                    command[index + 1],
+                    turn_guidance.TURN_GUIDANCE,
+                )
+                if session_id:
+                    self.assertEqual(
+                        command[-2:],
+                        ["--resume", session_id],
+                    )
 
         self.assertTrue(adapter.capabilities().turn_guidance)
 
@@ -352,6 +362,14 @@ class ClaudeEventTests(unittest.TestCase):
         text = turn_guidance.TURN_GUIDANCE.lower()
         self.assertIn("background", text)
         self.assertIn("tmux", text)
+
+    def test_turn_guidance_identifies_resumed_turn_as_telegram_managed(self):
+        text = turn_guidance.TURN_GUIDANCE.lower()
+        self.assertIn("telegram control-managed turn", text)
+        self.assertIn("local terminal", text)
+        self.assertIn("telegram_control_", text)
+        self.assertIn("voice note", text)
+        self.assertIn("session's history", text)
 
 
 class TurnGuidanceCapabilityTests(unittest.TestCase):
@@ -364,9 +382,24 @@ class TurnGuidanceCapabilityTests(unittest.TestCase):
         ):
             self.assertIsInstance(adapter.capabilities().turn_guidance, bool)
 
-    def test_codex_reports_guidance_unsupported_until_wired(self):
+    def test_codex_delivers_guidance_on_new_and_resumed_threads(self):
         adapter = provider_adapters.CodexExecAdapter(binary="/bin/codex")
-        self.assertFalse(adapter.capabilities().turn_guidance)
+        self.assertTrue(adapter.capabilities().turn_guidance)
+        for session_id, expected_method in (
+            (None, "thread/start"),
+            ("desktop-session", "thread/resume"),
+        ):
+            method, params = adapter._thread_request(
+                session_id,
+                "/tmp/project",
+                None,
+                "danger-full-access",
+            )
+            self.assertEqual(method, expected_method)
+            self.assertEqual(
+                params["developerInstructions"],
+                turn_guidance.TURN_GUIDANCE,
+            )
 
 
 class ConsoleCommandTests(unittest.TestCase):
@@ -614,6 +647,7 @@ class LiveControlContractTests(unittest.TestCase):
                     "cwd": "/tmp/project/app",
                     "sandbox": "workspace-write",
                     "approvalPolicy": "never",
+                    "developerInstructions": turn_guidance.TURN_GUIDANCE,
                     "model": "gpt-test",
                 },
             },

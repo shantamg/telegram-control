@@ -498,11 +498,8 @@ class CodexExecAdapter:
             interrupt=True,
             structured_events=True,
             interactive_console=True,
-            # Not yet wired. Codex is driven over the app-server protocol
-            # rather than a plain command line, so appending guidance means
-            # a config override or a session-start field, not an extra flag.
-            # Declared false so the gap is visible instead of assumed.
-            turn_guidance=False,
+            # Delivered as developer instructions in _thread_request().
+            turn_guidance=True,
         )
 
     def console_command(self, agent: ManagedAgent) -> list[str]:
@@ -570,6 +567,7 @@ class CodexExecAdapter:
             "cwd": launch_directory,
             "sandbox": sandbox,
             "approvalPolicy": "never",
+            "developerInstructions": TURN_GUIDANCE,
         }
         if model:
             params["model"] = str(model)
