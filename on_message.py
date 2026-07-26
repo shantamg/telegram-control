@@ -2163,6 +2163,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "stopping": "Stopping the active Codex turn…",
             "starting": "Stop queued while Codex starts…",
             "cancelled": "Cancelled before it started.",
+            "cleared": "Cleared the stopped turn; the next message can start.",
             "finished": "That turn already finished.",
         }[outcome]
         if callback_query_id:

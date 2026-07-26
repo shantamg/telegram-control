@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import subprocess
 import time
@@ -23,6 +24,27 @@ import telegram_help
 SCHEMA_VERSION = 23
 
 CONTROL_SPEAKER = "🎛 Control"
+
+_LOCAL_AGENT_LEASE_OWNER = re.compile(
+    r"(.+):([1-9][0-9]*):agent:[A-Za-z0-9_-]+"
+)
+
+
+def _local_agent_lease_owner_is_gone(lease_owner: Optional[str]) -> bool:
+    """Prove that a standard local agent lease no longer has a worker process."""
+
+    match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(str(lease_owner or ""))
+    if match is None or match.group(1) != socket.gethostname():
+        return False
+    try:
+        os.kill(int(match.group(2)), 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        # Permission failures and other ambiguous process errors are not proof
+        # that the worker is gone.
+        return False
+    return False
 
 
 def context_usage_summary(usage: Optional[dict[str, Any]]) -> Optional[str]:
@@ -10042,14 +10064,14 @@ class DurableStore:
         message_thread_id: Optional[int],
         now: Optional[float] = None,
     ) -> str:
-        """Persist Stop, or cancel locally if the provider has not started."""
+        """Persist Stop, or cancel locally when no worker can receive it."""
         timestamp = time.time() if now is None else float(now)
         thread_id = int(message_thread_id) if message_thread_id is not None else 0
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             row = self.connection.execute(
                 """
-                SELECT state, provider_turn_id
+                SELECT state, provider_turn_id, lease_owner
                 FROM agent_mailbox
                 WHERE mailbox_id = ? AND agent_id = ?
                 """,
@@ -10085,6 +10107,79 @@ class DurableStore:
                 )
                 self.connection.execute("COMMIT")
                 return "cancelled"
+            if _local_agent_lease_owner_is_gone(row["lease_owner"]):
+                orphaned_owner = str(row["lease_owner"])
+                self.connection.execute(
+                    """
+                    UPDATE agent_mailbox
+                    SET state = 'cancelled', lease_owner = NULL,
+                        lease_expires_at = NULL, provider_turn_id = NULL,
+                        last_error =
+                            'Cleared orphaned turn after Stop.',
+                        updated_at = ?
+                    WHERE mailbox_id = ? AND state = 'leased'
+                    """,
+                    (timestamp, int(mailbox_id)),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE agents
+                    SET lifecycle_state = 'registered', updated_at = ?
+                    WHERE agent_id = ? AND lifecycle_state = 'running'
+                    """,
+                    (timestamp, agent_id),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE agent_turn_controls
+                    SET state = 'rejected',
+                        result_text =
+                            'The turn was cleared after its worker exited.',
+                        updated_at = ?
+                    WHERE mailbox_id = ?
+                        AND state IN ('queued', 'delivery_in_flight')
+                    """,
+                    (timestamp, int(mailbox_id)),
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO events(
+                        kind, subject_type, subject_id, details_json, created_at
+                    )
+                    VALUES (
+                        'agent_turn_orphan_cleared', 'agent_mailbox', ?, ?, ?
+                    )
+                    """,
+                    (
+                        str(int(mailbox_id)),
+                        json.dumps(
+                            {
+                                "agent_id": agent_id,
+                                "lease_owner": orphaned_owner,
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        timestamp,
+                    ),
+                )
+                self._enqueue_finished_agent_control_edits(
+                    mailbox_id,
+                    timestamp,
+                )
+                self._expire_agent_stop_action(mailbox_id, timestamp)
+                self._enqueue_agent_status_edit(
+                    mailbox_id,
+                    "cancelled",
+                    self.label_text(
+                        self.agent_card_header(int(mailbox_id), agent_id),
+                        "⏹ Cleared after worker exit.",
+                    ),
+                    timestamp,
+                    terminal=True,
+                )
+                self.connection.execute("COMMIT")
+                return "cleared"
             provider_turn_id = (
                 str(row["provider_turn_id"])
                 if row["provider_turn_id"] is not None

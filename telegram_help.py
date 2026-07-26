@@ -79,7 +79,7 @@ Send a Telegram photo or any document normally, with an optional caption. Attach
 
 Send a Telegram voice note normally; it is transcribed locally and routed like text.
 
-Reply to an exact Control or agent message to continue that routed conversation. During an active turn, a reply to its progress card can steer or stop the work. Agents can also send requested voice or text progress updates through scoped Telegram skills.""",
+Reply to an exact Control or agent message to continue that routed conversation. During an active turn, a reply to its progress card can steer the work, and its Stop button interrupts the provider. If the owning worker has already exited, Stop clears the orphaned turn immediately so the next queued message can start. Agents can also send requested voice or text progress updates through scoped Telegram skills.""",
     ),
     HelpTopic(
         "skills",

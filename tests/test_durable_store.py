@@ -3689,6 +3689,138 @@ class DurableStoreTests(unittest.TestCase):
         ).fetchone()["state"]
         self.assertEqual(state, "cancelled")
 
+    def test_stop_clears_dead_local_worker_and_unblocks_next_message(self):
+        agent, _, _ = self._setup_routed_agent_turn()
+        dead_owner = (
+            f"{telegram_control.socket.gethostname()}:999999:"
+            "agent:deadbeef"
+        )
+        mailbox = self.store.claim_agent_mailbox(dead_owner, now=109)
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            dead_owner,
+            "turn-orphaned",
+            now=110,
+        )
+        self.store.ingest_update(callback_update(15, data="a:unused"), now=111)
+        callback_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 15"
+            ).fetchone()["job_id"]
+        )
+        self.store.ingest_update(
+            message_update(16, text="do the next thing"),
+            now=112,
+        )
+        next_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 16"
+            ).fetchone()["job_id"]
+        )
+        next_mailbox_id = self.store.enqueue_agent_message(
+            agent.agent_id,
+            next_job_id,
+            "do the next thing",
+            now=112,
+        )
+
+        with mock.patch(
+            "durable_store.os.kill",
+            side_effect=ProcessLookupError,
+        ) as kill:
+            outcome = self.store.request_agent_turn_cancel(
+                mailbox.mailbox_id,
+                agent.agent_id,
+                callback_job_id,
+                123,
+                None,
+                now=113,
+            )
+
+        self.assertEqual(outcome, "cleared")
+        kill.assert_called_once_with(999999, 0)
+        cleared = self.store.connection.execute(
+            """
+            SELECT state, lease_owner, lease_expires_at, provider_turn_id,
+                last_error
+            FROM agent_mailbox
+            WHERE mailbox_id = ?
+            """,
+            (mailbox.mailbox_id,),
+        ).fetchone()
+        self.assertEqual(cleared["state"], "cancelled")
+        self.assertIsNone(cleared["lease_owner"])
+        self.assertIsNone(cleared["lease_expires_at"])
+        self.assertIsNone(cleared["provider_turn_id"])
+        self.assertIn("orphaned", cleared["last_error"])
+        event = self.store.connection.execute(
+            """
+            SELECT subject_id, details_json
+            FROM events
+            WHERE kind = 'agent_turn_orphan_cleared'
+            """
+        ).fetchone()
+        self.assertEqual(event["subject_id"], str(mailbox.mailbox_id))
+        self.assertEqual(
+            json.loads(event["details_json"]),
+            {
+                "agent_id": agent.agent_id,
+                "lease_owner": dead_owner,
+            },
+        )
+        replacement = self.store.claim_agent_mailbox(
+            "replacement-worker",
+            now=114,
+        )
+        self.assertEqual(replacement.mailbox_id, next_mailbox_id)
+
+    def test_stop_does_not_clear_live_local_worker(self):
+        agent, _, _ = self._setup_routed_agent_turn()
+        live_owner = (
+            f"{telegram_control.socket.gethostname()}:999998:"
+            "agent:alivefeed"
+        )
+        mailbox = self.store.claim_agent_mailbox(live_owner, now=109)
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            live_owner,
+            "turn-live",
+            now=110,
+        )
+        self.store.ingest_update(callback_update(17, data="a:unused"), now=111)
+        callback_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 17"
+            ).fetchone()["job_id"]
+        )
+
+        with mock.patch("durable_store.os.kill") as kill:
+            outcome = self.store.request_agent_turn_cancel(
+                mailbox.mailbox_id,
+                agent.agent_id,
+                callback_job_id,
+                123,
+                None,
+                now=112,
+            )
+
+        self.assertEqual(outcome, "stopping")
+        kill.assert_called_once_with(999998, 0)
+        state = self.store.connection.execute(
+            "SELECT state FROM agent_mailbox WHERE mailbox_id = ?",
+            (mailbox.mailbox_id,),
+        ).fetchone()["state"]
+        self.assertEqual(state, "leased")
+        control_state = self.store.connection.execute(
+            """
+            SELECT state
+            FROM agent_turn_controls
+            WHERE mailbox_id = ? AND control_type = 'cancel'
+            """,
+            (mailbox.mailbox_id,),
+        ).fetchone()["state"]
+        self.assertEqual(control_state, "queued")
+
     def _assert_stop_survives_worker_crash_and_is_never_retried(
         self,
         control_state,

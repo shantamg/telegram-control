@@ -35,6 +35,8 @@ transcription runs on-device; only optional spoken replies leave the machine.
 - **Live turn control.** Each turn gets a progress card that streams the
   provider's user-facing output, a **⏹ Stop** button, and reply-to-steer: reply
   to the card and your text or voice becomes guidance for that exact turn.
+  Stop also clears a locally orphaned turn immediately, so the next queued
+  message is not held behind a dead worker's lease.
 - **Durability as the design.** Every update, job, and outbound API call is
   committed to SQLite before it is acted on, with leases, retries, dead-letter
   states, and a single ordered delivery lock. Killing any process mid-turn

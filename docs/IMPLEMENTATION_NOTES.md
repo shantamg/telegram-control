@@ -612,7 +612,18 @@ ID and adds a durable control queue for active worker turns:
   follow-up turn instead.
 - Stop is durable before and after the provider turn ID becomes available. It
   is delivered through app-server `turn/interrupt`; a cancellation is terminal
-  and is never retried as a failed turn.
+  and is never retried as a failed turn. If Stop can prove that a standard
+  same-host lease owner process no longer exists, it atomically clears that
+  orphaned turn instead of waiting for lease expiry; ambiguous, remote, or
+  permission-denied process checks retain the durable interrupt path. Clearing
+  releases the per-agent mailbox immediately so the next queued message can
+  start, and the terminal card says that the worker exited rather than claiming
+  that the provider acknowledged an interrupt. The clear is recorded as an
+  `agent_turn_orphan_cleared` event with the mailbox, agent, and former lease
+  owner. Verified on July 26, 2026 with regression tests for a dead same-host
+  worker immediately releasing the next queued turn, a live same-host worker
+  retaining the native Stop path, and all three existing crash/Stop recovery
+  states.
 - Controls are tied to the active mailbox lease and expected provider turn.
   Lease recovery rejects uncertain in-flight controls instead of replaying
   them against a replacement turn.
