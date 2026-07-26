@@ -1,0 +1,6 @@
+interface:
+  display_name: "Telegram Topic Teardown"
+  short_description: "Safely tear down the current managed topic"
+  default_prompt: "Use $telegram-topic-teardown to safely remove this managed Telegram topic and its session."
+policy:
+  allow_implicit_invocation: true

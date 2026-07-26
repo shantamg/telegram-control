@@ -3475,14 +3475,11 @@ class DurableStore:
                 (timestamp, int(binding_id)),
             )
             if agent_id is not None:
-                self.connection.execute(
-                    """
-                    UPDATE agents
-                    SET lifecycle_state = 'stopped',
-                        provider_session_id = NULL, updated_at = ?
-                    WHERE agent_id = ?
-                    """,
-                    (timestamp, agent_id),
+                self._archive_agent_for_retired_surface(
+                    agent_id,
+                    int(binding_id),
+                    explanation,
+                    timestamp,
                 )
             self.connection.execute(
                 """
@@ -3523,6 +3520,233 @@ class DurableStore:
             return True
         except BaseException:
             self.connection.execute("ROLLBACK")
+            raise
+
+    def _archive_agent_for_retired_surface(
+        self,
+        agent_id: str,
+        binding_id: int,
+        reason: str,
+        timestamp: float,
+    ) -> None:
+        """Detach a historical agent identity so its project can be reattached."""
+        row = self.connection.execute(
+            """
+            SELECT slug, hierarchical_name
+            FROM agents
+            WHERE agent_id = ? AND surface_binding_id = ?
+            """,
+            (str(agent_id), int(binding_id)),
+        ).fetchone()
+        if row is None:
+            raise StoreError("Managed agent surface changed during archival.")
+        archived_slug = f"retired_{agent_id}"
+        archived_name = f"retired--{agent_id}"
+        cursor = self.connection.execute(
+            """
+            UPDATE agents
+            SET slug = ?, hierarchical_name = ?, surface_binding_id = NULL,
+                lifecycle_state = 'stopped', provider_session_id = NULL,
+                updated_at = ?
+            WHERE agent_id = ? AND surface_binding_id = ?
+            """,
+            (
+                archived_slug,
+                archived_name,
+                float(timestamp),
+                str(agent_id),
+                int(binding_id),
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise StoreError("Managed agent changed during archival.")
+        self.connection.execute(
+            """
+            INSERT INTO events(
+                kind, subject_type, subject_id, details_json, created_at
+            )
+            VALUES ('managed_agent_archived', 'agent', ?, ?, ?)
+            """,
+            (
+                str(agent_id),
+                json.dumps(
+                    {
+                        "binding_id": int(binding_id),
+                        "hierarchical_name": str(row["hierarchical_name"]),
+                        "reason": str(reason),
+                        "slug": str(row["slug"]),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                float(timestamp),
+            ),
+        )
+
+    def teardown_managed_topic(
+        self,
+        *,
+        binding_id: int,
+        agent_id: str,
+        delete_operation_id: str,
+        reason: str = "Confirmed managed topic teardown.",
+        now: Optional[float] = None,
+    ) -> SurfaceBinding:
+        """Archive an idle managed topic and durably queue its Telegram deletion."""
+        timestamp = time.time() if now is None else float(now)
+        explanation = str(reason).strip()[:1000]
+        if not explanation or not delete_operation_id:
+            raise StoreError("Managed topic teardown metadata is invalid.")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT b.*
+                FROM surface_bindings AS b
+                JOIN agents AS a
+                    ON a.surface_binding_id = b.binding_id
+                    AND b.target_type = 'agent'
+                    AND b.target_id = a.agent_id
+                WHERE b.binding_id = ? AND a.agent_id = ?
+                    AND b.state = 'active' AND b.message_thread_id != 0
+                    AND a.role IN ('project', 'worker')
+                """,
+                (int(binding_id), str(agent_id)),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Managed topic is no longer available.")
+            busy = self.connection.execute(
+                """
+                SELECT 1
+                FROM agent_mailbox
+                WHERE agent_id = ? AND state IN ('queued', 'leased')
+                UNION ALL
+                SELECT 1
+                FROM agent_consoles
+                WHERE agent_id = ? AND state IN ('starting', 'running')
+                LIMIT 1
+                """,
+                (str(agent_id), str(agent_id)),
+            ).fetchone()
+            if busy is not None:
+                raise StoreError(
+                    "Wait for the active agent turn or console to finish, "
+                    "then confirm again."
+                )
+            worker = self.connection.execute(
+                """
+                SELECT name
+                FROM detached_workers
+                WHERE origin_agent_id = ?
+                ORDER BY worker_id
+                LIMIT 1
+                """,
+                (str(agent_id),),
+            ).fetchone()
+            if worker is not None:
+                raise StoreError(
+                    "Stop detached worker "
+                    f"'{str(worker['name'])}' before tearing down this topic."
+                )
+
+            chat_id = int(row["chat_id"])
+            thread_id = int(row["message_thread_id"])
+            self.connection.execute(
+                """
+                UPDATE callback_actions
+                SET state = 'expired', updated_at = ?
+                WHERE chat_id = ? AND message_thread_id = ?
+                    AND state = 'active'
+                """,
+                (timestamp, chat_id, thread_id),
+            )
+            self.connection.execute(
+                """
+                UPDATE telegram_message_routes
+                SET state = 'revoked', updated_at = ?
+                WHERE chat_id = ? AND message_thread_id = ?
+                    AND state = 'active'
+                """,
+                (timestamp, chat_id, thread_id),
+            )
+            self.connection.execute(
+                """
+                UPDATE surface_cards
+                SET state = 'stale', updated_at = ?
+                WHERE binding_id = ? AND state != 'stale'
+                """,
+                (timestamp, int(binding_id)),
+            )
+            self.connection.execute(
+                """
+                UPDATE forum_subjects
+                SET state = 'archived', updated_at = ?
+                WHERE surface_binding_id = ? AND state = 'active'
+                """,
+                (timestamp, int(binding_id)),
+            )
+            self._archive_agent_for_retired_surface(
+                str(agent_id),
+                int(binding_id),
+                explanation,
+                timestamp,
+            )
+            cursor = self.connection.execute(
+                """
+                UPDATE surface_bindings
+                SET state = 'revoked', last_probe_at = ?,
+                    last_probe_error = ?, updated_at = ?
+                WHERE binding_id = ? AND state = 'active'
+                """,
+                (
+                    timestamp,
+                    explanation,
+                    timestamp,
+                    int(binding_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StoreError("Managed topic changed during teardown.")
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('managed_topic_torn_down', 'surface', ?, ?, ?)
+                """,
+                (
+                    str(int(binding_id)),
+                    json.dumps(
+                        {
+                            "agent_id": str(agent_id),
+                            "chat_id": chat_id,
+                            "message_thread_id": thread_id,
+                            "reason": explanation,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                ),
+            )
+            self.enqueue_api_call(
+                operation_id=str(delete_operation_id),
+                method="deleteForumTopic",
+                params={
+                    "chat_id": chat_id,
+                    "message_thread_id": thread_id,
+                },
+                serialize_key=f"topic-teardown:{chat_id}:{thread_id}",
+                # Let the callback acknowledgement queued immediately after
+                # this transaction become deliverable before the deletion.
+                now=timestamp + 1.0,
+            )
+            binding = self._surface_binding_from_row(row)
+            self.connection.execute("COMMIT")
+            return binding
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
             raise
 
     @staticmethod
@@ -7604,6 +7828,151 @@ class DurableStore:
                     if voice_file_path is not None
                     else None
                 ),
+                serialize_key=f"agent-notification:{int(mailbox_id)}",
+                now=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return message_id
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def enqueue_agent_topic_teardown_prompt(
+        self,
+        *,
+        agent_id: str,
+        mailbox_id: int,
+        worker_id: str,
+        now: Optional[float] = None,
+    ) -> int:
+        """Post a scoped, durable confirmation card for the agent's home topic."""
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            target = self.agent_notification_target(
+                agent_id=agent_id,
+                mailbox_id=mailbox_id,
+                worker_id=worker_id,
+                now=timestamp,
+            )
+            row = self.connection.execute(
+                """
+                SELECT a.surface_binding_id, a.role, m.source_inbox_job_id,
+                    b.chat_id, b.message_thread_id, b.display_name
+                FROM agent_mailbox AS m
+                JOIN agents AS a ON a.agent_id = m.agent_id
+                JOIN surface_bindings AS b
+                    ON b.binding_id = a.surface_binding_id
+                    AND b.target_type = 'agent'
+                    AND b.target_id = a.agent_id
+                    AND b.state = 'active'
+                WHERE m.mailbox_id = ? AND m.agent_id = ?
+                    AND m.state = 'leased' AND m.lease_owner = ?
+                    AND m.lease_expires_at > ?
+                """,
+                (
+                    int(mailbox_id),
+                    str(agent_id),
+                    str(worker_id),
+                    timestamp,
+                ),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["role"]) not in {"project", "worker"}
+                or int(row["message_thread_id"]) <= 0
+            ):
+                raise StoreError("Managed topic teardown is unavailable here.")
+            if (
+                target.chat_id != int(row["chat_id"])
+                or int(target.message_thread_id or 0)
+                != int(row["message_thread_id"])
+            ):
+                raise StoreError(
+                    "Request teardown from the managed agent's home topic."
+                )
+            authorized_user_id = self._authorized_user_for_inbox_job(
+                int(row["source_inbox_job_id"])
+            )
+            if authorized_user_id is None:
+                raise StoreError("The teardown requester could not be authorized.")
+            payload = {
+                "agent_id": str(agent_id),
+                "binding_id": int(row["surface_binding_id"]),
+                "chat_id": int(row["chat_id"]),
+                "message_thread_id": int(row["message_thread_id"]),
+                "display_name": str(row["display_name"]),
+            }
+            confirm = self.create_callback_action(
+                operation_id=(
+                    f"agent-mailbox:{int(mailbox_id)}:"
+                    "topic-teardown-confirm"
+                ),
+                action_type="agent_topic_teardown_confirm",
+                payload=payload,
+                chat_id=int(row["chat_id"]),
+                message_thread_id=int(row["message_thread_id"]),
+                authorized_user_id=authorized_user_id,
+                one_time=False,
+                ttl_seconds=30 * 60,
+                now=timestamp,
+            )
+            cancel = self.create_callback_action(
+                operation_id=(
+                    f"agent-mailbox:{int(mailbox_id)}:"
+                    "topic-teardown-cancel"
+                ),
+                action_type="agent_topic_teardown_cancel",
+                payload=payload,
+                chat_id=int(row["chat_id"]),
+                message_thread_id=int(row["message_thread_id"]),
+                authorized_user_id=authorized_user_id,
+                one_time=True,
+                ttl_seconds=30 * 60,
+                now=timestamp,
+            )
+            message_id = self.enqueue_api_call(
+                operation_id=(
+                    f"agent-mailbox:{int(mailbox_id)}:"
+                    "topic-teardown-prompt"
+                ),
+                method="sendMessage",
+                params={
+                    "chat_id": int(row["chat_id"]),
+                    "message_thread_id": int(row["message_thread_id"]),
+                    "text": (
+                        "🎛 Control\n\n"
+                        "Tear down this managed topic and its session?\n\n"
+                        f"Topic: {str(row['display_name'])}\n\n"
+                        "This permanently deletes the Telegram topic and its "
+                        "message history. Telegram Control will archive the "
+                        "agent, clear its provider session, and revoke its "
+                        "routes, buttons, and cards."
+                    ),
+                    "reply_markup": {
+                        "inline_keyboard": [
+                            [
+                                {
+                                    "text": "Delete topic & session",
+                                    "callback_data": f"a:{confirm.token}",
+                                }
+                            ],
+                            [
+                                {
+                                    "text": "Cancel",
+                                    "callback_data": f"a:{cancel.token}",
+                                }
+                            ],
+                        ]
+                    },
+                },
+                route={
+                    "target_type": "agent",
+                    "target_id": str(agent_id),
+                    "policy": "reply",
+                    "ttl_seconds": 30 * 60,
+                },
                 serialize_key=f"agent-notification:{int(mailbox_id)}",
                 now=timestamp,
             )

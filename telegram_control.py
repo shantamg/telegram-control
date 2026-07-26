@@ -50,7 +50,11 @@ SCRIPT_PATH = Path(__file__).resolve()
 SKILLS_SOURCE_DIR = SCRIPT_PATH.parent / "skills"
 SHARED_SKILLS_DIR = Path.home() / ".agents" / "skills"
 CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
-MANAGED_SHARED_SKILLS = ("telegram-group-icon", "telegram-detached-worker")
+MANAGED_SHARED_SKILLS = (
+    "telegram-group-icon",
+    "telegram-detached-worker",
+    "telegram-topic-teardown",
+)
 DEFAULT_AGENT_WORKERS = 8
 MAX_AGENT_WORKERS = 16
 TOPIC_PROBE_INTERVAL_SECONDS = 24 * 60 * 60
@@ -1873,6 +1877,35 @@ def send_outbox_message(
             )
         except bridge.BridgeError as exc:
             error = str(exc)
+            if (
+                message.method == "deleteForumTopic"
+                and telegram_reports_missing_topic(error)
+            ):
+                # Topic deletion is convergent: a lost success response
+                # followed by "thread not found" means the requested end
+                # state already holds.
+                try:
+                    store.complete_outbox(
+                        message.message_id,
+                        worker_id,
+                        {"deleted": "already_missing"},
+                    )
+                except LeaseLostError:
+                    log_event(
+                        "outbox_lease_lost",
+                        message_id=message.message_id,
+                        operation_id=message.operation_id,
+                        attempts=message.attempts,
+                    )
+                    return
+                log_event(
+                    "outbox_sent",
+                    message_id=message.message_id,
+                    operation_id=message.operation_id,
+                    attempts=message.attempts,
+                    already_missing=True,
+                )
+                return
             if (
                 message.method == "editMessageText"
                 and "message is not modified" in error.lower()

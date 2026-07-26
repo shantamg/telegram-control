@@ -169,7 +169,10 @@ Registration atomically creates the project agent and changes the topic binding
 from `controller/control` to `agent/<agent_id>`. Repeating the same registration
 returns the existing agent; mismatched registrations and invalid slugs fail
 closed. Send `/agent` inside the topic for a path-safe registry, session,
-console, and latest provider-usage summary.
+console, and latest provider-usage summary. Send `/help` anywhere Control is
+available to open an editable, button-driven guide to commands, managed
+agents, detached workers, voice updates, installed skills, and topic teardown.
+Setup and introductory messages include the same `/help` hint.
 
 The live registry test passed on July 23, 2026. **Stage 2 Test** is bound to
 `tc--root--telegram-control` using the Codex provider and reports `registered`
@@ -539,6 +542,15 @@ chat ID, refuses private chats, revalidates the live mailbox lease, and checks
 the bot's **Change group info** administrator permission before changing the
 photo. The Telegram bot token remains in macOS Keychain.
 
+The `telegram-topic-teardown` skill gives an active managed topic a formal,
+owner-confirmed shutdown path. A natural request to tear down the current
+topic asks the scoped helper to post a permanent-deletion confirmation card.
+Confirmation refuses active turns, running consoles, and detached workers that
+still report to the topic. Once idle, it archives the managed agent and
+subject, revokes routes and callbacks, frees the project slug for reuse, and
+durably queues deletion of the exact Telegram topic. The provider performs no
+direct database, tmux, or Bot API deletion.
+
 Install or refresh repo-owned shared skills without reinstalling the
 controller:
 
@@ -660,14 +672,15 @@ Live setup:
    session; later requests continue it. Send `/status` in that topic to inspect
    or control its managed agent.
 
-Topics may be deleted normally in Telegram; no controller-specific delete
-command is required. The durable supervisor includes a `maintain-topics` loop
-that checks each active topic at most once per day. The Bot API has no
-read-only topic lookup, so the check sends one silent invisible message and
-deletes it immediately. Telegram's explicit `message thread not found` (or
-equivalent invalid-topic response) atomically revokes the topic route,
-callbacks, reply routes, and status card, archives a forum subject, stops its
-managed agent, and forgets the controller's resumable provider-session
+For immediate clean removal, ask the managed agent to tear down the current
+topic and confirm its Telegram card. If a topic is instead deleted directly in
+Telegram, the durable supervisor's `maintain-topics` loop repairs the stale
+state on its next check, at most once per day. The Bot API has no read-only
+topic lookup, so the check sends one silent invisible message and deletes it
+immediately. Telegram's explicit `message thread not found` (or equivalent
+invalid-topic response) atomically revokes the topic route, callbacks, reply
+routes, and status card, archives the forum subject and managed agent, frees
+the original slug, and forgets the controller's resumable provider-session
 pointer. Historical inbox/outbox and event rows remain as a compact audit
 trail. Network failures, permission errors, closed topics, and all ambiguous
 responses leave the binding active and retry on a later cycle; active agent

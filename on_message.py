@@ -20,6 +20,7 @@ import discovery
 import provider_defaults
 import router_contract
 import telegram_bridge as bridge
+import telegram_help
 import tmux_console
 import voice_responses
 from durable_store import (
@@ -365,6 +366,71 @@ def send_message(
         )
 
 
+def help_reply_markup(
+    store: DurableStore,
+    *,
+    menu_id: str,
+    chat_id: int,
+    thread_id: Optional[int],
+    user_id: int,
+    current_slug: str,
+) -> dict:
+    actions = []
+    for topic in telegram_help.TOPICS:
+        action = store.create_callback_action(
+            operation_id=f"help:{menu_id}:{topic.slug}",
+            action_type="help_topic",
+            payload={"menu_id": menu_id, "topic": topic.slug},
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            authorized_user_id=user_id,
+            one_time=False,
+            ttl_seconds=30 * 24 * 60 * 60,
+        )
+        actions.append((topic.label, action))
+    rows = option_button_rows(actions, width=2)
+    if current_slug != "home":
+        home = store.create_callback_action(
+            operation_id=f"help:{menu_id}:home",
+            action_type="help_topic",
+            payload={"menu_id": menu_id, "topic": "home"},
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            authorized_user_id=user_id,
+            one_time=False,
+            ttl_seconds=30 * 24 * 60 * 60,
+        )
+        rows.append(
+            [
+                {
+                    "text": "← Help menu",
+                    "callback_data": f"a:{home.token}",
+                }
+            ]
+        )
+    return {"inline_keyboard": rows}
+
+
+def send_help_menu() -> None:
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    user_id_text = os.environ.get("TELEGRAM_FROM_ID")
+    if not database_path or not job_id or not user_id_text:
+        send_message(telegram_help.HOME_TEXT)
+        return
+    chat_id, thread_id = surface_coordinates()
+    with DurableStore(Path(database_path)) as store:
+        reply_markup = help_reply_markup(
+            store,
+            menu_id=str(job_id),
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=int(user_id_text),
+            current_slug="home",
+        )
+    send_message(telegram_help.HOME_TEXT, reply_markup=reply_markup)
+
+
 def resolve_replied_message_route():
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
@@ -692,7 +758,8 @@ def create_agent_from_catalog(project_slug: str) -> None:
     if created:
         send_message(
             f"✅ Created managed agent {agent.hierarchical_name}.\n"
-            "Send a message in this topic to start its provider session."
+            "Send a message in this topic to start its provider session.\n\n"
+            f"{telegram_help.HELP_HINT}"
         )
     else:
         send_message(
@@ -888,7 +955,8 @@ def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
                 f"Workspace: {setup['project_path']}\n"
                 f"Provider: {setup['provider']}\n\n"
                 "This authorizes the private forum and binds its topics to "
-                "that workspace. Nothing changes until you confirm.",
+                "that workspace. Nothing changes until you confirm.\n\n"
+                f"{telegram_help.HELP_HINT}",
                 reply_markup={
                     "inline_keyboard": [
                         [
@@ -925,7 +993,8 @@ def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
         f"Forum: {display_name}\n\n"
         "Only your paired Telegram account will be accepted. Add Slam Paws "
         "as a forum administrator so ordinary text and voice messages reach "
-        "the controller. After authorizing, send your request again.",
+        "the controller. After authorizing, send your request again.\n\n"
+        f"{telegram_help.HELP_HINT}",
         reply_markup={
             "inline_keyboard": [
                 [
@@ -1048,7 +1117,8 @@ def prompt_forum_subject_provider_selection(
         )
     )
     send_message(
-        f"Choose an agent for “{display_name}”.\n\n{instruction}",
+        f"Choose an agent for “{display_name}”.\n\n{instruction}\n\n"
+        f"{telegram_help.HELP_HINT}",
         reply_markup={
             "inline_keyboard": [
                 [
@@ -1117,6 +1187,131 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     "callback_query_id": callback_query_id,
                     "text": exc.user_message,
                     "show_alert": exc.code in {"unauthorized", "invalid"},
+                },
+                "callback-answer",
+            )
+        return
+
+    if action.action_type == "help_topic":
+        topic_slug = str(action.payload.get("topic", ""))
+        menu_id = str(action.payload.get("menu_id", ""))
+        try:
+            page_text = telegram_help.page_text(topic_slug)
+        except ValueError:
+            raise StoreError("Stored help topic is invalid.") from None
+        if not menu_id or len(menu_id) > 80:
+            raise StoreError("Stored help menu identity is invalid.")
+        with DurableStore(Path(database_path)) as store:
+            reply_markup = help_reply_markup(
+                store,
+                menu_id=menu_id,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                current_slug=topic_slug,
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Help topic opened.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageText",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "text": speaker_labeled_text(page_text),
+                "reply_markup": reply_markup,
+            },
+            f"help-page:{topic_slug}",
+        )
+        return
+
+    if action.action_type == "agent_topic_teardown_cancel":
+        confirm_operation_id = action.operation_id.replace(
+            "topic-teardown-cancel",
+            "topic-teardown-confirm",
+        )
+        with DurableStore(Path(database_path)) as store:
+            store.retire_callback_action_operation(
+                confirm_operation_id,
+                "agent_topic_teardown_confirm",
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Topic teardown cancelled.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "topic-teardown-cancel-clear",
+        )
+        return
+
+    if action.action_type == "agent_topic_teardown_confirm":
+        agent_id = str(action.payload.get("agent_id", ""))
+        binding_id = int(action.payload.get("binding_id", 0))
+        target_chat_id = int(action.payload.get("chat_id", 0))
+        target_thread_id = int(action.payload.get("message_thread_id", 0))
+        if (
+            not agent_id
+            or binding_id <= 0
+            or target_chat_id != chat_id
+            or target_thread_id != int(thread_id or 0)
+        ):
+            raise StoreError("Stored topic teardown target is invalid.")
+        try:
+            with DurableStore(Path(database_path)) as store:
+                bound_agent = store.resolve_agent_for_surface(
+                    target_chat_id,
+                    target_thread_id,
+                )
+                if bound_agent is None or bound_agent.agent_id != agent_id:
+                    raise StoreError("Managed topic changed before teardown.")
+                console = tmux_console.reconcile_agent_console(store, agent_id)
+                if console is not None and console.state in {
+                    "starting",
+                    "running",
+                }:
+                    tmux_console.close_agent_console(store, bound_agent)
+                store.teardown_managed_topic(
+                    binding_id=binding_id,
+                    agent_id=agent_id,
+                    delete_operation_id=(
+                        f"{action.operation_id}:delete-forum-topic"
+                    ),
+                )
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Topic teardown queued.",
                 },
                 "callback-answer",
             )
@@ -1367,7 +1562,8 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             f"✅ This topic will use {provider_name}.\n"
             f"Model: {model_name}\n"
             f"Effort: {effort_name}\n\n"
-            "Send the first message to start a new session."
+            "Send the first message to start a new session.\n\n"
+            f"{telegram_help.HELP_HINT}"
         )
         return
 
@@ -1413,7 +1609,8 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         )
         send_message(
             f"✅ {display_name} is authorized.\n\n"
-            "Send your text or voice request in this topic again."
+            "Send your text or voice request in this topic again.\n\n"
+            f"{telegram_help.HELP_HINT}"
         )
         return
     if action.action_type in {
@@ -1512,7 +1709,8 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         send_message(
             f"✅ {workspace.display_name} is authorized and bound.\n\n"
             "Create or open any topic and send your request. Its subject "
-            "agent will be created automatically."
+            "agent will be created automatically.\n\n"
+            f"{telegram_help.HELP_HINT}"
         )
         return
 
@@ -3285,6 +3483,8 @@ def main() -> int:
                     send_agent_status()
                 else:
                     send_status_card(update)
+            elif text.strip().lower() == "/help":
+                send_help_menu()
             elif text.strip().lower() == "/projects":
                 send_project_catalog()
             elif agent_create is not None:
@@ -3349,7 +3549,10 @@ def main() -> int:
                 else:
                     enqueue_router_input(text)
         else:
-            send_message("Send me a text or Telegram voice message.")
+            send_message(
+                "Send me a text or Telegram voice message.\n\n"
+                f"{telegram_help.HELP_HINT}"
+            )
         return 0
     except subprocess.TimeoutExpired:
         send_message("❌ Local transcription timed out.")

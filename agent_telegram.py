@@ -60,6 +60,10 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Absolute path to a local PNG or JPEG image.",
     )
+    subparsers.add_parser(
+        "topic-teardown",
+        help="Post a confirmation card for tearing down the current topic.",
+    )
     return parser.parse_args()
 
 
@@ -133,6 +137,15 @@ def main() -> int:
                 image_path=args.image,
             )
         print("Telegram group icon updated.")
+        return 0
+    if args.mode == "topic-teardown":
+        with DurableStore(database_path) as store:
+            store.enqueue_agent_topic_teardown_prompt(
+                agent_id=agent_id,
+                mailbox_id=mailbox_id,
+                worker_id=worker_id,
+            )
+        print("Telegram topic teardown confirmation queued.")
         return 0
 
     if not KEY_PATTERN.fullmatch(args.key) or len(args.key) > 40:

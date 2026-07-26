@@ -206,6 +206,49 @@ class DurableStoreTests(unittest.TestCase):
         response = self.store.claim_outbox("sender", now=2_000_000_001)
         return agent, mailbox_id, response
 
+    def _leased_topic_agent(self, chat_id=-100777, thread_id=62):
+        self.store.ensure_surface_binding(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=chat_id,
+            surface_name="Stage 2 Test",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=100,
+        )
+        update = topic_message_update(10, "tear down this topic", thread_id)
+        update["message"]["chat"] = {
+            "id": chat_id,
+            "type": "supergroup",
+            "title": "Test",
+            "is_forum": True,
+        }
+        update["message"]["reply_to_message"]["chat"] = update["message"]["chat"]
+        self.store.ingest_update(update, now=100)
+        inbox = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+        ).fetchone()
+        mailbox_id = self.store.enqueue_agent_message(
+            agent.agent_id,
+            int(inbox["job_id"]),
+            "tear down this topic",
+            now=101,
+        )
+        self.store.claim_agent_mailbox(
+            "agent-worker",
+            now=102,
+            lease_seconds=10**12,
+        )
+        return agent, mailbox_id
+
     def test_configures_and_migrates_database(self):
         self.assertEqual(self.store.quick_check(), "ok")
         self.assertEqual(
@@ -2083,6 +2126,240 @@ class DurableStoreTests(unittest.TestCase):
                     "__photo_file_path": str(icon_path.resolve()),
                 },
             ),
+        )
+
+    def test_active_agent_turn_can_request_confirmed_topic_teardown(self):
+        agent, mailbox_id = self._leased_topic_agent()
+        environment = {
+            "TELEGRAM_CONTROL_DB": str(self.database_path),
+            "TELEGRAM_CONTROL_AGENT_ID": agent.agent_id,
+            "TELEGRAM_CONTROL_MAILBOX_ID": str(mailbox_id),
+            "TELEGRAM_CONTROL_WORKER_ID": "agent-worker",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with mock.patch.object(
+                agent_telegram.sys,
+                "argv",
+                ["agent_telegram.py", "topic-teardown"],
+            ):
+                with redirect_stdout(StringIO()):
+                    self.assertEqual(agent_telegram.main(), 0)
+
+        prompt = self.store.connection.execute(
+            """
+            SELECT method, params_json
+            FROM outbox_messages
+            WHERE operation_id = ?
+            """,
+            (f"agent-mailbox:{mailbox_id}:topic-teardown-prompt",),
+        ).fetchone()
+        self.assertEqual(prompt["method"], "sendMessage")
+        params = json.loads(prompt["params_json"])
+        self.assertIn("permanently deletes", params["text"])
+        buttons = params["reply_markup"]["inline_keyboard"]
+        self.assertEqual(buttons[0][0]["text"], "Delete topic & session")
+        self.assertEqual(buttons[1][0]["text"], "Cancel")
+        confirm = self.store.connection.execute(
+            """
+            SELECT one_time, authorized_user_id, payload_json
+            FROM callback_actions
+            WHERE action_type = 'agent_topic_teardown_confirm'
+            """
+        ).fetchone()
+        self.assertEqual(int(confirm["one_time"]), 0)
+        self.assertEqual(int(confirm["authorized_user_id"]), 123)
+        self.assertEqual(
+            json.loads(confirm["payload_json"])["agent_id"],
+            agent.agent_id,
+        )
+
+    def test_teardown_confirmation_retries_after_turn_then_archives_and_deletes(self):
+        agent, mailbox_id = self._leased_topic_agent()
+        self.store.enqueue_agent_topic_teardown_prompt(
+            agent_id=agent.agent_id,
+            mailbox_id=mailbox_id,
+            worker_id="agent-worker",
+        )
+        confirm = self.store.connection.execute(
+            """
+            SELECT token
+            FROM callback_actions
+            WHERE action_type = 'agent_topic_teardown_confirm'
+            """
+        ).fetchone()
+
+        def run_confirmation(update_id):
+            callback = callback_update(
+                update_id,
+                f"a:{confirm['token']}",
+                message_id=700,
+                message_thread_id=62,
+            )
+            callback["callback_query"]["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Test",
+                "is_forum": True,
+            }
+            self.store.ingest_update(callback, now=update_id + 100)
+            job = self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = ?",
+                (update_id,),
+            ).fetchone()
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(self.database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(int(job["job_id"])),
+                "TELEGRAM_CHAT_ID": "-100777",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_MESSAGE_ID": "700",
+                "TELEGRAM_MESSAGE_THREAD_ID": "62",
+            }
+            with mock.patch.dict(os.environ, environment, clear=True):
+                on_message.handle_callback(
+                    callback,
+                    callback["callback_query"],
+                )
+
+        run_confirmation(11)
+        self.assertIsNotNone(self.store.resolve_surface_binding(-100777, 62))
+        action = self.store.connection.execute(
+            """
+            SELECT state FROM callback_actions
+            WHERE action_type = 'agent_topic_teardown_confirm'
+            """
+        ).fetchone()
+        self.assertEqual(action["state"], "active")
+        busy_answer = self.store.connection.execute(
+            """
+            SELECT params_json FROM outbox_messages
+            WHERE operation_id = 'inbox:2:callback-answer'
+            """
+        ).fetchone()
+        self.assertIn(
+            "Wait for the active agent turn",
+            json.loads(busy_answer["params_json"])["text"],
+        )
+
+        self.store.complete_agent_mailbox(
+            mailbox_id,
+            "agent-worker",
+            "session-to-archive",
+            "The confirmation card is ready.",
+            {},
+            now=200,
+        )
+        run_confirmation(12)
+
+        self.assertIsNone(self.store.resolve_surface_binding(-100777, 62))
+        archived = self.store.connection.execute(
+            """
+            SELECT slug, hierarchical_name, surface_binding_id,
+                lifecycle_state, provider_session_id
+            FROM agents WHERE agent_id = ?
+            """,
+            (agent.agent_id,),
+        ).fetchone()
+        self.assertTrue(str(archived["slug"]).startswith("retired_"))
+        self.assertTrue(str(archived["hierarchical_name"]).startswith("retired--"))
+        self.assertIsNone(archived["surface_binding_id"])
+        self.assertEqual(archived["lifecycle_state"], "stopped")
+        self.assertIsNone(archived["provider_session_id"])
+        deletion = self.store.connection.execute(
+            """
+            SELECT method, params_json, state
+            FROM outbox_messages
+            WHERE operation_id LIKE
+                'agent-mailbox:%:topic-teardown-confirm:delete-forum-topic'
+            """
+        ).fetchone()
+        self.assertEqual(deletion["method"], "deleteForumTopic")
+        self.assertEqual(
+            json.loads(deletion["params_json"]),
+            {"chat_id": -100777, "message_thread_id": 62},
+        )
+
+        self.store.ensure_surface_binding(
+            chat_id=-100777,
+            message_thread_id=63,
+            surface_type="project",
+            display_name="Stage 2 Test",
+            target_type="controller",
+            target_id="control",
+            now=300,
+        )
+        replacement, created = self.store.register_project_agent(
+            chat_id=-100777,
+            surface_name="Stage 2 Test",
+            slug="telegram-control",
+            provider="codex",
+            project_path="/tmp/telegram-control",
+            now=301,
+        )
+        self.assertTrue(created)
+        self.assertNotEqual(replacement.agent_id, agent.agent_id)
+
+    def test_topic_teardown_waits_for_originating_detached_worker(self):
+        agent, mailbox_id = self._leased_topic_agent()
+        worker_binding = self.store.ensure_surface_binding(
+            chat_id=-100777,
+            message_thread_id=63,
+            surface_type="task",
+            display_name="long-job updates",
+            target_type="detached_worker",
+            target_id="long-job",
+            now=103,
+        )
+        self.store.create_detached_worker(
+            name="long-job",
+            binding_id=worker_binding.binding_id,
+            origin_agent_id=agent.agent_id,
+            project_path="/tmp/telegram-control",
+            provider="codex",
+            tmux_session_name="detached--long-job",
+            now=104,
+        )
+        self.store.complete_agent_mailbox(
+            mailbox_id,
+            "agent-worker",
+            "session-worker-block",
+            "Ready.",
+            {},
+            now=105,
+        )
+        with self.assertRaisesRegex(StoreError, "Stop detached worker 'long-job'"):
+            self.store.teardown_managed_topic(
+                binding_id=agent.surface_binding_id,
+                agent_id=agent.agent_id,
+                delete_operation_id="test:teardown:delete",
+                now=106,
+            )
+        self.assertIsNotNone(self.store.resolve_surface_binding(-100777, 62))
+
+    def test_missing_topic_delete_result_completes_idempotently(self):
+        message_id = self.store.enqueue_api_call(
+            "test:delete-topic",
+            "deleteForumTopic",
+            {"chat_id": -100777, "message_thread_id": 62},
+            now=100,
+        )
+        message = self.store.claim_outbox("sender", now=101)
+        self.assertEqual(message.message_id, message_id)
+        with mock.patch.object(
+            telegram_control.bridge,
+            "api_call",
+            side_effect=telegram_control.bridge.BridgeError(
+                "Bad Request: message thread not found"
+            ),
+        ):
+            telegram_control.send_outbox_message(
+                self.store,
+                "token",
+                message,
+                "sender",
+            )
+        self.assertEqual(
+            self.store.outbox_operation_state("test:delete-topic"),
+            "sent",
         )
 
     def test_failed_agent_turn_edit_falls_back_to_routed_message(self):
@@ -8017,6 +8294,92 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     store.status_counts()["router_mailbox"],
                     {"queued": 1},
+                )
+
+    def test_help_command_browses_pages_without_starting_a_router_turn(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=123,
+                    message_thread_id=62,
+                    surface_type="project",
+                    display_name="Stage 2 Test",
+                    target_type="controller",
+                    target_id="control",
+                )
+                store.ingest_update(
+                    topic_message_update(10, "/help"),
+                    now=100,
+                )
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(store, config, job, "worker")
+                menu = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(menu.method, "sendMessage")
+                self.assertIn("Telegram Control help", menu.params["text"])
+                buttons = menu.params["reply_markup"]["inline_keyboard"]
+                labels = {
+                    button["text"]
+                    for row in buttons
+                    for button in row
+                }
+                self.assertIn("Agents & sessions", labels)
+                self.assertIn("Topic teardown", labels)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM router_mailbox"
+                    ).fetchone()[0],
+                    0,
+                )
+                agent_button = next(
+                    button
+                    for row in buttons
+                    for button in row
+                    if button["text"] == "Agents & sessions"
+                )
+                callback = callback_update(
+                    11,
+                    agent_button["callback_data"],
+                    message_id=700,
+                    message_thread_id=62,
+                )
+                store.ingest_update(callback, now=101)
+                callback_job = store.claim_job("worker-2", now=101)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    callback_job,
+                    "worker-2",
+                )
+                outbound = []
+                while True:
+                    item = store.claim_outbox(
+                        f"sender-{len(outbound)}",
+                        now=10**12,
+                    )
+                    if item is None:
+                        break
+                    outbound.append(item)
+                page = next(
+                    item for item in outbound if item.method == "editMessageText"
+                )
+                self.assertIn("Agents and sessions", page.params["text"])
+                page_labels = {
+                    button["text"]
+                    for row in page.params["reply_markup"]["inline_keyboard"]
+                    for button in row
+                }
+                self.assertIn("← Help menu", page_labels)
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM router_mailbox"
+                    ).fetchone()[0],
+                    0,
                 )
 
     def test_bound_forum_topic_reuses_preselected_subject_agent(self):

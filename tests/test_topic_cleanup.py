@@ -118,11 +118,15 @@ class TopicCleanupTests(unittest.TestCase):
         self.assertEqual(archived["state"], "archived")
         agent = self.store.connection.execute(
             """
-            SELECT lifecycle_state, provider_session_id
+            SELECT slug, hierarchical_name, surface_binding_id,
+                lifecycle_state, provider_session_id
             FROM agents WHERE agent_id = ?
             """,
             (subject.agent_id,),
         ).fetchone()
+        self.assertTrue(str(agent["slug"]).startswith("retired_"))
+        self.assertTrue(str(agent["hierarchical_name"]).startswith("retired--"))
+        self.assertIsNone(agent["surface_binding_id"])
         self.assertEqual(agent["lifecycle_state"], "stopped")
         self.assertIsNone(agent["provider_session_id"])
         event = self.store.connection.execute(
