@@ -3043,8 +3043,13 @@ class DurableStore:
                                 int(mailbox["mailbox_id"]),
                                 "turn-started",
                                 (
-                                    f"{self.agent_speaker_header(str(mailbox['agent_id']))}"
-                                    "\n\n🧠 Codex is working…"
+                                    self.label_text(
+                                        self.agent_card_header(
+                                            int(mailbox["mailbox_id"]),
+                                            str(mailbox["agent_id"]),
+                                        ),
+                                        "🧠 Codex is working…",
+                                    )
                                 ),
                                 timestamp,
                             )
@@ -3053,7 +3058,10 @@ class DurableStore:
                             "dead",
                         }:
                             terminal_text = (
-                                f"{self.agent_speaker_header(str(mailbox['agent_id']))}"
+                                self.agent_card_header(
+                                    int(mailbox["mailbox_id"]),
+                                    str(mailbox["agent_id"]),
+                                )
                                 + (
                                     "\n\n⏹ Cancelled."
                                     if str(mailbox["state"]) == "cancelled"
@@ -8339,6 +8347,44 @@ class DurableStore:
             self.connection.execute("ROLLBACK")
             raise
 
+    def agent_surface_header(
+        self,
+        agent_id: str,
+        chat_id: Optional[int],
+        message_thread_id: Optional[int] = None,
+    ) -> str:
+        """Name the agent only where the surface does not already say it.
+
+        Inside an agent's own topic the name is on screen above every message,
+        so repeating it in each receipt and answer is noise. Elsewhere — a
+        relayed answer in the root Control chat, a reply continued from there —
+        the name is the only thing identifying who is speaking, so it stays.
+        """
+        if chat_id is None:
+            return self.agent_speaker_header(agent_id)
+        row = self.connection.execute(
+            """
+            SELECT b.chat_id, b.message_thread_id
+            FROM agents AS a
+            JOIN surface_bindings AS b
+                ON b.binding_id = a.surface_binding_id
+                AND b.target_type = 'agent' AND b.target_id = a.agent_id
+                AND b.state = 'active'
+            WHERE a.agent_id = ?
+            """,
+            (str(agent_id),),
+        ).fetchone()
+        if row is not None and int(row["chat_id"]) == int(chat_id):
+            bound_thread = row["message_thread_id"]
+            if int(bound_thread or 0) == int(message_thread_id or 0):
+                return ""
+        return self.agent_speaker_header(agent_id)
+
+    @staticmethod
+    def label_text(header: str, body: str) -> str:
+        """Prefix a speaker label, or leave the body alone when there is none."""
+        return f"{header}\n\n{body}" if header else body
+
     def agent_speaker_header(self, agent_id: str) -> str:
         """Durable surface name used to label agent-authored Telegram turns."""
         row = self.connection.execute(
@@ -8420,7 +8466,11 @@ class DurableStore:
         return AgentNotificationTarget(
             chat_id=chat_id,
             message_thread_id=thread_id if thread_id != 0 else None,
-            speaker=self.agent_speaker_header(agent_id),
+            speaker=self.agent_surface_header(
+                agent_id,
+                chat_id,
+                thread_id if thread_id != 0 else None,
+            ),
         )
 
     def outbox_operation_state(self, operation_id: str) -> Optional[str]:
@@ -8471,7 +8521,7 @@ class DurableStore:
                 params: dict[str, Any] = {
                     "chat_id": target.chat_id,
                     "message_thread_id": target.message_thread_id,
-                    "text": f"{target.speaker}\n\n{body}",
+                    "text": self.label_text(target.speaker, body),
                 }
             else:
                 method = "sendVoice"
@@ -8848,7 +8898,14 @@ class DurableStore:
                         if row["message_thread_id"] is not None
                         else {}
                     ),
-                    "text": f"{self.agent_speaker_header(str(row['agent_id']))}\n\n{prompt}",
+                    "text": self.label_text(
+                        self.agent_surface_header(
+                            str(row["agent_id"]),
+                            int(row["chat_id"]),
+                            row["message_thread_id"],
+                        ),
+                        prompt,
+                    ),
                     "reply_markup": {"inline_keyboard": keyboard},
                 },
                 route={
@@ -8895,14 +8952,23 @@ class DurableStore:
         self,
         agent_id: str,
         response_text: str,
+        chat_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
     ) -> list[str]:
-        """Chunk a response so every chunk carries the project identity.
+        """Chunk a response, labeling it only where the surface needs it.
 
         The chunk budget is reduced by the header length, so labeling never
         truncates payload, and every continuation chunk repeats the durable
-        speaker label.
+        speaker label. Given the delivery coordinates, an answer arriving in the
+        agent's own topic carries no label at all: the topic is the label.
         """
-        header = self.agent_speaker_header(agent_id)
+        header = (
+            self.agent_surface_header(agent_id, chat_id, message_thread_id)
+            if chat_id is not None
+            else self.agent_speaker_header(agent_id)
+        )
+        if not header:
+            return chunk_telegram_text(response_text)
         budget = max(1000, 3800 - len(header) - 2)
         return [
             f"{header}\n\n{chunk}"
@@ -9062,6 +9128,22 @@ class DurableStore:
             ),
             state=str(row["state"]),
             attempts=int(row["attempts"]),
+        )
+
+    def agent_card_header(self, mailbox_id: int, agent_id: str) -> str:
+        """Header for the card of one turn, wherever that card actually lives.
+
+        A turn dispatched from the root Control chat keeps its card there, and
+        that card must say which project is speaking. A turn in the agent's own
+        topic does not.
+        """
+        target = self._agent_receipt_target(int(mailbox_id))
+        if target is None:
+            return self.agent_speaker_header(str(agent_id))
+        return self.agent_surface_header(
+            str(agent_id),
+            int(target["chat_id"]),
+            target.get("message_thread_id"),
         )
 
     def _agent_receipt_target(
@@ -9276,7 +9358,12 @@ class DurableStore:
         timestamp: float,
     ) -> None:
         """Queue a new final response instead of overwriting its progress card."""
-        chunks = self.labeled_agent_chunks(agent_id, response_text)
+        chunks = self.labeled_agent_chunks(
+            agent_id,
+            response_text,
+            chat_id,
+            message_thread_id,
+        )
         reply_markup = self._agent_voice_button_markup(
             mailbox_id,
             agent_id,
@@ -9415,7 +9502,7 @@ class DurableStore:
                 """,
                 (turn_id, timestamp, int(mailbox_id)),
             )
-            speaker = self.agent_speaker_header(str(row["agent_id"]))
+            speaker = self.agent_card_header(mailbox_id, str(row["agent_id"]))
             provider_name = "Claude" if str(row["provider"]) == "claude" else "Codex"
             metadata_line = (
                 "\n\n⚙️ "
@@ -9434,9 +9521,11 @@ class DurableStore:
                     int(row["attempts"]),
                 ),
                 (
-                    f"{speaker}\n\n🧠 {provider_name} is working…"
-                    f"{metadata_line}"
-                    f"{context_line}"
+                    self.label_text(
+                        speaker,
+                        f"🧠 {provider_name} is working…"
+                        f"{metadata_line}{context_line}",
+                    )
                 ),
                 timestamp,
             )
@@ -9481,7 +9570,7 @@ class DurableStore:
                 raise LeaseLostError(
                     f"Agent mailbox lease for {mailbox_id} is no longer owned."
                 )
-            speaker = self.agent_speaker_header(str(row["agent_id"]))
+            speaker = self.agent_card_header(mailbox_id, str(row["agent_id"]))
             if stage in user_output_stages:
                 output = str(detail or "").strip()
                 if not output:
@@ -9500,7 +9589,7 @@ class DurableStore:
                         "progress-output",
                         int(row["attempts"]),
                     ),
-                    f"{speaker}\n\n{output}",
+                    self.label_text(speaker, output),
                     timestamp,
                     coalesce=True,
                 )
@@ -9535,8 +9624,10 @@ class DurableStore:
                     int(row["attempts"]),
                 ),
                 (
-                    f"{speaker}\n\n{labels[stage]}"
-                    f"{metadata_line}{context_line}"
+                    self.label_text(
+                        speaker,
+                        f"{labels[stage]}{metadata_line}{context_line}",
+                    )
                 ),
                 timestamp,
             )
@@ -9640,7 +9731,9 @@ class DurableStore:
                     "Inbox job was reused for a different steering request."
                 )
             control = self._agent_control_from_row(row)
-            speaker = html.escape(self.agent_speaker_header(agent_id))
+            speaker = html.escape(
+                self.agent_card_header(int(mailbox_id), agent_id)
+            )
             excerpt = html.escape(text[:1200])
             receipt_text = (
                 f"🧭 <b>Steering {speaker}…</b>\n"
@@ -10031,7 +10124,10 @@ class DurableStore:
                 self._enqueue_agent_status_edit(
                     mailbox_id,
                     "cancelled",
-                    f"{self.agent_speaker_header(agent_id)}\n\n⏹ Cancelled.",
+                    self.label_text(
+                        self.agent_card_header(int(mailbox_id), agent_id),
+                        "⏹ Cancelled.",
+                    ),
                     timestamp,
                     terminal=True,
                 )
@@ -10087,7 +10183,10 @@ class DurableStore:
             self._enqueue_agent_status_edit(
                 mailbox_id,
                 "stopping",
-                f"{self.agent_speaker_header(agent_id)}\n\n⏹ Stopping Codex…",
+                self.label_text(
+                    self.agent_card_header(int(mailbox_id), agent_id),
+                    "⏹ Stopping Codex…",
+                ),
                 timestamp,
             )
             self.connection.execute("COMMIT")
@@ -10160,7 +10259,10 @@ class DurableStore:
             self._enqueue_agent_status_edit(
                 mailbox_id,
                 "cancelled",
-                f"{self.agent_speaker_header(str(row['agent_id']))}\n\n⏹ Cancelled.",
+                self.label_text(
+                    self.agent_card_header(int(mailbox_id), str(row["agent_id"])),
+                    "⏹ Cancelled.",
+                ),
                 timestamp,
                 terminal=True,
             )
@@ -10532,17 +10634,18 @@ class DurableStore:
         stage: str,
         input_text: str,
         provider: str = "codex",
-        speaker: str = "Agent",
+        speaker: str = "",
         provider_summary: Optional[str] = None,
     ) -> str:
         transcript = input_text.strip()
         if len(transcript) > 3400:
             transcript = transcript[:3397].rstrip() + "…"
         transcript = html.escape(transcript)
-        escaped_speaker = html.escape(speaker)
+        # An empty speaker means the surface already names the agent.
+        speaker_line = f"<b>{html.escape(speaker)}</b>\n" if speaker else ""
         if stage == "sending":
             return (
-                f"<b>{escaped_speaker}</b>\n"
+                f"{speaker_line}"
                 f"📤 <b>Sending</b>\n<blockquote>{transcript}</blockquote>"
             )
         if stage == "working":
@@ -10553,7 +10656,7 @@ class DurableStore:
                 else ""
             )
             return (
-                f"<b>{escaped_speaker}</b>\n"
+                f"{speaker_line}"
                 f"🧠 <b>{provider_name} is working…</b>"
                 f"{metadata_line}\n"
                 f"<blockquote>{transcript}</blockquote>"
@@ -10593,7 +10696,10 @@ class DurableStore:
         if provider_row is None:
             raise StoreError("Managed voice receipt agent is unavailable.")
         provider = str(provider_row["provider"])
-        speaker = self.agent_speaker_header(str(provider_row["agent_id"]))
+        speaker = self.agent_card_header(
+            int(provider_row["mailbox_id"]),
+            str(provider_row["agent_id"]),
+        )
         provider_summary = self.agent_turn_summary(
             str(provider_row["agent_id"])
         )
@@ -10780,8 +10886,13 @@ class DurableStore:
                         expired_mailbox_id,
                         "cancelled",
                         (
-                            f"{self.agent_speaker_header(str(expired_row['agent_id']))}"
-                            "\n\n⏹ Cancelled."
+                            self.label_text(
+                                self.agent_card_header(
+                                    expired_mailbox_id,
+                                    str(expired_row["agent_id"]),
+                                ),
+                                "⏹ Cancelled.",
+                            )
                         ),
                         timestamp,
                         terminal=True,
@@ -11300,9 +11411,14 @@ class DurableStore:
                         mailbox_id,
                         "failed",
                         (
-                            f"{self.agent_speaker_header(str(row['agent_id']))}"
-                            "\n\n❌ Codex could not complete this request. "
-                            "You can retry or rephrase it."
+                            self.label_text(
+                                self.agent_card_header(
+                                    mailbox_id,
+                                    str(row["agent_id"]),
+                                ),
+                                "❌ Codex could not complete this request. "
+                                "You can retry or rephrase it.",
+                            )
                         ),
                         timestamp,
                         terminal=True,
@@ -11312,8 +11428,13 @@ class DurableStore:
                     mailbox_id,
                     f"retry-{attempts}",
                     (
-                        f"{self.agent_speaker_header(str(row['agent_id']))}"
-                        "\n\n🔄 Codex will retry this turn."
+                        self.label_text(
+                            self.agent_card_header(
+                                mailbox_id,
+                                str(row["agent_id"]),
+                            ),
+                            "🔄 Codex will retry this turn.",
+                        )
                     ),
                     timestamp,
                 )
@@ -11366,6 +11487,8 @@ class DurableStore:
         fallback_text = self.labeled_agent_chunks(
             str(row["agent_id"]),
             str(row["response_text"]),
+            fallback_chat_id,
+            thread_id,
         )[0]
         reply_markup = self._agent_voice_button_markup(
             int(mailbox_id),
@@ -11470,7 +11593,11 @@ class DurableStore:
                 "chat_id": int(chat_id),
                 "message_thread_id": message_thread_id,
                 "__voice_file_path": str(voice_file_path),
-                "caption": self.agent_speaker_header(agent_id),
+                "caption": self.agent_surface_header(
+                    agent_id,
+                    int(chat_id),
+                    message_thread_id,
+                ),
                 "reply_markup": {
                     "inline_keyboard": [
                         [

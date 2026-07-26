@@ -500,7 +500,11 @@ def enqueue_agent_reply_input(
         raise StoreError("Managed agent input requires the durable controller.")
     chat_id, thread_id = surface_coordinates()
     with DurableStore(Path(database_path)) as store:
-        speaker = store.agent_speaker_header(route.target_id)
+        speaker = store.agent_surface_header(
+            route.target_id,
+            chat_id,
+            thread_id,
+        )
         agent = store.resolve_agent(route.target_id)
         provider_summary = (
             provider_defaults.provider_turn_summary(
@@ -528,8 +532,9 @@ def enqueue_agent_reply_input(
             replied_message_id=route.telegram_message_id,
             receipt_text=receipt_text
             or (
-                f"📨 <b>Queued for {html.escape(speaker)}</b>"
-                f"{metadata_line}{context_line}"
+                "📨 <b>Queued"
+                + (f" for {html.escape(speaker)}" if speaker else "")
+                + f"</b>{metadata_line}{context_line}"
             ),
             receipt_parse_mode="HTML",
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
@@ -854,7 +859,9 @@ def enqueue_agent_input(
         if agent is None or agent.role not in {"project", "worker"}:
             raise StoreError("Managed agent route is no longer valid.")
         chat_id, thread_id = surface_coordinates()
-        speaker = html.escape(store.agent_speaker_header(agent.agent_id))
+        speaker = html.escape(
+            store.agent_surface_header(agent.agent_id, chat_id, thread_id)
+        )
         provider_summary = provider_defaults.provider_turn_summary(
             agent.provider,
             agent.provider_config,
@@ -869,7 +876,7 @@ def enqueue_agent_input(
             else ""
         )
         receipt = (
-            f"📨 <b>Queued for {speaker}</b>"
+            f"📨 <b>Queued{f' for {speaker}' if speaker else ''}</b>"
             f"{metadata_line}"
             f"{context_line}"
         )
@@ -3941,6 +3948,21 @@ def attachment_prompt(path: Path, caption: str, kind: str) -> str:
     return prompt
 
 
+def transcribing_receipt(
+    store: DurableStore,
+    agent_id: str,
+    chat_id: int,
+    thread_id: Optional[int],
+) -> str:
+    """Name the agent only when the surface does not already."""
+    speaker = html.escape(
+        store.agent_surface_header(agent_id, chat_id, thread_id)
+    )
+    if speaker:
+        return f"🎙️ <b>{speaker} is transcribing…</b>"
+    return "🎙️ <b>Transcribing…</b>"
+
+
 def transcribe_voice_note(voice: dict) -> str:
     """Download one Telegram voice note and transcribe it locally."""
     with tempfile.TemporaryDirectory(
@@ -4012,10 +4034,11 @@ def handle_voice(update: dict, voice: dict) -> None:
                 chat_id=chat_id,
                 message_thread_id=thread_id,
                 replied_message_id=agent_reply_route.telegram_message_id,
-                receipt_text=(
-                    "🎙️ <b>"
-                    f"{html.escape(store.agent_speaker_header(managed_agent.agent_id))} "
-                    "is transcribing…</b>"
+                receipt_text=transcribing_receipt(
+                    store,
+                    managed_agent.agent_id,
+                    chat_id,
+                    thread_id,
                 ),
                 input_kind="voice",
                 parse_mode="HTML",
@@ -4050,10 +4073,11 @@ def handle_voice(update: dict, voice: dict) -> None:
                 source_inbox_job_id=int(job_id),
                 chat_id=chat_id,
                 message_thread_id=thread_id,
-                receipt_text=(
-                    "🎙️ <b>"
-                    f"{html.escape(store.agent_speaker_header(managed_agent.agent_id))} "
-                    "is transcribing…</b>"
+                receipt_text=transcribing_receipt(
+                    store,
+                    managed_agent.agent_id,
+                    chat_id,
+                    thread_id,
                 ),
                 input_kind="voice",
                 parse_mode="HTML",

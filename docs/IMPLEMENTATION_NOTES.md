@@ -1103,6 +1103,36 @@ Until the daemons restart, a new topic still gets its pinned intro but no
 refreshes: recording the message ID and queueing edits both live in worker code
 that the running processes predate.
 
+## The surface is the label
+
+Every agent-authored message repeated the topic's own name — `📨 Queued for
+Prompt improvements`, `🎙️ Prompt improvements is transcribing…`, and the name
+above each answer — while Telegram already shows that name at the top of the
+screen. The label is now conditional on where the message lands.
+
+`agent_surface_header(agent_id, chat_id, message_thread_id)` returns an empty
+string when those coordinates are the agent's own bound surface, and the durable
+project name otherwise; `label_text` joins a header to a body, or returns the
+body untouched when there is none. `agent_card_header(mailbox_id, agent_id)`
+answers the same question for a turn card by resolving where that card actually
+lives, which matters because a turn dispatched from the root Control chat keeps
+its card there.
+
+So inside a topic the messages are now `📨 Queued`, `🎙️ Transcribing…`,
+`🧠 Codex is working…`, `⏹ Cancelled.`, and bare answers. In the root Control
+chat — relayed answers, dispatch previews, replies continued from there, and the
+fallback resend — the project name is retained, because there it is the only
+thing identifying who is speaking. `labeled_agent_chunks` takes optional
+delivery coordinates for exactly this reason: the same response is labeled when
+relayed and unlabeled in its own topic. `agent_voice_status_text` treats an empty
+speaker as "no speaker line" rather than defaulting to `Agent`.
+
+Verified by updating every affected assertion in both directions — the in-topic
+receipts, transcribing notices, working cards, voice status, scoped skill
+updates, and final answers lost their labels, while the two root-chat cases kept
+theirs, which is what proves the discriminator works rather than a blanket
+removal. Full suite green at 350 tests.
+
 ## Stage 0 legacy bridge commands
 
 The original non-durable bridge remains in `telegram_bridge.py` and is still

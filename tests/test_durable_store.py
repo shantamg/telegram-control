@@ -1430,7 +1430,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(outbound.params["message_thread_id"], 62)
         self.assertEqual(
             outbound.params["text"],
-            "telegram-control\n\ndone",
+            "done",
         )
         route = json.loads(
             self.store.connection.execute(
@@ -1851,7 +1851,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(final_message.params["message_thread_id"], 62)
         self.assertEqual(
             final_message.params["text"],
-            "telegram-control\n\nfast result",
+            "fast result",
         )
         self.assertIsNone(self.store.claim_outbox("other-sender", now=106))
         self.store.complete_outbox(
@@ -1938,7 +1938,8 @@ class DurableStoreTests(unittest.TestCase):
         )
         self.assertEqual(target.chat_id, 123)
         self.assertEqual(target.message_thread_id, 62)
-        self.assertEqual(target.speaker, "telegram-control")
+        # Inside the agent's own topic the surface already names it.
+        self.assertEqual(target.speaker, "")
 
         operation_id = (
             f"agent-mailbox:{mailbox_id}:notification:text:milestone:abc"
@@ -1965,7 +1966,7 @@ class DurableStoreTests(unittest.TestCase):
             {
                 "chat_id": 123,
                 "message_thread_id": 62,
-                "text": "telegram-control\n\nTests are running.",
+                "text": "Tests are running.",
             },
         )
         self.assertEqual(
@@ -2559,7 +2560,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(fallback.method, "sendMessage")
         self.assertEqual(
             fallback.params["text"],
-            "telegram-control\n\ndurable result",
+            "durable result",
         )
         self.assertEqual(fallback.params["message_thread_id"], 62)
 
@@ -8998,7 +8999,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 receipt = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(receipt.params["message_thread_id"], 62)
-                self.assertIn("Queued for Journal", receipt.params["text"])
+                self.assertIn("📨 <b>Queued</b>", receipt.params["text"])
 
                 followup = forum_update(
                     11,
@@ -10201,7 +10202,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 transcribing = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     transcribing.params["text"],
-                    "🎙️ <b>Journal is transcribing…</b>",
+                    "🎙️ <b>Transcribing…</b>",
                 )
 
     def test_new_private_forum_requires_confirmation_before_control(self):
@@ -11370,7 +11371,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     receipt.params["text"],
-                    "📨 <b>Queued for telegram-control</b>\n"
+                    "📨 <b>Queued</b>\n"
                     f"⚙️ <b>{provider_summary}</b>",
                 )
                 self.assertEqual(receipt.params["parse_mode"], "HTML")
@@ -11413,7 +11414,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(response.params["message_thread_id"], 62)
                 self.assertEqual(
                     response.params["text"],
-                    "telegram-control\n\nCodex adapter response",
+                    "Codex adapter response",
                 )
                 usage = store.latest_agent_usage(agent.agent_id)
                 self.assertEqual(usage["input_tokens"], 50)
@@ -11463,7 +11464,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     next_receipt.params["text"],
-                    "📨 <b>Queued for telegram-control</b>\n"
+                    "📨 <b>Queued</b>\n"
                     f"⚙️ <b>{provider_summary}</b>\n"
                     "📊 <b>Context before this turn:</b> "
                     "41% used · 82,500 / 200,000 tokens",
@@ -11634,7 +11635,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 receipt = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     receipt.params["text"],
-                    "🎙️ <b>telegram-control is transcribing…</b>",
+                    "🎙️ <b>Transcribing…</b>",
                 )
                 self.assertEqual(receipt.params["parse_mode"], "HTML")
                 self.assertEqual(
@@ -11667,7 +11668,6 @@ class DurableIntegrationTests(unittest.TestCase):
                 sending_edit = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(
                     sending_edit.params["text"],
-                    "<b>telegram-control</b>\n"
                     "📤 <b>Sending</b>\n"
                     "<blockquote>inspect &lt;voice&gt; &amp; route</blockquote>",
                 )
@@ -11686,7 +11686,6 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     working_edit.params["text"],
-                    "<b>telegram-control</b>\n"
                     "🧠 <b>Codex is working…</b>\n"
                     f"⚙️ <b>{provider_summary}</b>\n"
                     "<blockquote>inspect &lt;voice&gt; &amp; route</blockquote>",
@@ -11697,7 +11696,6 @@ class DurableIntegrationTests(unittest.TestCase):
                         "inspect <voice> & route",
                         "claude",
                     ),
-                    "<b>Agent</b>\n"
                     "🧠 <b>Claude is working…</b>\n"
                     "<blockquote>inspect &lt;voice&gt; &amp; route</blockquote>",
                 )
@@ -11713,7 +11711,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(final_message.params["message_thread_id"], 62)
                 self.assertEqual(
                     final_message.params["text"],
-                    "telegram-control\n\nvoice route complete",
+                    "voice route complete",
                 )
 
     def test_new_private_forum_voice_prompts_before_transcription(self):
