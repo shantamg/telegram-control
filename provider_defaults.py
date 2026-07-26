@@ -130,3 +130,25 @@ def describe_provider_config(
         return f"Default (currently {effective[key]})"
 
     return label("model"), label("effort")
+
+
+def provider_turn_summary(
+    provider: str,
+    provider_config: Optional[dict[str, Any]] = None,
+    working_directory: Optional[str] = None,
+    *,
+    home_directory: Optional[Path] = None,
+) -> str:
+    """Return compact effective provider metadata for transient turn cards."""
+
+    effective = effective_provider_config(
+        provider,
+        provider_config,
+        working_directory,
+        home_directory=home_directory,
+    )
+    provider_name = "Claude" if provider == "claude" else "Codex"
+    return (
+        f"{provider_name} · {effective['model']} · "
+        f"{effective['effort']} effort"
+    )

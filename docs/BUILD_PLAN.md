@@ -844,7 +844,8 @@ capture the effective context window directly from Codex app-server or Claude
 Agent SDK events, so `/agent`, the initial queued receipt, and generic working
 states can show a trustworthy occupied-context percentage without hard-coded
 model limits. The queued and working cards label it as the snapshot before the
-new turn; a new session or provider switch suppresses stale metadata.
+new turn and also show the effective provider, model, and effort; a new session
+or provider switch suppresses stale context metadata.
 
 The managed voice-input slice passed 58 offline tests and its live test on
 July 23, 2026:

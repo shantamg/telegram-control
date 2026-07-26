@@ -16,8 +16,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
+import provider_defaults
 
-SCHEMA_VERSION = 20
+
+SCHEMA_VERSION = 21
 
 CONTROL_SPEAKER = "🎛 Control"
 
@@ -211,6 +213,29 @@ class AgentConsole:
     agent_id: str
     tmux_session_name: str
     state: str
+
+
+@dataclass(frozen=True)
+class DetachedWorker:
+    worker_id: int
+    name: str
+    binding_id: int
+    origin_agent_id: Optional[str]
+    project_path: str
+    provider: str
+    tmux_session_name: str
+    intended_state: str
+    observed_state: str
+    restart_count: int
+
+    @property
+    def needs_restart(self) -> bool:
+        """Supposed to be running, but isn't.
+
+        The distinction the two state columns exist for: a worker the operator
+        stopped is not a worker that died.
+        """
+        return self.intended_state == "running" and self.observed_state == "stopped"
 
 
 @dataclass(frozen=True)
@@ -938,6 +963,53 @@ MIGRATION_20 = (
     """,
 )
 
+MIGRATION_21 = (
+    # A detached worker is a tmux session doing long-running work that must
+    # outlive the managed turn that started it. It reports into a topic of its
+    # own so the project's main topic stays conversational, and that topic is
+    # report-only: nothing owns it as a managed turn, so there is no live turn
+    # to talk over, and an inbound message there is answered by policy rather
+    # than routed to an agent.
+    #
+    # Recorded here rather than in a scratch file because the interesting
+    # questions are durable ones: which tmux session belongs to which topic,
+    # which project it was started for, and — after a crash or reboot — which
+    # workers were supposed to still be running.
+    """
+    CREATE TABLE detached_workers (
+        worker_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        binding_id INTEGER NOT NULL
+            REFERENCES surface_bindings(binding_id) ON DELETE RESTRICT,
+        origin_agent_id TEXT
+            REFERENCES agents(agent_id) ON DELETE SET NULL,
+        project_path TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        tmux_session_name TEXT NOT NULL UNIQUE,
+        -- What the operator asked for, kept apart from what is actually true.
+        -- Conflating them is what makes crash recovery guesswork: without
+        -- this, a vanished tmux session is indistinguishable from one that
+        -- was deliberately shut down.
+        intended_state TEXT NOT NULL
+            CHECK (intended_state IN ('running', 'stopped')),
+        observed_state TEXT NOT NULL
+            CHECK (observed_state IN ('starting', 'running', 'stopped')),
+        restart_count INTEGER NOT NULL DEFAULT 0,
+        last_restart_at REAL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX detached_workers_intent
+    ON detached_workers(intended_state, observed_state)
+    """,
+    """
+    CREATE UNIQUE INDEX detached_workers_binding
+    ON detached_workers(binding_id)
+    """,
+)
+
 
 ROUTER_INPUT_LIMIT = 8_000
 REPLY_QUOTE_LIMIT = 1_000
@@ -1327,6 +1399,11 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 20
                 self.connection.execute("PRAGMA user_version = 20")
+            if current < 21:
+                for statement in MIGRATION_21:
+                    self.connection.execute(statement)
+                current = 21
+                self.connection.execute("PRAGMA user_version = 21")
             # Referential integrity is audited before the commit so a failed
             # check rolls the whole migration back instead of stranding an
             # upgraded-but-broken database.
@@ -5729,13 +5806,15 @@ class DurableStore:
                 agent = self.resolve_agent(dispatch_agent_id)
                 if agent is None or agent.role != "project":
                     raise StoreError("Router dispatch target is not a project agent.")
+                metadata_line = (
+                    f"\n\n⚙️ {self.agent_turn_summary(agent.agent_id)}"
+                )
+                if len(preview_text) + len(metadata_line) <= 3800:
+                    preview_text += metadata_line
                 context_snapshot = self.agent_context_snapshot(agent.agent_id)
                 if context_snapshot is not None:
-                    provider_name = (
-                        "Claude" if agent.provider == "claude" else "Codex"
-                    )
                     context_line = (
-                        f"\n\n📊 {provider_name} context before this turn: "
+                        "\n\n📊 Context before this turn: "
                         f"{context_snapshot}"
                     )
                     if len(preview_text) + len(context_line) <= 3800:
@@ -6461,6 +6540,18 @@ class DurableStore:
 
         return context_usage_summary(self.current_agent_usage(agent_id))
 
+    def agent_turn_summary(self, agent_id: str) -> str:
+        """Return effective provider, model, and effort for a turn card."""
+
+        agent = self.resolve_agent(agent_id)
+        if agent is None:
+            raise StoreError("Managed agent was not found.")
+        return provider_defaults.provider_turn_summary(
+            agent.provider,
+            agent.provider_config,
+            agent.project_path,
+        )
+
     def pause_agent(self, agent_id: str, now: Optional[float] = None) -> ManagedAgent:
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
@@ -6701,6 +6792,191 @@ class DurableStore:
             self.connection.execute("ROLLBACK")
             raise
         return self._managed_agent_from_row(updated)
+
+    @staticmethod
+    def _detached_worker(row: Any) -> DetachedWorker:
+        return DetachedWorker(
+            worker_id=int(row["worker_id"]),
+            name=str(row["name"]),
+            binding_id=int(row["binding_id"]),
+            origin_agent_id=row["origin_agent_id"],
+            project_path=str(row["project_path"]),
+            provider=str(row["provider"]),
+            tmux_session_name=str(row["tmux_session_name"]),
+            intended_state=str(row["intended_state"]),
+            observed_state=str(row["observed_state"]),
+            restart_count=int(row["restart_count"]),
+        )
+
+    def create_detached_worker(
+        self,
+        *,
+        name: str,
+        binding_id: int,
+        project_path: str,
+        provider: str,
+        tmux_session_name: str,
+        origin_agent_id: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> DetachedWorker:
+        """Record a worker as intended-running before its process exists.
+
+        Written first so a crash between here and tmux leaves a row that
+        reconciliation can see and clean up, rather than an orphan session
+        nothing knows about.
+        """
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            binding = self.connection.execute(
+                "SELECT 1 FROM surface_bindings WHERE binding_id = ? AND state = 'active'",
+                (int(binding_id),),
+            ).fetchone()
+            if binding is None:
+                raise StoreError("Detached worker topic binding is unavailable.")
+            self.connection.execute(
+                """
+                INSERT INTO detached_workers (
+                    name, binding_id, origin_agent_id, project_path, provider,
+                    tmux_session_name, intended_state, observed_state,
+                    restart_count, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'running', 'starting', 0, ?, ?)
+                """,
+                (
+                    str(name),
+                    int(binding_id),
+                    origin_agent_id,
+                    str(project_path),
+                    str(provider),
+                    str(tmux_session_name),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            row = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except sqlite3.IntegrityError as error:
+            self.connection.execute("ROLLBACK")
+            raise StoreError(
+                "A detached worker already uses that name or tmux session."
+            ) from error
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self._detached_worker(row)
+
+    def resolve_detached_worker(self, name: str) -> Optional[DetachedWorker]:
+        row = self.connection.execute(
+            "SELECT * FROM detached_workers WHERE name = ?",
+            (str(name),),
+        ).fetchone()
+        return None if row is None else self._detached_worker(row)
+
+    def detached_worker_for_thread(
+        self,
+        chat_id: int,
+        message_thread_id: int,
+    ) -> Optional[DetachedWorker]:
+        """The worker that owns a topic, if any.
+
+        Inbound routing uses this to recognise a report-only topic before it
+        tries to find an agent to hand the message to.
+        """
+        row = self.connection.execute(
+            """
+            SELECT w.*
+            FROM detached_workers AS w
+            JOIN surface_bindings AS b ON b.binding_id = w.binding_id
+            WHERE b.chat_id = ? AND b.message_thread_id = ? AND b.state = 'active'
+            """,
+            (int(chat_id), int(message_thread_id)),
+        ).fetchone()
+        return None if row is None else self._detached_worker(row)
+
+    def list_detached_workers(self) -> list[DetachedWorker]:
+        rows = self.connection.execute(
+            "SELECT * FROM detached_workers ORDER BY worker_id"
+        ).fetchall()
+        return [self._detached_worker(row) for row in rows]
+
+    def set_detached_worker_states(
+        self,
+        name: str,
+        *,
+        intended_state: Optional[str] = None,
+        observed_state: Optional[str] = None,
+        bump_restart: bool = False,
+        now: Optional[float] = None,
+    ) -> DetachedWorker:
+        timestamp = time.time() if now is None else float(now)
+        if intended_state is not None and intended_state not in {"running", "stopped"}:
+            raise StoreError("Detached worker intended state is invalid.")
+        if observed_state is not None and observed_state not in {
+            "starting",
+            "running",
+            "stopped",
+        }:
+            raise StoreError("Detached worker observed state is invalid.")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Detached worker was not found.")
+            self.connection.execute(
+                """
+                UPDATE detached_workers
+                SET intended_state = ?,
+                    observed_state = ?,
+                    restart_count = restart_count + ?,
+                    last_restart_at = CASE WHEN ? THEN ? ELSE last_restart_at END,
+                    updated_at = ?
+                WHERE name = ?
+                """,
+                (
+                    intended_state or row["intended_state"],
+                    observed_state or row["observed_state"],
+                    1 if bump_restart else 0,
+                    1 if bump_restart else 0,
+                    timestamp,
+                    timestamp,
+                    str(name),
+                ),
+            )
+            updated = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self._detached_worker(updated)
+
+    def delete_detached_worker(self, name: str) -> DetachedWorker:
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                "SELECT * FROM detached_workers WHERE name = ?",
+                (str(name),),
+            ).fetchone()
+            if row is None:
+                raise StoreError("Detached worker was not found.")
+            self.connection.execute(
+                "DELETE FROM detached_workers WHERE name = ?",
+                (str(name),),
+            )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+        return self._detached_worker(row)
 
     def reserve_agent_console(
         self,
@@ -7859,6 +8135,10 @@ class DurableStore:
             )
             speaker = self.agent_speaker_header(str(row["agent_id"]))
             provider_name = "Claude" if str(row["provider"]) == "claude" else "Codex"
+            metadata_line = (
+                "\n\n⚙️ "
+                f"{self.agent_turn_summary(str(row['agent_id']))}"
+            )
             context_snapshot = self.agent_context_snapshot(str(row["agent_id"]))
             context_line = (
                 f"\n\n📊 Context before this turn: {context_snapshot}"
@@ -7873,6 +8153,7 @@ class DurableStore:
                 ),
                 (
                     f"{speaker}\n\n🧠 {provider_name} is working…"
+                    f"{metadata_line}"
                     f"{context_line}"
                 ),
                 timestamp,
@@ -7955,6 +8236,10 @@ class DurableStore:
                 ),
                 "cancelling": f"⏹ Stopping {provider_name}…",
             }
+            metadata_line = (
+                "\n\n⚙️ "
+                f"{self.agent_turn_summary(str(row['agent_id']))}"
+            )
             context_snapshot = self.agent_context_snapshot(str(row["agent_id"]))
             context_line = (
                 f"\n\n📊 Context before this turn: {context_snapshot}"
@@ -7967,7 +8252,10 @@ class DurableStore:
                     f"progress-{stage}",
                     int(row["attempts"]),
                 ),
-                f"{speaker}\n\n{labels[stage]}{context_line}",
+                (
+                    f"{speaker}\n\n{labels[stage]}"
+                    f"{metadata_line}{context_line}"
+                ),
                 timestamp,
             )
             self.connection.execute("COMMIT")
@@ -8963,6 +9251,7 @@ class DurableStore:
         input_text: str,
         provider: str = "codex",
         speaker: str = "Agent",
+        provider_summary: Optional[str] = None,
     ) -> str:
         transcript = input_text.strip()
         if len(transcript) > 3400:
@@ -8976,9 +9265,15 @@ class DurableStore:
             )
         if stage == "working":
             provider_name = "Claude" if provider == "claude" else "Codex"
+            metadata_line = (
+                f"\n⚙️ <b>{html.escape(provider_summary)}</b>"
+                if provider_summary
+                else ""
+            )
             return (
                 f"<b>{escaped_speaker}</b>\n"
-                f"🧠 <b>{provider_name} is working…</b>\n"
+                f"🧠 <b>{provider_name} is working…</b>"
+                f"{metadata_line}\n"
                 f"<blockquote>{transcript}</blockquote>"
             )
         raise StoreError("Managed voice status stage is invalid.")
@@ -9017,6 +9312,9 @@ class DurableStore:
             raise StoreError("Managed voice receipt agent is unavailable.")
         provider = str(provider_row["provider"])
         speaker = self.agent_speaker_header(str(provider_row["agent_id"]))
+        provider_summary = self.agent_turn_summary(
+            str(provider_row["agent_id"])
+        )
         result = json.loads(receipt["telegram_result_json"])
         params = json.loads(receipt["params_json"])
         try:
@@ -9044,6 +9342,7 @@ class DurableStore:
                     input_text,
                     provider,
                     speaker,
+                    provider_summary,
                 ),
                 "parse_mode": "HTML",
             },

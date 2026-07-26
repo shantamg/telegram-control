@@ -14,6 +14,7 @@ import on_message
 import agent_telegram
 import codex_sessions
 import provider_adapters
+import provider_defaults
 import router_contract
 import telegram_control
 from durable_store import (
@@ -264,17 +265,19 @@ class DurableStoreTests(unittest.TestCase):
     def test_managed_skill_install_uses_shared_real_directory_and_claude_link(self):
         root = Path(self.temporary_directory.name)
         source_directory = root / "repo-skills"
-        source_skill = source_directory / "telegram-group-icon"
-        (source_skill / "agents").mkdir(parents=True)
-        (source_skill / "SKILL.md").write_text(
-            "---\nname: telegram-group-icon\n"
-            "description: Test skill.\n---\n",
-            encoding="utf-8",
-        )
-        (source_skill / "agents" / "openai.yaml").write_text(
-            'interface:\n  display_name: "Telegram Group Icon"\n',
-            encoding="utf-8",
-        )
+        # Built from the managed list rather than one hardcoded name, so
+        # adding a skill does not silently leave this asserting about a subset.
+        for name in telegram_control.MANAGED_SHARED_SKILLS:
+            source_skill = source_directory / name
+            (source_skill / "agents").mkdir(parents=True)
+            (source_skill / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: Test skill.\n---\n",
+                encoding="utf-8",
+            )
+            (source_skill / "agents" / "openai.yaml").write_text(
+                f'interface:\n  display_name: "{name}"\n',
+                encoding="utf-8",
+            )
         shared_directory = root / ".agents" / "skills"
         claude_directory = root / ".claude" / "skills"
 
@@ -284,14 +287,15 @@ class DurableStoreTests(unittest.TestCase):
                 shared_directory,
                 claude_directory,
             ),
-            ["telegram-group-icon"],
+            list(telegram_control.MANAGED_SHARED_SKILLS),
         )
-        shared_skill = shared_directory / "telegram-group-icon"
-        claude_skill = claude_directory / "telegram-group-icon"
-        self.assertTrue(shared_skill.is_dir())
-        self.assertFalse(shared_skill.is_symlink())
-        self.assertTrue(claude_skill.is_symlink())
-        self.assertEqual(claude_skill.resolve(), shared_skill.resolve())
+        for name in telegram_control.MANAGED_SHARED_SKILLS:
+            shared_skill = shared_directory / name
+            claude_skill = claude_directory / name
+            self.assertTrue(shared_skill.is_dir())
+            self.assertFalse(shared_skill.is_symlink())
+            self.assertTrue(claude_skill.is_symlink())
+            self.assertEqual(claude_skill.resolve(), shared_skill.resolve())
 
     def test_duplicate_update_has_one_job_and_never_moves_offset_backwards(self):
         self.assertTrue(self.store.ingest_update(message_update(10), now=100))
@@ -2230,6 +2234,15 @@ class DurableStoreTests(unittest.TestCase):
             preview.card["route_retarget"],
             {"target_type": "agent", "target_id": agent.agent_id},
         )
+        self.assertIn(
+            "⚙️ "
+            + provider_defaults.provider_turn_summary(
+                agent.provider,
+                agent.provider_config,
+                agent.project_path,
+            ),
+            preview.params["text"],
+        )
         self.store.complete_outbox(
             preview.message_id,
             "sender",
@@ -2288,6 +2301,49 @@ class DurableStoreTests(unittest.TestCase):
             )
             self.assertEqual(durable.target_type, "agent")
             self.assertEqual(durable.target_id, agent.agent_id)
+
+    def test_working_card_shows_effective_model_and_effort(self):
+        agent, _, _ = self._setup_routed_agent_turn()
+        receipt = self.store.claim_outbox("sender", now=104)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=105,
+        )
+        preview = self.store.claim_outbox("sender", now=106)
+        self.store.complete_outbox(
+            preview.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=107,
+        )
+        mailbox = self.store.claim_agent_mailbox("agent", now=108)
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            "agent",
+            "provider-turn-1",
+            now=109,
+        )
+        row = self.store.connection.execute(
+            """
+            SELECT params_json
+            FROM outbox_messages
+            WHERE operation_id = ?
+            """,
+            (f"agent-mailbox:{mailbox.mailbox_id}:turn-started",),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        status_text = json.loads(row["params_json"])["text"]
+        self.assertIn(
+            "⚙️ "
+            + provider_defaults.provider_turn_summary(
+                agent.provider,
+                agent.provider_config,
+                agent.project_path,
+            ),
+            status_text,
+        )
 
     def test_provider_output_coalesces_on_the_existing_turn_card(self):
         _agent, _, router_mailbox_id = self._setup_routed_agent_turn()
@@ -6964,9 +7020,15 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(mailbox_row["state"], "queued")
                 receipt = store.claim_outbox("sender", now=10**12 + 2)
                 self.assertEqual(receipt.params["chat_id"], 123)
+                provider_summary = provider_defaults.provider_turn_summary(
+                    agent.provider,
+                    agent.provider_config,
+                    agent.project_path,
+                )
                 self.assertEqual(
                     receipt.params["text"],
-                    "📨 <b>Queued for telegram-control</b>",
+                    "📨 <b>Queued for telegram-control</b>\n"
+                    f"⚙️ <b>{provider_summary}</b>",
                 )
                 self.assertEqual(receipt.params["parse_mode"], "HTML")
 
@@ -9849,9 +9911,15 @@ class DurableIntegrationTests(unittest.TestCase):
                     {"queued": 1},
                 )
                 receipt = store.claim_outbox("sender", now=10**12)
+                provider_summary = provider_defaults.provider_turn_summary(
+                    agent.provider,
+                    agent.provider_config,
+                    agent.project_path,
+                )
                 self.assertEqual(
                     receipt.params["text"],
-                    "📨 <b>Queued for telegram-control</b>",
+                    "📨 <b>Queued for telegram-control</b>\n"
+                    f"⚙️ <b>{provider_summary}</b>",
                 )
                 self.assertEqual(receipt.params["parse_mode"], "HTML")
                 store.complete_outbox(
@@ -9944,7 +10012,8 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     next_receipt.params["text"],
                     "📨 <b>Queued for telegram-control</b>\n"
-                    "📊 <b>Codex context before this turn:</b> "
+                    f"⚙️ <b>{provider_summary}</b>\n"
+                    "📊 <b>Context before this turn:</b> "
                     "41% used · 82,500 / 200,000 tokens",
                 )
 
@@ -10158,10 +10227,16 @@ class DurableIntegrationTests(unittest.TestCase):
                     now=104,
                 )
                 working_edit = store.claim_outbox("sender", now=10**12)
+                provider_summary = provider_defaults.provider_turn_summary(
+                    agent.provider,
+                    agent.provider_config,
+                    agent.project_path,
+                )
                 self.assertEqual(
                     working_edit.params["text"],
                     "<b>telegram-control</b>\n"
                     "🧠 <b>Codex is working…</b>\n"
+                    f"⚙️ <b>{provider_summary}</b>\n"
                     "<blockquote>inspect &lt;voice&gt; &amp; route</blockquote>",
                 )
                 self.assertEqual(

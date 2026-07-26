@@ -29,6 +29,15 @@ class ProviderDefaultsTests(unittest.TestCase):
 
             self.assertEqual(model, "Default (currently gpt-5.6-sol)")
             self.assertEqual(effort, "Default (currently high)")
+            self.assertEqual(
+                provider_defaults.provider_turn_summary(
+                    "codex",
+                    {},
+                    "/tmp/example",
+                    home_directory=home,
+                ),
+                "Codex · gpt-5.6-sol · high effort",
+            )
 
     def test_claude_defaults_follow_user_and_project_settings(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

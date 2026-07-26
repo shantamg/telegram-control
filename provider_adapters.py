@@ -73,6 +73,19 @@ class ProviderAdapter(Protocol):
         """
         ...
 
+    def detached_launch_command(
+        self,
+        working_directory: str,
+        provider_config: dict[str, Any],
+    ) -> list[str]:
+        """Argv that starts a FRESH interactive session in a directory.
+
+        Distinct from console_command, which resumes an existing conversation.
+        A detached worker has no prior session to resume — it is started to do
+        new work — so this is the launch a caller drives with its own brief.
+        """
+        ...
+
     def run_turn(
         self,
         agent: ManagedAgent,
@@ -516,6 +529,28 @@ class CodexExecAdapter:
         if effort:
             command.extend(["--config", f'model_reasoning_effort="{effort}"'])
         command.append(agent.provider_session_id)
+        return command
+
+    def detached_launch_command(
+        self,
+        working_directory: str,
+        provider_config: dict[str, Any],
+    ) -> list[str]:
+        if not self.binary:
+            raise ProviderAdapterError("Codex CLI is not installed.")
+        command = [
+            self.binary,
+            "--cd",
+            str(working_directory),
+            "--sandbox",
+            str(provider_config.get("sandbox", "danger-full-access")),
+        ]
+        model = provider_config.get("model")
+        if model:
+            command.extend(["--model", str(model)])
+        effort = provider_config.get("effort")
+        if effort:
+            command.extend(["--config", f'model_reasoning_effort="{effort}"'])
         return command
 
     @staticmethod
@@ -1238,6 +1273,32 @@ class ClaudePrintAdapter:
         effort = agent.provider_config.get("effort")
         if effort:
             command.extend(["--effort", str(effort)])
+        return command
+
+    def detached_launch_command(
+        self,
+        working_directory: str,
+        provider_config: dict[str, Any],
+    ) -> list[str]:
+        if not self.binary:
+            raise ProviderAdapterError("Claude Code CLI is not installed.")
+        permission_mode = str(
+            provider_config.get("permission_mode", "bypassPermissions")
+        )
+        if permission_mode not in self.PERMISSION_MODES:
+            raise ProviderAdapterError("Claude permission mode is invalid.")
+        command = [self.binary, "--permission-mode", permission_mode]
+        if permission_mode == "bypassPermissions":
+            command.append("--dangerously-skip-permissions")
+        model = provider_config.get("model")
+        if model:
+            command.extend(["--model", str(model)])
+        effort = provider_config.get("effort")
+        if effort:
+            command.extend(["--effort", str(effort)])
+        # Claude Code has no "start in this directory" flag; the caller runs
+        # it with tmux's own -c, so working_directory is intentionally unused
+        # here rather than smuggled in as an argument.
         return command
 
     def command(

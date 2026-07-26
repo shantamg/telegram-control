@@ -380,14 +380,19 @@ def enqueue_agent_reply_input(route, text: str) -> None:
     with DurableStore(Path(database_path)) as store:
         speaker = store.agent_speaker_header(route.target_id)
         agent = store.resolve_agent(route.target_id)
-        provider_name = (
-            "Claude"
-            if agent is not None and agent.provider == "claude"
+        provider_summary = (
+            provider_defaults.provider_turn_summary(
+                agent.provider,
+                agent.provider_config,
+                agent.project_path,
+            )
+            if agent is not None
             else "Codex"
         )
         context_snapshot = store.agent_context_snapshot(route.target_id)
+        metadata_line = f"\n⚙️ <b>{html.escape(provider_summary)}</b>"
         context_line = (
-            f"\n📊 <b>{provider_name} context before this turn:</b> "
+            "\n📊 <b>Context before this turn:</b> "
             f"{context_snapshot}"
             if context_snapshot is not None
             else ""
@@ -401,6 +406,7 @@ def enqueue_agent_reply_input(route, text: str) -> None:
             replied_message_id=route.telegram_message_id,
             receipt_text=(
                 f"📨 <b>Queued for {html.escape(speaker)}</b>"
+                f"{metadata_line}"
                 f"{context_line}"
             ),
             receipt_parse_mode="HTML",
@@ -680,15 +686,24 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
             raise StoreError("Managed agent route is no longer valid.")
         chat_id, thread_id = surface_coordinates()
         speaker = html.escape(store.agent_speaker_header(agent.agent_id))
-        provider_name = "Claude" if agent.provider == "claude" else "Codex"
+        provider_summary = provider_defaults.provider_turn_summary(
+            agent.provider,
+            agent.provider_config,
+            agent.project_path,
+        )
         context_snapshot = store.agent_context_snapshot(agent.agent_id)
+        metadata_line = f"\n⚙️ <b>{html.escape(provider_summary)}</b>"
         context_line = (
-            f"\n📊 <b>{provider_name} context before this turn:</b> "
+            "\n📊 <b>Context before this turn:</b> "
             f"{context_snapshot}"
             if context_snapshot is not None
             else ""
         )
-        receipt = f"📨 <b>Queued for {speaker}</b>{context_line}"
+        receipt = (
+            f"📨 <b>Queued for {speaker}</b>"
+            f"{metadata_line}"
+            f"{context_line}"
+        )
         store.enqueue_agent_message_with_receipt(
             agent_id=agent.agent_id,
             source_inbox_job_id=int(job_id),

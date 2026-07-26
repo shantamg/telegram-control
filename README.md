@@ -207,7 +207,9 @@ conversation concurrently. The foreground `run --agent-workers` option accepts
 Each accepted agent turn immediately sends a compact queued receipt. When the
 current provider session has reported context metadata, that first receipt and
 the generic working states include a `Context before this turn` snapshot with
-the percentage used and token/window counts. Progress edits that same Telegram
+the percentage used and token/window counts. Those transient states also show
+the effective provider, model, and effort so inherited defaults are visible
+before streamed output replaces the card. Progress edits that same Telegram
 message while the provider runs. Completion sends the final answer as a new
 routed message so Telegram can notify the user, then durably queues deletion of
 the progress receipt only after Telegram acknowledges the last final-response

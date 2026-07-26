@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
+import detached_worker
 import discovery
 import provider_adapters
 import provider_defaults
@@ -49,7 +50,7 @@ SCRIPT_PATH = Path(__file__).resolve()
 SKILLS_SOURCE_DIR = SCRIPT_PATH.parent / "skills"
 SHARED_SKILLS_DIR = Path.home() / ".agents" / "skills"
 CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
-MANAGED_SHARED_SKILLS = ("telegram-group-icon",)
+MANAGED_SHARED_SKILLS = ("telegram-group-icon", "telegram-detached-worker")
 DEFAULT_AGENT_WORKERS = 8
 MAX_AGENT_WORKERS = 16
 TOPIC_PROBE_INTERVAL_SECONDS = 24 * 60 * 60
@@ -401,9 +402,31 @@ def dispatch_preview_text(
         if project is not None
         else str(arguments["project_slug"])
     )
+    target = store.resolve_project_agent(str(arguments["project_slug"]))
+    metadata_lines = []
+    if target is not None:
+        metadata_lines.append(
+            "⚙️ "
+            + provider_defaults.provider_turn_summary(
+                target.provider,
+                target.provider_config,
+                target.project_path,
+            )
+        )
+        context_snapshot = store.agent_context_snapshot(target.agent_id)
+        if context_snapshot is not None:
+            metadata_lines.append(
+                f"📊 Context before this turn: {context_snapshot}"
+            )
+    metadata = "\n".join(metadata_lines)
+    if metadata:
+        metadata = f"\n\n{metadata}"
     result = handoff_message(
         destination,
-        f"Sending: {arguments['message']}\n\nWaiting for {destination}…",
+        (
+            f"Sending: {arguments['message']}"
+            f"{metadata}\n\nWaiting for {destination}…"
+        ),
     )
     return result[:3800]
 
@@ -2310,6 +2333,143 @@ def install_managed_skills(
     return installed
 
 
+def _ensure_worker_topic(store, name: str):
+    """Create (or find) the worker's report-only topic in the managed chat."""
+    display_name = detached_worker.topic_name(name)
+    config = bridge.load_config()
+    chat_id = int(config["chat_id"])
+    existing = store.resolve_named_surface(chat_id, display_name, surface_type="task")
+    if existing is not None:
+        return existing
+    token = bridge.read_token()
+    bot = bridge.api_call(token, "getMe")
+    if not bool(bot.get("has_topics_enabled", False)):
+        raise StoreError(
+            "Telegram Threaded Mode is disabled for this bot. "
+            "Enable it in BotFather first."
+        )
+    topic = bridge.api_call(token, "createForumTopic", chat_id=chat_id, name=display_name)
+    try:
+        message_thread_id = int(topic["message_thread_id"])
+    except (KeyError, TypeError, ValueError):
+        raise StoreError("Telegram returned an invalid forum-topic result.") from None
+    return store.ensure_surface_binding(
+        chat_id=chat_id,
+        message_thread_id=message_thread_id,
+        surface_type="task",
+        display_name=display_name,
+        target_type="controller",
+        target_id="control",
+    )
+
+
+def worker_start_command(args: argparse.Namespace) -> None:
+    project_path = str(Path(args.project_path or os.getcwd()).expanduser().resolve())
+    provider_config = {}
+    if args.model:
+        provider_config["model"] = args.model
+    if args.effort:
+        provider_config["effort"] = args.effort
+    with open_store(args.db) as store:
+        binding = _ensure_worker_topic(store, args.name)
+        worker = detached_worker.create_worker(
+            store,
+            name=args.name,
+            binding_id=binding.binding_id,
+            project_path=project_path,
+            provider=args.provider,
+            provider_config=provider_config,
+        )
+    print(
+        json.dumps(
+            {
+                "name": worker.name,
+                "provider": worker.provider,
+                "project_path": worker.project_path,
+                "tmux_session": worker.tmux_session_name,
+                "topic": detached_worker.topic_name(worker.name),
+                "message_thread_id": binding.message_thread_id,
+                "attach": f"tmux attach-session -t '={worker.tmux_session_name}'",
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def worker_brief_command(args: argparse.Namespace) -> None:
+    brief = Path(args.file).expanduser().read_text(encoding="utf-8").strip()
+    if not brief:
+        raise StoreError("Brief file is empty.")
+    detached_worker.send_brief(args.name, brief)
+    print(f"Brief delivered to {detached_worker.tmux_session_name(args.name)}")
+
+
+def worker_report_command(args: argparse.Namespace) -> None:
+    text = sys.stdin.read()
+    with open_store(args.db) as store:
+        detached_worker.report(
+            store,
+            args.name,
+            key=args.key,
+            text=text,
+            mode="text" if args.text else "voice",
+        )
+    print("Report delivered.")
+
+
+def worker_status_command(args: argparse.Namespace) -> None:
+    with open_store(args.db) as store:
+        rows = []
+        for worker in store.list_detached_workers():
+            current = detached_worker.reconcile_worker(store, worker.name) or worker
+            rows.append(
+                {
+                    "name": current.name,
+                    "provider": current.provider,
+                    "intended": current.intended_state,
+                    "observed": current.observed_state,
+                    "needs_restart": current.needs_restart,
+                    "restart_count": current.restart_count,
+                    "tmux_session": current.tmux_session_name,
+                    "project_path": current.project_path,
+                }
+            )
+    print(json.dumps(rows, indent=2, sort_keys=True))
+
+
+def worker_stop_command(args: argparse.Namespace) -> None:
+    with open_store(args.db) as store:
+        worker = detached_worker.stop_worker(store, args.name)
+        deleted_topic = False
+        if args.delete_topic:
+            chat_id, thread_id = detached_worker.resolve_destination(store, args.name)
+            token = bridge.read_token()
+            bridge.api_call(
+                token,
+                "deleteForumTopic",
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+            )
+            store.retire_missing_topic(
+                worker.binding_id,
+                reason="Detached worker topic deleted at teardown.",
+            )
+            deleted_topic = True
+        store.delete_detached_worker(args.name)
+    print(
+        json.dumps(
+            {
+                "name": worker.name,
+                "stopped": True,
+                "topic_deleted": deleted_topic,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
 def install_skills_command(_: argparse.Namespace) -> None:
     installed = install_managed_skills()
     print("Installed shared Telegram Control skills:")
@@ -2939,6 +3099,48 @@ def build_parser() -> argparse.ArgumentParser:
         help=argparse.SUPPRESS,
     )
     restart_if_idle_parser.set_defaults(function=restart_if_idle_command)
+
+    worker_start_parser = subparsers.add_parser(
+        "worker-start",
+        help="Start a detached tmux worker with its own report-only topic.",
+    )
+    worker_start_parser.add_argument("name", help="Lowercase worker slug.")
+    worker_start_parser.add_argument(
+        "--provider", choices=("codex", "claude"), default="claude"
+    )
+    worker_start_parser.add_argument("--model", default=None)
+    worker_start_parser.add_argument("--effort", default=None)
+    worker_start_parser.add_argument("--project-path", default=None)
+    worker_start_parser.set_defaults(function=worker_start_command)
+
+    worker_brief_parser = subparsers.add_parser(
+        "worker-brief",
+        help="Send a task brief from a file into a detached worker.",
+    )
+    worker_brief_parser.add_argument("name")
+    worker_brief_parser.add_argument("--file", required=True)
+    worker_brief_parser.set_defaults(function=worker_brief_command)
+
+    worker_report_parser = subparsers.add_parser(
+        "worker-report",
+        help="Post an update from a detached worker into its topic (stdin).",
+    )
+    worker_report_parser.add_argument("name")
+    worker_report_parser.add_argument("--key", required=True)
+    worker_report_parser.add_argument("--text", action="store_true")
+    worker_report_parser.set_defaults(function=worker_report_command)
+
+    worker_status_parser = subparsers.add_parser(
+        "worker-status", help="Show detached worker intent versus reality."
+    )
+    worker_status_parser.set_defaults(function=worker_status_command)
+
+    worker_stop_parser = subparsers.add_parser(
+        "worker-stop", help="Stop a detached worker and optionally delete its topic."
+    )
+    worker_stop_parser.add_argument("name")
+    worker_stop_parser.add_argument("--delete-topic", action="store_true")
+    worker_stop_parser.set_defaults(function=worker_stop_command)
 
     install_skills_parser = subparsers.add_parser(
         "install-skills",
