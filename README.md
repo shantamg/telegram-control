@@ -134,8 +134,9 @@ the meet without fear repo in Software
 Control resolves it and asks you to confirm **Bind forum workspace**. After
 that, each new topic starts with the group's provider, model, and effort in one
 tap — and whatever you already sent runs as that topic's first turn, so nothing
-needs resending. Every topic opens with a pinned intro listing its commands, so
-`/help` is always one tap away.
+needs resending. Every topic keeps one pinned message listing its agent, model,
+effort, context used, and commands, edited in place as those change — so the pin
+is both the command shortcut and the live status of that topic.
 
 If you know the path up front, the first message can still do both at once:
 *"Set up this group for /absolute/workspace/path using Claude"* offers a single

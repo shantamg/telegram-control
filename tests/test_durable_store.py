@@ -2578,6 +2578,106 @@ class DurableStoreTests(unittest.TestCase):
         for handled in ("help", "agent", "status", "projects", "newgroup", "teardown"):
             self.assertIn(handled, [command["command"] for command in commands])
 
+    def _leased_forum_subject(self, workspace):
+        """A topic in a bound group, mid-turn — the surface that has an intro."""
+        forum = self.store.ensure_surface_binding(
+            chat_id=-100777,
+            surface_type="control",
+            display_name="Life",
+            target_type="controller",
+            target_id="control",
+            now=90,
+        )
+        self.store.bind_forum_workspace(
+            chat_id=-100777,
+            forum_binding_id=forum.binding_id,
+            project_path=str(workspace),
+            provider="codex",
+            now=91,
+        )
+        subject, _ = self.store.ensure_forum_subject(
+            chat_id=-100777,
+            message_thread_id=62,
+            display_name="Journal",
+            now=92,
+        )
+        update = topic_message_update(10, "do the thing", 62)
+        update["message"]["chat"] = {
+            "id": -100777,
+            "type": "supergroup",
+            "title": "Life",
+            "is_forum": True,
+        }
+        update["message"]["reply_to_message"]["chat"] = update["message"]["chat"]
+        self.store.ingest_update(update, now=100)
+        inbox = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+        ).fetchone()
+        mailbox_id = self.store.enqueue_agent_message(
+            subject.agent_id,
+            int(inbox["job_id"]),
+            "do the thing",
+            now=101,
+        )
+        self.store.claim_agent_mailbox(
+            "agent-worker",
+            now=102,
+            lease_seconds=10**12,
+        )
+        return subject, mailbox_id
+
+    def test_pinned_intro_is_refreshed_with_context_after_each_turn(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            self._check_intro_refresh(*self._leased_forum_subject(workspace))
+
+    def _check_intro_refresh(self, agent, mailbox_id):
+        self.store.record_topic_intro_message(-100777, 62, 4242, now=100)
+
+        self.store.complete_agent_mailbox(
+            mailbox_id,
+            "agent-worker",
+            "session-1",
+            "done",
+            {
+                "context_tokens": 82_500,
+                "context_window_tokens": 200_000,
+            },
+            now=101,
+        )
+
+        refresh = self.store.connection.execute(
+            """
+            SELECT operation_id, method, params_json, serialize_key
+            FROM outbox_messages
+            WHERE method = 'editMessageText'
+                AND operation_id LIKE 'topic-intro-refresh:%'
+            """
+        ).fetchone()
+        self.assertIsNotNone(refresh)
+        params = json.loads(refresh["params_json"])
+        self.assertEqual(params["message_id"], 4242)
+        self.assertEqual(params["chat_id"], -100777)
+        # The whole point: the pinned message now reports live context.
+        self.assertIn("41% used · 82,500 / 200,000 tokens", params["text"])
+        self.assertIn("Model:", params["text"])
+        self.assertIn("/help", params["text"])
+        # Intro edits must not queue behind (or ahead of) turn-card edits.
+        self.assertEqual(refresh["serialize_key"], "topic-intro:-100777:62")
+
+        # An unchanged render must not spend a Telegram call.
+        before = self.store.connection.execute(
+            "SELECT COUNT(*) FROM outbox_messages"
+        ).fetchone()[0]
+        self.assertIsNone(self.store.enqueue_topic_intro_refresh(agent.agent_id))
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM outbox_messages"
+            ).fetchone()[0],
+            before,
+        )
+
     def test_unknown_card_kind_records_the_send_instead_of_killing_the_sender(self):
         self.store.enqueue_api_call(
             operation_id="future:1",
@@ -9555,7 +9655,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 confirmation = next(
                     text
                     for text in messages
-                    if "“Journal” will use Claude" in text
+                    if "“Journal” uses Claude" in text
                 )
                 self.assertIn(
                     "Model: Default (currently opus)",
@@ -9565,6 +9665,9 @@ class DurableIntegrationTests(unittest.TestCase):
                     "Effort: Default (currently high)",
                     confirmation,
                 )
+                # A topic with no completed turn says so rather than implying a
+                # measurement it does not have.
+                self.assertIn("Context: no turn completed yet", confirmation)
                 subject = store.resolve_forum_subject(-100777, 62)
                 agent = store.resolve_agent(subject.agent_id)
                 self.assertEqual(agent.provider_config, {})

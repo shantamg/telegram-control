@@ -1146,47 +1146,25 @@ def pending_request_from_payload(payload: dict) -> Optional[str]:
     return carryable_pending_request(raw) if isinstance(raw, str) else None
 
 
-def send_topic_intro(
-    display_name: str,
-    provider: str,
-    provider_config: dict,
-    started: bool,
-) -> None:
+def send_topic_intro(display_name: str, started: bool) -> None:
     """Post this topic's standing header and pin it.
 
     Telegram never pins anything on its own, so the commands a topic needs were
     only ever reachable by scrolling back to whichever message happened to
-    mention them. One pinned intro per topic keeps them one tap away.
+    mention them. One pinned intro per topic keeps them one tap away, and later
+    turns edit this same message so its model, effort, and context stay current.
     """
-    provider_name = "Claude" if provider == "claude" else "Codex"
-    model_name, effort_name = provider_defaults.describe_provider_config(
-        provider,
-        provider_config,
-        forum_workspace_path(),
-    )
-    next_step = (
-        "Your message is running now."
-        if started
-        else "Send the first message to start a new session."
-    )
-    send_message(
-        f"✅ “{display_name}” will use {provider_name}.\n"
-        f"Model: {model_name}\n"
-        f"Effort: {effort_name}\n\n"
-        f"{next_step}\n\n"
-        "Commands here:\n"
-        "/help — browse the guide\n"
-        "/agent — this topic's agent, model, effort, and session\n"
-        "/status — this Telegram surface\n"
-        "/teardown — remove this topic and its session",
-        card={"kind": "topic_intro", "mode": "pin_after_send"},
-    )
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    binding = current_surface_binding()
+    if not database_path or binding is None or binding.target_type != "agent":
+        raise StoreError("A topic intro requires its managed agent.")
+    with DurableStore(Path(database_path)) as store:
+        text = store.topic_intro_text(binding.target_id, display_name, started)
+    send_message(text, card={"kind": "topic_intro", "mode": "pin_after_send"})
 
 
 def start_forum_subject_turn(
     display_name: str,
-    provider: str,
-    provider_config: dict,
     pending_request: Optional[str],
 ) -> None:
     """Introduce a newly configured topic, and run any request it held."""
@@ -1196,7 +1174,7 @@ def start_forum_subject_turn(
         and binding is not None
         and binding.target_type == "agent"
     )
-    send_topic_intro(display_name, provider, provider_config, started)
+    send_topic_intro(display_name, started)
     if started:
         enqueue_agent_input(binding.target_id, pending_request)
 
@@ -1673,12 +1651,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             },
             clear_operation,
         )
-        start_forum_subject_turn(
-            display_name,
-            workspace.provider,
-            workspace.provider_config,
-            pending_request,
-        )
+        start_forum_subject_turn(display_name, pending_request)
         return
 
     if action.action_type == "forum_subject_provider_select":
@@ -1948,8 +1921,6 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         )
         start_forum_subject_turn(
             display_name,
-            provider,
-            provider_config,
             pending_request_from_payload(action.payload),
         )
         return
@@ -2991,6 +2962,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 else:
                     store.resume_agent(agent_id)
                     result_text = "▶️ Agent resumed."
+                store.enqueue_topic_intro_refresh(agent_id)
         except StoreError as exc:
             if callback_query_id:
                 deliver_api_call(
@@ -3197,6 +3169,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 session_preserved = (
                     configured.provider_session_id == previous_session_id
                 )
+                # The pinned header reports model and effort, so it must not
+                # keep advertising the settings this call just replaced.
+                store.enqueue_topic_intro_refresh(agent_id)
         except StoreError as exc:
             if callback_query_id:
                 deliver_api_call(
@@ -3406,6 +3381,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     "Claude" if bound_agent.provider == "claude" else "Codex"
                 )
                 store.reset_agent_session(agent_id)
+                # A fresh session has no context yet; the header should say so
+                # rather than keep the retired session's last measurement.
+                store.enqueue_topic_intro_refresh(agent_id)
         except StoreError as exc:
             if callback_query_id:
                 deliver_api_call(

@@ -1066,7 +1066,42 @@ rather than failing if the network call does not land. A test asserts the
 registered list matches the help copy and Telegram's name and description limits.
 Registered live and confirmed with `getMyCommands` on July 26, 2026.
 
-Full suite green at 349 tests.
+### The pinned header is live, not a snapshot
+
+A pinned message that states a model, an effort, and a context measurement is
+only useful if those stay true, so the intro is now edited in place rather than
+left as a record of the moment a topic was created.
+
+`topic_intro_text` in `durable_store.py` is the single renderer for that message
+— provider, model, effort, the current session's context snapshot (or "no turn
+completed yet"), a paused marker when the agent is paused, and the command list —
+so the message a topic is created with and every later refresh cannot drift.
+`record_topic_intro_message` stores the pinned message's ID in the forum
+subject's existing `memory_json`, which deliberately avoids a migration:
+`surface_cards.card_type` is constrained by `CHECK (card_type IN ('status'))`, and
+a schema bump is exactly what breaks daemons still running older code.
+
+`enqueue_topic_intro_refresh` re-renders, compares a hash of the text against the
+stored `intro_revision`, and enqueues an `editMessageText` only when something
+actually changed — a quiet turn costs no Telegram call and never provokes
+"message is not modified". Refreshes carry their own `topic-intro:<chat>:<topic>`
+serialization key so they never queue behind, or ahead of, a live turn card. It
+runs in the same transaction that records a completed turn's usage, and on
+model/effort reconfiguration, pause, resume, and new-session reset.
+
+The refresh edit carries no `card_json` on purpose. An older sender interprets
+`topic_intro` cards strictly enough to reject a non-`sendMessage` method, so a
+carded edit would have crashed the very daemons this rollout has to survive.
+
+Verified with a test that leases a real forum-subject turn, completes it with
+provider-reported context, and asserts the queued edit targets the pinned message
+ID, reports `41% used · 82,500 / 200,000 tokens`, keeps the commands, uses the
+intro serialization key, and enqueues nothing at all on a second unchanged
+refresh. Full suite green at 350 tests.
+
+Until the daemons restart, a new topic still gets its pinned intro but no
+refreshes: recording the message ID and queueing edits both live in worker code
+that the running processes predate.
 
 ## Stage 0 legacy bridge commands
 

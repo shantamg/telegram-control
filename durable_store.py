@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import provider_defaults
+import telegram_help
 
 
 SCHEMA_VERSION = 23
@@ -2807,6 +2808,14 @@ class DurableStore:
                         ) from None
                     intro_thread_id = intro_params.get("message_thread_id")
                     if intro_thread_id is not None:
+                        # Remember the header so later turns can edit it in
+                        # place rather than posting the same summary again.
+                        self.record_topic_intro_message(
+                            intro_chat_id,
+                            int(intro_thread_id),
+                            intro_message_id,
+                            now=timestamp,
+                        )
                         # A topic can accumulate more than one pin, and Telegram
                         # shows them all. The intro is sent while the topic is
                         # brand new, so clearing first is the only moment where
@@ -7022,6 +7031,158 @@ class DurableStore:
 
         return context_usage_summary(self.current_agent_usage(agent_id))
 
+    def topic_intro_text(
+        self,
+        agent_id: str,
+        display_name: str,
+        started: Optional[bool] = None,
+    ) -> str:
+        """Render a topic's pinned header: what it runs and where it stands.
+
+        This is the one place the intro is composed, so the message a topic is
+        created with and every later refresh of that same message cannot drift
+        apart.
+        """
+        agent = self.resolve_agent(agent_id)
+        if agent is None:
+            raise StoreError("Managed agent was not found.")
+        provider_name = "Claude" if agent.provider == "claude" else "Codex"
+        model_name, effort_name = provider_defaults.describe_provider_config(
+            agent.provider,
+            agent.provider_config,
+            agent.project_path,
+        )
+        context_snapshot = self.agent_context_snapshot(agent_id)
+        lines = [
+            f"✅ “{display_name}” uses {provider_name}.",
+            f"Model: {model_name}",
+            f"Effort: {effort_name}",
+            f"Context: {context_snapshot or 'no turn completed yet'}",
+        ]
+        if agent.lifecycle_state == "paused":
+            lines.append("State: paused — new messages queue until resumed")
+        if started is not None:
+            lines.append("")
+            lines.append(
+                "Your message is running now."
+                if started
+                else "Send the first message to start a new session."
+            )
+        lines.extend(
+            [
+                "",
+                "Commands here:",
+                *(
+                    f"/{command.command} — {command.description}"
+                    for command in telegram_help.COMMANDS
+                ),
+            ]
+        )
+        return "\n".join(lines)
+
+    def record_topic_intro_message(
+        self,
+        chat_id: int,
+        message_thread_id: int,
+        telegram_message_id: int,
+        now: Optional[float] = None,
+    ) -> None:
+        """Remember which message is a topic's pinned header, so it can be
+        refreshed in place instead of replaced."""
+        timestamp = time.time() if now is None else float(now)
+        row = self.connection.execute(
+            """
+            SELECT subject_id, memory_json
+            FROM forum_subjects
+            WHERE forum_chat_id = ? AND message_thread_id = ? AND state = 'active'
+            """,
+            (int(chat_id), int(message_thread_id)),
+        ).fetchone()
+        if row is None:
+            return
+        memory = json.loads(row["memory_json"])
+        if not isinstance(memory, dict):
+            memory = {}
+        memory["intro_message_id"] = int(telegram_message_id)
+        memory.pop("intro_revision", None)
+        self.connection.execute(
+            """
+            UPDATE forum_subjects
+            SET memory_json = ?, updated_at = ?
+            WHERE subject_id = ?
+            """,
+            (
+                json.dumps(memory, separators=(",", ":"), sort_keys=True),
+                timestamp,
+                str(row["subject_id"]),
+            ),
+        )
+
+    def enqueue_topic_intro_refresh(
+        self,
+        agent_id: str,
+        now: Optional[float] = None,
+    ) -> Optional[int]:
+        """Bring a topic's pinned header up to date after anything changed it.
+
+        Model, effort, and context all move as an agent is used, and the pinned
+        message is where the owner looks for them. The edit is skipped when the
+        rendered text is unchanged, so a quiet turn costs no Telegram call and
+        never provokes "message is not modified".
+        """
+        timestamp = time.time() if now is None else float(now)
+        row = self.connection.execute(
+            """
+            SELECT s.subject_id, s.forum_chat_id, s.message_thread_id,
+                s.display_name, s.memory_json
+            FROM forum_subjects AS s
+            WHERE s.agent_id = ? AND s.state = 'active'
+            """,
+            (str(agent_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        memory = json.loads(row["memory_json"])
+        if not isinstance(memory, dict):
+            return None
+        message_id = memory.get("intro_message_id")
+        if not isinstance(message_id, int):
+            return None
+        text = self.topic_intro_text(agent_id, str(row["display_name"]))
+        revision = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        if memory.get("intro_revision") == revision:
+            return None
+        memory["intro_revision"] = revision
+        self.connection.execute(
+            """
+            UPDATE forum_subjects
+            SET memory_json = ?, updated_at = ?
+            WHERE subject_id = ?
+            """,
+            (
+                json.dumps(memory, separators=(",", ":"), sort_keys=True),
+                timestamp,
+                str(row["subject_id"]),
+            ),
+        )
+        return self.enqueue_api_call(
+            operation_id=(
+                f"topic-intro-refresh:{int(row['forum_chat_id'])}:"
+                f"{int(message_id)}:{revision}"
+            ),
+            method="editMessageText",
+            params={
+                "chat_id": int(row["forum_chat_id"]),
+                "message_id": int(message_id),
+                "text": text,
+            },
+            serialize_key=(
+                f"topic-intro:{int(row['forum_chat_id'])}:"
+                f"{int(row['message_thread_id'])}"
+            ),
+            now=timestamp,
+        )
+
     def agent_turn_summary(self, agent_id: str) -> str:
         """Return effective provider, model, and effort for a turn card."""
 
@@ -11021,6 +11182,12 @@ class DurableStore:
                     message_thread_id=delivery_thread_id,
                     timestamp=timestamp,
                 )
+            # This turn just changed the numbers the pinned header reports, so
+            # refresh it in the same transaction that recorded them.
+            self.enqueue_topic_intro_refresh(
+                str(row["agent_id"]),
+                now=timestamp,
+            )
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
