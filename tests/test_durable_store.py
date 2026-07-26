@@ -2184,6 +2184,122 @@ class DurableStoreTests(unittest.TestCase):
             agent.agent_id,
         )
 
+    def test_active_agent_turn_can_ask_the_owner_with_buttons(self):
+        agent, mailbox_id = self._leased_topic_agent()
+        environment = {
+            "TELEGRAM_CONTROL_DB": str(self.database_path),
+            "TELEGRAM_CONTROL_AGENT_ID": agent.agent_id,
+            "TELEGRAM_CONTROL_MAILBOX_ID": str(mailbox_id),
+            "TELEGRAM_CONTROL_WORKER_ID": "agent-worker",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with mock.patch.object(
+                agent_telegram.sys,
+                "argv",
+                [
+                    "agent_telegram.py",
+                    "ask",
+                    "--key",
+                    "group-automation",
+                    "--option",
+                    "Deep link only",
+                    "--option",
+                    "Full MTProto helper",
+                ],
+            ):
+                with mock.patch.object(
+                    agent_telegram.sys,
+                    "stdin",
+                    StringIO("How should groups be created?"),
+                ):
+                    with redirect_stdout(StringIO()):
+                        self.assertEqual(agent_telegram.main(), 0)
+
+        prompt = self.store.connection.execute(
+            """
+            SELECT method, params_json FROM outbox_messages
+            WHERE operation_id = ?
+            """,
+            (f"agent-mailbox:{mailbox_id}:choice-prompt:group-automation",),
+        ).fetchone()
+        self.assertEqual(prompt["method"], "sendMessage")
+        params = json.loads(prompt["params_json"])
+        self.assertIn("How should groups be created?", params["text"])
+        self.assertEqual(
+            [row[0]["text"] for row in params["reply_markup"]["inline_keyboard"]],
+            ["Deep link only", "Full MTProto helper"],
+        )
+        choices = self.store.connection.execute(
+            """
+            SELECT token, one_time, authorized_user_id, payload_json
+            FROM callback_actions
+            WHERE action_type = 'agent_choice'
+            ORDER BY action_id
+            """
+        ).fetchall()
+        self.assertEqual(len(choices), 2)
+        for choice in choices:
+            self.assertEqual(int(choice["one_time"]), 1)
+            self.assertEqual(int(choice["authorized_user_id"]), 123)
+        # The chosen option must come back as a new turn for the same agent,
+        # because the turn that asked is already gone.
+        second = choices[1]
+        callback = callback_update(
+            11,
+            f"a:{second['token']}",
+            message_id=700,
+            message_thread_id=62,
+        )
+        callback["callback_query"]["message"]["chat"] = {
+            "id": -100777,
+            "type": "supergroup",
+            "title": "Test",
+            "is_forum": True,
+        }
+        self.store.ingest_update(callback, now=111)
+        job = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 11",
+        ).fetchone()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_CONTROL_DB": str(self.database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(int(job["job_id"])),
+                "TELEGRAM_CHAT_ID": "-100777",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_MESSAGE_ID": "700",
+                "TELEGRAM_MESSAGE_THREAD_ID": "62",
+            },
+            clear=True,
+        ):
+            on_message.handle_callback(callback, callback["callback_query"])
+
+        queued = self.store.connection.execute(
+            """
+            SELECT agent_id, input_text FROM agent_mailbox
+            WHERE source_inbox_job_id = ?
+            """,
+            (int(job["job_id"]),),
+        ).fetchone()
+        self.assertEqual(str(queued["agent_id"]), agent.agent_id)
+        self.assertIn("Full MTProto helper", str(queued["input_text"]))
+        self.assertIn(
+            "How should groups be created?",
+            str(queued["input_text"]),
+        )
+        # Choosing one answer retires the alternatives.
+        states = [
+            row["state"]
+            for row in self.store.connection.execute(
+                """
+                SELECT state FROM callback_actions
+                WHERE action_type = 'agent_choice'
+                ORDER BY action_id
+                """
+            ).fetchall()
+        ]
+        self.assertEqual(states, ["expired", "consumed"])
+
     def test_teardown_confirmation_retries_after_turn_then_archives_and_deletes(self):
         agent, mailbox_id = self._leased_topic_agent()
         self.store.enqueue_agent_topic_teardown_prompt(

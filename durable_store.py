@@ -14,7 +14,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import provider_defaults
 
@@ -1012,6 +1012,9 @@ MIGRATION_21 = (
 
 
 ROUTER_INPUT_LIMIT = 8_000
+AGENT_CHOICE_LIMIT = 5
+AGENT_CHOICE_LABEL_LIMIT = 64
+AGENT_CHOICE_QUESTION_LIMIT = 1_000
 REPLY_QUOTE_LIMIT = 1_000
 REPLY_QUOTE_BEGIN = "[replied-to bot message begins]"
 REPLY_QUOTE_END = "[replied-to bot message ends]"
@@ -8135,6 +8138,169 @@ class DurableStore:
             if self.connection.in_transaction:
                 self.connection.execute("ROLLBACK")
             raise
+
+    def enqueue_agent_choice_prompt(
+        self,
+        *,
+        agent_id: str,
+        mailbox_id: int,
+        worker_id: str,
+        key: str,
+        question: str,
+        options: Sequence[str],
+        now: Optional[float] = None,
+    ) -> int:
+        """Ask the owner one bounded question with buttons, from inside a turn.
+
+        A managed turn is one-shot, so the answer cannot come back to the
+        running provider process. Each button therefore queues a new turn for
+        this same agent carrying the question and the chosen option, which is
+        how the router's own clarification already behaves. The options are
+        controller-authored labels bound to this agent's topic and owner; no
+        chat, topic, or prompt text travels in the callback data.
+        """
+        prompt = question.strip()
+        if not prompt or len(prompt) > AGENT_CHOICE_QUESTION_LIMIT:
+            raise StoreError(
+                "An agent question must be 1 to "
+                f"{AGENT_CHOICE_QUESTION_LIMIT} characters."
+            )
+        labels = [str(option).strip() for option in options]
+        if not 2 <= len(labels) <= AGENT_CHOICE_LIMIT:
+            raise StoreError(
+                f"An agent question needs 2 to {AGENT_CHOICE_LIMIT} options."
+            )
+        if len(set(labels)) != len(labels):
+            raise StoreError("Agent question options must be distinct.")
+        for label in labels:
+            if not label or len(label) > AGENT_CHOICE_LABEL_LIMIT:
+                raise StoreError(
+                    "Each option must be 1 to "
+                    f"{AGENT_CHOICE_LABEL_LIMIT} characters."
+                )
+            if any(ord(character) < 32 or ord(character) == 127 for character in label):
+                raise StoreError("Agent question options must be plain text.")
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            target = self.agent_notification_target(
+                agent_id=agent_id,
+                mailbox_id=mailbox_id,
+                worker_id=worker_id,
+                now=timestamp,
+            )
+            row = self.connection.execute(
+                """
+                SELECT a.agent_id, a.role, m.source_inbox_job_id,
+                    b.chat_id, b.message_thread_id
+                FROM agent_mailbox AS m
+                JOIN agents AS a ON a.agent_id = m.agent_id
+                JOIN surface_bindings AS b
+                    ON b.binding_id = a.surface_binding_id
+                    AND b.target_type = 'agent'
+                    AND b.target_id = a.agent_id
+                    AND b.state = 'active'
+                WHERE m.mailbox_id = ? AND m.agent_id = ?
+                    AND m.state = 'leased' AND m.lease_owner = ?
+                    AND m.lease_expires_at > ?
+                """,
+                (int(mailbox_id), str(agent_id), str(worker_id), timestamp),
+            ).fetchone()
+            if row is None or str(row["role"]) not in {"project", "worker"}:
+                raise StoreError("Asking the owner is unavailable here.")
+            if target.chat_id != int(row["chat_id"]) or int(
+                target.message_thread_id or 0
+            ) != int(row["message_thread_id"] or 0):
+                raise StoreError(
+                    "Ask the owner from the managed agent's own topic."
+                )
+            authorized_user_id = self._authorized_user_for_inbox_job(
+                int(row["source_inbox_job_id"])
+            )
+            if authorized_user_id is None:
+                raise StoreError("The question's recipient could not be authorized.")
+            keyboard = []
+            for index, label in enumerate(labels):
+                action = self.create_callback_action(
+                    operation_id=(
+                        f"agent-mailbox:{int(mailbox_id)}:choice:{key}:{index}"
+                    ),
+                    action_type="agent_choice",
+                    payload={
+                        "agent_id": str(row["agent_id"]),
+                        "question": prompt,
+                        "choice": label,
+                        "prompt_key": str(key),
+                        "mailbox_id": int(mailbox_id),
+                    },
+                    chat_id=int(row["chat_id"]),
+                    message_thread_id=(
+                        int(row["message_thread_id"])
+                        if row["message_thread_id"] is not None
+                        else None
+                    ),
+                    authorized_user_id=int(authorized_user_id),
+                    one_time=True,
+                    ttl_seconds=24 * 60 * 60,
+                    now=timestamp,
+                )
+                keyboard.append(
+                    [{"text": label, "callback_data": f"a:{action.token}"}]
+                )
+            message_id = self.enqueue_api_call(
+                operation_id=(
+                    f"agent-mailbox:{int(mailbox_id)}:choice-prompt:{key}"
+                ),
+                method="sendMessage",
+                params={
+                    "chat_id": int(row["chat_id"]),
+                    **(
+                        {"message_thread_id": int(row["message_thread_id"])}
+                        if row["message_thread_id"] is not None
+                        else {}
+                    ),
+                    "text": f"{self.agent_speaker_header(str(row['agent_id']))}\n\n{prompt}",
+                    "reply_markup": {"inline_keyboard": keyboard},
+                },
+                route={
+                    "target_type": "agent",
+                    "target_id": str(row["agent_id"]),
+                    "policy": "reply",
+                    "ttl_seconds": 24 * 60 * 60,
+                },
+                serialize_key=f"agent-notification:{int(mailbox_id)}",
+                now=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return message_id
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def resolve_agent_choice(
+        self,
+        mailbox_id: int,
+        prompt_key: str,
+        question: str,
+        choice: str,
+        now: Optional[float] = None,
+    ) -> str:
+        """Expire the sibling buttons and compose the answering turn's input."""
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute(
+            """
+            UPDATE callback_actions
+            SET state = 'expired', updated_at = ?
+            WHERE operation_id LIKE ? AND state = 'active'
+            """,
+            (timestamp, f"agent-mailbox:{int(mailbox_id)}:choice:{prompt_key}:%"),
+        )
+        return (
+            "The user answered the question you asked with a Telegram button.\n"
+            f"Question: {question}\n"
+            f"User's answer: {choice}"
+        )
 
     def labeled_agent_chunks(
         self,

@@ -864,6 +864,33 @@ starts with the controller note while `extract_user_request` returns only the
 owner's sentence, the full 331-test suite, and the offline router eval gate at
 14/14.
 
+## Agent-authored questions with buttons
+
+Agents could send text, voice, group icons, detached workers, and teardown
+cards, but they could not ask a question with choices — only Control could,
+through `ask_user`. The `telegram-ask-owner` skill closes that gap with
+`agent_telegram.py ask --key <key> --option <label> …`, question on standard
+input.
+
+A managed turn is one-shot, so the answer cannot return to the process that
+asked. `enqueue_agent_choice_prompt` therefore mirrors the router's
+clarification behavior: it validates the live mailbox lease, requires the
+agent's own topic, resolves the authorized user from the originating inbox job,
+and creates one opaque one-time callback action per option, all inside one
+transaction with the outbox message that carries the keyboard. Tapping an option
+expires its siblings and queues a **new turn for the same agent** containing the
+question and the chosen label, with the ordinary `📨 Queued` receipt. Options are
+bounded at 2–5 distinct plain-text labels of at most 64 characters, the question
+at 1,000; the callback data still carries only a token.
+
+The skill instructs agents to ask and then finish the current turn rather than
+waiting, because nothing will arrive before the process is torn down.
+
+Verified with a new test that runs the helper against a leased turn, asserts the
+queued keyboard and one-time owner-bound actions, taps the second option through
+`handle_callback`, and asserts the answering mailbox turn plus the expired
+sibling. Full suite green at 333 tests.
+
 ## Stage 0 legacy bridge commands
 
 The original non-durable bridge remains in `telegram_bridge.py` and is still

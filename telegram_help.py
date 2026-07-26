@@ -73,6 +73,7 @@ Reply to an exact Control or agent message to continue that routed conversation.
 You can ask an active managed agent to:
 • send a separate text progress update
 • reply with a Telegram voice note
+• ask you a question with tappable button options
 • create or change the current group's icon
 • start or stop a detached worker
 • safely tear down its current managed topic

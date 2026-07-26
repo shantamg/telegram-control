@@ -59,6 +59,7 @@ MANAGED_SHARED_SKILLS = (
     "telegram-topic-teardown",
     "telegram-text-update",
     "telegram-voice-message",
+    "telegram-ask-owner",
 )
 DEFAULT_AGENT_WORKERS = 8
 MAX_AGENT_WORKERS = 16

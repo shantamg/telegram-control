@@ -100,8 +100,8 @@ login:
 ```
 
 **4. Install the agent-facing skills** so managed Codex and Claude turns can
-send progress updates, voice notes, group icons, detached workers, and topic
-teardown:
+send progress updates, voice notes, questions with buttons, group icons,
+detached workers, and topic teardown:
 
 ```sh
 ./telegram_control.py install-skills

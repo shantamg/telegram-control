@@ -53,6 +53,23 @@ def parse_args() -> argparse.Namespace:
             required=True,
             help="Stable lowercase idempotency key, such as milestone or completion.",
         )
+    ask_parser = subparsers.add_parser(
+        "ask",
+        help="Ask the owner one question with buttons (question on stdin).",
+    )
+    ask_parser.add_argument(
+        "--key",
+        required=True,
+        help="Stable lowercase idempotency key for this question.",
+    )
+    ask_parser.add_argument(
+        "--option",
+        action="append",
+        required=True,
+        dest="options",
+        metavar="LABEL",
+        help="A button label; repeat for 2 to 5 options.",
+    )
     icon_parser = subparsers.add_parser("group-icon")
     icon_parser.add_argument(
         "--image",
@@ -152,6 +169,19 @@ def main() -> int:
         raise StoreError(
             "The update key must be 1 to 40 lowercase letters, numbers, or hyphens."
         )
+    if args.mode == "ask":
+        question = sys.stdin.read(MAX_INPUT_CHARACTERS + 1).strip()
+        with DurableStore(database_path) as store:
+            store.enqueue_agent_choice_prompt(
+                agent_id=agent_id,
+                mailbox_id=mailbox_id,
+                worker_id=worker_id,
+                key=args.key,
+                question=question,
+                options=args.options,
+            )
+        print("Telegram question queued.")
+        return 0
     text = sys.stdin.read(MAX_INPUT_CHARACTERS + 1).strip()
     if not text or len(text) > MAX_INPUT_CHARACTERS:
         raise StoreError(

@@ -2162,6 +2162,51 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     authorized_user_id=user_id,
                 )
         return
+    if action.action_type == "agent_choice":
+        target_agent_id = str(action.payload.get("agent_id", ""))
+        question = str(action.payload.get("question", ""))
+        choice = str(action.payload.get("choice", ""))
+        prompt_key = str(action.payload.get("prompt_key", ""))
+        prompt_mailbox_id = int(action.payload.get("mailbox_id", 0))
+        binding = current_surface_binding()
+        if (
+            not target_agent_id
+            or not question
+            or not choice
+            or not prompt_key
+            or binding is None
+            or binding.target_type != "agent"
+            or binding.target_id != target_agent_id
+        ):
+            raise StoreError("Stored agent question is no longer valid.")
+        with DurableStore(Path(database_path)) as store:
+            answer = store.resolve_agent_choice(
+                prompt_mailbox_id,
+                prompt_key,
+                question,
+                choice,
+            )
+        enqueue_agent_input(target_agent_id, answer)
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": f"Selected: {choice}",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "agent-choice-clear",
+        )
+        return
+
     if action.action_type == "router_clarification":
         router_mailbox_id = int(action.payload.get("router_mailbox_id", 0))
         choice = str(action.payload.get("choice", ""))

@@ -1,0 +1,6 @@
+interface:
+  display_name: "Telegram Ask Owner"
+  short_description: "Ask the owner one question with Telegram buttons"
+  default_prompt: "Use $telegram-ask-owner to give me tappable choices for this decision."
+policy:
+  allow_implicit_invocation: true
