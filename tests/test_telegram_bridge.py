@@ -972,6 +972,25 @@ class TokenValidationTests(unittest.TestCase):
             telegram_bridge.clean_and_validate_token("not a token")
 
 
+class GroupSetupLinkTests(unittest.TestCase):
+    def test_link_requests_the_rights_the_bot_actually_needs(self):
+        link = telegram_bridge.group_setup_link({"bot_username": "example_bot"})
+
+        # Adding and promoting in one tap is the whole point: a bot cannot
+        # promote itself, and without admin rights Group Privacy hides
+        # ordinary messages from it.
+        self.assertEqual(
+            link,
+            "https://t.me/example_bot?startgroup=true"
+            "&admin=change_info+delete_messages+manage_topics",
+        )
+
+    def test_missing_or_invalid_username_fails_closed(self):
+        for config in ({}, {"bot_username": ""}, {"bot_username": "no spaces!"}):
+            with self.assertRaises(telegram_bridge.BridgeError):
+                telegram_bridge.group_setup_link(config)
+
+
 class MessageDescriptionTests(unittest.TestCase):
     def test_describes_sender_without_mutating_message(self):
         message = {

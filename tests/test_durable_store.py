@@ -9298,6 +9298,74 @@ class DurableIntegrationTests(unittest.TestCase):
                 agent = store.resolve_agent(subject.agent_id)
                 self.assertEqual(agent.provider_config, {})
 
+    def test_newgroup_offers_the_one_tap_link_and_start_only_authorizes(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "bot_username": "example_bot",
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+
+                def process(update, worker, now):
+                    store.ingest_update(update, now=now)
+                    job = store.claim_job(worker, now=now)
+                    telegram_control.process_inbox_job(store, config, job, worker)
+                    return job
+
+                process(message_update(10, "/newgroup"), "worker-1", 100)
+                card = store.claim_outbox("sender", now=10**12)
+                self.assertIn("Add me to a new project group", card.params["text"])
+                self.assertEqual(
+                    card.params["reply_markup"]["inline_keyboard"][0][0],
+                    {
+                        "text": "Add me to a group",
+                        "url": (
+                            "https://t.me/example_bot?startgroup=true"
+                            "&admin=change_info+delete_messages+manage_topics"
+                        ),
+                    },
+                )
+                # /newgroup is deterministic controller work, not a router turn.
+                self.assertEqual(
+                    store.status_counts().get("router_mailbox", {}),
+                    {},
+                )
+
+                # Telegram delivers /start with a payload once the link adds the
+                # bot. That is an arrival, so it authorizes and nothing more.
+                arrival = message_update(11, "/start true")
+                arrival["message"]["chat"] = {
+                    "id": -100777,
+                    "type": "supergroup",
+                    "title": "Meet Without Fear",
+                    "is_forum": True,
+                }
+                arrival["message"]["message_thread_id"] = 2
+                process(arrival, "worker-2", 101)
+                self.assertEqual(
+                    store.status_counts().get("router_mailbox", {}),
+                    {},
+                )
+                prompts = [
+                    json.loads(row["params_json"])["text"]
+                    for row in store.connection.execute(
+                        """
+                        SELECT params_json FROM outbox_messages
+                        WHERE method = 'sendMessage'
+                        ORDER BY message_id
+                        """
+                    ).fetchall()
+                ]
+                self.assertTrue(
+                    any("Authorize this private forum" in text for text in prompts)
+                )
+                self.assertTrue(
+                    any("Which folder should this group work in" in text for text in prompts)
+                )
+
     def test_bound_forum_status_is_read_only_and_does_not_create_subject(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory) / "life"

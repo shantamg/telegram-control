@@ -23,7 +23,8 @@ Quick commands:
 /agent — inspect or manage this topic's agent
 /teardown — safely remove this managed topic and session
 /status — inspect this Telegram surface
-/projects — list enrolled projects"""
+/projects — list enrolled projects
+/newgroup — get the one-tap link to add me to a new project group"""
 
 
 TOPICS = (
@@ -87,7 +88,7 @@ These skills are scoped to the active Telegram turn. They do not accept arbitrar
 
 Use /projects to list enrolled workspaces. Inside an eligible project topic, /agent create <slug> attaches its managed agent.
 
-Setting up a new group: add the bot, promote it to administrator, enable Topics, then answer its question about which folder the group works in — a path or a description Control can find. Binding is confirmed with one button.
+Setting up a new group: send /newgroup in the main Control chat, create a private group, turn on Topics, then tap the link — Telegram adds the bot with the rights it needs in one step. Answer its question about which folder the group works in with a path or a description, and confirm the binding with one button.
 
 Each new topic in a bound group then starts with the group's own provider, model, and effort in one tap; "Choose a different agent…" opens the per-topic menus. Whatever you already sent runs as the topic's first turn, so you never resend it. Topic names and Telegram coordinates remain durable routing identities until formal teardown.""",
     ),

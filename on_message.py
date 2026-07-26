@@ -312,12 +312,20 @@ def inspect_keyboard() -> Optional[dict]:
     }
 
 
+def bot_username() -> str:
+    """Resolve the paired bot's username for user-facing copy and links."""
+    username = os.environ.get("TELEGRAM_BOT_USERNAME", "").strip()
+    if username:
+        return username
+    try:
+        return str(bridge.load_config().get("bot_username", "")).strip()
+    except bridge.BridgeError:
+        return ""
+
+
 def bot_label() -> str:
     """Name this bot the way the owner sees it, without hardcoding an identity."""
-    try:
-        username = str(bridge.load_config().get("bot_username", "")).strip()
-    except bridge.BridgeError:
-        username = ""
+    username = bot_username()
     return f"@{username}" if username else "this bot"
 
 
@@ -775,6 +783,28 @@ def send_project_catalog() -> None:
         ]
     )
     send_message("\n".join(lines))
+
+
+def send_group_setup_card() -> None:
+    """Hand over the one-tap link that adds this bot to a project group."""
+    link = bridge.group_setup_link({"bot_username": bot_username()})
+    send_message(
+        "Add me to a new project group:\n\n"
+        "1. Create a private Telegram group — any name.\n"
+        "2. Turn on Topics in the group's settings.\n"
+        "3. Tap the button below and pick that group. Telegram adds me and "
+        "asks you to grant Change group info, Delete messages, and Manage "
+        "topics in the same step — no separate promotion.\n\n"
+        "Then send anything in the group and I will ask which folder it works "
+        "in. A bot cannot create the group or enable Topics itself; those two "
+        "steps are yours.\n\n"
+        f"{telegram_help.HELP_HINT}",
+        reply_markup={
+            "inline_keyboard": [
+                [{"text": "Add me to a group", "url": link}]
+            ]
+        },
+    )
 
 
 def create_agent_from_catalog(project_slug: str) -> None:
@@ -4376,6 +4406,20 @@ def main() -> int:
                 request_topic_teardown()
             elif text.strip().lower() == "/projects":
                 send_project_catalog()
+            elif text.strip().lower() == "/newgroup":
+                send_group_setup_card()
+            elif re.fullmatch(r"/start(?:\s.*)?", text.strip(), re.DOTALL):
+                # The startgroup deep link delivers /start with a payload once
+                # Telegram finishes adding the bot. That is an arrival, not a
+                # request, so it only ever offers authorization.
+                if os.environ.get("TELEGRAM_CHAT_TYPE") == "supergroup":
+                    forum_is_authorized_or_prompt()
+                else:
+                    send_message(
+                        "I am already paired with this chat.\n\n"
+                        "Send /newgroup to add me to a project group, or "
+                        f"just tell me what you need.\n\n{telegram_help.HELP_HINT}"
+                    )
             elif agent_create is not None:
                 create_agent_from_catalog(agent_create.group(1))
             elif text.strip().lower() in {"/agent", "/agent status"}:

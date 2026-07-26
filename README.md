@@ -112,11 +112,18 @@ and links it into `~/.claude/skills/`. Skill metadata is read when a provider
 session starts, so restart an existing session before expecting a new skill to
 appear.
 
-**5. Add your first workspace.** In Telegram, create a private group, enable
-**Topics**, add your bot, and promote it to administrator — Telegram's default
-Group Privacy hides ordinary messages from non-admin bots. Send anything in the
-group and the bot offers **Authorize forum**, then asks which folder the group
-works in. Answer with a path or just a description:
+**5. Add your first workspace.** Send `/newgroup` in the bot chat. It replies
+with a link that adds the bot to a group you pick *and* requests the rights it
+needs — Change group info, Delete messages, Manage topics — in the same
+confirmation, so there is no separate promotion step. Telegram's Bot API does
+not let a bot create a group or enable Topics, so those two steps are yours:
+create a private group, turn on **Topics**, then tap the link.
+
+Admin rights are not optional: Telegram's default Group Privacy hides ordinary
+messages from non-admin bots.
+
+Once it joins, the bot offers **Authorize forum** and then asks which folder the
+group works in. Answer with a path or just a description:
 
 ```text
 ~/Software/my-project
@@ -145,6 +152,7 @@ Telegram commands (inside a chat or topic):
 | `/help` | Button-driven help browser. |
 | `/status` | Inspect this Telegram surface; editable status card. |
 | `/projects` | List enrolled workspaces. |
+| `/newgroup` | Get the one-tap link that adds the bot to a new project group with the rights it needs. |
 | `/agent` | Inspect or control this topic's agent: model, effort, session, console, context usage, pause/resume, new session, provider switch. |
 | `/teardown` | Confirmation-gated removal of this managed topic and its session state. |
 

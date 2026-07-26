@@ -891,6 +891,46 @@ queued keyboard and one-time owner-bound actions, taps the second option through
 `handle_callback`, and asserts the answering mailbox turn plus the expired
 sibling. Full suite green at 333 tests.
 
+## One tap to add the bot to a new group
+
+Standing up a project group meant five manual steps: create the group, enable
+Topics, add the bot, promote it to administrator, then create a topic. Telegram's
+Bot API can remove exactly one of them — a bot cannot create a group, add
+itself, promote itself, or toggle forum mode, and no method exists for any of
+that. Only a user-account (MTProto) client could, which was considered and
+deliberately not built: it would add the project's first third-party dependency
+and a stored session equivalent to full account access.
+
+What is possible is collapsing *add* and *promote* into one confirmation.
+`/newgroup` replies with a card whose inline URL button is
+`https://t.me/<bot>?startgroup=true&admin=change_info+delete_messages+manage_topics`,
+built by `bridge.group_setup_link` from the paired `bot_username`. Telegram then
+adds the bot to the chosen group and asks the owner to grant those three rights
+in the same step. The rights are the ones actually used: admin status at all is
+what defeats Group Privacy, `change_info` sets the group icon,
+`delete_messages` retires progress cards, and `manage_topics` creates and
+deletes managed and worker topics. An unusable or missing username fails closed
+rather than producing a broken link.
+
+Telegram delivers `/start <payload>` into the group once the link finishes
+adding the bot. That is an arrival rather than a request, so `/start` in a
+supergroup only ever runs the authorization prompt — which now also asks which
+folder the group works in — and is never routed to Control as work. The card is
+explicit that creating the group and enabling Topics remain manual.
+
+The handler also stopped re-reading `config.json` to name the bot: the worker
+passes `TELEGRAM_BOT_USERNAME` in the handler environment, with the config as a
+fallback, so user-facing copy and the link share one source of truth. Control's
+prompt now states that a bot cannot create a group and that the owner should be
+pointed at `/newgroup`, so a request for a separate group is no longer answered
+with a private-chat topic.
+
+Verified with unit coverage for the link's exact rights and its fail-closed
+paths, and an integration test asserting `/newgroup` queues the URL button
+without creating a router turn while `/start true` in an unauthorized forum
+produces the authorize-and-folder prompt and no router work. Full suite green at
+336 tests; offline router eval 14/14.
+
 ## Stage 0 legacy bridge commands
 
 The original non-durable bridge remains in `telegram_bridge.py` and is still

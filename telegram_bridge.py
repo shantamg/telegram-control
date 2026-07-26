@@ -34,6 +34,12 @@ LOG_DIR = Path.home() / "Library" / "Logs"
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
 SCRIPT_PATH = Path(__file__).resolve()
 DEFAULT_HANDLER_PATH = SCRIPT_PATH.with_name("on_message.py")
+# Telegram will not let a bot promote itself, but it will grant these rights in
+# the same tap that adds the bot, if the invite link asks for them: reading
+# ordinary group messages at all requires admin status, changing the group icon
+# requires change_info, retiring progress cards requires delete_messages, and
+# managed/worker topics require manage_topics.
+GROUP_ADMIN_RIGHTS = ("change_info", "delete_messages", "manage_topics")
 
 
 class BridgeError(RuntimeError):
@@ -493,6 +499,23 @@ def load_config() -> dict[str, Any]:
         raise BridgeError(f"Could not read configuration at {CONFIG_PATH}.") from None
 
 
+def group_setup_link(config: Optional[dict[str, Any]] = None) -> str:
+    """Build the deep link that adds this bot to a group as an administrator.
+
+    A bot cannot create a group or promote itself, but Telegram's startgroup
+    link collapses adding it and granting its rights into one confirmation, so
+    the owner is never asked to promote it as a separate step.
+    """
+    resolved = config if config is not None else load_config()
+    username = str(resolved.get("bot_username", "")).strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{4,32}", username):
+        raise BridgeError(
+            "The paired bot username is unavailable. Run setup again."
+        )
+    rights = "+".join(GROUP_ADMIN_RIGHTS)
+    return f"https://t.me/{username}?startgroup=true&admin={rights}"
+
+
 def save_config(config: dict[str, Any]) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     temporary_path = CONFIG_PATH.with_suffix(".tmp")
@@ -755,6 +778,10 @@ def process_update(
             "TELEGRAM_TEXT": str(message.get("text", "")),
             "TELEGRAM_FROM_ID": str(sender.get("id", "")),
             "TELEGRAM_FROM_USERNAME": str(sender.get("username", "")),
+            # The handler names the bot in user-facing copy and in the
+            # add-to-group link, so it gets the paired identity from the same
+            # config the worker already loaded rather than re-reading it.
+            "TELEGRAM_BOT_USERNAME": str(config.get("bot_username", "")),
             "TELEGRAM_CALLBACK_QUERY_ID": str(
                 callback_query.get("id", "") if isinstance(callback_query, dict) else ""
             ),
