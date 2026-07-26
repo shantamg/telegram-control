@@ -171,6 +171,7 @@ CLI (`./telegram_control.py <command>`, `--help` on any of them):
 | `console-open` / `console-status` / `console-close` | Explicit tmux takeover of a persisted agent session. |
 | `worker-start` / `worker-status` / `worker-report` / `worker-stop` | Start, inspect, report from, and stop recoverable detached workers; stopping removes their managed recovery file. |
 | `install-skills` | Install or refresh the repo-owned agent skills. |
+| `sync-commands` | Publish the Telegram command menu from the help copy (`install` does this too). |
 
 Prefer `restart` over `launchctl` for reloads: it schedules exactly one guarded
 restart. Note that any restart aborts in-flight turns.

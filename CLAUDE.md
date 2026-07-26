@@ -71,3 +71,18 @@ migrations older code can tolerate — a new table or a nullable column is safe
 to ignore, whereas renaming or dropping something the running version still
 reads is not. Say plainly in your report that a migration has been applied and
 that the daemons run older code until their next restart.
+
+**The schema is not the only mixed-version surface.** Anything a fresh handler
+process writes into the database and a long-running daemon later interprets is
+one too: outbox `card_json` kinds, route shapes, payload fields. A new
+`card_json` kind did exactly this on July 26, 2026 — the running sender was
+older, could not interpret it, raised, and the supervisor restarted the whole
+controller under live turns. `complete_outbox` now ignores card kinds it does
+not recognize instead of raising, but the rule stands: when you add a variant
+the daemons must read, make the unknown case a no-op for older code, and expect
+the first row to be handled by the previous version.
+
+Editing a live handler file is itself a rollout. `on_message.py` is re-read per
+turn, so a half-saved refactor is a syntax error for whoever messages the bot
+during that window. Prefer edits that keep the file parseable at every step,
+and check `~/Library/Logs/telegram-control.error.log` afterwards.

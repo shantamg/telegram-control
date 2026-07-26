@@ -1022,11 +1022,51 @@ a group that never granted the right (or a message that has since gone) reports
 `outbox_pin_skipped` event rather than retrying it eight times behind the rest
 of the queue.
 
+Because Telegram stacks pins and shows them all, the intro clears the topic's
+pins with `unpinAllForumTopicMessages` before pinning itself. That runs only
+while the topic is brand new, which is the one moment it cannot discard a pin
+the owner meant to keep, and it leaves exactly one pinned header.
+
 Verified with an integration test that drives topic creation through the one-tap
 start, asserts the intro lists all four commands and carries the pin card, drains
-the outbox, and asserts the queued `pinChatMessage` uses the acknowledged message
-ID; plus a unit test asserting a rights failure dead-letters on its first attempt
-and leaves the queue empty. Full suite green at 347 tests.
+the outbox, and asserts the queued unpin-then-pin pair uses the acknowledged
+message ID; plus a unit test asserting a rights failure dead-letters on its first
+attempt and leaves the queue empty.
+
+### What the first live rollout broke
+
+The first topic to reach this code (**Prompt improvements**, July 26, 2026)
+exposed a mixed-version fault, not a pinning fault. The sender still held code
+from before the commit, claimed the intro row, delivered it to Telegram, then
+could not interpret its unfamiliar `topic_intro` card kind and raised
+`Outbox surface card metadata is invalid.` The child exited, the supervisor
+restarted the whole controller two seconds after the intro was queued, and the
+orphaned lease held the row until it expired ten minutes later — at which point
+the new sender redelivered the intro (so that topic has two copies of it) and
+pinned it successfully.
+
+`complete_outbox` now treats an unrecognized card `kind` as "no follow-up work I
+know about": it records the delivery and returns, instead of raising. Known kinds
+with malformed fields still fail closed. A regression test completes a row
+carrying an invented kind and asserts the row reaches `sent`.
+
+The same rollout also proved that editing `on_message.py` is a live deploy: a
+mid-refactor save left the file unparseable and three turns died with
+`IndentationError` before the next save. Both hazards are now recorded in
+`CLAUDE.md`.
+
+### A command menu, which needs no pin at all
+
+Pinning helps, but Telegram already has a native affordance: `setMyCommands`
+puts every command in the compose field's menu, in every chat and topic, with no
+pin, no scrolling, and no admin right. `telegram_help.COMMANDS` is now the single
+source of truth — the `/help` home page is rendered from it — and
+`telegram_control.py sync-commands` publishes it. `install` runs it too, warning
+rather than failing if the network call does not land. A test asserts the
+registered list matches the help copy and Telegram's name and description limits.
+Registered live and confirmed with `getMyCommands` on July 26, 2026.
+
+Full suite green at 349 tests.
 
 ## Stage 0 legacy bridge commands
 

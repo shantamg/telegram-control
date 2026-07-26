@@ -2805,6 +2805,31 @@ class DurableStore:
                         raise StoreError(
                             "Telegram result cannot identify the topic intro."
                         ) from None
+                    intro_thread_id = intro_params.get("message_thread_id")
+                    if intro_thread_id is not None:
+                        # A topic can accumulate more than one pin, and Telegram
+                        # shows them all. The intro is sent while the topic is
+                        # brand new, so clearing first is the only moment where
+                        # it cannot discard a pin the owner meant to keep, and
+                        # it leaves exactly one pinned header behind.
+                        self.enqueue_api_call(
+                            operation_id=(
+                                f"topic-intro-unpin:{intro_chat_id}:"
+                                f"{int(intro_thread_id)}"
+                            ),
+                            method="unpinAllForumTopicMessages",
+                            params={
+                                "chat_id": intro_chat_id,
+                                "message_thread_id": int(intro_thread_id),
+                            },
+                            card={"kind": "topic_intro", "mode": "pin"},
+                            serialize_key=(
+                                str(row["serialize_key"])
+                                if row["serialize_key"] is not None
+                                else None
+                            ),
+                            now=timestamp,
+                        )
                     self.enqueue_api_call(
                         operation_id=(
                             f"topic-intro-pin:{intro_chat_id}:"
@@ -3204,6 +3229,16 @@ class DurableStore:
                         raise StoreError(
                             "Telegram result cannot identify its voice response."
                         ) from None
+                    self.connection.execute("COMMIT")
+                    return
+                if card_spec.get("kind") is not None:
+                    # A kind this version does not recognize can only come from
+                    # newer code that queued the row before this process was
+                    # replaced. The send itself already succeeded, so the only
+                    # safe reading is "no follow-up work I know about": record
+                    # the delivery and move on. Raising here killed the sender
+                    # mid-rollout once, and the supervisor restarted the whole
+                    # controller, aborting live turns.
                     self.connection.execute("COMMIT")
                     return
                 try:

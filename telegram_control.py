@@ -30,6 +30,7 @@ import provider_adapters
 import provider_defaults
 import router_contract
 import telegram_bridge as bridge
+import telegram_help
 import tmux_console
 import voice_responses
 from durable_store import (
@@ -1979,7 +1980,10 @@ def handle_outbox_send_failure(
     # Pinning a topic intro is decoration. When the bot lacks the right, or the
     # message is already gone, retrying eight times only fills the log and
     # delays the queue behind it; the intro itself is already delivered.
-    if message.method == "pinChatMessage" and any(
+    if message.method in {
+        "pinChatMessage",
+        "unpinAllForumTopicMessages",
+    } and any(
         marker in error.lower()
         for marker in (
             "not enough rights",
@@ -2724,6 +2728,30 @@ def install_skills_command(_: argparse.Namespace) -> None:
         print(f"- {name}")
 
 
+def registered_bot_commands() -> list[dict[str, str]]:
+    """Render the help copy's command list for Telegram's own command menu."""
+    commands = []
+    for command in telegram_help.COMMANDS:
+        name = command.command
+        description = command.description
+        if not re.fullmatch(r"[a-z0-9_]{1,32}", name):
+            raise StoreError(f"Bot command name is invalid: {name}")
+        if not 1 <= len(description) <= 256:
+            raise StoreError(f"Bot command description is invalid: {name}")
+        commands.append({"command": name, "description": description})
+    return commands
+
+
+def sync_commands_command(_: argparse.Namespace) -> None:
+    """Publish the command menu so every command is tappable, pin or not."""
+    token = bridge.read_token()
+    commands = registered_bot_commands()
+    bridge.api_call(token, "setMyCommands", commands=commands)
+    print(f"Registered {len(commands)} Telegram commands:")
+    for command in commands:
+        print(f"- /{command['command']} — {command['description']}")
+
+
 def install_command(args: argparse.Namespace) -> None:
     config = bridge.load_config()
     bridge.read_token()
@@ -2734,6 +2762,12 @@ def install_command(args: argparse.Namespace) -> None:
     with open_store(args.db):
         pass
     install_managed_skills()
+    try:
+        sync_commands_command(args)
+    except bridge.BridgeError as exc:
+        # A registered command menu is convenience, not a prerequisite; a
+        # network hiccup here must not abort installing the controller.
+        print(f"Warning: could not register Telegram commands: {exc}")
 
     bridge.LOG_DIR.mkdir(parents=True, exist_ok=True)
     bridge.PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -3447,6 +3481,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Install repo-owned skills for Codex and Claude discovery.",
     )
     install_skills_parser.set_defaults(function=install_skills_command)
+
+    sync_commands_parser = subparsers.add_parser(
+        "sync-commands",
+        help="Register the Telegram command menu from the help copy.",
+    )
+    sync_commands_parser.set_defaults(function=sync_commands_command)
 
     status_parser = subparsers.add_parser("status", help="Show durable queue status.")
     status_parser.set_defaults(function=status_command)

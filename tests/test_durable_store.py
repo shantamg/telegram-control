@@ -17,6 +17,7 @@ import provider_adapters
 import provider_defaults
 import router_contract
 import telegram_control
+import telegram_help
 from durable_store import (
     MIGRATION_1,
     MIGRATION_2,
@@ -2561,6 +2562,49 @@ class DurableStoreTests(unittest.TestCase):
             "telegram-control\n\ndurable result",
         )
         self.assertEqual(fallback.params["message_thread_id"], 62)
+
+    def test_registered_commands_match_the_help_copy_and_telegram_limits(self):
+        commands = telegram_control.registered_bot_commands()
+
+        # The help page and Telegram's own menu must not drift apart.
+        self.assertEqual(
+            [command["command"] for command in commands],
+            [command.command for command in telegram_help.COMMANDS],
+        )
+        for command in commands:
+            self.assertRegex(command["command"], r"^[a-z0-9_]{1,32}$")
+            self.assertTrue(1 <= len(command["description"]) <= 256)
+            self.assertIn(f"/{command['command']}", telegram_help.HOME_TEXT)
+        for handled in ("help", "agent", "status", "projects", "newgroup", "teardown"):
+            self.assertIn(handled, [command["command"] for command in commands])
+
+    def test_unknown_card_kind_records_the_send_instead_of_killing_the_sender(self):
+        self.store.enqueue_api_call(
+            operation_id="future:1",
+            method="sendMessage",
+            params={"chat_id": 123, "text": "queued by a newer version"},
+            card={"kind": "not_invented_yet", "mode": "something"},
+            now=100,
+        )
+        claimed = self.store.claim_outbox("sender", now=101)
+
+        # This is the live-rollout case: a sender still holding older code
+        # completes a row queued by newer code. Raising here once killed the
+        # child, and the supervisor restarted the controller under live turns.
+        self.store.complete_outbox(
+            claimed.message_id,
+            "sender",
+            {"message_id": 500},
+            now=102,
+        )
+
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT state FROM outbox_messages WHERE message_id = ?",
+                (claimed.message_id,),
+            ).fetchone()["state"],
+            "sent",
+        )
 
     def test_pin_without_rights_is_retired_instead_of_retried(self):
         self.store.enqueue_api_call(
@@ -9317,6 +9361,28 @@ class DurableIntegrationTests(unittest.TestCase):
                     "sender",
                     {"message_id": 4242},
                     now=10**12,
+                )
+                # Clearing first, then pinning, leaves exactly one pinned
+                # header in a topic that Telegram would otherwise stack pins in.
+                follow_ups = [
+                    (row["method"], json.loads(row["params_json"]))
+                    for row in store.connection.execute(
+                        """
+                        SELECT method, params_json FROM outbox_messages
+                        WHERE method IN (
+                            'unpinAllForumTopicMessages', 'pinChatMessage'
+                        )
+                        ORDER BY message_id
+                        """
+                    ).fetchall()
+                ]
+                self.assertEqual(
+                    [method for method, _ in follow_ups],
+                    ["unpinAllForumTopicMessages", "pinChatMessage"],
+                )
+                self.assertEqual(
+                    follow_ups[0][1],
+                    {"chat_id": -100777, "message_thread_id": 62},
                 )
                 pin = store.connection.execute(
                     """

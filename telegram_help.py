@@ -14,17 +14,30 @@ class HelpTopic(NamedTuple):
     text: str
 
 
-HOME_TEXT = """Telegram Control help
+class BotCommand(NamedTuple):
+    command: str
+    description: str
 
-Choose a topic below.
 
-Quick commands:
-/help — browse this guide
-/agent — inspect or manage this topic's agent
-/teardown — safely remove this managed topic and session
-/status — inspect this Telegram surface
-/projects — list enrolled projects
-/newgroup — get the one-tap link to add me to a new project group"""
+# Registered with Telegram so every command is tappable from the compose field's
+# menu in any chat or topic, with no pin and no scrolling. This tuple is the one
+# source of truth: the help home page below is rendered from it.
+COMMANDS = (
+    BotCommand("help", "Browse the Telegram Control guide"),
+    BotCommand("agent", "Inspect or manage this topic's agent"),
+    BotCommand("status", "Inspect this Telegram surface"),
+    BotCommand("projects", "List enrolled workspaces"),
+    BotCommand("newgroup", "Get the link that adds me to a new project group"),
+    BotCommand("teardown", "Safely remove this managed topic and session"),
+)
+
+
+HOME_TEXT = (
+    "Telegram Control help\n\nChoose a topic below.\n\nQuick commands:\n"
+    + "\n".join(
+        f"/{command.command} — {command.description}" for command in COMMANDS
+    )
+)
 
 
 TOPICS = (
