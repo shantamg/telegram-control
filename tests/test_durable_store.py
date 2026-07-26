@@ -2562,6 +2562,41 @@ class DurableStoreTests(unittest.TestCase):
         )
         self.assertEqual(fallback.params["message_thread_id"], 62)
 
+    def test_pin_without_rights_is_retired_instead_of_retried(self):
+        self.store.enqueue_api_call(
+            operation_id="topic-intro-pin:-100777:4242",
+            method="pinChatMessage",
+            params={
+                "chat_id": -100777,
+                "message_id": 4242,
+                "disable_notification": True,
+            },
+            card={"kind": "topic_intro", "mode": "pin"},
+            now=100,
+        )
+        pin = self.store.claim_outbox("sender", now=101)
+        with mock.patch.object(
+            telegram_control.bridge,
+            "api_call",
+            side_effect=telegram_control.bridge.BridgeError(
+                "Bad Request: not enough rights to manage pinned messages"
+            ),
+        ):
+            telegram_control.send_outbox_message(
+                self.store,
+                "token",
+                pin,
+                "sender",
+            )
+        state = self.store.connection.execute(
+            "SELECT state, attempts FROM outbox_messages WHERE message_id = ?",
+            (pin.message_id,),
+        ).fetchone()
+        # A group that never granted pin rights must not requeue this eight
+        # times: the intro itself was already delivered.
+        self.assertEqual(state["state"], "dead")
+        self.assertIsNone(self.store.claim_outbox("sender", now=10**12))
+
     def _setup_routed_agent_turn(self, provider="codex"):
         """Create control + project surfaces and one dispatched router turn."""
         self.store.ensure_surface_binding(
@@ -9190,6 +9225,120 @@ class DurableIntegrationTests(unittest.TestCase):
                     0,
                 )
 
+    def test_new_topic_intro_is_pinned_and_lists_its_commands(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            forum_chat = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            service_update = topic_created_update(10, "Journal")
+            service_update["message"]["chat"] = dict(forum_chat)
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace),
+                    provider="codex",
+                    now=91,
+                )
+
+                def process(update, worker, now):
+                    store.ingest_update(update, now=now)
+                    job = store.claim_job(worker, now=now)
+                    telegram_control.process_inbox_job(store, config, job, worker)
+
+                process(service_update, "worker-1", 100)
+                start = store.connection.execute(
+                    """
+                    SELECT token FROM callback_actions
+                    WHERE action_type = 'forum_subject_start' AND state = 'active'
+                    """
+                ).fetchone()
+                tap = callback_update(
+                    11,
+                    f"a:{start['token']}",
+                    message_id=700,
+                    message_thread_id=62,
+                )
+                tap["callback_query"]["message"]["chat"] = dict(forum_chat)
+                process(tap, "worker-2", 101)
+
+                intro = store.connection.execute(
+                    """
+                    SELECT message_id, params_json, card_json
+                    FROM outbox_messages
+                    WHERE card_json LIKE '%topic_intro%'
+                        AND method = 'sendMessage'
+                    """
+                ).fetchone()
+                self.assertIsNotNone(intro)
+                text = json.loads(intro["params_json"])["text"]
+                for command in ("/help", "/agent", "/status", "/teardown"):
+                    self.assertIn(command, text)
+                self.assertEqual(
+                    json.loads(intro["card_json"])["mode"],
+                    "pin_after_send",
+                )
+
+                # Telegram only reveals the message ID on acknowledgement, so
+                # the pin is queued from the send result.
+                claimed = store.claim_outbox("sender", now=10**12)
+                while claimed is not None and claimed.message_id != int(
+                    intro["message_id"]
+                ):
+                    store.complete_outbox(
+                        claimed.message_id,
+                        "sender",
+                        {"message_id": 900 + claimed.message_id},
+                        now=10**12,
+                    )
+                    claimed = store.claim_outbox("sender", now=10**12)
+                self.assertIsNotNone(claimed)
+                store.complete_outbox(
+                    claimed.message_id,
+                    "sender",
+                    {"message_id": 4242},
+                    now=10**12,
+                )
+                pin = store.connection.execute(
+                    """
+                    SELECT operation_id, method, params_json
+                    FROM outbox_messages
+                    WHERE method = 'pinChatMessage'
+                    """
+                ).fetchone()
+                self.assertIsNotNone(pin)
+                self.assertEqual(
+                    json.loads(pin["params_json"]),
+                    {
+                        "chat_id": -100777,
+                        "message_id": 4242,
+                        "disable_notification": True,
+                    },
+                )
+                self.assertEqual(
+                    pin["operation_id"],
+                    "topic-intro-pin:-100777:4242",
+                )
+
     def test_unbound_forum_message_is_framed_as_the_workspace_answer(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"
@@ -9380,7 +9529,7 @@ class DurableIntegrationTests(unittest.TestCase):
                         "text": "Add me to a group",
                         "url": (
                             "https://t.me/example_bot?startgroup=true"
-                            "&admin=change_info+delete_messages+manage_topics"
+                            "&admin=change_info+delete_messages+manage_topics+pin_messages"
                         ),
                     },
                 )

@@ -2697,7 +2697,8 @@ class DurableStore:
         try:
             row = self.connection.execute(
                 """
-                SELECT method, params_json, route_json, card_json
+                SELECT method, params_json, route_json, card_json,
+                    serialize_key
                 FROM outbox_messages
                 WHERE message_id = ? AND state = 'leased' AND lease_owner = ?
                 """,
@@ -2781,6 +2782,50 @@ class DurableStore:
                 )
             if row["card_json"] is not None:
                 card_spec = json.loads(row["card_json"])
+                if card_spec.get("kind") == "topic_intro":
+                    if card_spec.get("mode") == "pin":
+                        # The pin itself carries no follow-up work.
+                        self.connection.execute("COMMIT")
+                        return
+                    # A topic's intro is its standing header, so it is pinned
+                    # once Telegram reports the message ID it assigned. Pinning
+                    # is decoration: the sender retires a rights failure
+                    # instead of retrying it, and the intro text stands alone.
+                    if row["method"] != "sendMessage" or not isinstance(
+                        result, dict
+                    ):
+                        raise StoreError(
+                            "Only sendMessage can introduce a topic."
+                        )
+                    intro_params = json.loads(row["params_json"])
+                    try:
+                        intro_chat_id = int(intro_params["chat_id"])
+                        intro_message_id = int(result["message_id"])
+                    except (KeyError, TypeError, ValueError):
+                        raise StoreError(
+                            "Telegram result cannot identify the topic intro."
+                        ) from None
+                    self.enqueue_api_call(
+                        operation_id=(
+                            f"topic-intro-pin:{intro_chat_id}:"
+                            f"{intro_message_id}"
+                        ),
+                        method="pinChatMessage",
+                        params={
+                            "chat_id": intro_chat_id,
+                            "message_id": intro_message_id,
+                            "disable_notification": True,
+                        },
+                        card={"kind": "topic_intro", "mode": "pin"},
+                        serialize_key=(
+                            str(row["serialize_key"])
+                            if row["serialize_key"] is not None
+                            else None
+                        ),
+                        now=timestamp,
+                    )
+                    self.connection.execute("COMMIT")
+                    return
                 if card_spec.get("kind") == "router_turn":
                     try:
                         mode = str(card_spec["mode"])

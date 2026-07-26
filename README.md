@@ -115,10 +115,10 @@ appear.
 
 **5. Add your first workspace.** Send `/newgroup` in the bot chat. It replies
 with a link that adds the bot to a group you pick *and* requests the rights it
-needs — Change group info, Delete messages, Manage topics — in the same
-confirmation, so there is no separate promotion step. Telegram's Bot API does
-not let a bot create a group or enable Topics, so those two steps are yours:
-create a private group, turn on **Topics**, then tap the link.
+needs — Change group info, Delete messages, Manage topics, Pin messages — in the
+same confirmation, so there is no separate promotion step. Telegram's Bot API
+does not let a bot create a group or enable Topics, so those two steps are
+yours: create a private group, turn on **Topics**, then tap the link.
 
 Admin rights are not optional: Telegram's default Group Privacy hides ordinary
 messages from non-admin bots.
@@ -134,7 +134,8 @@ the meet without fear repo in Software
 Control resolves it and asks you to confirm **Bind forum workspace**. After
 that, each new topic starts with the group's provider, model, and effort in one
 tap — and whatever you already sent runs as that topic's first turn, so nothing
-needs resending. Send `/help` at any time.
+needs resending. Every topic opens with a pinned intro listing its commands, so
+`/help` is always one tap away.
 
 If you know the path up front, the first message can still do both at once:
 *"Set up this group for /absolute/workspace/path using Claude"* offers a single

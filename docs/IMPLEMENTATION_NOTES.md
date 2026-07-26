@@ -969,7 +969,7 @@ and a stored session equivalent to full account access.
 
 What is possible is collapsing *add* and *promote* into one confirmation.
 `/newgroup` replies with a card whose inline URL button is
-`https://t.me/<bot>?startgroup=true&admin=change_info+delete_messages+manage_topics`,
+`https://t.me/<bot>?startgroup=true&admin=change_info+delete_messages+manage_topics+pin_messages`,
 built by `bridge.group_setup_link` from the paired `bot_username`. Telegram then
 adds the bot to the chosen group and asks the owner to grant those three rights
 in the same step. The rights are the ones actually used: admin status at all is
@@ -996,6 +996,37 @@ paths, and an integration test asserting `/newgroup` queues the URL button
 without creating a router turn while `/start true` in an unauthorized forum
 produces the authorize-and-folder prompt and no router work. Full suite green at
 336 tests; offline router eval 14/14.
+
+## Every topic gets one pinned intro
+
+Telegram pins nothing on its own, and the controller never pinned anything
+either — the only pin in the whole durable record was made by hand from the
+owner's account, which is why topics looked inconsistent. A topic's commands
+were reachable only by scrolling back to whichever message last mentioned
+`/help`.
+
+Each topic now opens with one intro that states the agent, model, and effort and
+lists `/help`, `/agent`, `/status`, and `/teardown` as tappable commands, and
+that message is pinned. It replaces the previous confirmation rather than adding
+a message, and it is sent on both setup paths — the one-tap start and the
+per-topic customize chain — including when a carried request runs immediately,
+where it says so instead of asking for a first message.
+
+Pinning needs the message ID Telegram assigns, which only exists after the send
+is acknowledged, so the intro carries a `topic_intro` card and the outbox
+completion transaction queues `pinChatMessage` from the send result under the
+same serialization key. A multi-chunk intro pins its first chunk. `pin_messages`
+joined the rights the `/newgroup` link requests, but pinning stays decoration:
+a group that never granted the right (or a message that has since gone) reports
+`not enough rights`, and the sender retires that call immediately with an
+`outbox_pin_skipped` event rather than retrying it eight times behind the rest
+of the queue.
+
+Verified with an integration test that drives topic creation through the one-tap
+start, asserts the intro lists all four commands and carries the pin card, drains
+the outbox, and asserts the queued `pinChatMessage` uses the acknowledged message
+ID; plus a unit test asserting a rights failure dead-letters on its first attempt
+and leaves the queue empty. Full suite green at 347 tests.
 
 ## Stage 0 legacy bridge commands
 

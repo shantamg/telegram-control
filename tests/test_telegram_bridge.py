@@ -982,7 +982,7 @@ class GroupSetupLinkTests(unittest.TestCase):
         self.assertEqual(
             link,
             "https://t.me/example_bot?startgroup=true"
-            "&admin=change_info+delete_messages+manage_topics",
+            "&admin=change_info+delete_messages+manage_topics+pin_messages",
         )
 
     def test_missing_or_invalid_username_fails_closed(self):

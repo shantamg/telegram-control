@@ -333,6 +333,7 @@ def send_message(
     text: str,
     include_inspect_button: bool = False,
     reply_markup: Optional[dict] = None,
+    card: Optional[dict] = None,
 ) -> None:
     global OUTPUT_SEQUENCE
     chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
@@ -359,13 +360,17 @@ def send_message(
             "message_thread_id": thread_id,
             "text": chunk,
         }
-        if index == len(chunks) - 1 and reply_markup is not None:
+        last_chunk = index == len(chunks) - 1
+        if last_chunk and reply_markup is not None:
             params["reply_markup"] = reply_markup
         deliver_api_call(
             "sendMessage",
             params,
             f"message:{OUTPUT_SEQUENCE}",
             route=controller_reply_route(),
+            # A multi-chunk message pins its first chunk, which is the one
+            # carrying the header the reader is meant to see.
+            card=card if index == 0 else None,
         )
 
 
@@ -793,8 +798,9 @@ def send_group_setup_card() -> None:
         "1. Create a private Telegram group — any name.\n"
         "2. Turn on Topics in the group's settings.\n"
         "3. Tap the button below and pick that group. Telegram adds me and "
-        "asks you to grant Change group info, Delete messages, and Manage "
-        "topics in the same step — no separate promotion.\n\n"
+        "asks you to grant Change group info, Delete messages, Manage "
+        "topics, and Pin messages in the same step — no separate "
+        "promotion.\n\n"
         "Then send anything in the group and I will ask which folder it works "
         "in. A bot cannot create the group or enable Topics itself; those two "
         "steps are yours.\n\n"
@@ -1140,31 +1146,59 @@ def pending_request_from_payload(payload: dict) -> Optional[str]:
     return carryable_pending_request(raw) if isinstance(raw, str) else None
 
 
+def send_topic_intro(
+    display_name: str,
+    provider: str,
+    provider_config: dict,
+    started: bool,
+) -> None:
+    """Post this topic's standing header and pin it.
+
+    Telegram never pins anything on its own, so the commands a topic needs were
+    only ever reachable by scrolling back to whichever message happened to
+    mention them. One pinned intro per topic keeps them one tap away.
+    """
+    provider_name = "Claude" if provider == "claude" else "Codex"
+    model_name, effort_name = provider_defaults.describe_provider_config(
+        provider,
+        provider_config,
+        forum_workspace_path(),
+    )
+    next_step = (
+        "Your message is running now."
+        if started
+        else "Send the first message to start a new session."
+    )
+    send_message(
+        f"✅ “{display_name}” will use {provider_name}.\n"
+        f"Model: {model_name}\n"
+        f"Effort: {effort_name}\n\n"
+        f"{next_step}\n\n"
+        "Commands here:\n"
+        "/help — browse the guide\n"
+        "/agent — this topic's agent, model, effort, and session\n"
+        "/status — this Telegram surface\n"
+        "/teardown — remove this topic and its session",
+        card={"kind": "topic_intro", "mode": "pin_after_send"},
+    )
+
+
 def start_forum_subject_turn(
     display_name: str,
     provider: str,
     provider_config: dict,
     pending_request: Optional[str],
 ) -> None:
-    """Explain a newly configured topic, or just run the request it held."""
-    provider_name = "Claude" if provider == "claude" else "Codex"
-    if pending_request is not None:
-        binding = current_surface_binding()
-        if binding is not None and binding.target_type == "agent":
-            enqueue_agent_input(binding.target_id, pending_request)
-            return
-    model_name, effort_name = provider_defaults.describe_provider_config(
-        provider,
-        provider_config,
-        forum_workspace_path(),
+    """Introduce a newly configured topic, and run any request it held."""
+    binding = current_surface_binding()
+    started = (
+        pending_request is not None
+        and binding is not None
+        and binding.target_type == "agent"
     )
-    send_message(
-        f"✅ “{display_name}” will use {provider_name}.\n"
-        f"Model: {model_name}\n"
-        f"Effort: {effort_name}\n\n"
-        "Send the first message to start a new session.\n\n"
-        f"{telegram_help.HELP_HINT}"
-    )
+    send_topic_intro(display_name, provider, provider_config, started)
+    if started:
+        enqueue_agent_input(binding.target_id, pending_request)
 
 
 def forum_subject_setup_pending() -> bool:
