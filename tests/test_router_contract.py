@@ -196,7 +196,7 @@ class RouterContractTests(unittest.TestCase):
                 {"telegram-control"},
             )
 
-    def test_bind_forum_workspace_is_codex_only_and_requires_confirmation(self):
+    def test_bind_forum_workspace_takes_either_provider_and_confirms(self):
         call = parse_router_tool_call(
             '{"tool":"bind_forum_workspace","arguments":{'
             '"workspace":"loc_life","working_directory":null,'
@@ -208,10 +208,19 @@ class RouterContractTests(unittest.TestCase):
         self.assertEqual(call.arguments["provider"], "codex")
         self.assertEqual(call.arguments["effort"], "high")
 
+        # The forum's provider becomes every topic's default, so a group that
+        # should run Claude must be able to say so while binding.
+        claude = parse_router_tool_call(
+            '{"tool":"bind_forum_workspace","arguments":{'
+            '"workspace":"loc_life","provider":"claude"}}',
+            {"telegram-control"},
+        )
+        self.assertEqual(claude.arguments["provider"], "claude")
+
         with self.assertRaisesRegex(RouterContractError, "provider"):
             parse_router_tool_call(
                 '{"tool":"bind_forum_workspace","arguments":{'
-                '"workspace":"loc_life","provider":"claude"}}',
+                '"workspace":"loc_life","provider":"invented"}}',
                 {"telegram-control"},
             )
         with self.assertRaisesRegex(RouterContractError, "arguments"):

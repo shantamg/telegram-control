@@ -114,15 +114,23 @@ appear.
 
 **5. Add your first workspace.** In Telegram, create a private group, enable
 **Topics**, add your bot, and promote it to administrator — Telegram's default
-Group Privacy hides ordinary messages from non-admin bots. Then in the
-**General** topic send:
+Group Privacy hides ordinary messages from non-admin bots. Send anything in the
+group and the bot offers **Authorize forum**, then asks which folder the group
+works in. Answer with a path or just a description:
 
 ```text
-Set up this group for /absolute/workspace/path using Claude
+~/Software/my-project
+the meet without fear repo in Software
 ```
 
-Tap **Authorize and bind**, create a topic, choose the provider/model/effort
-from its buttons, and send an ordinary request. Send `/help` at any time.
+Control resolves it and asks you to confirm **Bind forum workspace**. After
+that, each new topic starts with the group's provider, model, and effort in one
+tap — and whatever you already sent runs as that topic's first turn, so nothing
+needs resending. Send `/help` at any time.
+
+If you know the path up front, the first message can still do both at once:
+*"Set up this group for /absolute/workspace/path using Claude"* offers a single
+**Authorize and bind** button.
 
 You can also work entirely in the private bot chat and let the Control agent
 find directories for you: *"add a project called Lovely, the peter-app

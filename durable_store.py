@@ -1019,6 +1019,12 @@ REPLY_CONTEXT_PREFIX = (
     "The user is replying to an earlier bot message on this surface."
 )
 USER_REPLY_MARKER = f"\n{REPLY_QUOTE_END}\n\nUser reply:\n"
+FORUM_SETUP_PREFIX = (
+    "This private Telegram forum is authorized but is not yet bound to a "
+    "workspace."
+)
+FORUM_SETUP_NOTE_END = "[controller note ends]"
+FORUM_SETUP_MARKER = f"\n{FORUM_SETUP_NOTE_END}\n\nUser message:\n"
 
 
 def compose_reply_context_input(
@@ -1071,6 +1077,36 @@ def compose_reply_context_input(
     return composed
 
 
+def compose_forum_setup_input(user_text: str) -> str:
+    """Frame a message in an unbound forum as the answer to "which folder?".
+
+    The owner is asked for a workspace the moment a forum is authorized, so
+    their next message is an answer, not ordinary work. Saying so explicitly
+    keeps Control from inspecting or dispatching it instead of proposing the
+    binding. The note is controller-authored and never contains a path, and it
+    is separated by the same marker convention as reply context, so validations
+    that require a value to appear explicitly in the user's own words still see
+    only the text below the marker.
+    """
+    user = user_text.strip()
+    note = (
+        f"{FORUM_SETUP_PREFIX}\n"
+        "The user was just asked which local folder this Telegram group "
+        "should work in, so the message below answers that question. Resolve "
+        "it with the discovery tools when it is a description rather than a "
+        "path, then propose bind_forum_workspace for confirmation. Do not "
+        "treat it as ordinary work, and never invent a location the user did "
+        "not state or that discovery did not return."
+        f"{FORUM_SETUP_MARKER}"
+    )
+    composed = f"{note}{user}"
+    if len(composed) > ROUTER_INPUT_LIMIT:
+        overflow = len(composed) - ROUTER_INPUT_LIMIT
+        user = user[: max(len(user) - overflow - 1, 0)].rstrip() + "…"
+        composed = f"{note}{user}"
+    return composed
+
+
 def chunk_telegram_text(text: str, limit: int = 3800) -> list[str]:
     if limit <= 0:
         raise StoreError("Telegram chunk limit must be positive.")
@@ -1111,6 +1147,10 @@ def extract_user_request(input_text: str) -> str:
         index = input_text.find(USER_REPLY_MARKER)
         if index != -1:
             return input_text[index + len(USER_REPLY_MARKER):]
+    if input_text.startswith(FORUM_SETUP_PREFIX):
+        index = input_text.find(FORUM_SETUP_MARKER)
+        if index != -1:
+            return input_text[index + len(FORUM_SETUP_MARKER):]
     return input_text
 
 
@@ -2399,8 +2439,10 @@ class DurableStore:
         action_type: Optional[str] = None,
         now: Optional[float] = None,
     ) -> int:
-        """Expire unused provider/model/effort choices for one topic."""
+        """Expire unused start/provider/model/effort choices for one topic."""
         setup_action_types = {
+            "forum_subject_start",
+            "forum_subject_customize",
             "forum_subject_provider_select",
             "forum_subject_model_select",
             "forum_subject_effort_select",
@@ -5134,15 +5176,22 @@ class DurableStore:
         if valid is None:
             raise StoreError("Main router surface is no longer valid.")
 
-    def enqueue_router_voice_receipt(
+    def enqueue_router_receipt(
         self,
         source_inbox_job_id: int,
         chat_id: int,
         message_thread_id: Optional[int],
         authorized_user_id: int,
+        receipt_text: str,
+        parse_mode: Optional[str] = None,
+        input_kind: Optional[str] = None,
         replied_message_id: Optional[int] = None,
         now: Optional[float] = None,
     ) -> int:
+        if parse_mode not in {None, "HTML"}:
+            raise StoreError("Router receipt parse mode is invalid.")
+        if input_kind not in {None, "voice"}:
+            raise StoreError("Router receipt input kind is invalid.")
         timestamp = time.time() if now is None else float(now)
         thread_id = int(message_thread_id) if message_thread_id is not None else 0
         self.connection.execute("BEGIN IMMEDIATE")
@@ -5154,32 +5203,36 @@ class DurableStore:
                 timestamp=timestamp,
             )
             self._ensure_main_agent(timestamp)
+            params = {
+                "chat_id": int(chat_id),
+                "message_thread_id": (
+                    int(message_thread_id)
+                    if message_thread_id is not None
+                    else None
+                ),
+                "text": receipt_text,
+            }
+            if parse_mode is not None:
+                params["parse_mode"] = parse_mode
+            card = {
+                "kind": "router_turn",
+                "source_inbox_job_id": int(source_inbox_job_id),
+                "mode": "receipt",
+            }
+            if input_kind is not None:
+                card["input_kind"] = input_kind
+                card["authorized_user_id"] = int(authorized_user_id)
             message_id = self.enqueue_api_call(
                 operation_id=f"router-input:{int(source_inbox_job_id)}:receipt",
                 method="sendMessage",
-                params={
-                    "chat_id": int(chat_id),
-                    "message_thread_id": (
-                        int(message_thread_id)
-                        if message_thread_id is not None
-                        else None
-                    ),
-                    "text": "🎙️ <b>Control is transcribing…</b>",
-                    "parse_mode": "HTML",
-                },
+                params=params,
                 route={
                     "target_type": "controller",
                     "target_id": "control",
                     "policy": "reply",
                     "ttl_seconds": 30 * 24 * 60 * 60,
                 },
-                card={
-                    "kind": "router_turn",
-                    "source_inbox_job_id": int(source_inbox_job_id),
-                    "input_kind": "voice",
-                    "authorized_user_id": int(authorized_user_id),
-                    "mode": "receipt",
-                },
+                card=card,
                 now=timestamp,
             )
             self.connection.execute("COMMIT")
@@ -5497,6 +5550,27 @@ class DurableStore:
             if self.connection.in_transaction:
                 self.connection.execute("ROLLBACK")
             raise
+
+    def enqueue_router_voice_receipt(
+        self,
+        source_inbox_job_id: int,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        authorized_user_id: int,
+        replied_message_id: Optional[int] = None,
+        now: Optional[float] = None,
+    ) -> int:
+        return self.enqueue_router_receipt(
+            source_inbox_job_id=source_inbox_job_id,
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            authorized_user_id=authorized_user_id,
+            receipt_text="🎙️ <b>Control is transcribing…</b>",
+            parse_mode="HTML",
+            input_kind="voice",
+            replied_message_id=replied_message_id,
+            now=now,
+        )
 
     def attach_router_mailbox_session(
         self,

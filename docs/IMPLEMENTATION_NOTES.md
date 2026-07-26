@@ -799,14 +799,70 @@ was already persisted before the download, so this feature requires no schema
 migration.
 
 Before making Telegram's `getFile` request or downloading any bytes, the inbox
-handler queues a durable `📎 Attachment received. Downloading securely…`
-outbox message. The independent sender can therefore acknowledge a slow
-attachment immediately instead of waiting for the download and agent receipt.
+handler queues the eventual router or agent turn receipt with
+`📎 Attachment received. Downloading securely…`. Routing later reuses that
+operation ID and card instead of sending a second message, so the independent
+sender can acknowledge a slow attachment immediately and the same Telegram
+message becomes the normal progress and response card.
 
 Verified with unit coverage for Telegram rendition selection, arbitrary
 documents and safe filename retention, deterministic private persistence,
 retry reuse, acknowledgement-before-download ordering, prompt construction,
-and the focused attachment suite.
+single-receipt reuse, and the focused attachment suite.
+
+## Fewer steps to a working group
+
+Setting up **Meet Without Fear** on July 25, 2026 took eleven Control messages
+and seven taps before any work ran, and asked the owner to send the same request
+twice. The durable record of that setup drove four changes.
+
+**A new group is asked for its folder instead of waiting to be told.** The
+authorize card and the post-authorize confirmation both end with the same
+question (`WORKSPACE_QUESTION` in `on_message.py`), because the workspace is the
+one thing the controller cannot infer. The card only asks it when the forum is
+still unbound; a re-authorized bound forum keeps the old "send your request
+again" wording.
+
+**A message in an authorized, unbound forum is framed as that answer.**
+`compose_forum_setup_input` prefixes a controller-authored note saying the owner
+was just asked which folder to use, and that the message below answers it. The
+note never contains a path, and it is separated by the same marker convention as
+reply context, so `extract_user_request` still returns only the user's own
+words — path, alias, model, and effort containment checks are unchanged. Unlike
+quoted bot text, this framing is trusted controller output, so
+`has_reply_context` explicitly reports `False` for it and the reply-context
+dispatch guard does not misfire. A bare description such as `the meet without
+fear repo in Software` therefore reaches Control as a bind request, and
+discovery resolves it to a ref before the usual confirmation.
+
+**A topic starts with its group's provider in one tap.** `bind_forum_workspace`
+already records the provider and any model/effort defaults, and
+`ensure_forum_subject` already inherits them, so asking provider → model →
+effort again re-asked a question the binding had answered. The card now states
+the inherited configuration and offers **▶️ Start \<provider\>**, with
+**Choose a different agent…** opening the previous three menus for a topic that
+should differ from its group. The start action re-reads the forum record at
+confirmation time rather than trusting its stored payload, so a stored button
+can never widen the provider it was issued against. `bind_forum_workspace` also
+accepts `claude` now; restricting it to Codex made the recorded default
+misleading for a Claude group.
+
+**An interrupted request is held, not discarded.** Setup carries the pending
+text (bounded at 4,000 characters) through the start, customize, provider,
+model, and effort payloads, and enqueues it to the new agent's mailbox as the
+topic's first turn once the subject exists. Voice notes are transcribed before
+the setup card appears so the transcript can be carried the same way — a few
+seconds of transcription is cheaper than asking someone to re-record. An
+attachment's generated prompt carries identically, so an image sent into a fresh
+topic also survives setup.
+
+Verified with the reworked topic-creation integration test (default card, the
+customize path, and per-topic Claude/sonnet/high still landing on the agent),
+a new one-tap test asserting the held request becomes the first mailbox item and
+that no setup buttons stay active, a new framing test asserting the router input
+starts with the controller note while `extract_user_request` returns only the
+owner's sentence, the full 331-test suite, and the offline router eval gate at
+14/14.
 
 ## Stage 0 legacy bridge commands
 

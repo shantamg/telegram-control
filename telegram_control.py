@@ -1000,9 +1000,9 @@ def forum_workspace_proposal(
                 f"{enrolled.display_name} is already enrolled; its working "
                 "directory cannot be changed while binding this forum."
             )
-        if enrolled.provider != "codex":
+        if enrolled.provider not in {"codex", "claude"}:
             raise StoreError(
-                "This release binds forum subjects to Codex workspaces only."
+                "That project's provider cannot back a forum workspace."
             )
         workspace_root = enrolled.project_path
         working_directory = enrolled.working_directory
@@ -1045,8 +1045,8 @@ def forum_workspace_proposal(
             provenance.append(workdir_provenance)
 
     provider = str(requested_provider or "codex")
-    if provider != "codex":
-        raise StoreError("This release binds forum subjects to Codex only.")
+    if provider not in {"codex", "claude"}:
+        raise StoreError("A forum workspace requires Codex or Claude.")
     provider_config = validate_provider_config(
         provider,
         {

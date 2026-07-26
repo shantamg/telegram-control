@@ -86,7 +86,9 @@ These skills are scoped to the active Telegram turn. They do not accept arbitrar
 
 Use /projects to list enrolled workspaces. Inside an eligible project topic, /agent create <slug> attaches its managed agent.
 
-In a bound private forum, each new topic can choose Codex or Claude, then its model and effort. Topic names and Telegram coordinates remain durable routing identities until formal teardown.""",
+Setting up a new group: add the bot, promote it to administrator, enable Topics, then answer its question about which folder the group works in — a path or a description Control can find. Binding is confirmed with one button.
+
+Each new topic in a bound group then starts with the group's own provider, model, and effort in one tap; "Choose a different agent…" opens the per-topic menus. Whatever you already sent runs as the topic's first turn, so you never resend it. Topic names and Telegram coordinates remain durable routing identities until formal teardown.""",
     ),
 )
 

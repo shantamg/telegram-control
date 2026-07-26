@@ -30,6 +30,7 @@ from durable_store import (
     DurableStore,
     StoreError,
     chunk_telegram_text,
+    compose_forum_setup_input,
     context_usage_summary,
 )
 
@@ -53,6 +54,13 @@ TRANSCRIPTION_TIMEOUT_SECONDS = 15 * 60
 TELEGRAM_TEXT_CHUNK = 3_800
 OUTPUT_SEQUENCE = 0
 CONTROL_SPEAKER = "🎛 Control"
+# Binding a folder is the one thing a new group cannot infer, so every entry
+# point asks for it directly instead of waiting to be told.
+WORKSPACE_QUESTION = (
+    "Which folder should this group work in? Reply with a path like "
+    "~/Software/my-project, or just describe the project and I will find it "
+    "and confirm before binding anything."
+)
 def deliver_api_call(
     method: str,
     params: dict,
@@ -468,7 +476,11 @@ def build_router_reply_input(update: dict, route, user_text: str) -> str:
     )
 
 
-def enqueue_agent_reply_input(route, text: str) -> None:
+def enqueue_agent_reply_input(
+    route,
+    text: str,
+    receipt_text: Optional[str] = None,
+) -> None:
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
     if not database_path or not job_id:
@@ -501,10 +513,10 @@ def enqueue_agent_reply_input(route, text: str) -> None:
             chat_id=chat_id,
             message_thread_id=thread_id,
             replied_message_id=route.telegram_message_id,
-            receipt_text=(
+            receipt_text=receipt_text
+            or (
                 f"📨 <b>Queued for {html.escape(speaker)}</b>"
-                f"{metadata_line}"
-                f"{context_line}"
+                f"{metadata_line}{context_line}"
             ),
             receipt_parse_mode="HTML",
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
@@ -792,7 +804,11 @@ def create_agent_from_catalog(project_slug: str) -> None:
         )
 
 
-def enqueue_agent_input(agent_id: str, text: str) -> None:
+def enqueue_agent_input(
+    agent_id: str,
+    text: str,
+    receipt_text: Optional[str] = None,
+) -> None:
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
     if not database_path or not job_id:
@@ -827,7 +843,7 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
             input_text=text,
             chat_id=chat_id,
             message_thread_id=thread_id,
-            receipt_text=receipt,
+            receipt_text=receipt_text or receipt,
             receipt_parse_mode="HTML",
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
         )
@@ -836,6 +852,7 @@ def enqueue_agent_input(agent_id: str, text: str) -> None:
 def enqueue_router_input(
     text: str,
     replied_message_id: Optional[int] = None,
+    receipt_text: Optional[str] = None,
 ) -> None:
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
@@ -865,7 +882,7 @@ def enqueue_router_input(
             chat_id=chat_id,
             message_thread_id=thread_id,
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
-            receipt_text="🧭 <b>Control is routing…</b>",
+            receipt_text=receipt_text or "🧭 <b>Control is routing…</b>",
             receipt_parse_mode="HTML",
             replied_message_id=replied_message_id,
         )
@@ -1018,7 +1035,8 @@ def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
         f"Forum: {display_name}\n\n"
         f"Only your paired Telegram account will be accepted. Add {bot_label()} "
         "as a forum administrator so ordinary text and voice messages reach "
-        "the controller. After authorizing, send your request again.\n\n"
+        "the controller.\n\n"
+        f"{WORKSPACE_QUESTION}\n\n"
         f"{telegram_help.HELP_HINT}",
         reply_markup={
             "inline_keyboard": [
@@ -1074,10 +1092,94 @@ def ensure_bound_forum_subject():
         )
 
 
+PENDING_REQUEST_LIMIT = 4_000
+
+
+def carryable_pending_request(text: Optional[str]) -> Optional[str]:
+    """Keep a request that setup interrupted so the user need not resend it."""
+    if text is None:
+        return None
+    pending = text.strip()
+    if not pending or len(pending) > PENDING_REQUEST_LIMIT:
+        return None
+    return pending
+
+
+def pending_request_from_payload(payload: dict) -> Optional[str]:
+    raw = payload.get("pending_request")
+    return carryable_pending_request(raw) if isinstance(raw, str) else None
+
+
+def start_forum_subject_turn(
+    display_name: str,
+    provider: str,
+    provider_config: dict,
+    pending_request: Optional[str],
+) -> None:
+    """Explain a newly configured topic, or just run the request it held."""
+    provider_name = "Claude" if provider == "claude" else "Codex"
+    if pending_request is not None:
+        binding = current_surface_binding()
+        if binding is not None and binding.target_type == "agent":
+            enqueue_agent_input(binding.target_id, pending_request)
+            return
+    model_name, effort_name = provider_defaults.describe_provider_config(
+        provider,
+        provider_config,
+        forum_workspace_path(),
+    )
+    send_message(
+        f"✅ “{display_name}” will use {provider_name}.\n"
+        f"Model: {model_name}\n"
+        f"Effort: {effort_name}\n\n"
+        "Send the first message to start a new session.\n\n"
+        f"{telegram_help.HELP_HINT}"
+    )
+
+
+def forum_subject_setup_pending() -> bool:
+    """Report whether this bound-forum topic still needs its agent confirmed."""
+    if os.environ.get("TELEGRAM_CHAT_TYPE") != "supergroup":
+        return False
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    if not database_path or not chat_id_text or not thread_id_text:
+        return False
+    chat_id = int(chat_id_text)
+    thread_id = int(thread_id_text)
+    with DurableStore(Path(database_path)) as store:
+        if store.resolve_forum_workspace(chat_id) is None:
+            return False
+        if store.resolve_forum_subject(chat_id, thread_id) is not None:
+            return False
+        binding = store.resolve_surface_binding(chat_id, thread_id)
+        return not (binding is not None and binding.target_type == "agent")
+
+
+def forum_workspace_path() -> Optional[str]:
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    if not database_path or not chat_id_text:
+        return None
+    with DurableStore(Path(database_path)) as store:
+        workspace = store.resolve_forum_workspace(int(chat_id_text))
+    return workspace.project_path if workspace is not None else None
+
+
 def prompt_forum_subject_provider_selection(
     request_was_already_sent: bool = False,
+    pending_request: Optional[str] = None,
 ) -> bool:
-    """Offer a provider before a bound forum topic receives its first turn."""
+    """Confirm a topic's agent before its first turn, using forum defaults.
+
+    The forum binding already recorded the provider and any model/effort
+    defaults for its subjects, so asking all three again is redundant. The
+    normal path is one button that starts the recorded configuration; the
+    per-topic provider, model, and effort menus stay available behind
+    **Choose a different agent…** for a topic that should differ from its
+    group.
+    """
     if os.environ.get("TELEGRAM_CHAT_TYPE") != "supergroup":
         return False
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
@@ -1113,49 +1215,71 @@ def prompt_forum_subject_provider_selection(
         binding = store.resolve_surface_binding(chat_id, thread_id)
         if binding is not None and binding.target_type == "agent":
             return False
-        actions = {}
-        for provider in ("codex", "claude"):
-            actions[provider] = store.create_callback_action(
-                operation_id=(
-                    f"inbox:{job_id}:forum-subject-provider:{provider}"
-                ),
-                action_type="forum_subject_provider_select",
-                payload={
-                    "chat_id": chat_id,
-                    "message_thread_id": thread_id,
-                    "display_name": display_name,
-                    "provider": provider,
-                },
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                authorized_user_id=int(user_id_text),
-                one_time=True,
-                ttl_seconds=24 * 60 * 60,
-            )
-
-    instruction = (
-        "Choose an agent, then send your request again."
-        if request_was_already_sent
-        else (
-            "Your first message will start a new session with the selected "
-            "agent."
+        pending = carryable_pending_request(pending_request)
+        payload = {
+            "chat_id": chat_id,
+            "message_thread_id": thread_id,
+            "display_name": display_name,
+        }
+        if pending is not None:
+            payload["pending_request"] = pending
+        start = store.create_callback_action(
+            operation_id=f"inbox:{job_id}:forum-subject-start",
+            action_type="forum_subject_start",
+            payload={
+                **payload,
+                "provider": workspace.provider,
+                "provider_config": workspace.provider_config,
+            },
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            authorized_user_id=int(user_id_text),
+            one_time=True,
+            ttl_seconds=24 * 60 * 60,
         )
+        customize = store.create_callback_action(
+            operation_id=f"inbox:{job_id}:forum-subject-customize",
+            action_type="forum_subject_customize",
+            payload=payload,
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            authorized_user_id=int(user_id_text),
+            one_time=True,
+            ttl_seconds=24 * 60 * 60,
+        )
+
+    provider_name = "Claude" if workspace.provider == "claude" else "Codex"
+    model_name, effort_name = provider_defaults.describe_provider_config(
+        workspace.provider,
+        workspace.provider_config,
+        workspace.project_path,
     )
+    if pending is not None:
+        instruction = "Your message is saved and runs as its first turn."
+    elif request_was_already_sent:
+        instruction = "Send your request again once this topic has its agent."
+    else:
+        instruction = "Your first message will start its session."
     send_message(
-        f"Choose an agent for “{display_name}”.\n\n{instruction}\n\n"
+        f"Start “{display_name}” with {provider_name}?\n\n"
+        f"Model: {model_name}\n"
+        f"Effort: {effort_name}\n\n"
+        f"{instruction}\n\n"
         f"{telegram_help.HELP_HINT}",
         reply_markup={
             "inline_keyboard": [
                 [
                     {
-                        "text": "Codex",
-                        "callback_data": f"a:{actions['codex'].token}",
-                    },
+                        "text": f"▶️ Start {provider_name}",
+                        "callback_data": f"a:{start.token}",
+                    }
+                ],
+                [
                     {
-                        "text": "Claude",
-                        "callback_data": f"a:{actions['claude'].token}",
-                    },
-                ]
+                        "text": "Choose a different agent…",
+                        "callback_data": f"a:{customize.token}",
+                    }
+                ],
             ]
         },
     )
@@ -1345,6 +1469,154 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             )
         return
 
+    if action.action_type in {
+        "forum_subject_start",
+        "forum_subject_customize",
+    }:
+        target_chat_id = int(action.payload.get("chat_id", 0))
+        target_thread_id = int(action.payload.get("message_thread_id", 0))
+        display_name = str(action.payload.get("display_name", "")).strip()
+        if (
+            target_chat_id != chat_id
+            or target_thread_id != thread_id
+            or not display_name
+            or len(display_name) > 128
+        ):
+            raise StoreError("Stored forum topic setup is invalid.")
+        pending_request = pending_request_from_payload(action.payload)
+        clear_operation = (
+            "forum-subject-start-clear"
+            if action.action_type == "forum_subject_start"
+            else "forum-subject-customize-clear"
+        )
+        if action.action_type == "forum_subject_customize":
+            with DurableStore(Path(database_path)) as store:
+                provider_actions = []
+                for provider in ("codex", "claude"):
+                    payload = {
+                        "chat_id": chat_id,
+                        "message_thread_id": target_thread_id,
+                        "display_name": display_name,
+                        "provider": provider,
+                    }
+                    if pending_request is not None:
+                        payload["pending_request"] = pending_request
+                    provider_actions.append(
+                        (
+                            "Claude" if provider == "claude" else "Codex",
+                            store.create_callback_action(
+                                operation_id=(
+                                    f"callback:{update['update_id']}:"
+                                    f"forum-subject-provider:{provider}"
+                                ),
+                                action_type="forum_subject_provider_select",
+                                payload=payload,
+                                chat_id=chat_id,
+                                message_thread_id=target_thread_id,
+                                authorized_user_id=user_id,
+                                one_time=True,
+                                ttl_seconds=24 * 60 * 60,
+                            ),
+                        )
+                    )
+                store.expire_forum_subject_setup_actions(
+                    chat_id,
+                    target_thread_id,
+                    action_type="forum_subject_start",
+                )
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": "Choose an agent.",
+                    },
+                    "callback-answer",
+                )
+            deliver_api_call(
+                "editMessageReplyMarkup",
+                {
+                    "chat_id": chat_id,
+                    "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                    "reply_markup": {"inline_keyboard": []},
+                },
+                clear_operation,
+            )
+            send_message(
+                f"Choose an agent for “{display_name}”.",
+                reply_markup={
+                    "inline_keyboard": option_button_rows(provider_actions, 2),
+                },
+            )
+            return
+
+        # The forum's own record is the authority for a default start, so a
+        # stored payload can never widen the provider it was issued against.
+        try:
+            with DurableStore(Path(database_path)) as store:
+                workspace = store.resolve_forum_workspace(chat_id)
+                if workspace is None:
+                    raise StoreError(
+                        "This forum is no longer bound to a workspace."
+                    )
+                subject, _ = store.ensure_forum_subject(
+                    chat_id=chat_id,
+                    message_thread_id=target_thread_id,
+                    display_name=display_name,
+                    provider=workspace.provider,
+                    provider_config=workspace.provider_config,
+                )
+                agent = store.resolve_agent(subject.agent_id)
+                if agent is None or agent.provider != workspace.provider:
+                    raise StoreError(
+                        "The selected forum agent could not be verified."
+                    )
+                store.expire_forum_subject_setup_actions(
+                    chat_id,
+                    target_thread_id,
+                )
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": (
+                        "Claude started."
+                        if workspace.provider == "claude"
+                        else "Codex started."
+                    ),
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            clear_operation,
+        )
+        start_forum_subject_turn(
+            display_name,
+            workspace.provider,
+            workspace.provider_config,
+            pending_request,
+        )
+        return
+
     if action.action_type == "forum_subject_provider_select":
         target_chat_id = int(action.payload.get("chat_id", 0))
         target_thread_id = int(action.payload.get("message_thread_id", 0))
@@ -1360,6 +1632,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             raise StoreError("Stored forum agent selection is invalid.")
         provider_name = "Claude" if provider == "claude" else "Codex"
         provider_options = provider_adapters.configuration_options(provider)
+        pending_request = pending_request_from_payload(action.payload)
         with DurableStore(Path(database_path)) as store:
             model_actions = []
             for label, model in provider_options.models:
@@ -1375,6 +1648,11 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                         "display_name": display_name,
                         "provider": provider,
                         "model": model,
+                        **(
+                            {"pending_request": pending_request}
+                            if pending_request is not None
+                            else {}
+                        ),
                     },
                     chat_id=chat_id,
                     message_thread_id=target_thread_id,
@@ -1439,6 +1717,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         ):
             raise StoreError("Stored forum model selection is invalid.")
         provider_options = provider_adapters.configuration_options(provider)
+        pending_request = pending_request_from_payload(action.payload)
         with DurableStore(Path(database_path)) as store:
             effort_actions = []
             for label, effort in provider_options.efforts:
@@ -1455,6 +1734,11 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                         "provider": provider,
                         "model": model,
                         "effort": effort,
+                        **(
+                            {"pending_request": pending_request}
+                            if pending_request is not None
+                            else {}
+                        ),
                     },
                     chat_id=chat_id,
                     message_thread_id=target_thread_id,
@@ -1580,11 +1864,6 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 )
             return
         provider_name = "Claude" if provider == "claude" else "Codex"
-        model_name, effort_name = provider_defaults.describe_provider_config(
-            provider,
-            provider_config,
-            agent.project_path,
-        )
         if callback_query_id:
             deliver_api_call(
                 "answerCallbackQuery",
@@ -1603,12 +1882,11 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             },
             "forum-subject-effort-clear",
         )
-        send_message(
-            f"✅ This topic will use {provider_name}.\n"
-            f"Model: {model_name}\n"
-            f"Effort: {effort_name}\n\n"
-            "Send the first message to start a new session.\n\n"
-            f"{telegram_help.HELP_HINT}"
+        start_forum_subject_turn(
+            display_name,
+            provider,
+            provider_config,
+            pending_request_from_payload(action.payload),
         )
         return
 
@@ -1652,10 +1930,16 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             },
             "forum-authorization-clear",
         )
+        with DurableStore(Path(database_path)) as store:
+            already_bound = store.resolve_forum_workspace(chat_id) is not None
         send_message(
             f"✅ {display_name} is authorized.\n\n"
-            "Send your text or voice request in this topic again.\n\n"
-            f"{telegram_help.HELP_HINT}"
+            + (
+                "Send your text or voice request in this topic again."
+                if already_bound
+                else WORKSPACE_QUESTION
+            )
+            + f"\n\n{telegram_help.HELP_HINT}"
         )
         return
     if action.action_type in {
@@ -3570,6 +3854,23 @@ def attachment_prompt(path: Path, caption: str, kind: str) -> str:
     return prompt
 
 
+def transcribe_voice_note(voice: dict) -> str:
+    """Download one Telegram voice note and transcribe it locally."""
+    with tempfile.TemporaryDirectory(
+        prefix="telegram-voice-"
+    ) as temporary_directory:
+        temp_dir = Path(temporary_directory)
+        source_path = temp_dir / "voice.ogg"
+        wav_path = temp_dir / "voice.wav"
+        bridge.download_telegram_file(
+            str(voice["file_id"]),
+            source_path,
+            max_bytes=MAX_VOICE_BYTES,
+        )
+        convert_to_wav(source_path, wav_path)
+        return transcribe_wav(wav_path)
+
+
 def handle_voice(update: dict, voice: dict) -> None:
     file_size = int(voice.get("file_size", 0))
     duration = int(voice.get("duration", 0))
@@ -3703,17 +4004,7 @@ def handle_voice(update: dict, voice: dict) -> None:
     else:
         send_message("🎙️ Voice message received. Transcribing locally with Parakeet V3…")
 
-    with tempfile.TemporaryDirectory(prefix="telegram-voice-") as temporary_directory:
-        temp_dir = Path(temporary_directory)
-        source_path = temp_dir / "voice.ogg"
-        wav_path = temp_dir / "voice.wav"
-        bridge.download_telegram_file(
-            str(voice["file_id"]),
-            source_path,
-            max_bytes=MAX_VOICE_BYTES,
-        )
-        convert_to_wav(source_path, wav_path)
-        transcript = transcribe_wav(wav_path)
+    transcript = transcribe_voice_note(voice)
 
     if managed_agent is not None:
         agent_input = transcript or (
@@ -3768,6 +4059,8 @@ def handle_voice(update: dict, voice: dict) -> None:
                 router_reply_route,
                 transcript,
             )
+        elif router_reply_route is None:
+            router_input = router_input_for_surface(router_input)
         chat_id, thread_id = surface_coordinates()
         with DurableStore(Path(database_path)) as store:
             store.enqueue_router_voice_message(
@@ -3788,7 +4081,109 @@ def handle_voice(update: dict, voice: dict) -> None:
         send_message("📝 Parakeet did not detect any speech in that voice message.")
 
 
-def route_user_input(update: dict, text: str) -> None:
+def awaiting_forum_workspace() -> bool:
+    """Report an authorized private forum that has no workspace yet."""
+    if os.environ.get("TELEGRAM_CHAT_TYPE") != "supergroup":
+        return False
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    if not database_path or not chat_id_text:
+        return False
+    chat_id = int(chat_id_text)
+    with DurableStore(Path(database_path)) as store:
+        forum = store.resolve_surface_binding(chat_id, None)
+        if (
+            forum is None
+            or forum.target_type != "controller"
+            or forum.target_id != "control"
+        ):
+            return False
+        return store.resolve_forum_workspace(chat_id) is None
+
+
+def router_input_for_surface(text: str) -> str:
+    """Tell Control when a message answers the pending workspace question."""
+    if awaiting_forum_workspace():
+        return compose_forum_setup_input(text)
+    return text
+
+
+def enqueue_attachment_receipt() -> Optional[str]:
+    """Queue the eventual turn card before downloading a routed attachment."""
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    user_id = os.environ.get("TELEGRAM_FROM_ID")
+    if not database_path or not job_id or not user_id:
+        raise StoreError("Attachment receipt requires the durable controller.")
+    chat_id, thread_id = surface_coordinates()
+    receipt_text = "📎 <b>Attachment received. Downloading securely…</b>"
+    reply_route = (
+        resolve_replied_message_route()
+        if os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
+        else None
+    )
+    binding = current_surface_binding()
+    with DurableStore(Path(database_path)) as store:
+        if reply_route is not None and reply_route.target_type == "agent":
+            store.enqueue_agent_reply_receipt(
+                agent_id=reply_route.target_id,
+                source_inbox_job_id=int(job_id),
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                replied_message_id=reply_route.telegram_message_id,
+                receipt_text=receipt_text,
+                input_kind="text",
+                parse_mode="HTML",
+            )
+            return receipt_text
+        if (
+            reply_route is not None
+            and reply_route.target_type == "controller"
+            and reply_route.target_id == "control"
+        ):
+            store.enqueue_router_receipt(
+                source_inbox_job_id=int(job_id),
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=int(user_id),
+                receipt_text=receipt_text,
+                parse_mode="HTML",
+                replied_message_id=reply_route.telegram_message_id,
+            )
+            return receipt_text
+        if binding is not None and binding.target_type == "agent":
+            store.enqueue_agent_receipt(
+                agent_id=binding.target_id,
+                source_inbox_job_id=int(job_id),
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                receipt_text=receipt_text,
+                input_kind="text",
+                parse_mode="HTML",
+            )
+            return receipt_text
+        if (
+            binding is not None
+            and binding.target_type == "controller"
+            and binding.target_id == "control"
+        ):
+            store.enqueue_router_receipt(
+                source_inbox_job_id=int(job_id),
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=int(user_id),
+                receipt_text=receipt_text,
+                parse_mode="HTML",
+            )
+            return receipt_text
+    return None
+
+
+def route_user_input(
+    update: dict,
+    text: str,
+    receipt_text: Optional[str] = None,
+) -> None:
     """Route normalized text, including prompts that reference attachments."""
     replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
     if replied_message_id:
@@ -3801,6 +4196,7 @@ def route_user_input(update: dict, text: str) -> None:
             enqueue_router_input(
                 build_router_reply_input(update, route, text),
                 replied_message_id=route.telegram_message_id,
+                receipt_text=receipt_text,
             )
         elif route is not None and route.target_type == "agent":
             if not try_enqueue_agent_steer(route, text):
@@ -3810,34 +4206,50 @@ def route_user_input(update: dict, text: str) -> None:
                     and binding.target_type == "agent"
                     and binding.target_id == route.target_id
                 ):
-                    enqueue_agent_input(route.target_id, text)
+                    enqueue_agent_input(
+                        route.target_id,
+                        text,
+                        receipt_text=receipt_text,
+                    )
                 else:
-                    enqueue_agent_reply_input(route, text)
+                    enqueue_agent_reply_input(
+                        route,
+                        text,
+                        receipt_text=receipt_text,
+                    )
         else:
             send_message("That replied-to message has no active durable route.")
         return
 
-    if prompt_forum_subject_provider_selection(request_was_already_sent=True):
+    if prompt_forum_subject_provider_selection(
+        request_was_already_sent=True,
+        pending_request=text,
+    ):
         return
     ensure_bound_forum_subject()
     binding = current_surface_binding()
     thread_id = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID")
+    router_text = router_input_for_surface(text)
     if thread_id and binding is None:
-        enqueue_router_input(text)
+        enqueue_router_input(router_text, receipt_text=receipt_text)
     elif thread_id and binding is not None:
         if binding.target_type == "agent":
-            enqueue_agent_input(binding.target_id, text)
+            enqueue_agent_input(
+                binding.target_id,
+                text,
+                receipt_text=receipt_text,
+            )
         elif (
             binding.target_type == "controller"
             and binding.target_id == "control"
         ):
-            enqueue_router_input(text)
+            enqueue_router_input(router_text, receipt_text=receipt_text)
         else:
             send_message(
                 "This topic's controller binding does not accept messages yet."
             )
     else:
-        enqueue_router_input(text)
+        enqueue_router_input(router_text, receipt_text=receipt_text)
 
 
 def main() -> int:
@@ -3865,11 +4277,18 @@ def main() -> int:
             if forum_is_authorized_or_prompt():
                 if (
                     not os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
-                    and prompt_forum_subject_provider_selection(
-                        request_was_already_sent=True,
-                    )
+                    and forum_subject_setup_pending()
                 ):
-                    return 0
+                    # Transcribe before the setup card so the voice note itself
+                    # can run as the first turn; re-recording it would be worse
+                    # than the few seconds this costs.
+                    if prompt_forum_subject_provider_selection(
+                        request_was_already_sent=True,
+                        pending_request=transcribe_voice_note(
+                            message["voice"]
+                        ),
+                    ):
+                        return 0
                 handle_voice(update, message["voice"])
         elif message and inbound_attachment(message) is not None:
             print(f"Received attachment from @{username}.", flush=True)
@@ -3881,13 +4300,14 @@ def main() -> int:
                 raise bridge.BridgeError(
                     "Telegram attachment metadata is unavailable."
                 )
-            # Queue this durable outbox operation before getFile or the content
+            # Queue the eventual turn card before getFile or the content
             # download so a slow transfer never delays user feedback.
-            send_message("📎 Attachment received. Downloading securely…")
+            receipt_text = enqueue_attachment_receipt()
             path = persist_inbound_attachment(attachment)
             route_user_input(
                 update,
                 attachment_prompt(path, caption, str(attachment["kind"])),
+                receipt_text=receipt_text,
             )
         elif message and "text" in message:
             text = str(message["text"])

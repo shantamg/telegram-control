@@ -38,11 +38,13 @@ from durable_store import (
     MIGRATION_18,
     CallbackActionError,
     DurableStore,
+    FORUM_SETUP_PREFIX,
     IncompatibleSchemaError,
     LeaseLostError,
     SCHEMA_VERSION,
     StoreError,
     context_usage_summary,
+    extract_user_request,
 )
 
 
@@ -2994,6 +2996,64 @@ class DurableStoreTests(unittest.TestCase):
             ).fetchall()
         ]
         self.assertEqual(queued_methods, ["sendMessage", "sendMessage"])
+
+    def test_agent_attachment_reuses_pre_download_turn_receipt(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Attachment Test",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        agent, _ = self.store.register_project_agent(
+            chat_id=123,
+            surface_name="Attachment Test",
+            slug="attachment-test",
+            provider="codex",
+            project_path="/tmp/attachment-test",
+            now=101,
+        )
+        self.store.ingest_update(topic_voice_update(10), now=102)
+        source_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+            ).fetchone()["job_id"]
+        )
+        receipt_text = "📎 <b>Attachment received. Downloading securely…</b>"
+        first_receipt_id = self.store.enqueue_agent_receipt(
+            agent_id=agent.agent_id,
+            source_inbox_job_id=source_job_id,
+            chat_id=123,
+            message_thread_id=62,
+            receipt_text=receipt_text,
+            input_kind="text",
+            parse_mode="HTML",
+            now=103,
+        )
+
+        self.store.enqueue_agent_message_with_receipt(
+            agent_id=agent.agent_id,
+            source_inbox_job_id=source_job_id,
+            input_text="Inspect /tmp/attachment-test/report.pdf",
+            chat_id=123,
+            message_thread_id=62,
+            receipt_text=receipt_text,
+            receipt_parse_mode="HTML",
+            authorized_user_id=123,
+            now=104,
+        )
+
+        receipts = self.store.connection.execute(
+            """
+            SELECT message_id
+            FROM outbox_messages
+            WHERE operation_id = ?
+            """,
+            (f"agent-input:{source_job_id}:receipt",),
+        ).fetchall()
+        self.assertEqual([int(row["message_id"]) for row in receipts], [first_receipt_id])
 
     def test_recovered_agent_attempt_uses_distinct_status_operations(self):
         self.store.ensure_surface_binding(
@@ -8682,16 +8742,17 @@ class DurableIntegrationTests(unittest.TestCase):
                     store.resolve_forum_subject(-100777, 62)
                 )
                 chooser = store.claim_outbox("sender", now=10**12)
+                # The forum already recorded Codex and gpt-5.6-sol when it was
+                # bound, so the default path states them instead of asking.
                 self.assertIn(
-                    "Choose an agent for “Journal”",
+                    "Start “Journal” with Codex?",
                     chooser.params["text"],
                 )
-                provider_buttons = chooser.params["reply_markup"][
-                    "inline_keyboard"
-                ][0]
+                self.assertIn("Model: gpt-5.6-sol", chooser.params["text"])
+                rows = chooser.params["reply_markup"]["inline_keyboard"]
                 self.assertEqual(
-                    [button["text"] for button in provider_buttons],
-                    ["Codex", "Claude"],
+                    [row[0]["text"] for row in rows],
+                    ["▶️ Start Codex", "Choose a different agent…"],
                 )
 
                 def callback(update_id, data):
@@ -8707,9 +8768,38 @@ class DurableIntegrationTests(unittest.TestCase):
                     return selection
 
                 process(
-                    callback(11, provider_buttons[1]["callback_data"]),
+                    callback(11, rows[1][0]["callback_data"]),
                     "worker-2",
                     101,
+                )
+                self.assertIsNone(
+                    store.resolve_forum_subject(-100777, 62)
+                )
+                provider_rows = store.connection.execute(
+                    """
+                    SELECT token, payload_json FROM callback_actions
+                    WHERE action_type = 'forum_subject_provider_select'
+                        AND state = 'active'
+                    ORDER BY action_id
+                    """
+                ).fetchall()
+                self.assertEqual(
+                    [
+                        json.loads(row["payload_json"])["provider"]
+                        for row in provider_rows
+                    ],
+                    ["codex", "claude"],
+                )
+                claude_provider = next(
+                    row
+                    for row in provider_rows
+                    if json.loads(row["payload_json"])["provider"] == "claude"
+                )
+
+                process(
+                    callback(20, f"a:{claude_provider['token']}"),
+                    "worker-2b",
+                    101.5,
                 )
                 self.assertIsNone(
                     store.resolve_forum_subject(-100777, 62)
@@ -8823,6 +8913,159 @@ class DurableIntegrationTests(unittest.TestCase):
                     "Help me organize today's notes.",
                 )
 
+    def test_first_request_starts_topic_in_one_tap_without_resending(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            forum_chat = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace),
+                    provider="codex",
+                    now=91,
+                )
+
+                def process(update, worker, now):
+                    store.ingest_update(update, now=now)
+                    job = store.claim_job(worker, now=now)
+                    telegram_control.process_inbox_job(store, config, job, worker)
+                    return job
+
+                request = topic_message_update(
+                    10,
+                    "Set the icon of this group to the logo in the repo.",
+                )
+                request["message"]["chat"] = dict(forum_chat)
+                request["message"]["reply_to_message"]["chat"] = dict(forum_chat)
+                request["message"]["reply_to_message"][
+                    "forum_topic_created"
+                ]["name"] = "Icon"
+                process(request, "worker-1", 100)
+
+                # The request must not be thrown away while setup happens.
+                self.assertIsNone(store.resolve_forum_subject(-100777, 62))
+                card = store.claim_outbox("sender", now=10**12)
+                self.assertIn("Start “Icon” with Codex?", card.params["text"])
+                self.assertIn("Your message is saved", card.params["text"])
+                start = store.connection.execute(
+                    """
+                    SELECT token, payload_json FROM callback_actions
+                    WHERE action_type = 'forum_subject_start'
+                        AND state = 'active'
+                    """
+                ).fetchone()
+                self.assertEqual(
+                    json.loads(start["payload_json"])["pending_request"],
+                    "Set the icon of this group to the logo in the repo.",
+                )
+
+                tap = callback_update(
+                    11,
+                    f"a:{start['token']}",
+                    message_id=700,
+                    message_thread_id=62,
+                )
+                tap["callback_query"]["message"]["chat"] = dict(forum_chat)
+                tap_job = process(tap, "worker-2", 101)
+
+                subject = store.resolve_forum_subject(-100777, 62)
+                self.assertIsNotNone(subject)
+                agent = store.resolve_agent(subject.agent_id)
+                self.assertEqual(agent.provider, "codex")
+                # One tap, and the held request is what actually runs.
+                mailbox = store.connection.execute(
+                    """
+                    SELECT agent_id, input_text FROM agent_mailbox
+                    WHERE source_inbox_job_id = ?
+                    """,
+                    (tap_job.job_id,),
+                ).fetchone()
+                self.assertEqual(str(mailbox["agent_id"]), subject.agent_id)
+                self.assertEqual(
+                    str(mailbox["input_text"]),
+                    "Set the icon of this group to the logo in the repo.",
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        """
+                        SELECT COUNT(*) FROM callback_actions
+                        WHERE chat_id = -100777 AND message_thread_id = 62
+                            AND state = 'active'
+                            AND action_type LIKE 'forum_subject_%'
+                        """
+                    ).fetchone()[0],
+                    0,
+                )
+
+    def test_unbound_forum_message_is_framed_as_the_workspace_answer(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            forum_chat = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Meet Without Fear",
+                "is_forum": True,
+            }
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Meet Without Fear",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                answer = topic_message_update(
+                    10,
+                    "the meet without fear repo in Software",
+                )
+                answer["message"]["chat"] = dict(forum_chat)
+                answer["message"]["reply_to_message"]["chat"] = dict(forum_chat)
+                store.ingest_update(answer, now=100)
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(store, config, job, "worker")
+
+                queued = store.connection.execute(
+                    "SELECT input_text FROM router_mailbox"
+                ).fetchone()
+                self.assertIsNotNone(queued)
+                input_text = str(queued["input_text"])
+                self.assertTrue(input_text.startswith(FORUM_SETUP_PREFIX))
+                self.assertIn("bind_forum_workspace", input_text)
+                # Path and alias containment checks must still see only the
+                # user's own words, and this is not untrusted quoted text.
+                self.assertEqual(
+                    extract_user_request(input_text),
+                    "the meet without fear repo in Software",
+                )
+                self.assertFalse(router_contract.has_reply_context(input_text))
+
     def test_topic_default_selection_names_effective_claude_defaults(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -8925,7 +9168,7 @@ class DurableIntegrationTests(unittest.TestCase):
                 confirmation = next(
                     text
                     for text in messages
-                    if "This topic will use Claude" in text
+                    if "“Journal” will use Claude" in text
                 )
                 self.assertIn(
                     "Model: Default (currently opus)",

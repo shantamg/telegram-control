@@ -17,12 +17,21 @@ from durable_store import (
     ManagedProject,
     StoreError,
     SurfaceBinding,
+    FORUM_SETUP_PREFIX,
     compose_reply_context_input,
     extract_user_request,
 )
 
 
 def has_reply_context(input_text: str) -> bool:
+    """Report whether quoted bot text precedes the user's own words.
+
+    Controller-authored framing (such as the unbound-forum setup note) is
+    stripped by the same extraction, but it is not untrusted quoted content, so
+    it must not make an ordinary dispatch look like a reply-context dispatch.
+    """
+    if input_text.startswith(FORUM_SETUP_PREFIX):
+        return False
     return extract_user_request(input_text) != input_text
 
 
@@ -135,7 +144,7 @@ CONTROLLER_TOOLS = (
         "arguments": {
             "workspace": "string (project slug, ref ID, or user-stated path)",
             "working_directory": "string|null (ref ID or path, optional)",
-            "provider": "codex|null",
+            "provider": "codex|claude|null",
             "model": "string|null",
             "effort": "low|medium|high|xhigh|max|ultra|null",
         },
@@ -494,7 +503,7 @@ def parse_router_tool_call(
                 "Tool argument 'working_directory' is invalid."
             )
         provider = arguments.get("provider")
-        if provider is not None and provider != "codex":
+        if provider is not None and provider not in {"codex", "claude"}:
             raise RouterContractError(
                 "Tool argument 'provider' is invalid."
             )
