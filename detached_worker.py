@@ -34,7 +34,7 @@ import provider_adapters
 import telegram_bridge
 import tmux_console
 import voice_responses
-from durable_store import DetachedWorker, DurableStore, StoreError
+from durable_store import DetachedWorker, DurableStore, StoreError, SurfaceBinding
 
 NAME_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 MAX_REPORT_CHARACTERS = 3_500
@@ -291,7 +291,42 @@ def report(
     )
 
 
-def report_only_notice(worker: DetachedWorker, main_topic_name: Optional[str]) -> str:
+def telegram_topic_url(binding: Optional[SurfaceBinding]) -> Optional[str]:
+    """Return a private-supergroup topic link when Telegram supports one."""
+    if (
+        binding is None
+        or binding.chat_id >= 0
+        or binding.message_thread_id is None
+        or binding.message_thread_id <= 0
+    ):
+        return None
+    internal_chat_id = str(abs(binding.chat_id))
+    if not internal_chat_id.startswith("100"):
+        return None
+    return (
+        f"https://t.me/c/{internal_chat_id[3:]}/"
+        f"{int(binding.message_thread_id)}"
+    )
+
+
+def origin_surface(
+    store: DurableStore,
+    worker: DetachedWorker,
+) -> Optional[SurfaceBinding]:
+    """Resolve the conversational topic that launched a detached worker."""
+    if not worker.origin_agent_id:
+        return None
+    agent = store.resolve_agent(worker.origin_agent_id)
+    if agent is None or agent.surface_binding_id is None:
+        return None
+    return store.resolve_surface_binding_by_id(agent.surface_binding_id)
+
+
+def report_only_notice(
+    worker: DetachedWorker,
+    main_topic_name: Optional[str],
+    main_topic_url: Optional[str] = None,
+) -> str:
     """The reply an inbound message to a worker topic gets.
 
     Worker topics are one-way by design. Steering a tmux session through chat
@@ -300,9 +335,12 @@ def report_only_notice(worker: DetachedWorker, main_topic_name: Optional[str]) -
     operator actually wants.
     """
     destination = f" in {main_topic_name}" if main_topic_name else ""
-    return (
+    notice = (
         f"This topic is report-only — it carries updates from the detached "
         f"worker '{worker.name}' and nothing here is read by it.\n\n"
         f"To steer or stop this worker, message the project's main agent"
         f"{destination}."
     )
+    if main_topic_url:
+        notice += f"\n\nOpen the main agent topic: {main_topic_url}"
+    return notice

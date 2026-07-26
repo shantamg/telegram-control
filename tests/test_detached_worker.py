@@ -1,10 +1,15 @@
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import detached_worker
+import on_message
 import provider_adapters
+import telegram_control
 from durable_store import DurableStore, StoreError
 
 
@@ -65,6 +70,25 @@ class DetachedWorkerStoreTests(unittest.TestCase):
         self.assertIsNotNone(found)
         self.assertEqual(found.name, worker.name)
         self.assertIsNone(self.store.detached_worker_for_thread(-100777, 999))
+
+    def test_worker_is_findable_from_a_previous_report_topic_alias(self):
+        worker = self._create()
+        alias_binding_id = self._active_binding(
+            chat_id=-100888,
+            thread_id=77,
+        )
+        self.store.connection.execute(
+            """
+            UPDATE surface_bindings
+            SET target_type = 'detached_worker', target_id = ?
+            WHERE binding_id = ?
+            """,
+            (worker.name, alias_binding_id),
+        )
+        self.store.connection.commit()
+        found = self.store.detached_worker_for_thread(-100888, 77)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.name, worker.name)
 
     def test_a_crashed_worker_is_distinguishable_from_a_stopped_one(self):
         # The whole reason intent and observation are separate columns.
@@ -157,12 +181,208 @@ class ReportOnlyNoticeTests(unittest.TestCase):
         self.assertIn("rails-fix", notice)
         self.assertIn("reservations", notice)
 
+    def test_notice_includes_a_direct_main_topic_link(self):
+        worker = mock.Mock(name="worker")
+        worker.name = "rails-fix"
+        notice = detached_worker.report_only_notice(
+            worker,
+            "reservations",
+            "https://t.me/c/4363256963/20",
+        )
+        self.assertIn("https://t.me/c/4363256963/20", notice)
+
     def test_notice_still_works_without_a_known_main_topic(self):
         worker = mock.Mock()
         worker.name = "rails-fix"
         notice = detached_worker.report_only_notice(worker, None)
         self.assertIn("report-only", notice)
         self.assertNotIn("None", notice)
+
+
+class DetachedWorkerTopicTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.database_path = Path(self.directory.name) / "controller.sqlite3"
+        self.store = DurableStore(self.database_path)
+        self.store.__enter__()
+        self.addCleanup(lambda: self.store.__exit__(None, None, None))
+        self.origin_binding = self.store.ensure_surface_binding(
+            chat_id=-1004472153577,
+            message_thread_id=103,
+            surface_type="task",
+            display_name="Test detach",
+            target_type="agent",
+            target_id="agent_origin",
+        )
+        now = 1_700_000_000.0
+        self.store.connection.execute(
+            """
+            INSERT INTO agents(
+                agent_id, parent_agent_id, role, slug, hierarchical_name,
+                provider, project_path, provider_session_id,
+                surface_binding_id, lifecycle_state, created_at, updated_at
+            )
+            VALUES (
+                'agent_origin', NULL, 'project', 'test-detach',
+                'root/test-detach', 'claude', '/tmp/project', NULL, ?,
+                'running', ?, ?
+            )
+            """,
+            (self.origin_binding.binding_id, now, now),
+        )
+        self.store.connection.commit()
+
+    def test_managed_turn_origin_uses_its_group_not_the_configured_chat(self):
+        with mock.patch.dict(
+            "os.environ",
+            {"TELEGRAM_CONTROL_AGENT_ID": "agent_origin"},
+            clear=False,
+        ):
+            chat_id, agent_id = telegram_control._worker_origin_context(self.store)
+        self.assertEqual(chat_id, -1004472153577)
+        self.assertEqual(agent_id, "agent_origin")
+
+    def test_worker_start_records_origin_and_creates_topic_in_its_group(self):
+        worker = SimpleNamespace(
+            name="haiku-poems",
+            provider="claude",
+            project_path=self.directory.name,
+            tmux_session_name="detached--haiku-poems",
+        )
+        args = SimpleNamespace(
+            name="haiku-poems",
+            provider="claude",
+            model="haiku",
+            effort=None,
+            project_path=self.directory.name,
+            db=self.database_path,
+        )
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"TELEGRAM_CONTROL_AGENT_ID": "agent_origin"},
+                clear=False,
+            ),
+            mock.patch.object(
+                telegram_control,
+                "open_store",
+                return_value=contextlib.nullcontext(self.store),
+            ),
+            mock.patch.object(
+                telegram_control,
+                "_ensure_worker_topic",
+                return_value=self.origin_binding,
+            ) as ensure_topic,
+            mock.patch.object(
+                telegram_control.detached_worker,
+                "create_worker",
+                return_value=worker,
+            ) as create_worker,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            telegram_control.worker_start_command(args)
+
+        ensure_topic.assert_called_once_with(
+            self.store,
+            "haiku-poems",
+            -1004472153577,
+        )
+        self.assertEqual(
+            create_worker.call_args.kwargs["origin_agent_id"],
+            "agent_origin",
+        )
+
+    def test_supergroup_topic_creation_does_not_require_private_threaded_mode(self):
+        with (
+            mock.patch.object(
+                telegram_control.bridge,
+                "read_token",
+                return_value="token",
+            ),
+            mock.patch.object(
+                telegram_control.bridge,
+                "api_call",
+                return_value={"message_thread_id": 220},
+            ) as api_call,
+        ):
+            binding = telegram_control._ensure_worker_topic(
+                self.store,
+                "haiku-poems",
+                -1004472153577,
+            )
+        self.assertEqual(binding.chat_id, -1004472153577)
+        self.assertEqual(binding.message_thread_id, 220)
+        self.assertEqual(binding.target_type, "detached_worker")
+        self.assertEqual(binding.target_id, "haiku-poems")
+        api_call.assert_called_once_with(
+            "token",
+            "createForumTopic",
+            chat_id=-1004472153577,
+            name="haiku-poems updates",
+        )
+
+    def test_topic_url_points_to_the_origin_topic_root(self):
+        self.assertEqual(
+            detached_worker.telegram_topic_url(self.origin_binding),
+            "https://t.me/c/4472153577/103",
+        )
+
+    def test_inbound_worker_topic_message_gets_notice_not_a_router_turn(self):
+        worker_binding = self.store.ensure_surface_binding(
+            chat_id=-1004472153577,
+            message_thread_id=220,
+            surface_type="task",
+            display_name="haiku-poems updates",
+            target_type="controller",
+            target_id="control",
+        )
+        self.store.create_detached_worker(
+            name="haiku-poems",
+            binding_id=worker_binding.binding_id,
+            origin_agent_id="agent_origin",
+            project_path="/tmp/project",
+            provider="claude",
+            tmux_session_name="detached--haiku-poems",
+        )
+        update = {
+            "update_id": 10,
+            "message": {
+                "message_id": 221,
+                "message_thread_id": 220,
+                "is_topic_message": True,
+                "from": {"id": 123, "is_bot": False},
+                "chat": {
+                    "id": -1004472153577,
+                    "type": "supergroup",
+                    "title": "Life",
+                    "is_forum": True,
+                },
+                "text": "Hi",
+            },
+        }
+        self.store.ingest_update(update, now=100)
+        job = self.store.claim_job("worker", now=100)
+        telegram_control.process_inbox_job(
+            self.store,
+            {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            },
+            job,
+            "worker",
+        )
+        response = self.store.claim_outbox("sender", now=10**12)
+        self.assertEqual(response.params["message_thread_id"], 220)
+        self.assertIn("report-only", response.params["text"])
+        self.assertIn("haiku-poems", response.params["text"])
+        self.assertIn("Test detach", response.params["text"])
+        self.assertIn("https://t.me/c/4472153577/103", response.params["text"])
+        router_count = self.store.connection.execute(
+            "SELECT COUNT(*) FROM router_mailbox"
+        ).fetchone()[0]
+        self.assertEqual(router_count, 0)
 
 
 if __name__ == "__main__":

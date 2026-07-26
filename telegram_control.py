@@ -2333,22 +2333,45 @@ def install_managed_skills(
     return installed
 
 
-def _ensure_worker_topic(store, name: str):
-    """Create (or find) the worker's report-only topic in the managed chat."""
+def _worker_origin_context(store) -> tuple[int, Optional[str]]:
+    """Find the chat and agent that own the managed turn starting a worker."""
+    origin_agent_id = os.environ.get("TELEGRAM_CONTROL_AGENT_ID")
+    if not origin_agent_id:
+        return int(bridge.load_config()["chat_id"]), None
+
+    agent = store.resolve_agent(origin_agent_id)
+    if agent is None or agent.surface_binding_id is None:
+        raise StoreError(
+            "The managed turn's originating Telegram topic is unavailable."
+        )
+    binding = store.resolve_surface_binding_by_id(agent.surface_binding_id)
+    if binding is None:
+        raise StoreError(
+            "The managed turn's originating Telegram topic is no longer active."
+        )
+    return binding.chat_id, agent.agent_id
+
+
+def _ensure_worker_topic(store, name: str, chat_id: int):
+    """Create (or find) the worker's report-only topic beside its origin."""
     display_name = detached_worker.topic_name(name)
-    config = bridge.load_config()
-    chat_id = int(config["chat_id"])
     existing = store.resolve_named_surface(chat_id, display_name, surface_type="task")
     if existing is not None:
         return existing
     token = bridge.read_token()
-    bot = bridge.api_call(token, "getMe")
-    if not bool(bot.get("has_topics_enabled", False)):
-        raise StoreError(
-            "Telegram Threaded Mode is disabled for this bot. "
-            "Enable it in BotFather first."
-        )
-    topic = bridge.api_call(token, "createForumTopic", chat_id=chat_id, name=display_name)
+    if chat_id > 0:
+        bot = bridge.api_call(token, "getMe")
+        if not bool(bot.get("has_topics_enabled", False)):
+            raise StoreError(
+                "Telegram Threaded Mode is disabled for this bot. "
+                "Enable it in BotFather first."
+            )
+    topic = bridge.api_call(
+        token,
+        "createForumTopic",
+        chat_id=chat_id,
+        name=display_name,
+    )
     try:
         message_thread_id = int(topic["message_thread_id"])
     except (KeyError, TypeError, ValueError):
@@ -2358,8 +2381,8 @@ def _ensure_worker_topic(store, name: str):
         message_thread_id=message_thread_id,
         surface_type="task",
         display_name=display_name,
-        target_type="controller",
-        target_id="control",
+        target_type="detached_worker",
+        target_id=name,
     )
 
 
@@ -2371,7 +2394,8 @@ def worker_start_command(args: argparse.Namespace) -> None:
     if args.effort:
         provider_config["effort"] = args.effort
     with open_store(args.db) as store:
-        binding = _ensure_worker_topic(store, args.name)
+        chat_id, origin_agent_id = _worker_origin_context(store)
+        binding = _ensure_worker_topic(store, args.name, chat_id)
         worker = detached_worker.create_worker(
             store,
             name=args.name,
@@ -2379,6 +2403,7 @@ def worker_start_command(args: argparse.Namespace) -> None:
             project_path=project_path,
             provider=args.provider,
             provider_config=provider_config,
+            origin_agent_id=origin_agent_id,
         )
     print(
         json.dumps(

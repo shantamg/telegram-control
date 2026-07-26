@@ -15,6 +15,7 @@ from typing import Optional
 
 import claude_sessions
 import codex_sessions
+import detached_worker
 import discovery
 import provider_defaults
 import router_contract
@@ -164,6 +165,30 @@ def surface_display_name() -> str:
         or os.environ.get("TELEGRAM_CHAT_TITLE")
         or "Control"
     )
+
+
+def handle_report_only_topic() -> bool:
+    """Answer worker-topic input by policy before any conversational routing."""
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID")
+    if not database_path or not chat_id_text or not thread_id_text:
+        return False
+    with DurableStore(Path(database_path)) as store:
+        worker = store.detached_worker_for_thread(
+            int(chat_id_text),
+            int(thread_id_text),
+        )
+        if worker is None:
+            return False
+        origin = detached_worker.origin_surface(store, worker)
+        notice = detached_worker.report_only_notice(
+            worker,
+            origin.display_name if origin is not None else None,
+            detached_worker.telegram_topic_url(origin),
+        )
+    send_message(notice)
+    return True
 
 
 def refresh_keyboard(token: str) -> dict:
@@ -3222,6 +3247,12 @@ def main() -> int:
         message = update.get("message")
         if callback_query:
             handle_callback(update, callback_query)
+        elif (
+            message
+            and not isinstance(message.get("forum_topic_created"), dict)
+            and handle_report_only_topic()
+        ):
+            return 0
         elif message and isinstance(message.get("forum_topic_created"), dict):
             topic_name = str(message["forum_topic_created"].get("name", ""))
             print(f"Received new forum topic: {topic_name}", flush=True)

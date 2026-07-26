@@ -6890,7 +6890,12 @@ class DurableStore:
             """
             SELECT w.*
             FROM detached_workers AS w
-            JOIN surface_bindings AS b ON b.binding_id = w.binding_id
+            JOIN surface_bindings AS b
+                ON b.binding_id = w.binding_id
+                OR (
+                    b.target_type = 'detached_worker'
+                    AND b.target_id = w.name
+                )
             WHERE b.chat_id = ? AND b.message_thread_id = ? AND b.state = 'active'
             """,
             (int(chat_id), int(message_thread_id)),
