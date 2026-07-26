@@ -2784,14 +2784,10 @@ class DurableStore:
             if row["card_json"] is not None:
                 card_spec = json.loads(row["card_json"])
                 if card_spec.get("kind") == "topic_intro":
-                    if card_spec.get("mode") == "pin":
-                        # The pin itself carries no follow-up work.
-                        self.connection.execute("COMMIT")
-                        return
-                    # A topic's intro is its standing header, so it is pinned
-                    # once Telegram reports the message ID it assigned. Pinning
-                    # is decoration: the sender retires a rights failure
-                    # instead of retrying it, and the intro text stands alone.
+                    # Telegram's registered command menu made pinning
+                    # unnecessary, so this only remembers which message opened
+                    # the topic, which is the message later turns edit to keep
+                    # its model, effort, and context current.
                     if row["method"] != "sendMessage" or not isinstance(
                         result, dict
                     ):
@@ -2808,56 +2804,12 @@ class DurableStore:
                         ) from None
                     intro_thread_id = intro_params.get("message_thread_id")
                     if intro_thread_id is not None:
-                        # Remember the header so later turns can edit it in
-                        # place rather than posting the same summary again.
                         self.record_topic_intro_message(
                             intro_chat_id,
                             int(intro_thread_id),
                             intro_message_id,
                             now=timestamp,
                         )
-                        # A topic can accumulate more than one pin, and Telegram
-                        # shows them all. The intro is sent while the topic is
-                        # brand new, so clearing first is the only moment where
-                        # it cannot discard a pin the owner meant to keep, and
-                        # it leaves exactly one pinned header behind.
-                        self.enqueue_api_call(
-                            operation_id=(
-                                f"topic-intro-unpin:{intro_chat_id}:"
-                                f"{int(intro_thread_id)}"
-                            ),
-                            method="unpinAllForumTopicMessages",
-                            params={
-                                "chat_id": intro_chat_id,
-                                "message_thread_id": int(intro_thread_id),
-                            },
-                            card={"kind": "topic_intro", "mode": "pin"},
-                            serialize_key=(
-                                str(row["serialize_key"])
-                                if row["serialize_key"] is not None
-                                else None
-                            ),
-                            now=timestamp,
-                        )
-                    self.enqueue_api_call(
-                        operation_id=(
-                            f"topic-intro-pin:{intro_chat_id}:"
-                            f"{intro_message_id}"
-                        ),
-                        method="pinChatMessage",
-                        params={
-                            "chat_id": intro_chat_id,
-                            "message_id": intro_message_id,
-                            "disable_notification": True,
-                        },
-                        card={"kind": "topic_intro", "mode": "pin"},
-                        serialize_key=(
-                            str(row["serialize_key"])
-                            if row["serialize_key"] is not None
-                            else None
-                        ),
-                        now=timestamp,
-                    )
                     self.connection.execute("COMMIT")
                     return
                 if card_spec.get("kind") == "router_turn":
@@ -7045,7 +6997,7 @@ class DurableStore:
         display_name: str,
         started: Optional[bool] = None,
     ) -> str:
-        """Render a topic's pinned header: what it runs and where it stands.
+        """Render a topic's header message: what it runs and where it stands.
 
         This is the one place the intro is composed, so the message a topic is
         created with and every later refresh of that same message cannot drift
@@ -7095,8 +7047,8 @@ class DurableStore:
         telegram_message_id: int,
         now: Optional[float] = None,
     ) -> None:
-        """Remember which message is a topic's pinned header, so it can be
-        refreshed in place instead of replaced."""
+        """Remember which message opened a topic, so it can be refreshed in
+        place instead of replaced."""
         timestamp = time.time() if now is None else float(now)
         row = self.connection.execute(
             """
@@ -7131,10 +7083,10 @@ class DurableStore:
         agent_id: str,
         now: Optional[float] = None,
     ) -> Optional[int]:
-        """Bring a topic's pinned header up to date after anything changed it.
+        """Bring a topic's header message up to date after anything changed it.
 
-        Model, effort, and context all move as an agent is used, and the pinned
-        message is where the owner looks for them. The edit is skipped when the
+        Model, effort, and context all move as an agent is used, and the topic's
+        opening message is where the owner looks for them. The edit is skipped when the
         rendered text is unchanged, so a quiet turn costs no Telegram call and
         never provokes "message is not modified".
         """
@@ -11293,7 +11245,7 @@ class DurableStore:
                     message_thread_id=delivery_thread_id,
                     timestamp=timestamp,
                 )
-            # This turn just changed the numbers the pinned header reports, so
+            # This turn just changed the numbers the header reports, so
             # refresh it in the same transaction that recorded them.
             self.enqueue_topic_intro_refresh(
                 str(row["agent_id"]),

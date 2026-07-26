@@ -969,7 +969,7 @@ and a stored session equivalent to full account access.
 
 What is possible is collapsing *add* and *promote* into one confirmation.
 `/newgroup` replies with a card whose inline URL button is
-`https://t.me/<bot>?startgroup=true&admin=change_info+delete_messages+manage_topics+pin_messages`,
+`https://t.me/<bot>?startgroup=true&admin=change_info+delete_messages+manage_topics`,
 built by `bridge.group_setup_link` from the paired `bot_username`. Telegram then
 adds the bot to the chosen group and asks the owner to grant those three rights
 in the same step. The rights are the ones actually used: admin status at all is
@@ -997,7 +997,7 @@ without creating a router turn while `/start true` in an unauthorized forum
 produces the authorize-and-folder prompt and no router work. Full suite green at
 336 tests; offline router eval 14/14.
 
-## Every topic gets one pinned intro
+## Every topic opens with one intro message
 
 Telegram pins nothing on its own, and the controller never pinned anything
 either — the only pin in the whole durable record was made by hand from the
@@ -1005,33 +1005,25 @@ owner's account, which is why topics looked inconsistent. A topic's commands
 were reachable only by scrolling back to whichever message last mentioned
 `/help`.
 
-Each topic now opens with one intro that states the agent, model, and effort and
-lists `/help`, `/agent`, `/status`, and `/teardown` as tappable commands, and
-that message is pinned. It replaces the previous confirmation rather than adding
-a message, and it is sent on both setup paths — the one-tap start and the
-per-topic customize chain — including when a carried request runs immediately,
-where it says so instead of asking for a first message.
+Each topic now opens with one intro that states the agent, model, effort, and
+context, and lists the commands. It replaces the previous confirmation rather
+than adding a message, and it is sent on both setup paths — the one-tap start and
+the per-topic customize chain — including when a carried request runs
+immediately, where it says so instead of asking for a first message.
 
-Pinning needs the message ID Telegram assigns, which only exists after the send
-is acknowledged, so the intro carries a `topic_intro` card and the outbox
-completion transaction queues `pinChatMessage` from the send result under the
-same serialization key. A multi-chunk intro pins its first chunk. `pin_messages`
-joined the rights the `/newgroup` link requests, but pinning stays decoration:
-a group that never granted the right (or a message that has since gone) reports
-`not enough rights`, and the sender retires that call immediately with an
-`outbox_pin_skipped` event rather than retrying it eight times behind the rest
-of the queue.
-
-Because Telegram stacks pins and shows them all, the intro clears the topic's
-pins with `unpinAllForumTopicMessages` before pinning itself. That runs only
-while the topic is brand new, which is the one moment it cannot discard a pin
-the owner meant to keep, and it leaves exactly one pinned header.
+That message was briefly pinned as well, and the pinning was then removed: the
+registered command menu (below) makes every command reachable from the compose
+field in every chat and topic, which is what pinning was for. `pinChatMessage`,
+`unpinAllForumTopicMessages`, the `pin_messages` right in the `/newgroup` link,
+and the sender's pin-specific failure handling are all gone. What remains of the
+mechanism is the part that earns its keep: the intro carries a `topic_intro`
+card, and the outbox completion transaction records the message ID Telegram
+assigned so later turns can edit that same message in place.
 
 Verified with an integration test that drives topic creation through the one-tap
-start, asserts the intro lists all four commands and carries the pin card, drains
-the outbox, and asserts the queued unpin-then-pin pair uses the acknowledged
-message ID; plus a unit test asserting a rights failure dead-letters on its first
-attempt and leaves the queue empty.
+start, asserts the intro lists the commands and carries the record card, drains
+the outbox, and asserts that no pin or unpin call is queued while the
+acknowledged message ID is stored on the subject.
 
 ### What the first live rollout broke
 
@@ -1043,7 +1035,7 @@ could not interpret its unfamiliar `topic_intro` card kind and raised
 restarted the whole controller two seconds after the intro was queued, and the
 orphaned lease held the row until it expired ten minutes later — at which point
 the new sender redelivered the intro (so that topic has two copies of it) and
-pinned it successfully.
+pinned it — the one pin this feature ever performed, since removed.
 
 `complete_outbox` now treats an unrecognized card `kind` as "no follow-up work I
 know about": it records the delivery and returns, instead of raising. Known kinds
@@ -1055,28 +1047,28 @@ mid-refactor save left the file unparseable and three turns died with
 `IndentationError` before the next save. Both hazards are now recorded in
 `CLAUDE.md`.
 
-### A command menu, which needs no pin at all
+### A command menu, which replaced pinning entirely
 
-Pinning helps, but Telegram already has a native affordance: `setMyCommands`
-puts every command in the compose field's menu, in every chat and topic, with no
-pin, no scrolling, and no admin right. `telegram_help.COMMANDS` is now the single
+Telegram has a native affordance that is simply better: `setMyCommands` puts
+every command in the compose field's menu, in every chat and topic, with no pin,
+no scrolling, and no admin right. `telegram_help.COMMANDS` is now the single
 source of truth — the `/help` home page is rendered from it — and
 `telegram_control.py sync-commands` publishes it. `install` runs it too, warning
 rather than failing if the network call does not land. A test asserts the
 registered list matches the help copy and Telegram's name and description limits.
 Registered live and confirmed with `getMyCommands` on July 26, 2026.
 
-### The pinned header is live, not a snapshot
+### The intro header is live, not a snapshot
 
-A pinned message that states a model, an effort, and a context measurement is
-only useful if those stay true, so the intro is now edited in place rather than
-left as a record of the moment a topic was created.
+A message that states a model, an effort, and a context measurement is only
+useful if those stay true, so the intro is edited in place rather than left as a
+record of the moment a topic was created.
 
 `topic_intro_text` in `durable_store.py` is the single renderer for that message
 — provider, model, effort, the current session's context snapshot (or "no turn
 completed yet"), a paused marker when the agent is paused, and the command list —
 so the message a topic is created with and every later refresh cannot drift.
-`record_topic_intro_message` stores the pinned message's ID in the forum
+`record_topic_intro_message` stores the intro message's ID in the forum
 subject's existing `memory_json`, which deliberately avoids a migration:
 `surface_cards.card_type` is constrained by `CHECK (card_type IN ('status'))`, and
 a schema bump is exactly what breaks daemons still running older code.
@@ -1094,14 +1086,14 @@ The refresh edit carries no `card_json` on purpose. An older sender interprets
 carded edit would have crashed the very daemons this rollout has to survive.
 
 Verified with a test that leases a real forum-subject turn, completes it with
-provider-reported context, and asserts the queued edit targets the pinned message
+provider-reported context, and asserts the queued edit targets the intro message
 ID, reports `41% used · 82,500 / 200,000 tokens`, keeps the commands, uses the
 intro serialization key, and enqueues nothing at all on a second unchanged
 refresh. Full suite green at 350 tests.
 
-Until the daemons restart, a new topic still gets its pinned intro but no
-refreshes: recording the message ID and queueing edits both live in worker code
-that the running processes predate.
+Until the daemons restart, a new topic still gets its intro but no refreshes:
+recording the message ID and queueing edits both live in worker code that the
+running processes predate.
 
 ## The surface is the label
 
@@ -1132,6 +1124,28 @@ receipts, transcribing notices, working cards, voice status, scoped skill
 updates, and final answers lost their labels, while the two root-chat cases kept
 theirs, which is what proves the discriminator works rather than a blanket
 removal. Full suite green at 350 tests.
+
+## Pinning removed, command menu kept
+
+Once the command menu was registered, pinning had no job left: typing `/` shows
+every command in any chat or topic, which is what the pin was reaching for. So it
+was taken out rather than maintained — `pinChatMessage`,
+`unpinAllForumTopicMessages`, the `pin_messages` right in the `/newgroup` link,
+the sender's pin-specific failure classification and its `outbox_pin_skipped`
+event, and the test that covered a rights failure.
+
+The `topic_intro` card survives with mode `record`: it exists only so the outbox
+completion transaction can store the message ID Telegram assigned, which is what
+lets later turns edit the topic's opening message in place. Its integration test
+now asserts the opposite of what it once did — that no pin or unpin call is
+queued, and that the acknowledged ID lands on the subject.
+
+The lesson worth keeping is in `CLAUDE.md`: `telegram_help.COMMANDS` is the one
+source of truth for the menu and the `/help` page, and adding a command means
+updating that tuple, handling it, and running `sync-commands` — because the menu
+is published, not derived, so an unregistered command is effectively hidden.
+
+Full suite green at 349 tests.
 
 ## Stage 0 legacy bridge commands
 

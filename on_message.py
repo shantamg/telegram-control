@@ -368,8 +368,8 @@ def send_message(
             params,
             f"message:{OUTPUT_SEQUENCE}",
             route=controller_reply_route(),
-            # A multi-chunk message pins its first chunk, which is the one
-            # carrying the header the reader is meant to see.
+            # Only the first chunk carries card metadata: it is the message
+            # the topic remembers as its header.
             card=card if index == 0 else None,
         )
 
@@ -803,9 +803,8 @@ def send_group_setup_card() -> None:
         "1. Create a private Telegram group — any name.\n"
         "2. Turn on Topics in the group's settings.\n"
         "3. Tap the button below and pick that group. Telegram adds me and "
-        "asks you to grant Change group info, Delete messages, Manage "
-        "topics, and Pin messages in the same step — no separate "
-        "promotion.\n\n"
+        "asks you to grant Change group info, Delete messages, and Manage "
+        "topics in the same step — no separate promotion.\n\n"
         "Then send anything in the group and I will ask which folder it works "
         "in. A bot cannot create the group or enable Topics itself; those two "
         "steps are yours.\n\n"
@@ -1154,12 +1153,11 @@ def pending_request_from_payload(payload: dict) -> Optional[str]:
 
 
 def send_topic_intro(display_name: str, started: bool) -> None:
-    """Post this topic's standing header and pin it.
+    """Open the topic with its standing header.
 
-    Telegram never pins anything on its own, so the commands a topic needs were
-    only ever reachable by scrolling back to whichever message happened to
-    mention them. One pinned intro per topic keeps them one tap away, and later
-    turns edit this same message so its model, effort, and context stay current.
+    Commands are reachable from Telegram's registered command menu, so this
+    message exists for state rather than navigation: later turns edit it in
+    place so its model, effort, and context stay current.
     """
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     binding = current_surface_binding()
@@ -1167,7 +1165,7 @@ def send_topic_intro(display_name: str, started: bool) -> None:
         raise StoreError("A topic intro requires its managed agent.")
     with DurableStore(Path(database_path)) as store:
         text = store.topic_intro_text(binding.target_id, display_name, started)
-    send_message(text, card={"kind": "topic_intro", "mode": "pin_after_send"})
+    send_message(text, card={"kind": "topic_intro", "mode": "record"})
 
 
 def start_forum_subject_turn(
@@ -3176,7 +3174,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 session_preserved = (
                     configured.provider_session_id == previous_session_id
                 )
-                # The pinned header reports model and effort, so it must not
+                # The topic's header reports model and effort, so it must not
                 # keep advertising the settings this call just replaced.
                 store.enqueue_topic_intro_refresh(agent_id)
         except StoreError as exc:

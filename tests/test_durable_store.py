@@ -2707,41 +2707,6 @@ class DurableStoreTests(unittest.TestCase):
             "sent",
         )
 
-    def test_pin_without_rights_is_retired_instead_of_retried(self):
-        self.store.enqueue_api_call(
-            operation_id="topic-intro-pin:-100777:4242",
-            method="pinChatMessage",
-            params={
-                "chat_id": -100777,
-                "message_id": 4242,
-                "disable_notification": True,
-            },
-            card={"kind": "topic_intro", "mode": "pin"},
-            now=100,
-        )
-        pin = self.store.claim_outbox("sender", now=101)
-        with mock.patch.object(
-            telegram_control.bridge,
-            "api_call",
-            side_effect=telegram_control.bridge.BridgeError(
-                "Bad Request: not enough rights to manage pinned messages"
-            ),
-        ):
-            telegram_control.send_outbox_message(
-                self.store,
-                "token",
-                pin,
-                "sender",
-            )
-        state = self.store.connection.execute(
-            "SELECT state, attempts FROM outbox_messages WHERE message_id = ?",
-            (pin.message_id,),
-        ).fetchone()
-        # A group that never granted pin rights must not requeue this eight
-        # times: the intro itself was already delivered.
-        self.assertEqual(state["state"], "dead")
-        self.assertIsNone(self.store.claim_outbox("sender", now=10**12))
-
     def _setup_routed_agent_turn(self, provider="codex"):
         """Create control + project surfaces and one dispatched router turn."""
         self.store.ensure_surface_binding(
@@ -9370,7 +9335,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     0,
                 )
 
-    def test_new_topic_intro_is_pinned_and_lists_its_commands(self):
+    def test_new_topic_intro_lists_commands_and_is_remembered(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory) / "life"
             workspace.mkdir()
@@ -9440,11 +9405,12 @@ class DurableIntegrationTests(unittest.TestCase):
                     self.assertIn(command, text)
                 self.assertEqual(
                     json.loads(intro["card_json"])["mode"],
-                    "pin_after_send",
+                    "record",
                 )
 
                 # Telegram only reveals the message ID on acknowledgement, so
-                # the pin is queued from the send result.
+                # the topic learns which message to keep current from the send
+                # result.
                 claimed = store.claim_outbox("sender", now=10**12)
                 while claimed is not None and claimed.message_id != int(
                     intro["message_id"]
@@ -9463,48 +9429,21 @@ class DurableIntegrationTests(unittest.TestCase):
                     {"message_id": 4242},
                     now=10**12,
                 )
-                # Clearing first, then pinning, leaves exactly one pinned
-                # header in a topic that Telegram would otherwise stack pins in.
-                follow_ups = [
-                    (row["method"], json.loads(row["params_json"]))
-                    for row in store.connection.execute(
+                # Registered commands replaced pinning, so nothing is pinned
+                # or unpinned; the acknowledged ID is simply remembered.
+                self.assertEqual(
+                    store.connection.execute(
                         """
-                        SELECT method, params_json FROM outbox_messages
+                        SELECT COUNT(*) FROM outbox_messages
                         WHERE method IN (
-                            'unpinAllForumTopicMessages', 'pinChatMessage'
+                            'pinChatMessage', 'unpinAllForumTopicMessages'
                         )
-                        ORDER BY message_id
                         """
-                    ).fetchall()
-                ]
-                self.assertEqual(
-                    [method for method, _ in follow_ups],
-                    ["unpinAllForumTopicMessages", "pinChatMessage"],
+                    ).fetchone()[0],
+                    0,
                 )
-                self.assertEqual(
-                    follow_ups[0][1],
-                    {"chat_id": -100777, "message_thread_id": 62},
-                )
-                pin = store.connection.execute(
-                    """
-                    SELECT operation_id, method, params_json
-                    FROM outbox_messages
-                    WHERE method = 'pinChatMessage'
-                    """
-                ).fetchone()
-                self.assertIsNotNone(pin)
-                self.assertEqual(
-                    json.loads(pin["params_json"]),
-                    {
-                        "chat_id": -100777,
-                        "message_id": 4242,
-                        "disable_notification": True,
-                    },
-                )
-                self.assertEqual(
-                    pin["operation_id"],
-                    "topic-intro-pin:-100777:4242",
-                )
+                subject = store.resolve_forum_subject(-100777, 62)
+                self.assertEqual(subject.memory["intro_message_id"], 4242)
 
     def test_unbound_forum_message_is_framed_as_the_workspace_answer(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -9699,7 +9638,7 @@ class DurableIntegrationTests(unittest.TestCase):
                         "text": "Add me to a group",
                         "url": (
                             "https://t.me/example_bot?startgroup=true"
-                            "&admin=change_info+delete_messages+manage_topics+pin_messages"
+                            "&admin=change_info+delete_messages+manage_topics"
                         ),
                     },
                 )

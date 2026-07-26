@@ -1977,39 +1977,6 @@ def handle_outbox_send_failure(
     worker_id: str,
     error: str,
 ) -> None:
-    # Pinning a topic intro is decoration. When the bot lacks the right, or the
-    # message is already gone, retrying eight times only fills the log and
-    # delays the queue behind it; the intro itself is already delivered.
-    if message.method in {
-        "pinChatMessage",
-        "unpinAllForumTopicMessages",
-    } and any(
-        marker in error.lower()
-        for marker in (
-            "not enough rights",
-            "chat_admin_required",
-            "message to pin not found",
-            "message_id_invalid",
-            "chat not modified",
-        )
-    ):
-        try:
-            store.fail_outbox(
-                message.message_id,
-                worker_id,
-                error,
-                max_attempts=message.attempts,
-            )
-        except LeaseLostError:
-            pass
-        log_event(
-            "outbox_pin_skipped",
-            message_id=message.message_id,
-            operation_id=message.operation_id,
-            error=error[:200],
-        )
-        return
-
     permanent_card_edit_failure = (
         message.method == "editMessageText"
         and message.card is not None

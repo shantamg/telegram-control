@@ -26,6 +26,23 @@ in `telegram_help.py` in the same change, and the README if the setup path,
 commands, or repository map moved. Record new behavior and what you verified in
 `docs/IMPLEMENTATION_NOTES.md`.
 
+**Every Telegram command must be registered.** `telegram_help.COMMANDS` is the
+single source of truth: it feeds both Telegram's own command menu (the list that
+appears when the owner types `/`) and the `/help` home page. Adding, renaming, or
+removing a command means, in the same change:
+
+1. add or edit its entry in `telegram_help.COMMANDS`, with a description that
+   reads well in the menu;
+2. handle it in `on_message.py`;
+3. run `./telegram_control.py sync-commands` so Telegram is updated now — the
+   command menu is not derived at runtime, it is published, and `install` is the
+   only other thing that publishes it.
+
+The registered menu is the reason nothing needs pinning to stay reachable, so a
+command that exists in the handler but not in `COMMANDS` is effectively hidden.
+`tests/test_durable_store.py` asserts the two lists agree and that every entry
+fits Telegram's name and description limits.
+
 Nothing here should hardcode a personal path, username, or bot name: this repo
 is meant to be usable by someone else's setup. Resolve paths from the script
 location, `Path.home()`, or config.

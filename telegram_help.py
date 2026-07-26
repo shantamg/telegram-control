@@ -107,7 +107,7 @@ Setting up a new group: send /newgroup in the main Control chat, create a privat
 
 Each new topic in a bound group then starts with the group's own provider, model, and effort in one tap; "Choose a different agent…" opens the per-topic menus. Whatever you already sent runs as the topic's first turn, so you never resend it.
 
-Every topic keeps one pinned message listing its agent, model, effort, context used, and commands. It is edited in place as those change, so tapping the pin always shows the current state. Topic names and Telegram coordinates remain durable routing identities until formal teardown.""",
+Every topic opens with one message listing its agent, model, effort, and context used. It is edited in place as those change, so it always shows the current state. Type / in any chat or topic for the command menu. Topic names and Telegram coordinates remain durable routing identities until formal teardown.""",
     ),
 )
 

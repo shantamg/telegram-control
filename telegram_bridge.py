@@ -37,15 +37,9 @@ DEFAULT_HANDLER_PATH = SCRIPT_PATH.with_name("on_message.py")
 # Telegram will not let a bot promote itself, but it will grant these rights in
 # the same tap that adds the bot, if the invite link asks for them: reading
 # ordinary group messages at all requires admin status, changing the group icon
-# requires change_info, retiring progress cards requires delete_messages,
-# managed/worker topics require manage_topics, and pinning each topic's intro
-# requires pin_messages.
-GROUP_ADMIN_RIGHTS = (
-    "change_info",
-    "delete_messages",
-    "manage_topics",
-    "pin_messages",
-)
+# requires change_info, retiring progress cards requires delete_messages, and
+# managed/worker topics require manage_topics.
+GROUP_ADMIN_RIGHTS = ("change_info", "delete_messages", "manage_topics")
 
 
 class BridgeError(RuntimeError):
