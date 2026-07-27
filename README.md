@@ -134,6 +134,7 @@ policy. In particular:
 - [Providers and optional capabilities](docs/guides/providers-and-capabilities.md)
 - [Customization](docs/guides/customization.md)
 - [Security model](docs/reference/security.md)
+- [Telegram message style](docs/TELEGRAM_MESSAGE_STYLE.md)
 - [GitHub maintainer setup](docs/contributing/maintainer-setup.md)
 - [Repository architecture](docs/contributing/architecture.md)
 - [Exact implementation notes](docs/IMPLEMENTATION_NOTES.md)

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from typing import NamedTuple
+
+from telegram_formatting import escape_html
 
 
 HELP_HINT = "Type /help to browse Telegram Control help."
@@ -40,6 +43,32 @@ HOME_TEXT = (
     )
 )
 
+_COMMAND_REFERENCE = re.compile(r"(?<![A-Za-z0-9_])(/[a-z][a-z0-9_]*)")
+
+
+def _inline_html(text: str) -> str:
+    escaped = escape_html(text)
+    return _COMMAND_REFERENCE.sub(r"<code>\1</code>", escaped)
+
+
+def _document_html(text: str) -> str:
+    """Render authored help copy with a consistent Telegram HTML hierarchy."""
+
+    lines = text.splitlines()
+    rendered: list[str] = []
+    for index, line in enumerate(lines):
+        inline = _inline_html(line)
+        if index == 0 and inline:
+            rendered.append(f"<b>{inline}</b>")
+        elif line == "Quick commands:":
+            rendered.append("<b>Quick commands</b>")
+        else:
+            rendered.append(inline)
+    return "\n".join(rendered)
+
+
+HOME_HTML = _document_html(HOME_TEXT)
+
 
 TOPICS = (
     HelpTopic(
@@ -49,7 +78,9 @@ TOPICS = (
 
 Use /agent inside a managed topic to inspect its provider, model, effort, session, console, and context usage.
 
-The /agent controls can change the current model and effort while preserving the existing conversation, pause or resume the agent, start a fresh session, resume a previous session, or switch providers. Codex and Claude each expose their own supported choices. Reconfiguration waits for an active turn or console to become idle. Ordinary messages in the topic go to its bound agent.""",
+The /agent controls can change the current model and effort while preserving the existing conversation, pause or resume the agent, start a fresh session, resume a previous session, or switch providers. Codex and Claude each expose their own supported choices. Reconfiguration waits for an active turn or console to become idle. Ordinary messages in the topic go to its bound agent.
+
+Claude and Codex answers use safe native Telegram formatting for common Markdown such as headings, emphasis, links, lists, quotes, and code. If formatting cannot be validated or Telegram rejects it, Control falls back to plain text rather than losing the answer.""",
     ),
     HelpTopic(
         "detached",
@@ -130,3 +161,9 @@ def page_text(slug: str) -> str:
     if topic is None:
         raise ValueError("Unknown Telegram help topic.")
     return topic.text
+
+
+def page_html(slug: str) -> str:
+    """Return safe, controller-owned Telegram HTML for one help page."""
+
+    return _document_html(page_text(slug))

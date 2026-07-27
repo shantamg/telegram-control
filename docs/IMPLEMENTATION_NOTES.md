@@ -334,8 +334,9 @@ exit across the bridge.
 
 Controller-owned progress text uses Telegram HTML formatting with escaped
 dynamic content: stage labels are bold and voice transcripts are block quotes.
-Provider output remains plain text until a tested renderer can safely support a
-documented Markdown subset without interpreting arbitrary model text as markup.
+Provider output uses a tested Markdown-to-entity renderer with a documented
+subset and plain-text fallbacks; arbitrary model text is never passed directly
+to a Telegram parse mode.
 
 `/agent` includes one-time, topic-bound lifecycle buttons. **Pause** prevents
 new mailbox claims while allowing Telegram inputs to queue durably; **Resume**
@@ -1568,3 +1569,35 @@ reaches Telegram. Both the direct command and Control router set
 `parse_mode=HTML`; router fallback sends infer that formatting from the durable
 `list_projects` tool name, so a late receipt or failed edit cannot expose raw
 tags.
+
+## Telegram messages share one safe formatting boundary
+
+`telegram_formatting.py` now centralizes the Control speaker label, controller
+HTML escaping and balanced chunking, semantic status icons, and provider
+Markdown rendering. Help pages and the workspace catalog use the shared
+controller boundary: authored structure may use Telegram HTML, while every
+dynamic value is escaped. Long HTML messages close and reopen active tags at
+chunk boundaries rather than risking a split tag or entity. Literal controller
+messages keep their bodies unchanged and use an explicit entity only to bold
+the trusted speaker label.
+
+Claude and Codex output is compiled to explicit Telegram `MessageEntity`
+objects, never passed through a Telegram parse mode. The documented subset
+supports headings, emphasis, inline and fenced code, safe links, lists, task
+markers, quotes, and dividers. Unsupported inline syntax stays literal; an
+invalid fenced document falls back to its exact source. Entity offsets use
+UTF-16 code units and are recomputed after speaker labeling and chunking, so
+emoji and spans crossing message boundaries remain valid. Provider source text
+continues to be stored unchanged for retries, session history, and TTS.
+
+The durable sender also has a delivery fallback: if Telegram rejects a message
+entity payload, it atomically removes the entities and immediately retries the
+same visible text. This needs no schema migration and is compatible with older
+workers because outbox parameters were already forwarded generically.
+
+Verified with focused renderer tests for Markdown constructs, ambiguous
+underscores, malformed fences, non-BMP UTF-16 offsets, cross-chunk spans,
+escaped controller content, and balanced HTML. Durable integration coverage
+asserts formatted provider final edits, immediate entity-rejection fallback,
+formatted `/help` sends and edits, and unchanged multi-chunk delivery
+semantics.

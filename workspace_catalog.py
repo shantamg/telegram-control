@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
-import html
 from typing import Optional
 
 from durable_store import WorkspaceInventoryEntry
+from telegram_formatting import escape_html
 
 
 def _count_text(count: int, singular: str, plural: str) -> str:
@@ -14,7 +14,7 @@ def _count_text(count: int, singular: str, plural: str) -> str:
 
 
 def _escape(value: str) -> str:
-    return html.escape(str(value), quote=False)
+    return escape_html(value)
 
 
 def render_workspace_catalog(

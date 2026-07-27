@@ -19,12 +19,13 @@ from typing import Any, Optional, Sequence
 
 import app_config
 import provider_defaults
+import telegram_formatting
 import telegram_help
 
 
 SCHEMA_VERSION = 23
 
-CONTROL_SPEAKER = "🎛 Control"
+CONTROL_SPEAKER = telegram_formatting.CONTROL_SPEAKER
 
 _LOCAL_AGENT_LEASE_OWNER = re.compile(
     r"(.+):([1-9][0-9]*):agent:[A-Za-z0-9_-]+"
@@ -6177,6 +6178,7 @@ class DurableStore:
         timestamp: float,
         operation_suffix: str = "final-edit",
         route_retarget: Optional[dict[str, str]] = None,
+        rendered: Optional[telegram_formatting.RenderedChunk] = None,
     ) -> bool:
         row = self.connection.execute(
             """
@@ -6202,10 +6204,19 @@ class DurableStore:
         params: dict[str, Any] = {
             "chat_id": int(row["chat_id"]),
             "message_id": telegram_message_id,
-            "text": preview_text,
         }
         if str(row["tool_name"] or "") == "list_projects":
+            params["text"] = preview_text
             params["parse_mode"] = "HTML"
+        else:
+            rendered_message = rendered
+            if rendered_message is None:
+                rendered_message = (
+                    telegram_formatting.render_labeled_markdown_chunks(
+                        preview_text
+                    )[0]
+                )
+            rendered_message.add_to_params(params)
         reply_markup = self._router_reply_markup(mailbox_id)
         if (
             reply_markup is None
@@ -6995,7 +7006,7 @@ class DurableStore:
         row = self.connection.execute(
             """
             SELECT r.chat_id, r.message_thread_id, r.preview_text,
-                r.tool_name, a.agent_id
+                r.tool_name, a.agent_id, a.response_text
             FROM router_mailbox AS r
             LEFT JOIN agent_mailbox AS a
                 ON a.source_inbox_job_id = r.source_inbox_job_id
@@ -7026,13 +7037,26 @@ class DurableStore:
         params: dict[str, Any] = {
             "chat_id": int(row["chat_id"]),
             "message_thread_id": thread_id if thread_id != 0 else None,
-            "text": str(row["preview_text"]),
         }
         reply_markup = self._router_reply_markup(mailbox_id)
         if reply_markup is not None:
             params["reply_markup"] = reply_markup
         if str(row["tool_name"] or "") == "list_projects":
+            params["text"] = str(row["preview_text"])
             params["parse_mode"] = "HTML"
+        elif (
+            str(row["tool_name"] or "") == "send_to_agent"
+            and row["agent_id"] is not None
+            and row["response_text"] is not None
+        ):
+            self.rendered_agent_chunks(
+                str(row["agent_id"]),
+                str(row["response_text"]),
+            )[0].add_to_params(params)
+        else:
+            telegram_formatting.render_labeled_markdown_chunks(
+                str(row["preview_text"])
+            )[0].add_to_params(params)
         return self.enqueue_api_call(
             operation_id=f"router-mailbox:{int(mailbox_id)}:final-fallback",
             method="sendMessage",
@@ -9354,6 +9378,25 @@ class DurableStore:
             for chunk in chunk_telegram_text(response_text, limit=budget)
         ]
 
+    def rendered_agent_chunks(
+        self,
+        agent_id: str,
+        response_text: str,
+        chat_id: Optional[int] = None,
+        message_thread_id: Optional[int] = None,
+    ) -> list[telegram_formatting.RenderedChunk]:
+        """Render provider Markdown with an optional durable speaker label."""
+
+        header = (
+            self.agent_surface_header(agent_id, chat_id, message_thread_id)
+            if chat_id is not None
+            else self.agent_speaker_header(agent_id)
+        )
+        return telegram_formatting.render_markdown_chunks(
+            response_text,
+            speaker=header,
+        )
+
     def enqueue_agent_message(
         self,
         agent_id: str,
@@ -9881,7 +9924,7 @@ class DurableStore:
         timestamp: float,
     ) -> None:
         """Queue a new final response instead of overwriting its progress card."""
-        chunks = self.labeled_agent_chunks(
+        chunks = self.rendered_agent_chunks(
             agent_id,
             response_text,
             chat_id,
@@ -9904,8 +9947,8 @@ class DurableStore:
                     if int(message_thread_id) != 0
                     else None
                 ),
-                "text": chunk,
             }
+            chunk.add_to_params(params)
             card = None
             if index == len(chunks):
                 if reply_markup is not None:
@@ -11727,10 +11770,6 @@ class DurableStore:
                 raise LeaseLostError(
                     f"Agent mailbox lease for {mailbox_id} is no longer owned."
                 )
-            labeled_chunks = self.labeled_agent_chunks(
-                str(row["agent_id"]),
-                response_text,
-            )
             if row["reply_chat_id"] is not None:
                 # A reply-routed turn delivers back to the surface the user
                 # replied on, independent of the agent's own project topic.
@@ -11806,7 +11845,11 @@ class DurableStore:
             ).fetchone()
             if router_origin is not None:
                 router_mailbox_id = int(router_origin["mailbox_id"])
-                labeled_response = labeled_chunks[0]
+                rendered_chunks = self.rendered_agent_chunks(
+                    str(row["agent_id"]),
+                    response_text,
+                )
+                labeled_response = rendered_chunks[0].text
                 self.connection.execute(
                     """
                     UPDATE router_mailbox
@@ -11828,26 +11871,28 @@ class DurableStore:
                         "target_type": "agent",
                         "target_id": str(row["agent_id"]),
                     },
+                    rendered=rendered_chunks[0],
                 )
                 router_thread_id = int(router_origin["message_thread_id"])
-                for index, chunk in enumerate(labeled_chunks[1:], start=2):
+                for index, chunk in enumerate(rendered_chunks[1:], start=2):
                     # Continuation chunks are the same agent speaking, so
                     # they carry the same label and route back to the agent.
+                    continuation_params: dict[str, Any] = {
+                        "chat_id": int(router_origin["chat_id"]),
+                        "message_thread_id": (
+                            router_thread_id
+                            if router_thread_id != 0
+                            else None
+                        ),
+                    }
+                    chunk.add_to_params(continuation_params)
                     self.enqueue_api_call(
                         operation_id=(
                             f"router-mailbox:{router_mailbox_id}:"
                             f"agent-response:{index}"
                         ),
                         method="sendMessage",
-                        params={
-                            "chat_id": int(router_origin["chat_id"]),
-                            "message_thread_id": (
-                                router_thread_id
-                                if router_thread_id != 0
-                                else None
-                            ),
-                            "text": chunk,
-                        },
+                        params=continuation_params,
                         route={
                             "target_type": "agent",
                             "target_id": str(row["agent_id"]),
@@ -12080,7 +12125,7 @@ class DurableStore:
             thread_id = int(binding["message_thread_id"])
         # Only the receipt edit (the first chunk) failed; later chunks were
         # queued separately, so the fallback resends just that first chunk.
-        fallback_text = self.labeled_agent_chunks(
+        rendered_fallback = self.rendered_agent_chunks(
             str(row["agent_id"]),
             str(row["response_text"]),
             fallback_chat_id,
@@ -12097,8 +12142,8 @@ class DurableStore:
         fallback_params: dict[str, Any] = {
             "chat_id": fallback_chat_id,
             "message_thread_id": thread_id if thread_id != 0 else None,
-            "text": fallback_text,
         }
+        rendered_fallback.add_to_params(fallback_params)
         if reply_markup is not None:
             fallback_params["reply_markup"] = reply_markup
         return self.enqueue_api_call(
@@ -12441,6 +12486,63 @@ class DurableStore:
             self.connection.execute("ROLLBACK")
             raise
         return new_state
+
+    def retry_outbox_without_entities(
+        self,
+        message_id: int,
+        worker_id: str,
+        error: str,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Degrade one leased formatted message to plain text exactly once."""
+
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.connection.execute(
+                """
+                SELECT params_json
+                FROM outbox_messages
+                WHERE message_id = ? AND state = 'leased' AND lease_owner = ?
+                """,
+                (int(message_id), worker_id),
+            ).fetchone()
+            if row is None:
+                raise LeaseLostError(
+                    f"Outbox lease for message {message_id} is no longer owned."
+                )
+            params = json.loads(row["params_json"])
+            if not isinstance(params.get("entities"), list):
+                self.connection.execute("COMMIT")
+                return False
+            params.pop("entities", None)
+            cursor = self.connection.execute(
+                """
+                UPDATE outbox_messages
+                SET params_json = ?, state = 'queued', available_at = ?,
+                    lease_owner = NULL, lease_expires_at = NULL,
+                    last_error = ?, updated_at = ?
+                WHERE message_id = ? AND state = 'leased' AND lease_owner = ?
+                """,
+                (
+                    json.dumps(params, separators=(",", ":"), sort_keys=True),
+                    timestamp,
+                    str(error)[:2000],
+                    timestamp,
+                    int(message_id),
+                    worker_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LeaseLostError(
+                    f"Outbox lease for message {message_id} is no longer owned."
+                )
+            self.connection.execute("COMMIT")
+            return True
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
 
     def retry_dead(self, queue: str, now: Optional[float] = None) -> int:
         timestamp = time.time() if now is None else float(now)

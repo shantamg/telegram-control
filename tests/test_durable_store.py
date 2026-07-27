@@ -4696,6 +4696,48 @@ class DurableStoreTests(unittest.TestCase):
         )
         return agent
 
+    def test_agent_markdown_uses_explicit_entities_on_final_edit(self):
+        agent, _, _ = self._setup_routed_agent_turn()
+        receipt = self.store.claim_outbox("sender", now=104)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=105,
+        )
+        preview = self.store.claim_outbox("sender", now=106)
+        self.store.complete_outbox(
+            preview.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=107,
+        )
+        mailbox = self.store.claim_agent_mailbox("agent", now=108)
+        self.store.complete_agent_mailbox(
+            mailbox.mailbox_id,
+            "agent",
+            "project-session-1",
+            "# Result\n\n**Passed** with `unittest`.",
+            {},
+            now=109,
+        )
+
+        final_edit = self.store.claim_outbox("sender", now=110)
+        self.assertEqual(final_edit.method, "editMessageText")
+        self.assertEqual(
+            final_edit.params["text"],
+            "telegram-control\n\nResult\n\nPassed with unittest.",
+        )
+        self.assertNotIn("parse_mode", final_edit.params)
+        self.assertEqual(
+            [entity["type"] for entity in final_edit.params["entities"]],
+            ["bold", "bold", "bold", "code"],
+        )
+        self.assertEqual(
+            final_edit.card["route_retarget"]["target_id"],
+            agent.agent_id,
+        )
+
     def test_control_reply_to_retargeted_message_runs_agent_turn(self):
         agent = self._retargeted_final_message()
         self.store.ingest_update(
@@ -5132,6 +5174,41 @@ class DurableStoreTests(unittest.TestCase):
         cleanup = self.store.claim_outbox("sender", now=130)
         self.assertEqual(cleanup.method, "deleteMessage")
         self.assertEqual(cleanup.params["message_id"], 800)
+
+    def test_rejected_entities_retry_immediately_as_plain_text(self):
+        message_id = self.store.enqueue_api_call(
+            operation_id="formatted:message",
+            method="sendMessage",
+            params={
+                "chat_id": 123,
+                "text": "formatted",
+                "entities": [
+                    {"type": "bold", "offset": 0, "length": 9},
+                ],
+            },
+            now=100,
+        )
+        message = self.store.claim_outbox("sender", now=101)
+        self.assertEqual(message.message_id, message_id)
+
+        with mock.patch.object(
+            telegram_control.bridge,
+            "api_call",
+            side_effect=telegram_control.bridge.BridgeError(
+                "Bad Request: can't parse entities"
+            ),
+        ):
+            telegram_control.send_outbox_message(
+                self.store,
+                "token",
+                message,
+                "sender",
+            )
+
+        retry = self.store.claim_outbox("sender", now=10**12)
+        self.assertEqual(retry.message_id, message_id)
+        self.assertEqual(retry.params["text"], "formatted")
+        self.assertNotIn("entities", retry.params)
 
     def test_whitespace_padded_response_sends_real_content_before_cleanup(self):
         agent = self._retargeted_final_message()
@@ -9528,6 +9605,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(menu.method, "sendMessage")
                 self.assertIn("Telegram Control help", menu.params["text"])
                 self.assertIn("/teardown", menu.params["text"])
+                self.assertEqual(menu.params["parse_mode"], "HTML")
+                self.assertIn("<b>Telegram Control help</b>", menu.params["text"])
+                self.assertIn("<code>/teardown</code>", menu.params["text"])
                 buttons = menu.params["reply_markup"]["inline_keyboard"]
                 labels = {
                     button["text"]
@@ -9576,6 +9656,8 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 self.assertIn("Safe topic teardown", page.params["text"])
                 self.assertIn("/teardown", page.params["text"])
+                self.assertEqual(page.params["parse_mode"], "HTML")
+                self.assertIn("<b>Safe topic teardown</b>", page.params["text"])
                 page_labels = {
                     button["text"]
                     for row in page.params["reply_markup"]["inline_keyboard"]
@@ -12804,6 +12886,9 @@ class DurableIntegrationTests(unittest.TestCase):
                     queued.params,
                     {
                         "chat_id": 123,
+                        "entities": [
+                            {"type": "bold", "offset": 0, "length": 10},
+                        ],
                         "message_thread_id": 7,
                         "text": "🎛 Control\n\ndurable reply",
                     },

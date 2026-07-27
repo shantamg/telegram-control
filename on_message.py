@@ -23,6 +23,7 @@ import provider_adapters
 import provider_defaults
 import router_contract
 import telegram_bridge as bridge
+import telegram_formatting
 import telegram_help
 import tmux_console
 import voice_responses
@@ -31,7 +32,6 @@ from durable_store import (
     CallbackActionError,
     DurableStore,
     StoreError,
-    chunk_telegram_text,
     compose_forum_setup_input,
     context_usage_summary,
 )
@@ -55,7 +55,7 @@ MAX_ATTACHMENT_BYTES = 20_000_000
 TRANSCRIPTION_TIMEOUT_SECONDS = 15 * 60
 TELEGRAM_TEXT_CHUNK = 3_800
 OUTPUT_SEQUENCE = 0
-CONTROL_SPEAKER = "🎛 Control"
+CONTROL_SPEAKER = telegram_formatting.CONTROL_SPEAKER
 # Binding a folder is the one thing a new group cannot infer, so every entry
 # point asks for it directly instead of waiting to be told.
 WORKSPACE_QUESTION = (
@@ -440,18 +440,30 @@ def send_message(
         speaker, payload = labeled.split("\n\n", 1)
     else:
         speaker, payload = current_speaker_header(), labeled
-    budget = max(1000, TELEGRAM_TEXT_CHUNK - len(speaker) - 2)
-    chunks = chunk_telegram_text(payload, limit=budget)
+    if parse_mode == "HTML":
+        chunks = [
+            telegram_formatting.RenderedChunk(text=chunk)
+            for chunk in telegram_formatting.render_controller_html_chunks(
+                payload,
+                speaker=speaker,
+                limit=TELEGRAM_TEXT_CHUNK,
+            )
+        ]
+    else:
+        chunks = telegram_formatting.render_plain_chunks(
+            payload,
+            speaker=speaker,
+            limit=TELEGRAM_TEXT_CHUNK,
+        )
     if include_inspect_button:
         reply_markup = inspect_keyboard()
-    for index, payload_chunk in enumerate(chunks):
-        chunk = f"{speaker}\n\n{payload_chunk}"
+    for index, chunk in enumerate(chunks):
         OUTPUT_SEQUENCE += 1
         params = {
             "chat_id": chat_id,
             "message_thread_id": thread_id,
-            "text": chunk,
         }
+        chunk.add_to_params(params)
         if parse_mode is not None:
             params["parse_mode"] = parse_mode
         last_chunk = index == len(chunks) - 1
@@ -518,7 +530,7 @@ def send_help_menu() -> None:
     job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
     user_id_text = os.environ.get("TELEGRAM_FROM_ID")
     if not database_path or not job_id or not user_id_text:
-        send_message(telegram_help.HOME_TEXT)
+        send_message(telegram_help.HOME_HTML, parse_mode="HTML")
         return
     chat_id, thread_id = surface_coordinates()
     with DurableStore(Path(database_path)) as store:
@@ -530,7 +542,11 @@ def send_help_menu() -> None:
             user_id=int(user_id_text),
             current_slug="home",
         )
-    send_message(telegram_help.HOME_TEXT, reply_markup=reply_markup)
+    send_message(
+        telegram_help.HOME_HTML,
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+    )
 
 
 def request_topic_teardown() -> None:
@@ -1633,7 +1649,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         topic_slug = str(action.payload.get("topic", ""))
         menu_id = str(action.payload.get("menu_id", ""))
         try:
-            page_text = telegram_help.page_text(topic_slug)
+            page_text = telegram_help.page_html(topic_slug)
         except ValueError:
             raise StoreError("Stored help topic is invalid.") from None
         if not menu_id or len(menu_id) > 80:
@@ -1661,7 +1677,11 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             {
                 "chat_id": chat_id,
                 "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
-                "text": speaker_labeled_text(page_text),
+                "text": (
+                    f"<b>{telegram_formatting.escape_html(current_speaker_header())}</b>"
+                    f"\n\n{page_text}"
+                ),
+                "parse_mode": "HTML",
                 "reply_markup": reply_markup,
             },
             f"help-page:{topic_slug}",

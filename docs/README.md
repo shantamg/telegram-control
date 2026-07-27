@@ -16,6 +16,7 @@ Start with the path that matches what you are trying to do.
 
 - [Configuration reference](reference/configuration.md)
 - [Security and permission model](reference/security.md)
+- [Telegram message formatting and style](TELEGRAM_MESSAGE_STYLE.md)
 - [`/help` inside Telegram](../telegram_help.py), the source for the live
   command guide
 

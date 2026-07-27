@@ -32,6 +32,7 @@ import provider_adapters
 import provider_defaults
 import router_contract
 import telegram_bridge as bridge
+import telegram_formatting
 import telegram_help
 import tmux_console
 import voice_responses
@@ -76,7 +77,7 @@ ROUTER_MAX_INPUT_TOKENS = 180_000
 ROUTER_MAX_DISCOVERY_STEPS = 6
 ROUTER_MAX_DISCOVERY_REFS = 40
 ROUTER_MAX_LOOP_SECONDS = 240.0
-CONTROL_SPEAKER = "🎛 Control"
+CONTROL_SPEAKER = telegram_formatting.CONTROL_SPEAKER
 MISSING_TOPIC_ERROR_MARKERS = (
     "message thread not found",
     "topic_id_invalid",
@@ -1996,6 +1997,41 @@ def handle_outbox_send_failure(
     worker_id: str,
     error: str,
 ) -> None:
+    formatting_rejection = (
+        isinstance(message.params.get("entities"), list)
+        and not bridge.is_retryable_telegram_error(error)
+        and any(
+            marker in error.lower()
+            for marker in (
+                "can't parse entities",
+                "cannot parse entities",
+                "entity",
+                "offset",
+            )
+        )
+    )
+    if formatting_rejection:
+        try:
+            if store.retry_outbox_without_entities(
+                message.message_id,
+                worker_id,
+                error,
+            ):
+                log_event(
+                    "outbox_formatting_fallback",
+                    message_id=message.message_id,
+                    operation_id=message.operation_id,
+                    attempts=message.attempts,
+                )
+                return
+        except LeaseLostError:
+            log_event(
+                "outbox_lease_lost",
+                message_id=message.message_id,
+                operation_id=message.operation_id,
+                attempts=message.attempts,
+            )
+            return
     permanent_card_edit_failure = (
         message.method == "editMessageText"
         and message.card is not None

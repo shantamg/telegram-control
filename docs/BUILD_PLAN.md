@@ -636,10 +636,11 @@ duplicate operations.
 - Additional bot identities: use one Slam Paws identity across private forum
   groups first. Add bot-token namespacing only if a real Telegram usability or
   isolation limitation appears.
-- Rich provider responses: controller-owned statuses may use escaped Telegram
-  HTML now. Before styling arbitrary agent output, build fixture coverage for a
-  safe Markdown-to-entity renderer and evaluate Telegram Rich Messages. Never
-  pass untrusted model text directly to an HTML or Markdown parse mode.
+- Rich provider responses: implemented with a tested Markdown-to-entity
+  renderer and formatting-aware chunking. Arbitrary agent output is never
+  passed to an HTML or Markdown parse mode, and rejected entities retry as
+  plain text. Telegram Rich Messages remain a future transport option rather
+  than a prerequisite for safe native formatting.
 - Exact fast Codex router model: benchmark against routing fixtures.
 - Local versus online TTS: begin by adapting the known working voice script,
   retain an adapter boundary.
