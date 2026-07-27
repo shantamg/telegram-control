@@ -303,7 +303,7 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
             observed_state="stopped",
         )
 
-    def test_recovery_file_contract_is_created_outside_tmp(self):
+    def test_recovery_file_is_created_outside_tmp(self):
         self.assertTrue(self.recovery_file.is_file())
         self.assertEqual(
             self.recovery_file,
@@ -312,14 +312,16 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
             / "recover-me"
             / "RECOVERY.md",
         )
-        text = self.recovery_file.read_text(encoding="utf-8")
-        self.assertIn("Native wakeups and scheduled tasks", text)
-        contract = detached_worker.recovery_file_contract(
-            self.worker.name,
-            self.recovery_file,
-        )
-        self.assertIn("provider's native teamwork", contract)
-        self.assertIn(str(self.recovery_file), contract)
+
+    def test_launch_preamble_asks_for_no_bookkeeping(self):
+        preamble = detached_worker.launch_preamble(self.worker.name)
+        self.assertIn(self.worker.name, preamble)
+        self.assertIn("native scheduling", preamble)
+        # The worker is never handed a file to maintain: resuming its session
+        # restores its scheduled work, so an inventory would duplicate state
+        # the harness already keeps.
+        self.assertNotIn("RECOVERY.md", preamble)
+        self.assertNotIn(str(self.recovery_file), preamble)
 
     def test_worker_teardown_removes_only_its_managed_recovery_file(self):
         companion = self.recovery_file.parent / "operator-note.txt"
@@ -359,7 +361,8 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(worker.recovery_generation, 1)
         self.assertEqual(worker.restart_count, 1)
         recovery_prompt = resume_command.call_args.args[1]
-        self.assertIn(str(self.recovery_file), recovery_prompt)
+        self.assertNotIn(str(self.recovery_file), recovery_prompt)
+        self.assertIn("recreate anything that is missing", recovery_prompt)
         self.assertIn("worker-recovery-confirm recover-me", recovery_prompt)
         start_session.assert_called_once_with(
             "detached--recover-me",

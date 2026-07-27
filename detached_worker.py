@@ -55,9 +55,9 @@ BRIEF_SUBMIT_DELAY_SECONDS = 0.2
 
 DEFAULT_RECOVERY_PROMPT = """You have been automatically resumed after the host or detached session stopped unexpectedly.
 
-Restore the working state of this exact conversation. Read your durable recovery file first and treat it as the explicit inventory of state that must be reactivated. Review the prior conversation and durable project files as supporting context. Re-establish every Claude/Codex-native background agent, wakeup, scheduled task, monitor, or other process recorded there. Reconcile the current time and external state before acting, and do not repeat side effects that already completed.
+Check whether your scheduled tasks, wakeups, loops, monitors, and background work are still active, and recreate anything that is missing. Do not repeat side effects that already completed.
 
-After you have verified that the expected state is restored, run the recovery-confirm command provided below with a short plain-text summary on standard input. If restoration cannot be completed safely, run the recovery-fail command instead and explain why. Do not claim recovery merely because this session opened."""
+Then run the recovery-confirm command below with a short plain-text summary on standard input, or the recovery-fail command if you cannot safely continue. Do not claim recovery merely because this session opened."""
 
 RECOVERY_FILE_TEMPLATE = """# Detached Worker Recovery State
 
@@ -144,33 +144,22 @@ def remove_recovery_file(store: DurableStore, worker: DetachedWorker) -> bool:
     return removed
 
 
-def recovery_file_contract(name: str, path: Path | str) -> str:
-    return f"""Telegram Control detached-worker recovery contract
+def launch_preamble(name: str) -> str:
+    """The one thing a worker needs to be told at launch.
 
-You are detached worker '{name}'. Your durable recovery file is:
-{path}
-
-Read it now. Keep it current for the entire lifetime of this worker. Whenever you create, change, complete, or cancel anything that would matter after this process disappears, update that file immediately. This includes active goals, Claude/Codex-native wakeups and scheduled tasks, background agents, monitors, processes, exact commands, durable artifact paths, external identifiers, next expected actions, verification steps, and whether recreating an action is safe.
-
-The file must always be sufficient for this same provider conversation to restore its working state after a reboot. Remove completed state that should not be restarted. Never put the only copy of recovery instructions in /tmp or an in-memory process.
-
-Do not invent a separate scheduler. Continue using your provider's native teamwork, background, wakeup, and scheduling features. This file is only their durable recovery inventory.
-
-Wait for the task brief after applying this contract."""
-
-
-def recovery_file_reminder(name: str, path: Path | str) -> str:
-    """A short re-anchor for briefs after the first.
-
-    The full contract is delivered once, as the launch prompt. Repeating it
-    verbatim on every relay cost about 290 tokens a time, told the worker to
-    "wait for the task brief" that was already sitting underneath it, and — by
-    sheer repetition — weighted recovery bookkeeping above the actual work.
-    A two-line reminder keeps the recency anchor without any of that.
+    Workers used to be handed a recovery contract here: read this file, keep an
+    inventory of every wakeup and background agent in it, update it on every
+    change. That was written on the assumption that a resumed session came back
+    empty and had to rebuild itself from notes. It does not — resuming the exact
+    session ID restores its scheduled work, so the inventory was a hand-kept
+    copy of state the harness already had. Maintaining it cost far more context
+    than recovery ever did.
     """
     return (
-        f"Reminder: you are detached worker '{name}'; keep {path} current "
-        "whenever durable state changes. Your instruction follows below."
+        f"You are detached worker '{name}', running in tmux so your work "
+        "survives after the turn that started you has ended. Use your own "
+        "native scheduling, wakeup, loop, and background features as normal; "
+        "nothing here replaces them. Wait for the task brief."
     )
 
 
@@ -212,7 +201,7 @@ def create_worker(
         config,
         provider_session_id=provider_session_id,
     )
-    command.append(recovery_file_contract(name, recovery_file))
+    command.append(launch_preamble(name))
 
     worker = store.create_detached_worker(
         name=name,
@@ -482,8 +471,7 @@ def _recovery_prompt(store: DurableStore, worker: DetachedWorker) -> str:
     )
     base = worker.recovery_prompt.strip() or DEFAULT_RECOVERY_PROMPT
     return (
-        f"{base}\n\nDurable recovery file:\n"
-        f"{worker.recovery_file_path}\n\n"
+        f"{base}\n\n"
         f"Recovery generation: {generation}\n\n"
         "Success command (summary on standard input):\n"
         f"{confirm}\n\n"

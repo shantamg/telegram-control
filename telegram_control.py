@@ -2533,15 +2533,10 @@ def worker_brief_command(args: argparse.Namespace) -> None:
                 recovery_file_path=str(recovery_file),
                 recovery_prompt=detached_worker.DEFAULT_RECOVERY_PROMPT,
             )
-        # The full contract is the worker's launch prompt, so every brief that
-        # reaches here is already after it. Re-anchor briefly rather than
-        # re-pasting it.
-        delivered = (
-            detached_worker.recovery_file_reminder(worker.name, recovery_file)
-            + "\n\nTask brief:\n\n"
-            + brief
-        )
-    detached_worker.send_brief(args.name, delivered)
+    # Delivered verbatim. The worker was told who it is at launch, and a brief
+    # is usually a relay of something the owner just said, so anything prepended
+    # here is a standing instruction repeated for no one's benefit.
+    detached_worker.send_brief(args.name, brief)
     print(f"Brief delivered to {detached_worker.tmux_session_name(args.name)}")
 
 

@@ -977,6 +977,37 @@ carry `recovery_file_reminder` instead: two lines naming the worker and its
 recovery-file path, ending by pointing at the instruction below rather than
 asking the worker to wait for it. Verified with the 29 detached-worker tests.
 
+### Then the premise turned out to be wrong
+
+The contract existed to answer a question nobody had tested: what does a resumed
+worker come back knowing? The assumption was "nothing" — hence an inventory the
+worker hand-maintained so it could rebuild itself from notes.
+
+A direct experiment says otherwise. A throwaway Claude session was launched with
+a fixed `--session-id`, told to schedule a recurring job, and killed at the tmux
+level. Resuming that session ID and calling `CronList` returned the job, and the
+raw transcript confirms the call was made by the new process rather than
+summarized out of replayed history. A fresh session in the same directory
+returned nothing, ruling out a global scheduler. `CronCreate`'s own description
+("dies when Claude exits") describes process exit — accurate for `--print`
+turns, wrong for a resumed interactive session.
+
+So the inventory was a hand-kept copy of state the harness already restores, and
+maintaining it was the expensive half of the design: `journey-story` grew a
+14.7 KB `RECOVERY.md` rewritten by shell heredoc roughly twenty times a session,
+an order of magnitude more context than the contract repeats ever cost.
+
+`recovery_file_contract` and `recovery_file_reminder` are therefore gone.
+`launch_preamble` tells a worker only that it is detached and should keep using
+its native scheduling, wakeup, loop, and background features; briefs are
+delivered verbatim; and `DEFAULT_RECOVERY_PROMPT` asks the resumed worker to
+check its scheduled work is still active, recreate what is missing, and confirm.
+
+The durable-store plumbing is deliberately untouched — `recovery_file_path`,
+generations, and the confirm/fail handshake all stay. Removing them means a
+schema migration on a live system for no behavioral gain, so the columns simply
+go quiet and `RECOVERY.md` is created but never mentioned to the worker.
+
 ## Agent-authored questions with buttons
 
 Agents could send text, voice, group icons, detached workers, and teardown

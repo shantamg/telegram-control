@@ -31,11 +31,10 @@ names both the tmux session and the topic.
 - `--provider` takes `claude` or `codex`. Ask the user if they have not said.
 - `--model` and `--effort` are optional; omit them to inherit local defaults.
 - The command creates the topic (idempotent), starts the tmux session, and
-  prints the session name, topic, and durable recovery-file path.
-- The harness gives the worker its full recovery-file contract once, as the
-  launch prompt. Do not replace that contract with a scheduler: the provider
-  continues to use its own native teamwork, wakeup, background, and scheduling
-  features.
+  prints the session name and topic.
+- The launch prompt tells the worker only who it is and that it should keep
+  using its own native scheduling, wakeup, loop, and background features. It is
+  not asked to keep any recovery inventory.
 
 Then give the worker its task. **Write the brief to a file first** and point the
 worker at it — briefs are long, and typing one through `send-keys` is fragile:
@@ -50,19 +49,13 @@ explicitly tells the worker to report at milestones (see below). Include
 anything the worker cannot discover for itself — it does not inherit your
 conversation.
 
-Each brief is prefixed with a two-line reminder of the worker's name and
-recovery-file path, not the whole contract — the contract already arrived as the
-launch prompt, and re-pasting it on every relay wasted context and told the
-worker to wait for a brief that was already underneath it.
+The brief is delivered verbatim, with nothing prepended.
 
-The contract instructs the worker to update its
-durable `RECOVERY.md` whenever it creates, changes, completes, or cancels state
-that matters after process loss. This includes goals, native scheduled tasks
-and wakeups, background agents, monitors, exact restart commands, durable
-artifacts and identifiers, verification steps, and idempotency warnings. On
-recovery the same provider conversation reads that file, reactivates its own
-native work, and explicitly confirms success or failure; the controller sends
-the result through its durable Telegram outbox.
+Recovery is deliberately thin. Resuming the exact provider session ID restores
+the conversation and its scheduled work, so the recovery turn only asks the
+worker to check that its scheduled tasks, wakeups, loops, and monitors are still
+active, recreate anything missing, and confirm success or failure; the
+controller sends the result through its durable Telegram outbox.
 
 ## Making the worker report
 
