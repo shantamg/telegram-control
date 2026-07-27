@@ -23,6 +23,7 @@ Start with the path that matches what you are trying to do.
 
 - [Contributing](../CONTRIBUTING.md)
 - [Governance and behavioral-change policy](../GOVERNANCE.md)
+- [GitHub maintainer setup](contributing/maintainer-setup.md)
 - [Repository architecture](contributing/architecture.md)
 - [Implementation notes](IMPLEMENTATION_NOTES.md), including exact invariants,
   failure behavior, migrations, and verification history

@@ -1,0 +1,48 @@
+name: Feature request
+description: Propose a focused improvement
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user need is not met today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful change.
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Intended scope
+      options:
+        - Optional per-install preference
+        - Optional per-workspace preference
+        - New optional capability
+        - Change to the default behavior
+        - Core security or durability behavior
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and compatibility
+      description: Could configuration solve this? What existing behavior or state might change?
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Preparation
+      options:
+        - label: I searched existing issues and pull requests.
+          required: true
+        - label: I read the governance policy for default and invariant changes.
+          required: true

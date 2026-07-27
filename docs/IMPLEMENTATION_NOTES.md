@@ -1499,3 +1499,26 @@ workflow, `/bind` requirement, automatic topic startup, optional Control
 agent, and Claude-only behavior. The registered command list remains the
 single source of truth and all 174 durable-store/integration tests pass with
 the updated help copy.
+
+## The repository carries an explicit collaboration contract
+
+The project now includes Apache-2.0 licensing and notice files, contribution
+and governance policies, a security reporting path, a code of conduct,
+CODEOWNERS, structured bug and feature forms, and a pull-request checklist.
+Governance gives the lead maintainer final responsibility for the canonical
+project while making a clear distinction between personal configuration,
+ordinary pull requests, and deliberately divergent forks.
+
+The macOS CI workflow compiles the tree and runs the complete dependency-free
+test suite on the oldest supported Python line (3.9) and a current line (3.13).
+Both third-party actions are pinned to full commit SHAs, the workflow token is
+read-only, concurrent superseded runs are cancelled, and each job has a
+bounded timeout.
+
+Repository files cannot enforce GitHub permissions. The maintainer guide
+therefore records the owner-only work: confirm the proposed license; audit the
+complete history before changing visibility; create an active `main` ruleset
+requiring pull requests, resolved conversations, both CI checks, and protected
+history; keep required approvals at zero while there is only one reviewer;
+raise it to one with CODEOWNER review when a second maintainer exists; restrict
+Actions and collaborator access; and enable the available security features.
