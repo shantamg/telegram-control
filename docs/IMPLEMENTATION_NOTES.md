@@ -1415,3 +1415,28 @@ binding with Claude and no router mailbox, provider capability discovery,
 automatic first-message startup, opt-in topic confirmation, and the complete
 legacy Control path when explicitly enabled. The 174 durable-store and
 integration tests pass after both modes were separated.
+
+## Readiness is capability-based
+
+`doctor` now defines one core: local macOS, Python 3.9 or newer, a valid paired
+handler and Keychain token, a healthy SQLite store, and at least one runnable
+Claude Code or Codex CLI. It reports the two providers separately and rejects a
+configured default that is not installed. Enabling the optional conversational
+Control agent adds Codex to the core requirements because that legacy router is
+still a Codex agent.
+
+Handy, its Parakeet model, ffmpeg, edge-tts, and tmux are reported as optional
+capabilities. Missing voice input, spoken-reply, console, or detached-worker
+support no longer makes a text-only installation look broken. The report also
+states the authentication boundary precisely: it verifies that a provider CLI
+runs, while the provider's own terminal login remains the source of truth.
+
+After Telegram pairing, `telegram_control.py bootstrap` runs the readiness
+check, installs the durable controller and shared skills, publishes the command
+menu, and prints live status. It is the single installation entry point for a
+person or coding agent; the lower-level `init`, `doctor`, `install`, and
+`install-skills` commands remain independently useful.
+
+Verified with readiness tests for a Claude-only text installation, the
+Control-without-Codex rejection, executable version reporting, and bootstrap
+ordering.
