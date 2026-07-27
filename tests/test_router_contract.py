@@ -1,6 +1,10 @@
 import unittest
 
-from durable_store import ManagedProject, SurfaceBinding
+from durable_store import (
+    ManagedProject,
+    SurfaceBinding,
+    WorkspaceInventoryEntry,
+)
 from router_contract import (
     REPLY_CONTEXT_PREFIX,
     REPLY_QUOTE_BEGIN,
@@ -155,6 +159,42 @@ class RouterContractTests(unittest.TestCase):
         self.assertIn('"kind":"private_forum_topic"', prompt)
         self.assertIn('"forum_name":"Life"', prompt)
         self.assertIn('"workspace_bound":false', prompt)
+        self.assertNotIn("/secret/local/path", prompt)
+
+    def test_main_agent_prompt_exposes_forum_only_workspaces_without_slugs(self):
+        prompt = build_main_agent_prompt(
+            "what workspaces are connected?",
+            [self.project],
+            [],
+            workspace_inventory=[
+                WorkspaceInventoryEntry(
+                    project_slug=None,
+                    display_name="Life",
+                    providers=("claude",),
+                    forum_names=("Life",),
+                    active_topic_count=4,
+                    active_session_count=4,
+                    project_agent_state=None,
+                ),
+                WorkspaceInventoryEntry(
+                    project_slug="telegram-control",
+                    display_name="Telegram Control",
+                    providers=("codex",),
+                    forum_names=("Telegram Control",),
+                    active_topic_count=9,
+                    active_session_count=9,
+                    project_agent_state="not_created",
+                ),
+            ],
+        )
+        self.assertIn('"name":"Life"', prompt)
+        self.assertIn('"active_topics":4', prompt)
+        self.assertIn('"project_slug":null', prompt)
+        self.assertIn('"project_slug":"telegram-control"', prompt)
+        self.assertIn(
+            "Only entries with a project_slug support slug-based project tools",
+            prompt,
+        )
         self.assertNotIn("/secret/local/path", prompt)
 
     def test_tool_call_normalizes_safe_dispatch(self):

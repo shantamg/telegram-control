@@ -19,6 +19,7 @@ import provider_defaults
 import router_contract
 import telegram_control
 import telegram_help
+import workspace_catalog
 from durable_store import (
     MIGRATION_1,
     MIGRATION_2,
@@ -1459,6 +1460,103 @@ class DurableStoreTests(unittest.TestCase):
             self.store.resolve_surface_binding(123, 62).target_id,
             agent.agent_id,
         )
+
+    def test_workspace_inventory_combines_projects_forums_and_sessions(self):
+        root = Path(self.temporary_directory.name)
+        telegram_workspace = root / "telegram-control"
+        life_workspace = root / "life"
+        telegram_workspace.mkdir()
+        life_workspace.mkdir()
+
+        self.store.enroll_project(
+            slug="telegram-control",
+            display_name="Telegram Control",
+            provider="codex",
+            project_path=os.path.realpath(telegram_workspace),
+            now=100,
+        )
+        telegram_forum = self.store.ensure_surface_binding(
+            chat_id=-100701,
+            surface_type="control",
+            display_name="Telegram Control",
+            target_type="controller",
+            target_id="control",
+            now=101,
+        )
+        self.store.bind_forum_workspace(
+            chat_id=-100701,
+            forum_binding_id=telegram_forum.binding_id,
+            project_path=str(telegram_workspace),
+            provider="codex",
+            now=102,
+        )
+        telegram_subject, _ = self.store.ensure_forum_subject(
+            chat_id=-100701,
+            message_thread_id=11,
+            display_name="Maintenance",
+            now=103,
+        )
+
+        life_forum = self.store.ensure_surface_binding(
+            chat_id=-100702,
+            surface_type="control",
+            display_name="Life",
+            target_type="controller",
+            target_id="control",
+            now=104,
+        )
+        self.store.bind_forum_workspace(
+            chat_id=-100702,
+            forum_binding_id=life_forum.binding_id,
+            project_path=str(life_workspace),
+            provider="claude",
+            now=105,
+        )
+        life_subject, _ = self.store.ensure_forum_subject(
+            chat_id=-100702,
+            message_thread_id=21,
+            display_name="Budget",
+            now=106,
+        )
+        self.store.ensure_forum_subject(
+            chat_id=-100702,
+            message_thread_id=22,
+            display_name="Email",
+            now=107,
+        )
+        self.store.connection.execute(
+            """
+            UPDATE agents SET provider_session_id = 'session-active'
+            WHERE agent_id IN (?, ?)
+            """,
+            (telegram_subject.agent_id, life_subject.agent_id),
+        )
+
+        inventory = self.store.list_workspace_inventory()
+        self.assertEqual(
+            [entry.display_name for entry in inventory],
+            ["Life", "Telegram Control"],
+        )
+        life, telegram = inventory
+        self.assertIsNone(life.project_slug)
+        self.assertEqual(life.providers, ("claude",))
+        self.assertEqual(life.forum_names, ("Life",))
+        self.assertEqual(life.active_topic_count, 2)
+        self.assertEqual(life.active_session_count, 1)
+        self.assertEqual(telegram.project_slug, "telegram-control")
+        self.assertEqual(telegram.forum_names, ("Telegram Control",))
+        self.assertEqual(telegram.active_topic_count, 1)
+        self.assertEqual(telegram.active_session_count, 1)
+
+        rendered = workspace_catalog.render_workspace_catalog(inventory)
+        self.assertIn("Connected workspaces", rendered)
+        self.assertIn("Life (claude)", rendered)
+        self.assertIn("2 active topics · 1 session", rendered)
+        self.assertIn(
+            "telegram-control — Telegram Control (codex)",
+            rendered,
+        )
+        self.assertNotIn(str(root), rendered)
 
     def test_project_aliases_are_durable_unique_and_resolvable(self):
         project, _ = self.store.enroll_project(
@@ -10277,7 +10375,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     ).fetchall()
                 ]
                 self.assertTrue(
-                    any("No local projects are enrolled." in text for text in texts),
+                    any("No workspaces are connected yet." in text for text in texts),
                     texts,
                 )
                 # It is controller work, so it never reaches an agent or router.
@@ -10322,6 +10420,55 @@ class DurableIntegrationTests(unittest.TestCase):
                     store.status_counts().get("router_mailbox", {}),
                     {"queued": 1},
                 )
+
+    def test_project_catalog_lists_bound_forum_without_enrollment(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            workspace = Path(temporary_directory) / "life"
+            workspace.mkdir()
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace),
+                    provider="claude",
+                    now=91,
+                )
+                subject, _ = store.ensure_forum_subject(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    display_name="Budget",
+                    now=92,
+                )
+                store.connection.execute(
+                    """
+                    UPDATE agents SET provider_session_id = 'session-life'
+                    WHERE agent_id = ?
+                    """,
+                    (subject.agent_id,),
+                )
+
+            with mock.patch.dict(
+                os.environ,
+                {"TELEGRAM_CONTROL_DB": str(database_path)},
+                clear=False,
+            ), mock.patch.object(on_message, "send_message") as send:
+                on_message.send_project_catalog()
+
+            send.assert_called_once()
+            text = send.call_args.args[0]
+            self.assertIn("Connected workspaces", text)
+            self.assertIn("Life (claude)", text)
+            self.assertIn("1 active topic · 1 session", text)
+            self.assertNotIn(str(workspace), text)
 
     def test_newgroup_offers_the_one_tap_link_and_start_only_authorizes(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

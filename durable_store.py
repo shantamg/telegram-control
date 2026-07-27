@@ -317,6 +317,19 @@ class ForumWorkspace:
 
 
 @dataclass(frozen=True)
+class WorkspaceInventoryEntry:
+    """Path-free read model spanning enrolled projects and bound forums."""
+
+    project_slug: Optional[str]
+    display_name: str
+    providers: tuple[str, ...]
+    forum_names: tuple[str, ...]
+    active_topic_count: int
+    active_session_count: int
+    project_agent_state: Optional[str]
+
+
+@dataclass(frozen=True)
 class ForumSubject:
     subject_id: str
     forum_chat_id: int
@@ -5042,6 +5055,90 @@ class DurableStore:
             """
         ).fetchall()
         return [self._managed_project_from_row(row) for row in rows]
+
+    def list_workspace_inventory(self) -> list[WorkspaceInventoryEntry]:
+        """List each active workspace once across both durable storage models.
+
+        Enrolled projects predate private forum workspaces. Their canonical
+        workspace and working-directory pair is the shared identity used here,
+        so a project that is also bound to a group is reported once without
+        copying or exposing either stored path.
+        """
+        inventory: dict[tuple[str, str], dict[str, Any]] = {}
+        for project in self.list_projects():
+            agent = self.resolve_project_agent(project.slug)
+            key = (project.project_path, project.working_directory)
+            inventory[key] = {
+                "project_slug": project.slug,
+                "display_name": project.display_name,
+                "providers": {project.provider},
+                "forum_names": set(),
+                "active_topic_count": 0,
+                "active_session_count": 0,
+                "project_agent_state": (
+                    agent.lifecycle_state if agent is not None else "not_created"
+                ),
+            }
+
+        forum_rows = self.connection.execute(
+            """
+            SELECT w.project_path, w.working_directory, w.display_name,
+                w.provider,
+                COUNT(s.subject_id) AS active_topic_count,
+                SUM(
+                    CASE WHEN a.provider_session_id IS NOT NULL THEN 1 ELSE 0 END
+                ) AS active_session_count
+            FROM forum_workspaces AS w
+            LEFT JOIN forum_subjects AS s
+                ON s.forum_chat_id = w.chat_id AND s.state = 'active'
+            LEFT JOIN agents AS a ON a.agent_id = s.agent_id
+            WHERE w.state = 'active'
+            GROUP BY w.chat_id
+            ORDER BY lower(w.display_name), w.chat_id
+            """
+        ).fetchall()
+        for row in forum_rows:
+            key = (str(row["project_path"]), str(row["working_directory"]))
+            entry = inventory.get(key)
+            if entry is None:
+                entry = {
+                    "project_slug": None,
+                    "display_name": str(row["display_name"]),
+                    "providers": set(),
+                    "forum_names": set(),
+                    "active_topic_count": 0,
+                    "active_session_count": 0,
+                    "project_agent_state": None,
+                }
+                inventory[key] = entry
+            entry["providers"].add(str(row["provider"]))
+            entry["forum_names"].add(str(row["display_name"]))
+            entry["active_topic_count"] += int(row["active_topic_count"])
+            entry["active_session_count"] += int(
+                row["active_session_count"] or 0
+            )
+
+        entries = [
+            WorkspaceInventoryEntry(
+                project_slug=entry["project_slug"],
+                display_name=entry["display_name"],
+                providers=tuple(sorted(entry["providers"])),
+                forum_names=tuple(
+                    sorted(entry["forum_names"], key=str.casefold)
+                ),
+                active_topic_count=int(entry["active_topic_count"]),
+                active_session_count=int(entry["active_session_count"]),
+                project_agent_state=entry["project_agent_state"],
+            )
+            for entry in inventory.values()
+        ]
+        return sorted(
+            entries,
+            key=lambda entry: (
+                entry.display_name.casefold(),
+                entry.project_slug or "",
+            ),
+        )
 
     def project_alias_map(self) -> dict[str, list[str]]:
         rows = self.connection.execute(

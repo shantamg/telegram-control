@@ -1530,3 +1530,32 @@ requiring pull requests, resolved conversations, both CI checks, and protected
 history; keep required approvals at zero while there is only one reviewer;
 raise it to one with CODEOWNER review when a second maintainer exists; restrict
 Actions and collaborator access; and enable the available security features.
+
+## Workspace inventory spans projects and bound groups
+
+The original `/projects` implementation read only the `managed_projects`
+catalog. Private group setup later introduced `forum_workspaces` and
+`forum_subjects`, so a valid group bound directly to a folder could own many
+persisted topic sessions without appearing in `/projects` or in the optional
+Control agent's workspace context.
+
+`DurableStore.list_workspace_inventory()` now builds a path-free read model
+across both storage systems. It deduplicates an enrolled project and a bound
+forum only when their validated workspace-root and working-directory pair both
+match, aggregates active topic and provider-session counts across every forum
+using that workspace, and never exposes either stored path. It does not copy
+forum rows into `managed_projects`, assign unstable synthetic slugs, or require
+a schema migration.
+
+The direct `/projects` command and Control's `list_projects` response render the
+same connected-workspace inventory. Control's prompt also receives this
+inventory separately from the enrolled-project tool catalog: forum-only
+workspaces are visible with a null project slug, while slug-gated project tools
+remain limited to actual `managed_projects` rows. This preserves validation and
+avoids implying that Control can dispatch to an arbitrary topic in another
+group.
+
+Verified with store coverage for project/forum deduplication and active session
+aggregation, path-safe rendering coverage, router-prompt coverage for
+forum-only workspaces, and an end-to-end `/projects@bot` group-command fixture
+whose only workspace is a bound forum.

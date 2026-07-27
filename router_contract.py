@@ -17,6 +17,7 @@ from durable_store import (
     ManagedProject,
     StoreError,
     SurfaceBinding,
+    WorkspaceInventoryEntry,
     FORUM_SETUP_PREFIX,
     compose_reply_context_input,
     extract_user_request,
@@ -197,13 +198,15 @@ def build_main_agent_prompt(
     project_aliases: Optional[dict[str, list[str]]] = None,
     topics: Iterable[SurfaceBinding] = (),
     current_surface: Optional[dict[str, Any]] = None,
+    workspace_inventory: Iterable[WorkspaceInventoryEntry] = (),
 ) -> str:
     text = user_input.strip()
     if not text or len(text) > 8000:
         raise RouterContractError("Main-agent input is invalid.")
     aliases = project_aliases or {}
+    project_list = list(projects)
     catalog = []
-    for project in projects:
+    for project in project_list:
         if project.state != "active":
             continue
         item = {
@@ -223,6 +226,30 @@ def build_main_agent_prompt(
         }
         for state in agent_states
     ]
+    known_workspaces = [
+        {
+            "name": entry.display_name,
+            "providers": list(entry.providers),
+            "project_slug": entry.project_slug,
+            "groups": list(entry.forum_names),
+            "active_topics": entry.active_topic_count,
+            "sessions": entry.active_session_count,
+        }
+        for entry in workspace_inventory
+    ]
+    if not known_workspaces:
+        known_workspaces = [
+            {
+                "name": project.display_name,
+                "providers": [project.provider],
+                "project_slug": project.slug,
+                "groups": [],
+                "active_topics": 0,
+                "sessions": 0,
+            }
+            for project in project_list
+            if project.state == "active"
+        ]
     topic_catalog = [
         {
             "message_thread_id": int(topic.message_thread_id),
@@ -281,12 +308,17 @@ def build_main_agent_prompt(
         f"{reply_context_rule}"
         "When a user names an alias, return the canonical project slug shown "
         "in the catalog. Preserve explicit provider, model, and effort choices. "
+        "Known workspaces include both enrolled projects and bound Telegram "
+        "groups. Only entries with a project_slug support slug-based project "
+        "tools; group topics remain independent conversations. "
         "If the user asks for a subjective choice such as best, fastest, or "
         "cheapest without naming a model, use ask_user rather than guessing.\n\n"
         f"Tools:\n{json.dumps(CONTROLLER_TOOLS, separators=(',', ':'), sort_keys=True)}"
         "\n\nDiscovery tools:\n"
         f"{json.dumps(DISCOVERY_TOOLS, separators=(',', ':'), sort_keys=True)}"
         f"\n\nProjects:\n{json.dumps(catalog, separators=(',', ':'), sort_keys=True)}"
+        "\n\nKnown workspaces:\n"
+        f"{json.dumps(known_workspaces, separators=(',', ':'), sort_keys=True)}"
         f"\n\nAgents:\n{json.dumps(states, separators=(',', ':'), sort_keys=True)}"
         f"\n\nTopics:\n{json.dumps(topic_catalog, separators=(',', ':'), sort_keys=True)}"
         "\n\nCurrent surface:\n"

@@ -26,7 +26,7 @@ COMMANDS = (
     BotCommand("help", "Browse the Telegram Control guide"),
     BotCommand("agent", "Inspect or manage this topic's agent"),
     BotCommand("status", "Inspect this Telegram surface"),
-    BotCommand("projects", "List enrolled workspaces"),
+    BotCommand("projects", "List connected workspaces and topic sessions"),
     BotCommand("newgroup", "Get the link that adds me to a new project group"),
     BotCommand("bind", "Bind this group to an exact local folder"),
     BotCommand("teardown", "Safely remove this managed topic and session"),
@@ -105,7 +105,7 @@ These skills are scoped to the active Telegram turn. They do not accept arbitrar
         "Projects & topics",
         """Projects and topics
 
-Use /projects to list enrolled workspaces.
+Use /projects to list every connected workspace, including group-only workspaces, with its active topic and session counts. A workspace that is both enrolled in the older project catalog and bound to a group appears only once.
 
 Setting up a new group: send /newgroup in the bot’s private chat, create a private group, enable Topics, choose Telegram’s separate “View as Topics” display mode, then tap the link. Telegram adds the bot with the rights it needs in one step. Authorize the forum, then send /bind followed by an exact existing folder path and confirm the workspace and provider.
 

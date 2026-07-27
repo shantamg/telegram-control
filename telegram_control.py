@@ -35,6 +35,7 @@ import telegram_bridge as bridge
 import telegram_help
 import tmux_console
 import voice_responses
+import workspace_catalog
 from durable_store import (
     SCHEMA_VERSION,
     AgentMailboxJob,
@@ -752,23 +753,10 @@ def project_inspection_text(
 
 
 def project_catalog_text(store: DurableStore) -> str:
-    projects = store.list_projects()
-    if not projects:
-        return "No projects are enrolled yet."
-    lines = ["Enrolled projects", ""]
-    aliases = store.project_alias_map()
-    for project in projects:
-        agent = store.resolve_project_agent(project.slug)
-        state = agent.lifecycle_state if agent is not None else "not created"
-        line = (
-            f"{project.slug} — {project.display_name} "
-            f"({project.provider}) · {state}"
-        )
-        project_aliases = aliases.get(project.slug, [])
-        if project_aliases:
-            line += "\n  Aliases: " + ", ".join(project_aliases)
-        lines.append(line)
-    return "\n".join(lines)
+    return workspace_catalog.render_workspace_catalog(
+        store.list_workspace_inventory(),
+        store.project_alias_map(),
+    )
 
 
 def alias_appears_in_input(alias: str, user_input: str) -> bool:
@@ -1309,6 +1297,7 @@ def process_router_mailbox_job(
             provider_config={"sandbox": "read-only"},
         )
         projects = store.list_projects()
+        workspace_inventory = store.list_workspace_inventory()
         topics = store.list_topic_surfaces(job.chat_id)
         forum_workspace = (
             store.resolve_forum_workspace(job.chat_id)
@@ -1357,6 +1346,7 @@ def process_router_mailbox_job(
             store.project_alias_map(),
             topics,
             current_surface,
+            workspace_inventory=workspace_inventory,
         )
         # Bounded multi-step loop: read-only discovery calls repeat until the
         # model returns one terminal tool. Completed steps are persisted, so

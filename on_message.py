@@ -26,6 +26,7 @@ import telegram_bridge as bridge
 import telegram_help
 import tmux_console
 import voice_responses
+import workspace_catalog
 from durable_store import (
     CallbackActionError,
     DurableStore,
@@ -864,23 +865,11 @@ def send_project_catalog() -> None:
         send_message("Project catalog requires the durable controller.")
         return
     with DurableStore(Path(database_path)) as store:
-        projects = store.list_projects()
-    if not projects:
-        send_message("No local projects are enrolled.")
-        return
-    lines = ["Enrolled projects", ""]
-    for project in projects:
-        lines.append(
-            f"{project.slug} — {project.display_name} ({project.provider})"
+        text = workspace_catalog.render_workspace_catalog(
+            store.list_workspace_inventory(),
+            store.project_alias_map(),
         )
-    lines.extend(
-        [
-            "",
-            "Inside a provisioned project topic, send:",
-            "/agent create <slug>",
-        ]
-    )
-    send_message("\n".join(lines))
+    send_message(text)
 
 
 def send_group_setup_card() -> None:

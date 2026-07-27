@@ -90,6 +90,8 @@ for the exact Telegram settings and why each permission is needed.
 
 - One project group can contain many independent topic conversations.
 - Topic sessions and queues survive controller restarts.
+- `/projects` lists every connected workspace with its active topic and session
+  counts, whether it came from the older project catalog or a bound group.
 - `/agent` changes provider, model, effort, or session for the current topic.
 - Replying to the progress card steers the active turn; **Stop** interrupts it.
 - Attachments are saved to private local paths the agent can inspect.
