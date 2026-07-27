@@ -37,7 +37,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     },
     "prompts": {
         "preamble": "",
+        "preamble_file": "",
         "response_style": "",
+        "response_style_file": "",
     },
     "presentation": {
         "status_style": "standard",
@@ -47,6 +49,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 WORKSPACE_CONFIG_NAME = ".telegram-control.json"
 LOCAL_WORKSPACE_CONFIG_NAME = ".telegram-control.local.json"
 MAX_PROMPT_TEXT = 4_000
+INSTALL_CONFIG_PATH = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / "telegram-bridge"
+    / "config.json"
+)
 
 
 def _read_object(path: Path) -> dict[str, Any]:
@@ -128,15 +137,31 @@ def validate_settings(value: dict[str, Any]) -> dict[str, Any]:
         raise ConfigError("telegram_control.prompts must be an object.")
     _require_keys(
         prompts,
-        {"preamble", "response_style"},
+        {
+            "preamble",
+            "preamble_file",
+            "response_style",
+            "response_style_file",
+        },
         "telegram_control.prompts",
     )
-    for name in ("preamble", "response_style"):
+    for name in (
+        "preamble",
+        "preamble_file",
+        "response_style",
+        "response_style_file",
+    ):
         prompt = prompts.get(name)
         if not isinstance(prompt, str) or len(prompt) > MAX_PROMPT_TEXT:
             raise ConfigError(
                 f"telegram_control.prompts.{name} must be a string of at most "
                 f"{MAX_PROMPT_TEXT} characters."
+            )
+    for name in ("preamble", "response_style"):
+        if prompts[name].strip() and prompts[f"{name}_file"].strip():
+            raise ConfigError(
+                f"telegram_control.prompts.{name} and {name}_file cannot "
+                "both be set."
             )
 
     presentation = merged.get("presentation")
@@ -192,6 +217,23 @@ def control_agent_enabled(
     )
 
 
+def installed_settings(
+    workspace_path: Optional[str] = None,
+    *,
+    config_path: Optional[Path] = None,
+) -> dict[str, Any]:
+    """Load the private per-install config for a worker-side rendering path."""
+    path = INSTALL_CONFIG_PATH if config_path is None else Path(config_path)
+    config = _read_object(path)
+    existing_workspace = (
+        workspace_path
+        if workspace_path
+        and Path(workspace_path).expanduser().is_dir()
+        else None
+    )
+    return effective_settings(config, existing_workspace)
+
+
 def confirm_topic_agent(
     bridge_config: Optional[dict[str, Any]] = None,
     workspace_path: Optional[str] = None,
@@ -203,12 +245,59 @@ def confirm_topic_agent(
     )
 
 
-def prompt_addition(settings: dict[str, Any]) -> str:
+def _prompt_value(
+    prompts: dict[str, str],
+    name: str,
+    workspace_path: Optional[str],
+) -> str:
+    inline = prompts[name].strip()
+    if inline:
+        return inline
+    file_value = prompts[f"{name}_file"].strip()
+    if not file_value:
+        return ""
+    candidate = Path(file_value).expanduser()
+    if not candidate.is_absolute():
+        if not workspace_path:
+            raise ConfigError(
+                f"prompts.{name}_file must be absolute outside a workspace."
+            )
+        workspace = Path(workspace_path).expanduser().resolve()
+        candidate = (workspace / candidate).resolve()
+        try:
+            candidate.relative_to(workspace)
+        except ValueError:
+            raise ConfigError(
+                f"prompts.{name}_file must stay inside the workspace."
+            ) from None
+    try:
+        text = candidate.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise ConfigError(f"Could not read prompt file {candidate}.") from exc
+    if len(text) > MAX_PROMPT_TEXT:
+        raise ConfigError(
+            f"Prompt file {candidate} exceeds {MAX_PROMPT_TEXT} characters."
+        )
+    return text
+
+
+def prompt_addition(
+    settings: dict[str, Any],
+    workspace_path: Optional[str] = None,
+) -> str:
     """Render only user-customizable guidance, never the core safety contract."""
     validated = validate_settings(settings)
     sections = []
-    preamble = validated["prompts"]["preamble"].strip()
-    response_style = validated["prompts"]["response_style"].strip()
+    preamble = _prompt_value(
+        validated["prompts"],
+        "preamble",
+        workspace_path,
+    )
+    response_style = _prompt_value(
+        validated["prompts"],
+        "response_style",
+        workspace_path,
+    )
     if preamble:
         sections.append(f"User-configured standing context:\n{preamble}")
     if response_style:

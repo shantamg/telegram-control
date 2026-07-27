@@ -88,6 +88,50 @@ class AppConfigTests(unittest.TestCase):
             "User-configured response style:\nBe concise.",
         )
 
+    def test_prompt_files_are_workspace_relative_and_contained(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            prompt = workspace / "prompts" / "style.md"
+            prompt.parent.mkdir()
+            prompt.write_text("Use calm, direct prose.", encoding="utf-8")
+            settings = app_config.effective_settings(
+                {
+                    "telegram_control": {
+                        "prompts": {
+                            "response_style_file": "prompts/style.md",
+                        }
+                    }
+                }
+            )
+            self.assertIn(
+                "Use calm, direct prose.",
+                app_config.prompt_addition(settings, str(workspace)),
+            )
+            escaped = app_config.effective_settings(
+                {
+                    "telegram_control": {
+                        "prompts": {
+                            "response_style_file": "../outside.md",
+                        }
+                    }
+                }
+            )
+            with self.assertRaisesRegex(app_config.ConfigError, "inside"):
+                app_config.prompt_addition(escaped, str(workspace))
+
+    def test_inline_and_file_prompt_cannot_both_be_set(self):
+        with self.assertRaisesRegex(app_config.ConfigError, "cannot both"):
+            app_config.effective_settings(
+                {
+                    "telegram_control": {
+                        "prompts": {
+                            "preamble": "Inline",
+                            "preamble_file": "/tmp/preamble.md",
+                        }
+                    }
+                }
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

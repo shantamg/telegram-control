@@ -10,9 +10,10 @@ from io import StringIO
 from pathlib import Path
 from unittest import mock
 
-import on_message
 import agent_telegram
+import app_config
 import codex_sessions
+import on_message
 import provider_adapters
 import provider_defaults
 import router_contract
@@ -1133,6 +1134,25 @@ class DurableStoreTests(unittest.TestCase):
             self.store.agent_speaker_header(agent.agent_id),
             "Journal",
         )
+
+        compact_settings = app_config.effective_settings(
+            {
+                "telegram_control": {
+                    "presentation": {"status_style": "compact"},
+                }
+            }
+        )
+        with mock.patch(
+            "durable_store.app_config.installed_settings",
+            return_value=compact_settings,
+        ):
+            compact = self.store.topic_intro_text(
+                agent.agent_id,
+                "Journal",
+                started=False,
+            )
+        self.assertIn("“Journal” · Codex", compact)
+        self.assertNotIn("Commands here:", compact)
 
         duplicate, duplicate_created = self.store.ensure_forum_subject(
             chat_id=-100777,

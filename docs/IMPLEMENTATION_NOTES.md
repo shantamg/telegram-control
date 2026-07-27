@@ -1440,3 +1440,34 @@ person or coding agent; the lower-level `init`, `doctor`, `install`, and
 Verified with readiness tests for a Claude-only text installation, the
 Control-without-Codex rejection, executable version reporting, and bootstrap
 ordering.
+
+## Customization is layered, scoped, and subordinate to safety
+
+Behavior settings now resolve in a fixed order: built-in defaults, the
+per-install `telegram_control` object in private `config.json`, shared
+`.telegram-control.json` workspace settings, then the ignored
+`.telegram-control.local.json` personal workspace override. Unknown keys,
+invalid enum values, conflicting inline/file prompts, oversized prompts, and
+relative prompt files that escape their workspace all fail with a specific
+configuration error. `telegram_control.py config show --effective
+--workspace <path>` prints the merged result and every participating path.
+
+The customizable prompt surface has two intentionally separate fields:
+`preamble` supplies standing user or project context and `response_style`
+describes how the agent should communicate. Each can instead name a Markdown
+file. These sections are appended after the non-replaceable Telegram Control
+turn contract; they cannot delete or replace its lifecycle, capability, or
+background-work safety instructions. Both the Claude system-prompt adapter and
+Codex developer-instruction adapter receive the same effective guidance.
+
+`presentation.status_style` controls the durable topic header. `compact` keeps
+only the topic, provider/model/effort, context, and immediate state;
+`standard` preserves the normal command-oriented header; `detailed` adds the
+workspace, permission mode, provider-session state, and lifecycle. Rendering
+reads the same install and workspace layers, so a personal local override
+changes one person's installation without changing repository defaults.
+
+Verified with configuration precedence and validation tests, contained
+Markdown prompt-file tests, byte-for-byte preservation of the default core
+guidance, custom-guidance ordering, compact topic rendering, and effective
+configuration inspection.

@@ -1,0 +1,22 @@
+{
+  "telegram_control": {
+    "control_agent": {
+      "enabled": false
+    },
+    "topics": {
+      "confirm_agent": false
+    },
+    "defaults": {
+      "provider": "auto"
+    },
+    "prompts": {
+      "preamble": "",
+      "preamble_file": "",
+      "response_style": "",
+      "response_style_file": ""
+    },
+    "presentation": {
+      "status_style": "standard"
+    }
+  }
+}

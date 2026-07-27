@@ -1,5 +1,8 @@
+import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -155,6 +158,38 @@ class ReadinessTests(unittest.TestCase):
             telegram_control.bootstrap_command(args)
 
         self.assertEqual(calls, ["doctor", "install", "status"])
+
+    def test_config_show_prints_effective_workspace_layers(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory)
+            (workspace / ".telegram-control.json").write_text(
+                json.dumps(
+                    {"presentation": {"status_style": "compact"}}
+                ),
+                encoding="utf-8",
+            )
+            args = SimpleNamespace(
+                workspace=str(workspace),
+                effective=True,
+            )
+            output = StringIO()
+            with mock.patch.object(
+                telegram_control.bridge,
+                "load_config",
+                return_value={},
+            ), redirect_stdout(output):
+                telegram_control.config_show_command(args)
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(
+            payload["effective"]["presentation"]["status_style"],
+            "compact",
+        )
+        self.assertTrue(
+            payload["layers"]["workspace"].endswith(
+                ".telegram-control.json"
+            )
+        )
 
 
 if __name__ == "__main__":

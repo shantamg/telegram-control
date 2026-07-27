@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Literal, Optional, Protocol
 
 from durable_store import ManagedAgent, StoreError
-from turn_guidance import TURN_GUIDANCE
+from turn_guidance import TURN_GUIDANCE, effective_turn_guidance
 
 
 class ProviderAdapterError(StoreError):
@@ -626,12 +626,13 @@ class CodexExecAdapter:
         launch_directory: str,
         model: Optional[Any],
         sandbox: str,
+        guidance: str = TURN_GUIDANCE,
     ) -> tuple[str, dict[str, Any]]:
         params: dict[str, Any] = {
             "cwd": launch_directory,
             "sandbox": sandbox,
             "approvalPolicy": "never",
-            "developerInstructions": TURN_GUIDANCE,
+            "developerInstructions": guidance,
         }
         if model:
             params["model"] = str(model)
@@ -808,6 +809,7 @@ class CodexExecAdapter:
                     launch_directory,
                     model,
                     sandbox,
+                    effective_turn_guidance(agent.project_path),
                 )
                 _write_json_line(
                     process,
@@ -1405,7 +1407,12 @@ class ClaudePrintAdapter:
             command.append("--dangerously-skip-permissions")
         # Appended rather than replacing the system prompt: this adds one
         # standing constraint and leaves Claude Code's own instructions intact.
-        command.extend(["--append-system-prompt", TURN_GUIDANCE])
+        command.extend(
+            [
+                "--append-system-prompt",
+                effective_turn_guidance(agent.project_path),
+            ]
+        )
         model = agent.provider_config.get("model")
         if model:
             command.extend(["--model", str(model)])

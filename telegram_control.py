@@ -3472,6 +3472,37 @@ def doctor_command(args: argparse.Namespace) -> None:
     )
 
 
+def config_show_command(args: argparse.Namespace) -> None:
+    """Print the validated effective settings after all requested layers."""
+    config = bridge.load_config()
+    workspace = (
+        str(Path(args.workspace).expanduser().resolve())
+        if args.workspace
+        else None
+    )
+    try:
+        settings = app_config.effective_settings(config, workspace)
+    except app_config.ConfigError as exc:
+        raise StoreError(str(exc)) from None
+    result = {
+        "effective": settings,
+        "layers": {
+            "install": str(bridge.CONFIG_PATH),
+            "workspace": (
+                str(Path(workspace) / app_config.WORKSPACE_CONFIG_NAME)
+                if workspace
+                else None
+            ),
+            "workspace_local": (
+                str(Path(workspace) / app_config.LOCAL_WORKSPACE_CONFIG_NAME)
+                if workspace
+                else None
+            ),
+        },
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
 def retry_command(args: argparse.Namespace) -> None:
     with open_store(args.db) as store:
         count = store.retry_dead(args.queue)
@@ -3801,7 +3832,33 @@ def build_parser() -> argparse.ArgumentParser:
     console_status_parser.add_argument("agent", help="Hierarchical managed-agent name.")
     console_status_parser.set_defaults(function=console_status_command)
 
-    doctor_parser = subparsers.add_parser("doctor", help="Check Stage 1 prerequisites.")
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Inspect validated layered Telegram Control settings.",
+    )
+    config_subparsers = config_parser.add_subparsers(
+        dest="config_command",
+        required=True,
+    )
+    config_show_parser = config_subparsers.add_parser(
+        "show",
+        help="Show effective settings and their file locations.",
+    )
+    config_show_parser.add_argument(
+        "--effective",
+        action="store_true",
+        help="Accepted for clarity; effective output is always shown.",
+    )
+    config_show_parser.add_argument(
+        "--workspace",
+        help="Include shared and local settings from this workspace.",
+    )
+    config_show_parser.set_defaults(function=config_show_command)
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Check local Mac readiness and optional capabilities.",
+    )
     doctor_parser.set_defaults(function=doctor_command)
 
     retry_parser = subparsers.add_parser("retry", help="Requeue dead items.")
