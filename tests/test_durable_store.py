@@ -11612,16 +11612,24 @@ class DurableIntegrationTests(unittest.TestCase):
 
                 self.assertEqual(response.params["message_thread_id"], 62)
                 self.assertIn(
-                    "Name: tc--root--telegram-control",
+                    "<code>tc--root--telegram-control</code> · project",
                     response.params["text"],
                 )
-                self.assertIn("State: registered", response.params["text"])
+                self.assertEqual(response.params["parse_mode"], "HTML")
+                self.assertIn("<b>Runtime</b>", response.params["text"])
+                self.assertIn("<b>Workspace</b>", response.params["text"])
                 self.assertIn(
-                    "Model: Default (currently gpt-5.6-sol)",
+                    "<b>State:</b> registered",
                     response.params["text"],
                 )
                 self.assertIn(
-                    "Effort: Default (currently high)",
+                    "<b>Model:</b> "
+                    "<code>Default (currently gpt-5.6-sol)</code>",
+                    response.params["text"],
+                )
+                self.assertIn(
+                    "<b>Effort:</b> "
+                    "<code>Default (currently high)</code>",
                     response.params["text"],
                 )
                 self.assertNotIn("Last turn:", response.params["text"])
@@ -12537,9 +12545,11 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 status = store.claim_outbox("sender-3", now=10**12 + 2)
                 self.assertIn(
-                    "Context: 41% used · 82,500 / 200,000 tokens",
+                    "<b>Context:</b> 41% used · 82,500 / 200,000 tokens",
                     status.params["text"],
                 )
+                self.assertIn("<b>Usage</b>", status.params["text"])
+                self.assertEqual(status.params["parse_mode"], "HTML")
                 store.complete_outbox(
                     status.message_id,
                     "sender-3",

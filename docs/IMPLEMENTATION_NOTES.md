@@ -1601,3 +1601,13 @@ escaped controller content, and balanced HTML. Durable integration coverage
 asserts formatted provider final edits, immediate entity-rejection fallback,
 formatted `/help` sends and edits, and unchanged multi-chunk delivery
 semantics.
+
+The direct `/agent` status command now follows the same controller hierarchy
+instead of emitting one dense plain-text field list. Its escaped HTML card has
+separate **Runtime**, **Workspace**, and conditional **Usage** sections;
+provider, model, effort, workspace, and working-directory identifiers use code
+styling, while labels and section headings provide the scan hierarchy. The
+existing lifecycle, session, model, effort, and provider buttons are unchanged.
+Because `/agent` is handled by a fresh `on_message.py` process, this presentation
+change takes effect on the next command without waiting for the long-running
+workers to reload.

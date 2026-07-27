@@ -76,7 +76,7 @@ TOPICS = (
         "Agents & sessions",
         """Agents and sessions
 
-Use /agent inside a managed topic to inspect its provider, model, effort, session, console, and context usage.
+Use /agent inside a managed topic to inspect a grouped Runtime, Workspace, and Usage card covering its provider, model, effort, state, session, console, and context usage.
 
 The /agent controls can change the current model and effort while preserving the existing conversation, pause or resume the agent, start a fresh session, resume a previous session, or switch providers. Codex and Claude each expose their own supported choices. Reconfiguration waits for an active turn or console to become idle. Ordinary messages in the topic go to its bound agent.
 

@@ -818,23 +818,31 @@ def send_agent_status() -> None:
     with DurableStore(Path(database_path)) as store:
         # Durable project identity, not a directory basename.
         project_name = store.agent_speaker_header(agent.agent_id)
-    workspace_lines = ""
+    workspace_fields: list[tuple[str, str, bool]] = []
     if agent.project_path:
         workspace_name = Path(agent.project_path).name
-        workspace_lines = f"\nWorkspace: {workspace_name}"
+        workspace_fields.append(("Workspace", workspace_name, True))
         workdir = agent.working_directory or agent.project_path
         if workdir != agent.project_path:
             try:
                 relative = Path(workdir).relative_to(agent.project_path)
-                workspace_lines += f"\nWorking directory: {relative}"
-            except ValueError:
-                workspace_lines += (
-                    f"\nWorking directory: {Path(workdir).name}"
+                workspace_fields.append(
+                    ("Working directory", str(relative), True)
                 )
-        workspace_lines += (
-            "\nGit: repository detected"
-            if agent.git_repository_root is not None
-            else "\nGit: not required"
+            except ValueError:
+                workspace_fields.append(
+                    ("Working directory", Path(workdir).name, True)
+                )
+        workspace_fields.append(
+            (
+                "Git",
+                (
+                    "repository detected"
+                    if agent.git_repository_root is not None
+                    else "not required"
+                ),
+                False,
+            )
         )
     session = "not started" if not agent.provider_session_id else "persisted"
     console_state = console.state if console is not None else "stopped"
@@ -843,8 +851,7 @@ def send_agent_status() -> None:
         agent.provider_config,
         agent.project_path,
     )
-    usage_line = ""
-    context_line = ""
+    usage_fields: list[tuple[str, str]] = []
     if usage is not None:
         input_tokens = int(usage.get("input_tokens", 0))
         cached_tokens = int(
@@ -854,29 +861,53 @@ def send_agent_status() -> None:
             )
         )
         output_tokens = int(usage.get("output_tokens", 0))
-        usage_line = (
-            "\nLast turn: "
-            f"{input_tokens:,} input ({cached_tokens:,} cached) · "
-            f"{output_tokens:,} output"
+        usage_fields.append(
+            (
+                "Last turn",
+                f"{input_tokens:,} input ({cached_tokens:,} cached) · "
+                f"{output_tokens:,} output",
+            )
         )
         context_summary = context_usage_summary(usage)
         if context_summary is not None:
-            context_line = f"\nContext: {context_summary}"
+            usage_fields.insert(0, ("Context", context_summary))
+    escape = telegram_formatting.escape_html
+    provider_name = "Claude" if agent.provider == "claude" else "Codex"
+    lines = [
+        "<b>Managed agent</b>",
+        (
+            f"<code>{escape(agent.hierarchical_name)}</code> · "
+            f"{escape(agent.role)}"
+        ),
+        "",
+        "<b>Runtime</b>",
+        f"<b>Provider:</b> <code>{escape(provider_name)}</code>",
+        f"<b>Model:</b> <code>{escape(model_name)}</code>",
+        f"<b>Effort:</b> <code>{escape(effort_name)}</code>",
+        f"<b>State:</b> {escape(agent.lifecycle_state)}",
+        f"<b>Session:</b> {escape(session)}",
+        f"<b>Console:</b> {escape(console_state)}",
+        "",
+        "<b>Workspace</b>",
+        f"<b>Project:</b> {escape(project_name)}",
+    ]
+    for label, value, use_code in workspace_fields:
+        rendered_value = (
+            f"<code>{escape(value)}</code>"
+            if use_code
+            else escape(value)
+        )
+        lines.append(f"<b>{escape(label)}:</b> {rendered_value}")
+    if usage_fields:
+        lines.extend(["", "<b>Usage</b>"])
+        lines.extend(
+            f"<b>{escape(label)}:</b> {escape(value)}"
+            for label, value in usage_fields
+        )
     send_message(
-        "Managed agent\n\n"
-        f"Name: {agent.hierarchical_name}\n"
-        f"Role: {agent.role}\n"
-        f"Provider: {agent.provider}\n"
-        f"Model: {model_name}\n"
-        f"Effort: {effort_name}\n"
-        f"Project: {project_name}"
-        f"{workspace_lines}\n"
-        f"State: {agent.lifecycle_state}\n"
-        f"Session: {session}\n"
-        f"Console: {console_state}"
-        f"{context_line}"
-        f"{usage_line}",
+        "\n".join(lines),
         reply_markup=keyboard,
+        parse_mode="HTML",
     )
 
 
