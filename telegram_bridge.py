@@ -803,6 +803,13 @@ def process_update(
             # add-to-group link, so it gets the paired identity from the same
             # config the worker already loaded rather than re-reading it.
             "TELEGRAM_BOT_USERNAME": str(config.get("bot_username", "")),
+            # Product settings are non-secret and are handed to the fresh
+            # per-update handler from the worker's already-loaded config.
+            "TELEGRAM_CONTROL_SETTINGS_JSON": json.dumps(
+                config.get("telegram_control", {}),
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
             "TELEGRAM_CALLBACK_QUERY_ID": str(
                 callback_query.get("id", "") if isinstance(callback_query, dict) else ""
             ),

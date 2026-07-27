@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import app_config
 import claude_sessions
 import codex_sessions
 import detached_worker
@@ -57,10 +58,51 @@ CONTROL_SPEAKER = "🎛 Control"
 # Binding a folder is the one thing a new group cannot infer, so every entry
 # point asks for it directly instead of waiting to be told.
 WORKSPACE_QUESTION = (
+    "Which folder should this group work in? Reply with an exact path like "
+    "~/Software/my-project. I will validate it and ask you to confirm before "
+    "binding anything."
+)
+CONTROL_WORKSPACE_QUESTION = (
     "Which folder should this group work in? Reply with a path like "
-    "~/Software/my-project, or just describe the project and I will find it "
+    "~/Software/my-project, or describe the project and Control will find it "
     "and confirm before binding anything."
 )
+
+
+def effective_app_settings(workspace_path: Optional[str] = None) -> dict:
+    try:
+        encoded = os.environ.get("TELEGRAM_CONTROL_SETTINGS_JSON")
+        if encoded is not None:
+            install_settings = json.loads(encoded)
+            if not isinstance(install_settings, dict):
+                raise app_config.ConfigError(
+                    "Handler Telegram Control settings must be an object."
+                )
+            bridge_config = {"telegram_control": install_settings}
+        else:
+            bridge_config = bridge.load_config()
+        return app_config.effective_settings(
+            bridge_config,
+            workspace_path,
+        )
+    except (
+        app_config.ConfigError,
+        bridge.BridgeError,
+        json.JSONDecodeError,
+    ) as exc:
+        raise StoreError(str(exc)) from None
+
+
+def control_agent_enabled() -> bool:
+    return bool(effective_app_settings()["control_agent"]["enabled"])
+
+
+def workspace_question() -> str:
+    return (
+        CONTROL_WORKSPACE_QUESTION
+        if control_agent_enabled()
+        else WORKSPACE_QUESTION
+    )
 def deliver_api_call(
     method: str,
     params: dict,
@@ -976,9 +1018,20 @@ def enqueue_router_input(
         )
 
 
-def proposed_forum_setup(text: str) -> Optional[dict]:
-    """Recognize an explicit first-message forum setup with a local path."""
-    if not re.search(r"\b(?:set\s*up|bind|workspace)\b", text, re.IGNORECASE):
+def proposed_forum_setup(
+    text: str,
+    *,
+    require_intent: bool = True,
+) -> Optional[dict]:
+    """Recognize a forum workspace path without asking an LLM to resolve it."""
+    if (
+        require_intent
+        and not re.search(
+            r"\b(?:set\s*up|bind|workspace)\b",
+            text,
+            re.IGNORECASE,
+        )
+    ):
         return None
     lowered = text.casefold()
     mentions_codex = bool(re.search(r"\bcodex\b", lowered))
@@ -1012,10 +1065,186 @@ def proposed_forum_setup(text: str) -> Optional[dict]:
             "project_path": workspace_root,
             "working_directory": workdir,
             "git_repository_root": git_root,
-            "provider": "claude" if mentions_claude else "codex",
-            "provider_config": {},
+            "requested_provider": (
+                "claude"
+                if mentions_claude
+                else "codex"
+                if mentions_codex
+                else None
+            ),
         }
     return None
+
+
+def forum_setup_providers(setup: dict) -> list[str]:
+    """Resolve provider choices from explicit text, settings, and local CLIs."""
+    availability = provider_adapters.provider_availability()
+    requested = setup.get("requested_provider")
+    if requested is not None:
+        return [requested] if availability.get(str(requested)) else []
+
+    settings = effective_app_settings(str(setup["project_path"]))
+    preferred = str(settings["defaults"]["provider"])
+    if preferred != "auto":
+        return [preferred] if availability.get(preferred) else []
+    return [
+        provider
+        for provider in ("claude", "codex")
+        if availability.get(provider)
+    ]
+
+
+def send_forum_binding_prompt(
+    setup: dict,
+    *,
+    display_name: str,
+    already_authorized: bool,
+) -> bool:
+    """Offer one deterministic, confirmation-gated forum binding."""
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    user_id_text = os.environ.get("TELEGRAM_FROM_ID")
+    if not all(
+        (
+            database_path,
+            job_id,
+            chat_id_text,
+            thread_id_text,
+            user_id_text,
+        )
+    ):
+        raise StoreError("Forum workspace binding requires the durable controller.")
+    chat_id = int(chat_id_text)
+    thread_id = int(thread_id_text)
+    providers = forum_setup_providers(setup)
+    requested = setup.get("requested_provider")
+    if not providers:
+        detail = (
+            f"{str(requested).title()} was requested, but its CLI is not installed."
+            if requested
+            else "Neither Claude Code nor Codex is installed."
+        )
+        send_message(
+            f"❌ {detail}\n\n"
+            "Install and authenticate at least one provider, then send /bind "
+            "with the workspace path again."
+        )
+        return True
+
+    buttons = []
+    with DurableStore(Path(database_path)) as store:
+        for provider in providers:
+            payload = {
+                "chat_id": chat_id,
+                "display_name": display_name,
+                "project_path": setup["project_path"],
+                "working_directory": setup["working_directory"],
+                "git_repository_root": setup["git_repository_root"],
+                "provider": provider,
+                "provider_config": {},
+                "already_authorized": already_authorized,
+            }
+            action = store.create_callback_action(
+                operation_id=(
+                    f"inbox:{job_id}:direct-bind-forum:{provider}"
+                ),
+                action_type="authorize_bind_forum",
+                payload=payload,
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=int(user_id_text),
+                one_time=True,
+                ttl_seconds=60 * 60,
+            )
+            provider_name = "Claude" if provider == "claude" else "Codex"
+            buttons.append(
+                [
+                    {
+                        "text": (
+                            "Authorize and bind"
+                            if len(providers) == 1 and not already_authorized
+                            else f"Use {provider_name}"
+                        ),
+                        "callback_data": f"a:{action.token}",
+                    }
+                ]
+            )
+        cancel = store.create_callback_action(
+            operation_id=f"inbox:{job_id}:direct-bind-forum-cancel",
+            action_type="authorize_bind_forum_cancel",
+            payload={
+                "chat_id": chat_id,
+                "display_name": display_name,
+                "already_authorized": already_authorized,
+            },
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            authorized_user_id=int(user_id_text),
+            one_time=True,
+            ttl_seconds=60 * 60,
+        )
+    buttons.append(
+        [{"text": "Cancel", "callback_data": f"a:{cancel.token}"}]
+    )
+    if len(providers) == 1:
+        provider_name = "Claude" if providers[0] == "claude" else "Codex"
+        provider_line = f"Provider: {provider_name}"
+        question = (
+            f"Bind {display_name} to this workspace?"
+            if already_authorized
+            else f"Set up {display_name} for this workspace?"
+        )
+    else:
+        provider_line = "Provider: choose below"
+        question = (
+            f"Choose {display_name}’s default agent and bind this workspace."
+        )
+    send_message(
+        f"{question}\n\n"
+        f"Workspace: {setup['project_path']}\n"
+        f"{provider_line}\n\n"
+        + (
+            "The forum is already authorized. Nothing is bound until you confirm."
+            if already_authorized
+            else "This authorizes the private forum and binds its topics to "
+            "that workspace. Nothing changes until you confirm."
+        )
+        + f"\n\n{telegram_help.HELP_HINT}",
+        reply_markup={"inline_keyboard": buttons},
+    )
+    return True
+
+
+def prompt_direct_forum_binding(text: str) -> bool:
+    """Complete an authorized forum's binding without the Control agent."""
+    if control_agent_enabled() or not awaiting_forum_workspace():
+        return False
+    command = addressed_command(text)
+    candidate_text = (
+        command[len("/bind") :].strip()
+        if command.lower().startswith("/bind")
+        else text
+    )
+    setup = proposed_forum_setup(candidate_text, require_intent=False)
+    if setup is None:
+        send_message(
+            "I need an exact existing folder path before this group can start.\n\n"
+            "Send /bind followed by a path, for example:\n"
+            "/bind ~/Software/my-project\n\n"
+            "Folder descriptions are available only when the optional Control "
+            "agent is enabled."
+        )
+        return True
+    return send_forum_binding_prompt(
+        setup,
+        display_name=(
+            os.environ.get("TELEGRAM_CHAT_TITLE")
+            or f"Forum {os.environ.get('TELEGRAM_CHAT_ID', '')}"
+        ).strip(),
+        already_authorized=True,
+    )
 
 
 def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
@@ -1052,59 +1281,11 @@ def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
             return True
         setup = proposed_forum_setup(text) if text else None
         if setup is not None:
-            payload = {
-                "chat_id": chat_id,
-                "display_name": display_name,
-                **setup,
-            }
-            confirm = store.create_callback_action(
-                operation_id=f"inbox:{job_id}:authorize-bind-forum",
-                action_type="authorize_bind_forum",
-                payload=payload,
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                authorized_user_id=int(user_id_text),
-                one_time=True,
-                ttl_seconds=60 * 60,
+            return not send_forum_binding_prompt(
+                setup,
+                display_name=display_name,
+                already_authorized=False,
             )
-            cancel = store.create_callback_action(
-                operation_id=f"inbox:{job_id}:authorize-bind-forum-cancel",
-                action_type="authorize_bind_forum_cancel",
-                payload={
-                    "chat_id": chat_id,
-                    "display_name": display_name,
-                },
-                chat_id=chat_id,
-                message_thread_id=thread_id,
-                authorized_user_id=int(user_id_text),
-                one_time=True,
-                ttl_seconds=60 * 60,
-            )
-            send_message(
-                f"Set up {display_name} for this workspace?\n\n"
-                f"Workspace: {setup['project_path']}\n"
-                f"Provider: {setup['provider']}\n\n"
-                "This authorizes the private forum and binds its topics to "
-                "that workspace. Nothing changes until you confirm.\n\n"
-                f"{telegram_help.HELP_HINT}",
-                reply_markup={
-                    "inline_keyboard": [
-                        [
-                            {
-                                "text": "Authorize and bind",
-                                "callback_data": f"a:{confirm.token}",
-                            }
-                        ],
-                        [
-                            {
-                                "text": "Cancel",
-                                "callback_data": f"a:{cancel.token}",
-                            }
-                        ],
-                    ]
-                },
-            )
-            return False
         action = store.create_callback_action(
             operation_id=f"inbox:{job_id}:authorize-forum",
             action_type="authorize_forum",
@@ -1124,7 +1305,7 @@ def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
         f"Only your paired Telegram account will be accepted. Add {bot_label()} "
         "as a forum administrator so ordinary text and voice messages reach "
         "the controller.\n\n"
-        f"{WORKSPACE_QUESTION}\n\n"
+        f"{workspace_question()}\n\n"
         f"{telegram_help.HELP_HINT}",
         reply_markup={
             "inline_keyboard": [
@@ -1258,6 +1439,26 @@ def forum_workspace_path() -> Optional[str]:
     with DurableStore(Path(database_path)) as store:
         workspace = store.resolve_forum_workspace(int(chat_id_text))
     return workspace.project_path if workspace is not None else None
+
+
+def forum_subject_requires_confirmation() -> bool:
+    workspace = forum_workspace_path()
+    if workspace is None:
+        return False
+    return bool(
+        effective_app_settings(workspace)["topics"]["confirm_agent"]
+    )
+
+
+def provision_direct_forum_subject(*, first_turn_queued: bool = False):
+    """Create a bound topic agent from group defaults and introduce it once."""
+    result = ensure_bound_forum_subject()
+    if result is None:
+        return None
+    subject, created = result
+    if created:
+        send_topic_intro(subject.display_name, first_turn_queued)
+    return subject
 
 
 def prompt_forum_subject_provider_selection(
@@ -2023,7 +2224,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             + (
                 "Send your text or voice request in this topic again."
                 if already_bound
-                else WORKSPACE_QUESTION
+                else workspace_question()
             )
             + f"\n\n{telegram_help.HELP_HINT}"
         )
@@ -2060,7 +2261,11 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 },
                 "forum-setup-clear",
             )
-            send_message("Cancelled. The forum was not authorized or bound.")
+            send_message(
+                "Cancelled. The forum remains authorized but unbound."
+                if bool(action.payload.get("already_authorized"))
+                else "Cancelled. The forum was not authorized or bound."
+            )
             return
         required = {
             "project_path",
@@ -2122,9 +2327,16 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "forum-setup-clear",
         )
         send_message(
-            f"✅ {workspace.display_name} is authorized and bound.\n\n"
-            "Create or open any topic and send your request. Its subject "
-            "agent will be created automatically.\n\n"
+            f"✅ {workspace.display_name} is "
+            + (
+                "bound"
+                if bool(action.payload.get("already_authorized"))
+                else "authorized and bound"
+            )
+            + ".\n\n"
+            "Create or open any topic and send your request. Its agent starts "
+            "automatically with this group’s defaults; use /agent inside a "
+            "topic whenever you want different settings.\n\n"
             f"{telegram_help.HELP_HINT}"
         )
         return
@@ -4349,11 +4561,14 @@ def route_user_input(
             and route.target_type == "controller"
             and route.target_id == "control"
         ):
-            enqueue_router_input(
-                build_router_reply_input(update, route, text),
-                replied_message_id=route.telegram_message_id,
-                receipt_text=receipt_text,
-            )
+            if control_agent_enabled():
+                enqueue_router_input(
+                    build_router_reply_input(update, route, text),
+                    replied_message_id=route.telegram_message_id,
+                    receipt_text=receipt_text,
+                )
+            else:
+                send_direct_mode_home()
         elif route is not None and route.target_type == "agent":
             if not try_enqueue_agent_steer(route, text):
                 binding = current_surface_binding()
@@ -4377,17 +4592,25 @@ def route_user_input(
             send_message("That replied-to message has no active durable route.")
         return
 
-    if prompt_forum_subject_provider_selection(
-        request_was_already_sent=True,
-        pending_request=text,
+    if prompt_direct_forum_binding(text):
+        return
+    if (
+        forum_subject_requires_confirmation()
+        and prompt_forum_subject_provider_selection(
+            request_was_already_sent=True,
+            pending_request=text,
+        )
     ):
         return
-    ensure_bound_forum_subject()
+    provision_direct_forum_subject(first_turn_queued=True)
     binding = current_surface_binding()
     thread_id = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID")
     router_text = router_input_for_surface(text)
     if thread_id and binding is None:
-        enqueue_router_input(router_text, receipt_text=receipt_text)
+        if control_agent_enabled():
+            enqueue_router_input(router_text, receipt_text=receipt_text)
+        else:
+            send_direct_mode_home()
     elif thread_id and binding is not None:
         if binding.target_type == "agent":
             enqueue_agent_input(
@@ -4399,13 +4622,36 @@ def route_user_input(
             binding.target_type == "controller"
             and binding.target_id == "control"
         ):
-            enqueue_router_input(router_text, receipt_text=receipt_text)
+            if control_agent_enabled():
+                enqueue_router_input(router_text, receipt_text=receipt_text)
+            else:
+                send_direct_mode_home()
         else:
             send_message(
                 "This topic's controller binding does not accept messages yet."
             )
     else:
-        enqueue_router_input(router_text, receipt_text=receipt_text)
+        if control_agent_enabled():
+            enqueue_router_input(router_text, receipt_text=receipt_text)
+        else:
+            send_direct_mode_home()
+
+
+def send_direct_mode_home() -> None:
+    """Explain the deterministic surface instead of silently invoking Control."""
+    if os.environ.get("TELEGRAM_CHAT_TYPE") == "supergroup":
+        send_message(
+            "This group does not have a workspace yet.\n\n"
+            "Send /bind followed by an exact folder path, for example:\n"
+            "/bind ~/Software/my-project"
+        )
+        return
+    send_message(
+        "This chat is the setup and administration home.\n\n"
+        "Send /newgroup to connect a workspace, /projects to inspect existing "
+        "workspaces, or /help for the guide. Work happens directly inside each "
+        "group’s topics."
+    )
 
 
 def main() -> int:
@@ -4427,10 +4673,18 @@ def main() -> int:
             topic_name = str(message["forum_topic_created"].get("name", ""))
             print(f"Received new forum topic: {topic_name}", flush=True)
             if forum_is_authorized_or_prompt():
-                prompt_forum_subject_provider_selection()
+                if forum_subject_requires_confirmation():
+                    prompt_forum_subject_provider_selection()
+                else:
+                    provision_direct_forum_subject()
         elif message and "voice" in message:
             print(f"Received voice message from @{username}.", flush=True)
             if forum_is_authorized_or_prompt():
+                if not control_agent_enabled() and awaiting_forum_workspace():
+                    prompt_direct_forum_binding(
+                        transcribe_voice_note(message["voice"])
+                    )
+                    return 0
                 if (
                     not os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
                     and forum_subject_setup_pending()
@@ -4438,12 +4692,25 @@ def main() -> int:
                     # Transcribe before the setup card so the voice note itself
                     # can run as the first turn; re-recording it would be worse
                     # than the few seconds this costs.
-                    if prompt_forum_subject_provider_selection(
-                        request_was_already_sent=True,
-                        pending_request=transcribe_voice_note(
-                            message["voice"]
-                        ),
+                    if forum_subject_requires_confirmation():
+                        if prompt_forum_subject_provider_selection(
+                            request_was_already_sent=True,
+                            pending_request=transcribe_voice_note(
+                                message["voice"]
+                            ),
+                        ):
+                            return 0
+                    else:
+                        provision_direct_forum_subject(
+                            first_turn_queued=True,
+                        )
+                if not control_agent_enabled():
+                    direct_binding = current_surface_binding()
+                    if (
+                        direct_binding is None
+                        or direct_binding.target_type != "agent"
                     ):
+                        send_direct_mode_home()
                         return 0
                 handle_voice(update, message["voice"])
         elif message and inbound_attachment(message) is not None:
@@ -4491,6 +4758,12 @@ def main() -> int:
                 send_project_catalog()
             elif command.lower() == "/newgroup":
                 send_group_setup_card()
+            elif command.lower().startswith("/bind"):
+                if not prompt_direct_forum_binding(text):
+                    send_message(
+                        "Use /bind inside an authorized private group that "
+                        "still needs a workspace."
+                    )
             elif re.fullmatch(r"/start(?:\s.*)?", command, re.DOTALL):
                 # The startgroup deep link delivers /start with a payload once
                 # Telegram finishes adding the bot. That is an arrival, not a
@@ -4506,7 +4779,11 @@ def main() -> int:
             elif agent_create is not None:
                 create_agent_from_catalog(agent_create.group(1))
             elif command.lower() in {"/agent", "/agent status"}:
-                if not prompt_forum_subject_provider_selection():
+                if forum_subject_requires_confirmation():
+                    if not prompt_forum_subject_provider_selection():
+                        send_agent_status()
+                else:
+                    provision_direct_forum_subject()
                     send_agent_status()
             else:
                 route_user_input(update, text)

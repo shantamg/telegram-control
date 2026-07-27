@@ -25,6 +25,40 @@ class ProviderAdapterError(StoreError):
     """Raised when a provider cannot complete a normalized turn."""
 
 
+PROVIDER_BINARY_CANDIDATES = {
+    "codex": (
+        Path("/opt/homebrew/bin/codex"),
+        Path("/usr/local/bin/codex"),
+    ),
+    "claude": (
+        Path.home() / ".local" / "bin" / "claude",
+        Path("/opt/homebrew/bin/claude"),
+        Path("/usr/local/bin/claude"),
+    ),
+}
+
+
+def provider_binary(provider: str) -> Optional[str]:
+    """Return an installed provider CLI without constructing an adapter."""
+    if provider not in PROVIDER_BINARY_CANDIDATES:
+        raise ProviderAdapterError(f"Unknown provider: {provider}")
+    discovered = shutil.which(provider)
+    if discovered:
+        return discovered
+    for candidate in PROVIDER_BINARY_CANDIDATES[provider]:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def provider_availability() -> dict[str, Optional[str]]:
+    """Return the local Claude/Codex capability map used by setup and doctor."""
+    return {
+        provider: provider_binary(provider)
+        for provider in ("claude", "codex")
+    }
+
+
 class ProviderTurnCancelled(ProviderAdapterError):
     """Raised after a running provider turn has been cancelled."""
 
@@ -504,15 +538,7 @@ class CodexExecAdapter:
         control_timeout_seconds: float = 30.0,
         _popen_factory: Callable[..., Any] = subprocess.Popen,
     ):
-        self.binary = binary or shutil.which("codex")
-        if not self.binary:
-            for candidate in (
-                Path("/opt/homebrew/bin/codex"),
-                Path("/usr/local/bin/codex"),
-            ):
-                if candidate.is_file():
-                    self.binary = str(candidate)
-                    break
+        self.binary = binary or provider_binary("codex")
         if not self.binary:
             raise ProviderAdapterError("Codex CLI is not installed.")
         self.timeout_seconds = int(timeout_seconds)
@@ -1270,16 +1296,7 @@ class ClaudePrintAdapter:
         control_timeout_seconds: float = 30.0,
         _popen_factory: Callable[..., Any] = subprocess.Popen,
     ):
-        self.binary = binary or shutil.which("claude")
-        if not self.binary:
-            for candidate in (
-                Path.home() / ".local" / "bin" / "claude",
-                Path("/opt/homebrew/bin/claude"),
-                Path("/usr/local/bin/claude"),
-            ):
-                if candidate.is_file():
-                    self.binary = str(candidate)
-                    break
+        self.binary = binary or provider_binary("claude")
         if not self.binary:
             raise ProviderAdapterError("Claude Code CLI is not installed.")
         self.timeout_seconds = int(timeout_seconds)

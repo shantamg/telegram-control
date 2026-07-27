@@ -715,6 +715,9 @@ class DurableStoreTests(unittest.TestCase):
             "TELEGRAM_MESSAGE_THREAD_ID": "",
             "TELEGRAM_FROM_ID": "123",
             "TELEGRAM_FROM_USERNAME": "tester",
+            "TELEGRAM_CONTROL_SETTINGS_JSON": json.dumps(
+                {"control_agent": {"enabled": True}}
+            ),
         }
         with mock.patch.dict(os.environ, environment, clear=True):
             with mock.patch.object(
@@ -2979,7 +2982,15 @@ class DurableStoreTests(unittest.TestCase):
             self.assertRegex(command["command"], r"^[a-z0-9_]{1,32}$")
             self.assertTrue(1 <= len(command["description"]) <= 256)
             self.assertIn(f"/{command['command']}", telegram_help.HOME_TEXT)
-        for handled in ("help", "agent", "status", "projects", "newgroup", "teardown"):
+        for handled in (
+            "help",
+            "agent",
+            "status",
+            "projects",
+            "newgroup",
+            "bind",
+            "teardown",
+        ):
             self.assertIn(handled, [command["command"] for command in commands])
 
     def _leased_forum_subject(self, workspace):
@@ -6611,6 +6622,9 @@ class DurableIntegrationTests(unittest.TestCase):
             config = {
                 "chat_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             with DurableStore(database_path) as store:
                 store.ingest_update(message_update(), now=100)
@@ -6630,6 +6644,29 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertEqual(
                     store.status_counts()["router_mailbox"],
                     {"queued": 1},
+                )
+
+    def test_private_chat_is_admin_home_in_direct_mode(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                store.ingest_update(message_update(), now=100)
+                job = store.claim_job("worker", now=100, lease_seconds=60)
+
+                telegram_control.process_inbox_job(store, config, job, "worker")
+
+                reply = store.claim_outbox("sender", now=10**12)
+                self.assertIn(
+                    "setup and administration home",
+                    reply.params["text"],
+                )
+                self.assertEqual(
+                    store.status_counts().get("router_mailbox", {}),
+                    {},
                 )
 
     def test_router_dispatches_atomically_and_relays_agent_response(self):
@@ -6684,6 +6721,9 @@ class DurableIntegrationTests(unittest.TestCase):
             config = {
                 "chat_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             fake = FakeRouterAdapter()
             created_root = Path(temporary_directory) / "secret-local-path"
@@ -6963,6 +7003,9 @@ class DurableIntegrationTests(unittest.TestCase):
             config = {
                 "chat_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             fake = FakeRouterAdapter()
             with DurableStore(database_path) as store:
@@ -7091,6 +7134,9 @@ class DurableIntegrationTests(unittest.TestCase):
             config = {
                 "chat_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             with DurableStore(database_path) as store:
                 store.enroll_project(
@@ -7241,6 +7287,9 @@ class DurableIntegrationTests(unittest.TestCase):
             config = {
                 "chat_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             with DurableStore(database_path) as store:
                 store.ingest_update(
@@ -7362,6 +7411,9 @@ class DurableIntegrationTests(unittest.TestCase):
             config = {
                 "chat_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             with DurableStore(database_path) as store:
                 store.ingest_update(
@@ -7469,6 +7521,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 "chat_id": 123,
                 "owner_user_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             update = topic_message_update(
                 10,
@@ -7876,6 +7931,9 @@ class DurableIntegrationTests(unittest.TestCase):
             config = {
                 "chat_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             fake = FakeRouterAdapter()
             with DurableStore(database_path) as store:
@@ -8093,6 +8151,9 @@ class DurableIntegrationTests(unittest.TestCase):
             config = {
                 "chat_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             with DurableStore(database_path) as store:
                 store.ingest_update(message_update(), now=100)
@@ -8243,6 +8304,9 @@ class DurableIntegrationTests(unittest.TestCase):
             config = {
                 "chat_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             with DurableStore(database_path) as store:
                 store.ingest_update(message_update(), now=100)
@@ -8618,6 +8682,9 @@ class DurableIntegrationTests(unittest.TestCase):
             config = {
                 "chat_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             with DurableStore(database_path) as store:
                 store.ingest_update(message_update(), now=100)
@@ -9194,6 +9261,9 @@ class DurableIntegrationTests(unittest.TestCase):
             config = {
                 "chat_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             with DurableStore(database_path) as store:
                 store.ensure_surface_binding(
@@ -9557,6 +9627,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 "chat_id": 123,
                 "owner_user_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "topics": {"confirm_agent": True},
+                },
             }
             forum_chat = {
                 "id": -100777,
@@ -9772,7 +9845,7 @@ class DurableIntegrationTests(unittest.TestCase):
                     "Help me organize today's notes.",
                 )
 
-    def test_first_request_starts_topic_in_one_tap_without_resending(self):
+    def test_first_request_starts_topic_directly_without_resending(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory) / "life"
             workspace.mkdir()
@@ -9820,45 +9893,19 @@ class DurableIntegrationTests(unittest.TestCase):
                 request["message"]["reply_to_message"][
                     "forum_topic_created"
                 ]["name"] = "Icon"
-                process(request, "worker-1", 100)
-
-                # The request must not be thrown away while setup happens.
-                self.assertIsNone(store.resolve_forum_subject(-100777, 62))
-                card = store.claim_outbox("sender", now=10**12)
-                self.assertIn("Start “Icon” with Codex?", card.params["text"])
-                self.assertIn("Your message is saved", card.params["text"])
-                start = store.connection.execute(
-                    """
-                    SELECT token, payload_json FROM callback_actions
-                    WHERE action_type = 'forum_subject_start'
-                        AND state = 'active'
-                    """
-                ).fetchone()
-                self.assertEqual(
-                    json.loads(start["payload_json"])["pending_request"],
-                    "Set the icon of this group to the logo in the repo.",
-                )
-
-                tap = callback_update(
-                    11,
-                    f"a:{start['token']}",
-                    message_id=700,
-                    message_thread_id=62,
-                )
-                tap["callback_query"]["message"]["chat"] = dict(forum_chat)
-                tap_job = process(tap, "worker-2", 101)
+                request_job = process(request, "worker-1", 100)
 
                 subject = store.resolve_forum_subject(-100777, 62)
                 self.assertIsNotNone(subject)
                 agent = store.resolve_agent(subject.agent_id)
                 self.assertEqual(agent.provider, "codex")
-                # One tap, and the held request is what actually runs.
+                # The group's confirmed default is enough to start immediately.
                 mailbox = store.connection.execute(
                     """
                     SELECT agent_id, input_text FROM agent_mailbox
                     WHERE source_inbox_job_id = ?
                     """,
-                    (tap_job.job_id,),
+                    (request_job.job_id,),
                 ).fetchone()
                 self.assertEqual(str(mailbox["agent_id"]), subject.agent_id)
                 self.assertEqual(
@@ -9886,6 +9933,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 "chat_id": 123,
                 "owner_user_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "topics": {"confirm_agent": True},
+                },
             }
             forum_chat = {
                 "id": -100777,
@@ -9994,6 +10044,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 "chat_id": 123,
                 "owner_user_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             forum_chat = {
                 "id": -100777,
@@ -10162,6 +10215,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 "owner_user_id": 123,
                 "bot_username": "example_bot",
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             forum_chat = {
                 "id": -100777,
@@ -10484,6 +10540,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 "chat_id": 123,
                 "owner_user_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
 
             def forum_update(update_id, text):
@@ -10786,6 +10845,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 "chat_id": 123,
                 "owner_user_id": 123,
                 "handler_path": str(Path(on_message.__file__).resolve()),
+                "telegram_control": {
+                    "control_agent": {"enabled": True},
+                },
             }
             update = topic_message_update(
                 10,
@@ -10942,6 +11004,10 @@ class DurableIntegrationTests(unittest.TestCase):
                     on_message.discovery,
                     "load_discovery_roots",
                     return_value=[root.resolve()],
+                ), mock.patch.object(
+                    on_message.provider_adapters,
+                    "provider_availability",
+                    return_value={"claude": "/bin/claude", "codex": None},
                 ):
                     with mock.patch.object(
                         on_message.sys,
@@ -11007,6 +11073,121 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 self.assertEqual(workspace_record.provider, "claude")
                 self.assertEqual(workspace_record.provider_config, {})
+
+    def test_authorized_forum_binds_exact_path_without_control_agent(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            workspace = root / "life"
+            workspace.mkdir()
+            database_path = root / "controller.sqlite3"
+            update = topic_message_update(
+                10,
+                f"/bind {workspace} using Claude",
+            )
+            update["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Life",
+                "is_forum": True,
+            }
+            update["message"]["reply_to_message"]["forum_topic_created"][
+                "name"
+            ] = "General"
+            with DurableStore(database_path) as store:
+                store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Life",
+                    target_type="controller",
+                    target_id="control",
+                    now=90,
+                )
+                store.ingest_update(update, now=100)
+                job = store.connection.execute(
+                    "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+                ).fetchone()
+
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": str(job["job_id"]),
+                "TELEGRAM_CONTROL_SETTINGS_JSON": "{}",
+                "TELEGRAM_CHAT_ID": "-100777",
+                "TELEGRAM_CHAT_TYPE": "supergroup",
+                "TELEGRAM_CHAT_TITLE": "Life",
+                "TELEGRAM_TOPIC_NAME": "General",
+                "TELEGRAM_MESSAGE_ID": "99",
+                "TELEGRAM_MESSAGE_THREAD_ID": "62",
+                "TELEGRAM_REPLY_TO_MESSAGE_ID": "",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_FROM_USERNAME": "tester",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    on_message.discovery,
+                    "load_discovery_roots",
+                    return_value=[root.resolve()],
+                ), mock.patch.object(
+                    on_message.provider_adapters,
+                    "provider_availability",
+                    return_value={"claude": "/bin/claude", "codex": None},
+                ), mock.patch.object(
+                    on_message.sys,
+                    "stdin",
+                    StringIO(json.dumps(update)),
+                ):
+                    self.assertEqual(on_message.main(), 0)
+
+            with DurableStore(database_path) as store:
+                self.assertEqual(
+                    store.status_counts().get("router_mailbox", {}),
+                    {},
+                )
+                prompt = store.claim_outbox("sender", now=10**12)
+                self.assertIn("Bind Life to this workspace?", prompt.params["text"])
+                buttons = prompt.params["reply_markup"]["inline_keyboard"]
+                self.assertEqual(
+                    [row[0]["text"] for row in buttons],
+                    ["Use Claude", "Cancel"],
+                )
+                callback = callback_update(
+                    11,
+                    buttons[0][0]["callback_data"],
+                    message_id=700,
+                    message_thread_id=62,
+                )
+                callback["callback_query"]["message"]["chat"] = dict(
+                    update["message"]["chat"]
+                )
+                store.ingest_update(callback, now=101)
+                callback_job = store.connection.execute(
+                    "SELECT job_id FROM inbox_jobs WHERE update_id = 11"
+                ).fetchone()
+
+            callback_environment = {
+                **environment,
+                "TELEGRAM_CONTROL_JOB_ID": str(callback_job["job_id"]),
+                "TELEGRAM_MESSAGE_ID": "700",
+            }
+            with mock.patch.dict(
+                os.environ,
+                callback_environment,
+                clear=False,
+            ), mock.patch.object(
+                on_message.sys,
+                "stdin",
+                StringIO(json.dumps(callback)),
+            ):
+                self.assertEqual(on_message.main(), 0)
+
+            with DurableStore(database_path) as store:
+                bound = store.resolve_forum_workspace(-100777)
+                self.assertIsNotNone(bound)
+                self.assertEqual(bound.project_path, str(workspace.resolve()))
+                self.assertEqual(bound.provider, "claude")
+                self.assertEqual(
+                    store.status_counts().get("router_mailbox", {}),
+                    {},
+                )
 
     def test_status_command_reuses_existing_project_topic_binding(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

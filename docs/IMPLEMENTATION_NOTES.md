@@ -1377,3 +1377,41 @@ runtime components only if it can do so without losing queued messages.
 
 Prerequisites, first-time setup, runtime state locations, the test command, and
 the security boundary are documented in [../README.md](../README.md).
+
+## Direct mode is the default
+
+The conversational Control agent is no longer part of the required request
+path. Built-in settings disable it by default, and the supervisor omits
+`work-router` unless `telegram_control.control_agent.enabled` is explicitly
+true. The router schema, worker, and confirmation machinery remain available
+for installations that still want natural-language discovery and delegation.
+
+The paired private bot chat is now a deterministic setup and administration
+home in direct mode. It exposes commands but does not turn arbitrary text,
+voice, or attachments into Codex router work. An authorized group that still
+needs a workspace accepts `/bind <exact-path>` or an exact path as its next
+message. The handler resolves symlinks, enforces configured discovery roots,
+validates the workspace, detects installed Claude and Codex CLIs, and presents
+only locally available providers in a one-time confirmation card. A descriptive
+folder answer continues to use the old discovery router only when Control is
+opted in.
+
+Once a group is bound, its provider choice is sufficient authorization to
+create topic agents. New Telegram topics now inherit the group default
+automatically; their first ordinary message creates the durable subject and is
+queued directly as the first agent turn. The former per-topic confirmation card
+is available through `telegram_control.topics.confirm_agent`, while `/agent`
+continues to expose provider, model, effort, permission, and session changes at
+any time.
+
+Provider discovery is shared by setup and adapters, so Claude and Codex are
+reported independently instead of constructing the wrong adapter to discover a
+missing binary. Non-secret Telegram Control settings are passed from the
+worker's already-loaded config into each fresh handler process, avoiding
+per-turn configuration drift.
+
+Verified with direct-mode tests covering the private admin home, exact-path
+binding with Claude and no router mailbox, provider capability discovery,
+automatic first-message startup, opt-in topic confirmation, and the complete
+legacy Control path when explicitly enabled. The 174 durable-store and
+integration tests pass after both modes were separated.

@@ -28,6 +28,7 @@ COMMANDS = (
     BotCommand("status", "Inspect this Telegram surface"),
     BotCommand("projects", "List enrolled workspaces"),
     BotCommand("newgroup", "Get the link that adds me to a new project group"),
+    BotCommand("bind", "Bind this group to an exact local folder"),
     BotCommand("teardown", "Safely remove this managed topic and session"),
 )
 
