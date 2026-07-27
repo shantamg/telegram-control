@@ -1,292 +1,170 @@
 # Telegram Control
 
-Run local Codex and Claude Code agents from your phone, over Telegram.
+Run Claude Code or Codex on your Mac from Telegram.
 
-Send text, an attachment, or a voice note to your own Telegram bot; a durable
-controller on your Mac saves attachments privately, transcribes voice locally,
-routes the request to the right agent, runs the turn in the real working
-directory, and streams the answer back with buttons you can tap to steer,
-stop, or continue the conversation.
+Telegram Control gives each project its own private Telegram group and each
+conversation its own topic. Send text, files, photos, or optional voice notes;
+the controller durably queues the work, runs the selected coding agent in the
+bound local folder, and streams the answer back to Telegram.
 
+The default experience is deliberately direct:
+
+```text
+private project group
+└── Telegram topic ──▶ one Claude or Codex session in one local workspace
 ```
-Telegram ──▶ collector ──▶ SQLite (durable queues) ──▶ router / agent workers
-   ▲                                                          │
-   └────────────── outbox sender (ordered, idempotent) ◀───────┘
-```
 
-Everything is local: one bot token in the macOS Keychain, one SQLite database,
-one LaunchAgent, and the `codex` / `claude` CLIs you already use. There is no
-server, no webhook, and no third-party service in the request path. Voice
-transcription runs on-device; only optional spoken replies leave the machine.
+There is no required central routing agent. After a group is bound to a folder,
+create a topic and start talking. An older conversational Control layer remains
+available as an opt-in feature for people who want natural-language workspace
+discovery and delegation.
 
-## What it does
+> **Current support:** a single, local Mac. Linux servers, hosted deployment,
+> containers, and multi-host operation are future work, not supported setup
+> paths.
 
-- **Text, attachments, and voice in; text and voice out.** Photos and arbitrary
-  Telegram documents are saved to private durable paths that Codex and Claude
-  can inspect. Voice notes are transcribed on-device with Handy's Parakeet V3
-  model. Transient Telegram voice-download failures retry behind the existing
-  receipt and become visible errors only if every durable attempt fails.
-  Answers can be read aloud on demand via a **🔊 Listen** button.
-- **One bot, many workspaces.** A private Telegram group per project, a topic
-  per agent. Each topic is durably bound to a workspace directory and a
-  persisted Codex or Claude session, so conversations survive restarts.
-- **A conversational Control chat.** The main chat is an agent, not a command
-  parser: it can search your directories (read-only, inside configured roots),
-  inspect projects, dispatch work to project agents, and propose new agents.
-  Every mutation is gated behind a one-time confirmation button.
-- **Live turn control.** Each turn gets a progress card that streams the
-  provider's user-facing output, a **⏹ Stop** button, and reply-to-steer: reply
-  to the card and your text or voice becomes guidance for that exact turn.
-  Stop also clears a locally orphaned turn immediately, so the next queued
-  message is not held behind a dead worker's lease.
-- **Durability as the design.** Every update, job, and outbound API call is
-  committed to SQLite before it is acted on, with leases, retries, dead-letter
-  states, and a single ordered delivery lock. Killing any process mid-turn
-  loses nothing.
-- **Recoverable detached workers** for jobs that must outlive a one-shot turn.
-  Each keeps a durable recovery inventory, reports into its own Telegram
-  topic, and resumes the exact Codex or Claude conversation after a reboot.
-- **`/help` in Telegram**, a button-driven guide to the commands, agents,
-  skills, and teardown flows.
+## What you need
 
-## Requirements
+| Capability | Required? | What happens without it |
+| --- | --- | --- |
+| macOS and Python 3.9+ | Yes | Installation stops with a specific readiness error. |
+| A private Telegram bot | Yes | `SETUP.command` walks you through BotFather and pairing. |
+| Claude Code **or** Codex CLI | Yes, one or both | Topics use whichever authenticated provider is available. A Claude-only installation does not need Codex. |
+| Handy + Parakeet V3 + ffmpeg | No | Text and file messages work; local voice transcription is unavailable. |
+| edge-tts + ffmpeg | No | Text replies work; the Listen button cannot create spoken replies. |
+| tmux | No | Normal topic conversations work; console takeover and detached workers are unavailable. |
+| Conversational Control agent | No, off by default | Groups bind by exact path with `/bind`; no Codex router is started. |
 
-| Requirement | Notes |
-| --- | --- |
-| macOS | LaunchAgent, Keychain, and `launchctl` are assumed throughout. |
-| Python 3.9+ | Uses the system `/usr/bin/python3`. No third-party packages. |
-| A Telegram bot | Create one with [@BotFather](https://t.me/BotFather). Enable **Threaded Mode** if you want topics in the private bot chat. |
-| `codex` and/or `claude` CLI | At least one, already authenticated and working from your terminal. |
-| [Handy](https://github.com/cjpais/Handy) with Parakeet V3 | Only needed for voice input. Expected at `/Applications/Handy.app/Contents/MacOS/handy` with models under `~/Library/Application Support/com.pais.handy/models/parakeet-tdt-0.6b-v3-int8`. |
-| `ffmpeg` | Needed for voice in and out. Found at `/opt/homebrew/bin/ffmpeg`, `/usr/local/bin/ffmpeg`, or on `PATH`. |
-| `edge-tts` | Optional, for spoken replies. Expected at `~/.local/bin/edge-tts`. |
-| `tmux` | Optional, for the interactive console takeover and detached workers. |
+No Python packages need to be installed. Provider authentication is owned by
+the Claude Code and Codex CLIs, just as it is in your terminal.
 
-Those last three binaries are looked up per use: an absolute override in
-`config.json` (`handy_binary`, `ffmpeg_binary`, `edge_tts_binary`) wins, then
-the documented locations above, then `PATH`. If one is missing entirely, voice
-input or spoken replies fail with a clear message naming the path — text keeps
-working.
-
-## Setup
+## Install on a local Mac
 
 ```sh
-git clone <your-fork-url> telegram-control
+git clone https://github.com/shantamg/telegram-control.git
 cd telegram-control
-```
-
-**1. Pair the bot.** Double-click `SETUP.command`, or run it from the
-repository root:
-
-```sh
 ./SETUP.command
 ```
 
-It asks BotFather for a token, verifies it, stores it in the macOS Keychain
-under the service `telegram-bridge-bot-token`, then waits for you to send the
-bot a message so it can record exactly which Telegram account and chat are
-authorized. Nothing else is ever accepted. Press Control-C once the foreground
-echo test replies to you.
-
-**2. Create the durable database and check the prerequisites.**
+The setup assistant verifies the bot token, stores it in the macOS Keychain,
+and waits for a message from the one Telegram account that will be authorized.
+After the foreground echo test succeeds, press Control-C and run:
 
 ```sh
-./telegram_control.py init
-./telegram_control.py doctor
+./telegram_control.py bootstrap
 ```
 
-**3. Install the background controller.** This replaces the Stage 0 listener
-with the supervised collector, workers, and outbox sender, and starts them at
-login:
+`bootstrap` runs the readiness checks, initializes the durable database,
+installs the shared agent skills, publishes the Telegram command menu, and
+installs the login LaunchAgent. Confirm the result with:
 
 ```sh
-./telegram_control.py install
 ./telegram_control.py status
 ```
 
-**4. Install the agent-facing skills** so managed Codex and Claude turns can
-send progress updates, voice notes, questions with buttons, group icons,
-new conversational topics, detached workers, and topic teardown:
+For the human checkpoints, troubleshooting, and uninstall details, follow the
+[complete local-Mac setup guide](docs/getting-started/local-mac.md).
 
-```sh
-./telegram_control.py install-skills
-```
+## Connect the first project
 
-This copies each skill into `~/.agents/skills/` (which Codex reads directly)
-and links it into `~/.claude/skills/`. Skill metadata is read when a provider
-session starts, so restart an existing session before expecting a new skill to
-appear.
+1. Send `/newgroup` to the bot's private chat.
+2. Create a private Telegram group and enable **Topics**.
+3. Use Telegram's **View as Topics** display mode, not **View as Messages**.
+   This is a separate per-account display choice and makes each agent
+   conversation feel like its own chat.
+4. Tap the link from `/newgroup` to add the bot with the requested admin rights.
+5. In the group, send `/bind` followed by an exact existing folder:
 
-**5. Add your first workspace.** Send `/newgroup` in the bot chat. It replies
-with a link that adds the bot to a group you pick *and* requests the rights it
-needs — Change group info, Delete messages, Manage topics — in the same
-confirmation, so there is no separate promotion step. Telegram's Bot API
-does not let a bot create a group or enable Topics, so those two steps are
-yours: create a private group, turn on **Topics**, then tap the link.
+   ```text
+   /bind ~/Software/my-project
+   ```
 
-Admin rights are not optional: Telegram's default Group Privacy hides ordinary
-messages from non-admin bots.
+6. Confirm the folder and provider. Then create a topic and send a message.
+   The topic agent is created automatically and the message becomes its first
+   turn.
 
-Once it joins, the bot offers **Authorize forum** and then asks which folder the
-group works in. Answer with a path or just a description:
+See [Set up a Telegram project group](docs/getting-started/telegram-group.md)
+for the exact Telegram settings and why each permission is needed.
+
+## Everyday behavior
+
+- One project group can contain many independent topic conversations.
+- Topic sessions and queues survive controller restarts.
+- `/agent` changes provider, model, effort, or session for the current topic.
+- Replying to the progress card steers the active turn; **Stop** interrupts it.
+- Attachments are saved to private local paths the agent can inspect.
+- `/help` is the in-Telegram source of truth for commands and workflows.
+- Agents can create more conversational topics when asked.
+- Optional detached workers use tmux for work that must outlive one turn.
+
+## Customize without changing the project
+
+Behavioral preferences are layered so personal choices do not need to become
+forks or change defaults for everyone:
 
 ```text
-~/Software/my-project
-the meet without fear repo in Software
+built-in defaults
+  < private per-install config
+  < workspace .telegram-control.json
+  < workspace .telegram-control.local.json
 ```
 
-Control resolves it and asks you to confirm **Bind forum workspace**. After
-that, each new topic starts with the group's provider, model, and effort in one
-tap — and whatever you already sent runs as that topic's first turn, so nothing
-needs resending. Every topic opens with one message listing its agent, model,
-effort, and context used, edited in place as those change, so it is always the
-current status of that topic. Commands themselves come from Telegram's own menu:
-type `/` in any chat or topic.
+You can choose the default provider, opt into a topic confirmation step, add
+standing context or response-style guidance, and select compact, standard, or
+detailed topic status text. The core safety and routing contract cannot be
+replaced through these settings.
 
-An active topic agent can also create and start another regular conversational
-topic for you. Ask naturally — for example, *"Create a topic called API audit
-and have it inspect the issue we just surfaced."* The new topic inherits the
-group's provider, model, and effort unless you explicitly override them, and
-the originating agent turns the task into the new topic's first prompt so it
-can begin working immediately. This is separate from a detached worker: the
-new topic is an ordinary independent conversation that you steer directly.
+Start with [Customization and configuration](docs/guides/customization.md) and
+inspect the resolved result with:
 
-If you know the path up front, the first message can still do both at once:
-*"Set up this group for /absolute/workspace/path using Claude"* offers a single
-**Authorize and bind** button.
+```sh
+./telegram_control.py config show
+```
 
-You can also work entirely in the private bot chat and let the Control agent
-find directories for you: *"add a project called Lovely, the peter-app
-subdirectory of the lovely repo in software inside my user directory"*.
+## Documentation
 
-## Everyday commands
+The [documentation index](docs/README.md) separates first-time setup, user
+guides, configuration reference, implementation details, and contributor
+policy. In particular:
 
-Telegram commands (inside a chat or topic):
+- [Local Mac setup](docs/getting-started/local-mac.md)
+- [Telegram group and topic setup](docs/getting-started/telegram-group.md)
+- [Providers and optional capabilities](docs/guides/providers-and-capabilities.md)
+- [Customization](docs/guides/customization.md)
+- [Security model](docs/reference/security.md)
+- [Repository architecture](docs/contributing/architecture.md)
+- [Exact implementation notes](docs/IMPLEMENTATION_NOTES.md)
+- [Original build plan](docs/BUILD_PLAN.md)
 
-| Command | Effect |
-| --- | --- |
-| `/help` | Button-driven help browser. |
-| `/status` | Inspect this Telegram surface; editable status card. |
-| `/projects` | List enrolled workspaces. |
-| `/newgroup` | Get the one-tap link that adds the bot to a new project group with the rights it needs. |
-| `/agent` | Inspect or control this topic's agent: model, effort, session, console, context usage, pause/resume, new session, provider switch. |
-| `/teardown` | Confirmation-gated removal of this managed topic and its session state. |
+## Contributing
 
-CLI (`./telegram_control.py <command>`, `--help` on any of them):
+Issues, focused pull requests, and forks are welcome. Please read
+[CONTRIBUTING.md](CONTRIBUTING.md) and [GOVERNANCE.md](GOVERNANCE.md) before
+changing core behavior. User preferences should normally become explicit,
+layered configuration rather than new universal defaults.
 
-| Command | Effect |
-| --- | --- |
-| `init` / `doctor` / `status` | Create the database, check prerequisites, show queue state. |
-| `install` / `request-restart` | Install or reload the LaunchAgent-backed controller. `request-restart` queues a reload the supervisor applies once nothing is leased. |
-| `run` | Run everything in the foreground for debugging. |
-| `collect`, `work`, `work-router`, `work-agents`, `send-outbox`, `maintain-topics` | Run one loop at a time; add `--once` to handle a single item. |
-| `retry inbox\|router\|agent\|outbox` | Requeue dead-lettered items. |
-| `enroll-project`, `provision-topic`, `register-agent` | Terminal-side workspace and topic wiring. |
-| `console-open` / `console-status` / `console-close` | Explicit tmux takeover of a persisted agent session. |
-| `worker-start` / `worker-status` / `worker-report` / `worker-stop` | Start, inspect, report from, and stop recoverable detached workers; stopping removes their managed recovery file. |
-| `install-skills` | Install or refresh the repo-owned agent skills. |
-| `sync-commands` | Publish the Telegram command menu from the help copy (`install` does this too). |
-
-Prefer `request-restart` for reloads: it records the intention and the
-supervisor applies it at the next idle moment, so no turn is aborted. `restart`
-still exists for an immediate guarded restart, and `launchctl` should not be
-used directly — macOS can turn a submitted reload job into a restart loop.
-
-## Repository map
-
-| Path | Responsibility |
-| --- | --- |
-| `telegram_control.py` | CLI and durable controller: collector, workers, outbox sender, supervisor, LaunchAgent install, console and worker commands. |
-| `durable_store.py` | All SQLite persistence: schema, migrations, queues, leases, routes, callbacks, agents, sagas. The core of the system. |
-| `on_message.py` | Per-turn message handler: authorization, commands, voice transcription, confirmations, card rendering. |
-| `provider_adapters.py` | Provider-neutral turn execution for Codex and Claude, including streaming, usage, and interrupts. |
-| `provider_defaults.py`, `codex_sessions.py`, `claude_sessions.py` | Read-only inspection of local provider config and persisted sessions. |
-| `router_contract.py`, `router_eval.py` | The typed controller-tool vocabulary for the Control agent, and its repeatable eval gate. |
-| `discovery.py` | Bounded, read-only filesystem discovery inside authorized roots. |
-| `voice_responses.py` | Text-to-speech for Telegram voice replies. |
-| `helper_paths.py` | Resolves the external helper binaries (ffmpeg, Handy, edge-tts) per machine. |
-| `agent_telegram.py` | Helper agents call to post scoped text/voice updates from inside a turn. |
-| `detached_worker.py`, `tmux_console.py` | tmux-backed detached workers and interactive session takeover. |
-| `turn_guidance.py` | Guidance injected into every managed turn. |
-| `telegram_help.py` | Copy for the in-Telegram `/help` browser. |
-| `telegram_bridge.py` | Token/Keychain, config, pairing, and the raw Telegram API layer (plus the Stage 0 listener). |
-| `skills/` | Repo-owned agent skills installed by `install-skills`. |
-| `tests/` | Dependency-free unit and fault-injection tests. |
-
-## Where to look for what
-
-| Question | Go to |
-| --- | --- |
-| How do I use it from Telegram? | `/help` in Telegram — source of truth in `telegram_help.py`. |
-| How does mechanism X actually behave, and what was verified? | [docs/IMPLEMENTATION_NOTES.md](docs/IMPLEMENTATION_NOTES.md) |
-| Why is it built this way; what are the stages and acceptance gates? | [docs/BUILD_PLAN.md](docs/BUILD_PLAN.md) |
-| What must I know before editing this repo? | [CLAUDE.md](CLAUDE.md) (`AGENTS.md` is a symlink to it) |
-| What can agents do from inside a turn? | [skills/](skills/) |
-| What is stored, and where? | `durable_store.py`, plus *Runtime state* below. |
-
-## Tests
+Run the dependency-free test suite with:
 
 ```sh
 /usr/bin/python3 -m unittest discover -s tests -v
 ```
 
-They are dependency-free and never call Telegram, read the Keychain, or launch
-a provider. The router contract also has an offline eval gate, plus an optional
-live run that uses isolated provider sessions:
+## Security
 
-```sh
-/usr/bin/python3 router_eval.py
-/usr/bin/python3 router_eval.py --live
-```
+Only the Telegram account confirmed during pairing is accepted, only in its
+paired private chat or explicitly authorized private forum groups. The bot
+token stays in the macOS Keychain and is not passed to providers.
 
-## Runtime state
+Managed agents intentionally run with permissive provider settings by default
+because unattended turns cannot answer interactive permission prompts. Anyone
+who controls the paired Telegram account can therefore cause code to run with
+the agent's local permissions. Read the [security model](docs/reference/security.md)
+before binding sensitive folders, and report vulnerabilities according to
+[SECURITY.md](SECURITY.md).
 
-Deliberately outside Git:
+## Project status
 
-- Bot token: macOS Keychain, service `telegram-bridge-bot-token`
-- Incoming attachments:
-  `~/Library/Application Support/telegram-bridge/attachments/inbox-<job-id>/`
-- Pairing and configuration:
-  `~/Library/Application Support/telegram-bridge/config.json`
-- Durable database:
-  `~/Library/Application Support/telegram-bridge/controller.sqlite3`
-- LaunchAgent: `~/Library/LaunchAgents/local.telegram-bridge.plist`
-- Logs, all in `~/Library/Logs/`: `telegram-control.log`,
-  `telegram-bridge.log`, `telegram-bridge.error.log`
-
-Optional `config.json` keys: `discovery_roots` bounds where the Control agent
-may look for workspaces (defaults to your home directory); `handy_binary`,
-`ffmpeg_binary`, and `edge_tts_binary` override the helper locations above with
-absolute paths.
-
-## Security boundary
-
-- Incoming Telegram content is **data, never a shell command**.
-- Only the single Telegram account confirmed during pairing is accepted, only
-  in the paired private chat or in private forum groups with no public
-  username. Everything else is discarded before its content reaches SQLite.
-- Buttons carry opaque, short-lived, one-time action tokens — never commands,
-  prompts, paths, or privileged payloads. The real action lives in SQLite and
-  is revalidated against its chat, topic, user, and expiry on every tap.
-- Filesystem access is bounded: agents run inside a confirmed workspace root
-  enforced by symlink-resolved containment checks at proposal, confirmation,
-  and every launch. Discovery is read-only and confined to the configured
-  roots.
-- Text quoted from replies is explicitly marked as data and cannot, by itself,
-  authorize a dispatch — the user's own words must name the destination.
-- The bot token never reaches a provider, a skill helper, or a process argument
-  list.
-
-Be clear-eyed about the flip side: managed agents run with permissive provider
-settings by default (Codex `danger-full-access` / approval `never`, Claude
-`bypassPermissions`), because an unattended turn cannot answer a permission
-prompt. That is deliberate, and it means anyone who controls your paired
-Telegram account can run code on your Mac. Set `provider_config.permission_mode`
-to something stricter if that is not the trade you want.
-
-## Status
-
-Personal software, run daily by its author on one Mac. It is shareable and the
-setup path above is real, but expect macOS-specific assumptions, hardcoded
-helper paths, and single-host design (the delivery lock is a local `flock`).
-Issues and forks welcome; do not expect it to be a product.
+Telegram Control is personal software used daily by its maintainer. The local
+Mac setup is the supported path, but it is not a hosted service or a polished
+consumer product. The durable core is extensively tested; new installations
+should still begin with a non-sensitive workspace.

@@ -1471,3 +1471,31 @@ Verified with configuration precedence and validation tests, contained
 Markdown prompt-file tests, byte-for-byte preservation of the default core
 guidance, custom-guidance ordering, compact topic rendering, and effective
 configuration inspection.
+
+## Documentation follows the supported user journey
+
+The root README is now an orientation and quick-start page rather than the only
+manual. `docs/README.md` indexes focused local-Mac installation, Telegram group
+setup, provider/capability, customization, configuration, security, and
+architecture documents. The supported path is explicit: pair the bot, run
+`bootstrap`, bind a private topic-enabled group to an exact local folder, and
+start an agent conversation by sending the first message in a topic.
+
+The requirements table distinguishes the one-provider core from optional local
+voice input, external spoken replies, and tmux features. It states that a
+Claude-only direct-mode installation does not require Codex, while the opt-in
+conversational Control agent does. Linux, EC2, containers, and multi-host
+operation are recorded as deferred rather than implied variants of the
+LaunchAgent/Keychain design.
+
+Telegram group documentation distinguishes enabling Topics from the
+per-account **View as Topics** versus **View as Messages** display choice and
+strongly recommends topic view. Screenshot slots are documented with a
+sanitization checklist; no image from the maintainer's live bot, groups, local
+paths, or provider sessions was committed.
+
+The in-Telegram Projects & topics help page now describes the same direct
+workflow, `/bind` requirement, automatic topic startup, optional Control
+agent, and Claude-only behavior. The registered command list remains the
+single source of truth and all 174 durable-store/integration tests pass with
+the updated help copy.
