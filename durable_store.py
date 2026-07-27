@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+import app_config
 import provider_defaults
 import telegram_help
 
@@ -7184,12 +7185,60 @@ class DurableStore:
             agent.project_path,
         )
         context_snapshot = self.agent_context_snapshot(agent_id)
+        try:
+            settings_workspace = (
+                agent.project_path
+                if agent.project_path
+                and Path(agent.project_path).is_dir()
+                else None
+            )
+            presentation = app_config.installed_settings(
+                settings_workspace
+            )["presentation"]
+        except app_config.ConfigError as exc:
+            raise StoreError(str(exc)) from None
+        style = str(presentation["status_style"])
+        if style == "compact":
+            lines = [
+                f"✅ “{display_name}” · {provider_name} · {model_name} · "
+                f"{effort_name}",
+                f"Context: {context_snapshot or 'new session'}",
+            ]
+            if agent.lifecycle_state == "paused":
+                lines.append("State: paused")
+            if started is not None:
+                lines.append(
+                    "Your message is running now."
+                    if started
+                    else "Send a message to start."
+                )
+            return "\n".join(lines)
+
         lines = [
             f"✅ “{display_name}” uses {provider_name}.",
             f"Model: {model_name}",
             f"Effort: {effort_name}",
             f"Context: {context_snapshot or 'no turn completed yet'}",
         ]
+        if style == "detailed":
+            permission = (
+                agent.provider_config.get("permission_mode", "bypassPermissions")
+                if agent.provider == "claude"
+                else agent.provider_config.get("sandbox", "danger-full-access")
+            )
+            lines.extend(
+                [
+                    f"Workspace: {agent.working_directory or agent.project_path}",
+                    f"Permissions: {permission}",
+                    "Session: "
+                    + (
+                        "connected"
+                        if agent.provider_session_id
+                        else "starts with the first turn"
+                    ),
+                    f"State: {agent.lifecycle_state}",
+                ]
+            )
         if agent.lifecycle_state == "paused":
             lines.append("State: paused — new messages queue until resumed")
         if started is not None:

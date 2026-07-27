@@ -1,8 +1,11 @@
 import json
 import queue
 import subprocess
+import tempfile
 import unittest
 import uuid
+from pathlib import Path
+from unittest import mock
 
 import provider_adapters
 import turn_guidance
@@ -132,6 +135,25 @@ def claude_agent(**overrides):
 
 
 class CodexEventTests(unittest.TestCase):
+    def test_provider_availability_reports_each_cli_independently(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            claude = Path(temporary_directory) / "claude"
+            claude.write_text("#!/bin/sh\n", encoding="utf-8")
+            with mock.patch.object(
+                provider_adapters.shutil,
+                "which",
+                side_effect=lambda name: (
+                    str(claude) if name == "claude" else None
+                ),
+            ), mock.patch.dict(
+                provider_adapters.PROVIDER_BINARY_CANDIDATES,
+                {"claude": (), "codex": ()},
+            ):
+                available = provider_adapters.provider_availability()
+
+        self.assertEqual(available["claude"], str(claude))
+        self.assertIsNone(available["codex"])
+
     def test_managed_codex_default_is_unrestricted_without_approvals(self):
         self.assertEqual(
             provider_adapters.CodexExecAdapter._sandbox_mode(codex_agent()),

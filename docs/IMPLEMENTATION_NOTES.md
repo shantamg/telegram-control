@@ -1377,3 +1377,156 @@ runtime components only if it can do so without losing queued messages.
 
 Prerequisites, first-time setup, runtime state locations, the test command, and
 the security boundary are documented in [../README.md](../README.md).
+
+## Direct mode is the default
+
+The conversational Control agent is no longer part of the required request
+path. Built-in settings disable it by default, and the supervisor omits
+`work-router` unless `telegram_control.control_agent.enabled` is explicitly
+true. The router schema, worker, and confirmation machinery remain available
+for installations that still want natural-language discovery and delegation.
+
+The paired private bot chat is now a deterministic setup and administration
+home in direct mode. It exposes commands but does not turn arbitrary text,
+voice, or attachments into Codex router work. An authorized group that still
+needs a workspace accepts `/bind <exact-path>` or an exact path as its next
+message. The handler resolves symlinks, enforces configured discovery roots,
+validates the workspace, detects installed Claude and Codex CLIs, and presents
+only locally available providers in a one-time confirmation card. A descriptive
+folder answer continues to use the old discovery router only when Control is
+opted in.
+
+Once a group is bound, its provider choice is sufficient authorization to
+create topic agents. New Telegram topics now inherit the group default
+automatically; their first ordinary message creates the durable subject and is
+queued directly as the first agent turn. The former per-topic confirmation card
+is available through `telegram_control.topics.confirm_agent`, while `/agent`
+continues to expose provider, model, effort, permission, and session changes at
+any time.
+
+Provider discovery is shared by setup and adapters, so Claude and Codex are
+reported independently instead of constructing the wrong adapter to discover a
+missing binary. Non-secret Telegram Control settings are passed from the
+worker's already-loaded config into each fresh handler process, avoiding
+per-turn configuration drift.
+
+Verified with direct-mode tests covering the private admin home, exact-path
+binding with Claude and no router mailbox, provider capability discovery,
+automatic first-message startup, opt-in topic confirmation, and the complete
+legacy Control path when explicitly enabled. The 174 durable-store and
+integration tests pass after both modes were separated.
+
+## Readiness is capability-based
+
+`doctor` now defines one core: local macOS, Python 3.9 or newer, a valid paired
+handler and Keychain token, a healthy SQLite store, and at least one runnable
+Claude Code or Codex CLI. It reports the two providers separately and rejects a
+configured default that is not installed. Enabling the optional conversational
+Control agent adds Codex to the core requirements because that legacy router is
+still a Codex agent.
+
+Handy, its Parakeet model, ffmpeg, edge-tts, and tmux are reported as optional
+capabilities. Missing voice input, spoken-reply, console, or detached-worker
+support no longer makes a text-only installation look broken. The report also
+states the authentication boundary precisely: it verifies that a provider CLI
+runs, while the provider's own terminal login remains the source of truth.
+
+After Telegram pairing, `telegram_control.py bootstrap` runs the readiness
+check, installs the durable controller and shared skills, publishes the command
+menu, and prints live status. It is the single installation entry point for a
+person or coding agent; the lower-level `init`, `doctor`, `install`, and
+`install-skills` commands remain independently useful.
+
+Verified with readiness tests for a Claude-only text installation, the
+Control-without-Codex rejection, executable version reporting, and bootstrap
+ordering.
+
+## Customization is layered, scoped, and subordinate to safety
+
+Behavior settings now resolve in a fixed order: built-in defaults, the
+per-install `telegram_control` object in private `config.json`, shared
+`.telegram-control.json` workspace settings, then the ignored
+`.telegram-control.local.json` personal workspace override. Unknown keys,
+invalid enum values, conflicting inline/file prompts, oversized prompts, and
+relative prompt files that escape their workspace all fail with a specific
+configuration error. `telegram_control.py config show --effective
+--workspace <path>` prints the merged result and every participating path.
+
+The customizable prompt surface has two intentionally separate fields:
+`preamble` supplies standing user or project context and `response_style`
+describes how the agent should communicate. Each can instead name a Markdown
+file. These sections are appended after the non-replaceable Telegram Control
+turn contract; they cannot delete or replace its lifecycle, capability, or
+background-work safety instructions. Both the Claude system-prompt adapter and
+Codex developer-instruction adapter receive the same effective guidance.
+
+`presentation.status_style` controls the durable topic header. `compact` keeps
+only the topic, provider/model/effort, context, and immediate state;
+`standard` preserves the normal command-oriented header; `detailed` adds the
+workspace, permission mode, provider-session state, and lifecycle. Rendering
+reads the same install and workspace layers, so a personal local override
+changes one person's installation without changing repository defaults.
+
+Verified with configuration precedence and validation tests, contained
+Markdown prompt-file tests, byte-for-byte preservation of the default core
+guidance, custom-guidance ordering, compact topic rendering, and effective
+configuration inspection.
+
+## Documentation follows the supported user journey
+
+The root README is now an orientation and quick-start page rather than the only
+manual. `docs/README.md` indexes focused local-Mac installation, Telegram group
+setup, provider/capability, customization, configuration, security, and
+architecture documents. The supported path is explicit: pair the bot, run
+`bootstrap`, bind a private topic-enabled group to an exact local folder, and
+start an agent conversation by sending the first message in a topic.
+
+The requirements table distinguishes the one-provider core from optional local
+voice input, external spoken replies, and tmux features. It states that a
+Claude-only direct-mode installation does not require Codex, while the opt-in
+conversational Control agent does. Linux, EC2, containers, and multi-host
+operation are recorded as deferred rather than implied variants of the
+LaunchAgent/Keychain design.
+
+Telegram group documentation distinguishes enabling Topics from the
+per-account **View as Topics** versus **View as Messages** display choice and
+strongly recommends topic view. Screenshot slots are documented with a
+sanitization checklist; no image from the maintainer's live bot, groups, local
+paths, or provider sessions was committed.
+
+The in-Telegram Projects & topics help page now describes the same direct
+workflow, `/bind` requirement, automatic topic startup, optional Control
+agent, and Claude-only behavior. The registered command list remains the
+single source of truth and all 174 durable-store/integration tests pass with
+the updated help copy.
+
+## The repository carries an explicit collaboration contract
+
+The project now includes Apache-2.0 licensing and notice files, contribution
+and governance policies, a security reporting path, a code of conduct,
+CODEOWNERS, structured bug and feature forms, and a pull-request checklist.
+Governance gives the lead maintainer final responsibility for the canonical
+project while making a clear distinction between personal configuration,
+ordinary pull requests, and deliberately divergent forks.
+
+The macOS CI workflow compiles the tree and runs the complete dependency-free
+test suite on the oldest supported Python line (3.9) and a current line (3.13).
+Both third-party actions are pinned to full commit SHAs, the workflow token is
+read-only, concurrent superseded runs are cancelled, and each job has a
+bounded timeout.
+
+The first hosted run exposed three tests that accidentally depended on the
+maintainer Mac's paired config or installed Codex binary. The voice-handler
+tests now supply the same serialized settings environment as the real worker,
+and the tmux collision test injects its provider adapter. The workflow uses the
+current Node 24/ESM GitHub-owned actions with checkout credentials explicitly
+disabled after checkout, so the dependency-free claim is exercised on a clean
+runner rather than masked by the live installation.
+
+Repository files cannot enforce GitHub permissions. The maintainer guide
+therefore records the owner-only work: confirm the proposed license; audit the
+complete history before changing visibility; create an active `main` ruleset
+requiring pull requests, resolved conversations, both CI checks, and protected
+history; keep required approvals at zero while there is only one reviewer;
+raise it to one with CODEOWNER review when a second maintainer exists; restrict
+Actions and collaborator access; and enable the available security features.

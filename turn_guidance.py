@@ -25,6 +25,10 @@ preamble buys attention from the actual task.
 
 from __future__ import annotations
 
+from typing import Any, Optional
+
+import app_config
+
 TURN_GUIDANCE = (
     "You are currently running inside a Telegram Control-managed turn, even "
     "if this session originally started or previously ran in a local terminal. "
@@ -39,3 +43,17 @@ TURN_GUIDANCE = (
     "mid-work and its results are lost. Run short work in the foreground, and "
     "put work that must outlive this turn in a detached tmux session."
 )
+
+
+def effective_turn_guidance(
+    workspace_path: Optional[str],
+    bridge_config: Optional[dict[str, Any]] = None,
+) -> str:
+    """Append user style/context after the non-replaceable core contract."""
+    settings = (
+        app_config.effective_settings(bridge_config, workspace_path)
+        if bridge_config is not None
+        else app_config.installed_settings(workspace_path)
+    )
+    addition = app_config.prompt_addition(settings, workspace_path)
+    return TURN_GUIDANCE if not addition else f"{TURN_GUIDANCE}\n\n{addition}"

@@ -1,0 +1,15 @@
+# The lead maintainer reviews changes to the canonical repository.
+* @shantamg
+
+# These surfaces define the security, routing, lifecycle, and contributor
+# contracts and should never merge without an explicit owner review.
+/durable_store.py @shantamg
+/on_message.py @shantamg
+/provider_adapters.py @shantamg
+/telegram_bridge.py @shantamg
+/telegram_control.py @shantamg
+/turn_guidance.py @shantamg
+/.github/ @shantamg
+/CLAUDE.md @shantamg
+/GOVERNANCE.md @shantamg
+/SECURITY.md @shantamg

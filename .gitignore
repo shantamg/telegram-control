@@ -19,6 +19,7 @@ venv/
 *.token
 *.secret
 config.json
+.telegram-control.local.json
 offset
 state/
 data/

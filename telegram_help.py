@@ -28,6 +28,7 @@ COMMANDS = (
     BotCommand("status", "Inspect this Telegram surface"),
     BotCommand("projects", "List enrolled workspaces"),
     BotCommand("newgroup", "Get the link that adds me to a new project group"),
+    BotCommand("bind", "Bind this group to an exact local folder"),
     BotCommand("teardown", "Safely remove this managed topic and session"),
 )
 
@@ -104,15 +105,17 @@ These skills are scoped to the active Telegram turn. They do not accept arbitrar
         "Projects & topics",
         """Projects and topics
 
-Use /projects to list enrolled workspaces. Inside an eligible project topic, /agent create <slug> attaches its managed agent.
+Use /projects to list enrolled workspaces.
 
-Setting up a new group: send /newgroup in the main Control chat, create a private group, turn on Topics, then tap the link — Telegram adds the bot with the rights it needs in one step. Answer its question about which folder the group works in with a path or a description, and confirm the binding with one button.
+Setting up a new group: send /newgroup in the bot’s private chat, create a private group, enable Topics, choose Telegram’s separate “View as Topics” display mode, then tap the link. Telegram adds the bot with the rights it needs in one step. Authorize the forum, then send /bind followed by an exact existing folder path and confirm the workspace and provider.
 
-Each new topic in a bound group then starts with the group's own provider, model, and effort in one tap; "Choose a different agent…" opens the per-topic menus. Whatever you already sent runs as the topic's first turn, so you never resend it.
+Each new topic in a bound group starts immediately with the group’s provider, model, and effort. Whatever you already sent runs as the topic’s first turn, so you never resend it. Use /agent to inspect or change that topic’s conversation.
 
 An active topic agent can create another regular conversational topic in the same group and queue a self-contained first prompt there. Ask it to create a topic by name and describe the separate task; the new independent session begins immediately and is conversational, unlike a detached worker's report-only topic.
 
-Every topic opens with one message listing its agent, model, effort, and context used. It is edited in place as those change, so it always shows the current state. Type / in any chat or topic for the command menu. Topic names and Telegram coordinates remain durable routing identities until formal teardown.""",
+The central conversational Control agent is optional and disabled by default. Direct mode does not need it: work happens in group topics, and a Claude-only installation does not need Codex.
+
+Every topic opens with one status message, edited in place as its state changes. Type / in any chat or topic for the command menu. Topic names and Telegram coordinates remain durable routing identities until formal teardown.""",
     ),
 )
 

@@ -1,0 +1,60 @@
+name: Bug report
+description: Report reproducible incorrect behavior
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include tokens, private Telegram data, provider credentials, or sensitive paths. Report vulnerabilities through SECURITY.md instead.
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: Commit SHA or release where the problem occurred.
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS and Python
+      placeholder: macOS 15.x, Python 3.9.x
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      options:
+        - Claude Code
+        - Codex
+        - Both
+        - Provider-independent
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Use sanitized names and paths.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Sanitized doctor/status output
+      description: Remove chat IDs, usernames, paths, and session identifiers.
+      render: shell

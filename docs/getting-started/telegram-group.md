@@ -1,0 +1,78 @@
+# Set up a Telegram project group
+
+Telegram Control works best as one private group per project and one topic per
+agent conversation.
+
+## Create and authorize the group
+
+1. Send `/newgroup` in the bot's private chat.
+2. Create a new **private** Telegram group.
+3. Open the group's settings and enable **Topics**.
+4. Return to the bot's private chat and tap the add-to-group link.
+5. Choose the new group and approve the requested admin rights.
+6. Confirm the bot's **Authorize forum** card.
+
+Telegram's Bot API cannot create a group or enable Topics, so those remain
+human steps. The bot requests Change group info, Delete messages, and Manage
+topics. Admin access also ensures Telegram's default Group Privacy setting does
+not hide ordinary messages from the bot.
+
+Public groups and groups with a public username are rejected by design.
+
+## Use “View as Topics”
+
+Enabling Topics and choosing how to display them are separate settings.
+Telegram offers **View as Topics** and **View as Messages**. Choose **View as
+Topics** for a Telegram Control group.
+
+In topic view, the group opens as a list of separate conversations, which
+matches Telegram Control's routing model: one topic is one persisted agent
+session. “View as Messages” blends messages from every topic into a conventional
+group timeline and makes independent agent conversations much harder to follow.
+
+This is an account/client display preference rather than a bot-controlled
+group permission. Telegram documents that the choice is associated with the
+account and synchronized to its other logged-in sessions. If the group starts
+showing one combined timeline, open its menu and switch back to **View as
+Topics**.
+
+## Bind the local folder
+
+In the authorized group, send an exact path:
+
+```text
+/bind ~/Software/my-project
+```
+
+The folder must already exist, be within the configured discovery roots, and
+be safe to use as an agent workspace. Telegram Control resolves symlinks and
+shows the exact path and available provider choices before changing anything.
+Confirm the binding.
+
+Descriptions such as “my project in Software” require the optional
+conversational Control agent. Direct mode intentionally uses deterministic
+paths and does not spend a provider turn guessing which folder you meant.
+
+## Start talking
+
+Create a new Telegram topic and send a message. In the default configuration:
+
+- the topic is immediately provisioned with the group's provider;
+- your message is queued as its first turn;
+- the initial status message is edited in place as provider, model, effort,
+  session, and context change.
+
+No central Control topic and no extra “choose an agent” tap are required. Use
+`/agent` inside a topic to inspect or change that conversation. Use `/help` to
+browse the complete command guide.
+
+An active agent can also create another ordinary conversational topic when you
+ask it to. That new topic is independent and directly steerable. This differs
+from a detached worker's report-only topic.
+
+## Suggested screenshot set
+
+The first public documentation pass intentionally avoids screenshots that
+might expose a Telegram account, private group, bot username, or local path.
+The checklist in [`docs/assets/screenshots/README.md`](../assets/screenshots/README.md)
+defines the sanitized screenshots to add later.

@@ -24,8 +24,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
+import app_config
 import detached_worker
 import discovery
+import helper_paths
 import provider_adapters
 import provider_defaults
 import router_contract
@@ -82,6 +84,14 @@ MISSING_TOPIC_ERROR_MARKERS = (
 RELOAD_JOB_PREFIX = "local.telegram-control.reload"
 DEFAULT_RESTART_DELAY_SECONDS = 20.0
 MAX_RESTART_DELAY_SECONDS = 5 * 60.0
+HANDY_MODEL_DIR = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / "com.pais.handy"
+    / "models"
+    / "parakeet-tdt-0.6b-v3-int8"
+)
 
 
 def control_message(text: str) -> str:
@@ -2220,6 +2230,7 @@ def maintain_topics_command(args: argparse.Namespace) -> None:
 def supervisor_commands(
     database_path: Path,
     agent_workers: int = DEFAULT_AGENT_WORKERS,
+    control_agent_enabled: bool = False,
 ) -> list[list[str]]:
     count = int(agent_workers)
     if count < 1 or count > MAX_AGENT_WORKERS:
@@ -2230,8 +2241,9 @@ def supervisor_commands(
     commands = [
         [*base, "collect"],
         [*base, "work"],
-        [*base, "work-router"],
     ]
+    if control_agent_enabled:
+        commands.append([*base, "work-router"])
     commands.extend([*base, "work-agents"] for _ in range(count))
     commands.append([*base, "maintain-workers"])
     commands.append([*base, "maintain-topics"])
@@ -2278,7 +2290,16 @@ def run_command(args: argparse.Namespace) -> None:
             "stale_reload_jobs_removed",
             labels=removed_reload_jobs,
         )
-    commands = supervisor_commands(args.db, args.agent_workers)
+    config = bridge.load_config()
+    try:
+        control_enabled = app_config.control_agent_enabled(config)
+    except app_config.ConfigError as exc:
+        raise StoreError(str(exc)) from None
+    commands = supervisor_commands(
+        args.db,
+        args.agent_workers,
+        control_agent_enabled=control_enabled,
+    )
     processes: list[subprocess.Popen[Any]] = []
     try:
         for command in commands:
@@ -2287,6 +2308,7 @@ def run_command(args: argparse.Namespace) -> None:
             "supervisor_started",
             child_pids=[process.pid for process in processes],
             agent_workers=int(args.agent_workers),
+            control_agent_enabled=control_enabled,
         )
         next_restart_check = time.time()
         while True:
@@ -2849,6 +2871,16 @@ def install_command(args: argparse.Namespace) -> None:
     )
 
 
+def bootstrap_command(args: argparse.Namespace) -> None:
+    """Validate and install the complete local Mac controller after pairing."""
+    print("Checking this Mac before installation…")
+    doctor_command(args)
+    print("\nInstalling Telegram Control and its shared skills…")
+    install_command(args)
+    print("\nInstalled. Current status:")
+    status_command(args)
+
+
 def restart_command(args: argparse.Namespace) -> None:
     """Schedule exactly one controller restart from a self-cleaning job."""
     delay = float(args.delay_seconds)
@@ -3244,8 +3276,50 @@ def console_status_command(args: argparse.Namespace) -> None:
     )
 
 
+def executable_status(path: Optional[str]) -> tuple[bool, str]:
+    if not path:
+        return False, "not installed"
+    candidate = Path(path)
+    if not candidate.is_file() or not os.access(candidate, os.X_OK):
+        return False, f"not executable at {candidate}"
+    try:
+        result = subprocess.run(
+            [str(candidate), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False, f"could not run {candidate}"
+    if result.returncode != 0:
+        return False, f"--version exited {result.returncode} at {candidate}"
+    version = (result.stdout or result.stderr).strip().splitlines()
+    return True, version[0][:160] if version else str(candidate)
+
+
 def doctor_command(args: argparse.Namespace) -> None:
-    problems = []
+    """Report core readiness separately from optional local capabilities."""
+    problems: list[str] = []
+    notices: list[str] = []
+    config: dict[str, Any] = {}
+    settings: Optional[dict[str, Any]] = None
+
+    if sys.platform != "darwin":
+        problems.append(
+            "This release supports local macOS only; "
+            f"the current platform is {sys.platform}."
+        )
+    else:
+        print("Platform: macOS")
+    if sys.version_info < (3, 9):
+        problems.append(
+            "Python 3.9 or newer is required; "
+            f"found {sys.version.split()[0]}."
+        )
+    else:
+        print(f"Python: {sys.version.split()[0]} ({sys.executable})")
+
     try:
         config = bridge.load_config()
         print(f"Pairing: chat {config['chat_id']}")
@@ -3256,6 +3330,127 @@ def doctor_command(args: argparse.Namespace) -> None:
         print("Keychain token: available")
     except bridge.BridgeError as exc:
         problems.append(str(exc))
+    if config:
+        try:
+            settings = app_config.effective_settings(config)
+            print(
+                "Mode: "
+                + (
+                    "optional conversational Control enabled"
+                    if settings["control_agent"]["enabled"]
+                    else "direct topics (Control disabled)"
+                )
+            )
+        except app_config.ConfigError as exc:
+            problems.append(str(exc))
+
+        handler_value = config.get("handler_path")
+        handler = (
+            Path(str(handler_value)).expanduser().resolve()
+            if handler_value
+            else None
+        )
+        if handler is None or not handler.is_file():
+            problems.append(
+                "The paired handler path is missing. Run SETUP.command again."
+            )
+        else:
+            print(f"Handler: {handler}")
+
+    availability = provider_adapters.provider_availability()
+    working_providers: dict[str, str] = {}
+    for provider in ("claude", "codex"):
+        name = "Claude Code" if provider == "claude" else "Codex"
+        usable, detail = executable_status(availability[provider])
+        if usable:
+            working_providers[provider] = str(availability[provider])
+            print(f"{name}: available ({detail})")
+        else:
+            notices.append(f"{name}: unavailable ({detail})")
+    if not working_providers:
+        problems.append(
+            "Install and authenticate Claude Code or Codex before installing."
+        )
+    if settings is not None:
+        preferred = str(settings["defaults"]["provider"])
+        if preferred != "auto" and preferred not in working_providers:
+            problems.append(
+                f"The configured default provider is {preferred}, but its CLI "
+                "is unavailable."
+            )
+        if (
+            settings["control_agent"]["enabled"]
+            and "codex" not in working_providers
+        ):
+            problems.append(
+                "The optional conversational Control agent requires Codex, "
+                "but the Codex CLI is unavailable."
+            )
+
+    handy = helper_paths.resolve_binary(
+        "handy_binary",
+        Path("/Applications/Handy.app/Contents/MacOS/handy"),
+        command_name="handy",
+    )
+    ffmpeg = helper_paths.resolve_binary(
+        "ffmpeg_binary",
+        Path("/opt/homebrew/bin/ffmpeg"),
+        Path("/usr/local/bin/ffmpeg"),
+        command_name="ffmpeg",
+    )
+    edge_tts = helper_paths.resolve_binary(
+        "edge_tts_binary",
+        Path.home() / ".local" / "bin" / "edge-tts",
+        command_name="edge-tts",
+    )
+    handy_ready = handy.is_file() and os.access(handy, os.X_OK)
+    ffmpeg_ready = ffmpeg.is_file() and os.access(ffmpeg, os.X_OK)
+    model_ready = HANDY_MODEL_DIR.is_dir()
+    voice_input_ready = handy_ready and ffmpeg_ready and model_ready
+    spoken_reply_ready = (
+        edge_tts.is_file()
+        and os.access(edge_tts, os.X_OK)
+        and ffmpeg_ready
+    )
+    tmux = shutil.which("tmux")
+    print(
+        "Text and attachments: "
+        + ("ready" if working_providers else "not ready")
+    )
+    print(
+        "Voice input: "
+        + (
+            "ready"
+            if voice_input_ready
+            else "optional; unavailable"
+        )
+    )
+    if not voice_input_ready:
+        missing = []
+        if not handy_ready:
+            missing.append(f"Handy ({handy})")
+        if not model_ready:
+            missing.append(f"Parakeet model ({HANDY_MODEL_DIR})")
+        if not ffmpeg_ready:
+            missing.append(f"ffmpeg ({ffmpeg})")
+        notices.append("Voice input needs " + ", ".join(missing) + ".")
+    print(
+        "Spoken replies: "
+        + ("ready" if spoken_reply_ready else "optional; unavailable")
+    )
+    if not spoken_reply_ready:
+        notices.append(
+            "Spoken replies need edge-tts and ffmpeg."
+        )
+    print(
+        "Interactive console and detached workers: "
+        + ("ready" if tmux else "optional; unavailable")
+    )
+    if not tmux:
+        notices.append(
+            "Interactive console takeover and detached workers need tmux."
+        )
+
     try:
         with open_store(args.db) as store:
             check = store.quick_check()
@@ -3265,11 +3460,47 @@ def doctor_command(args: argparse.Namespace) -> None:
                 print(f"Database: ok ({store.path})")
     except (OSError, sqlite3.Error, StoreError) as exc:
         problems.append(str(exc))
+    for notice in notices:
+        print(f"Optional: {notice}")
     if problems:
         for problem in problems:
             print(f"Problem: {problem}", file=sys.stderr)
         raise StoreError(f"Doctor found {len(problems)} problem(s).")
-    print("Doctor: all Stage 1 prerequisites passed.")
+    print(
+        "Doctor: core text and attachment operation is ready. "
+        "Provider authentication must already work in its own terminal CLI."
+    )
+
+
+def config_show_command(args: argparse.Namespace) -> None:
+    """Print the validated effective settings after all requested layers."""
+    config = bridge.load_config()
+    workspace = (
+        str(Path(args.workspace).expanduser().resolve())
+        if args.workspace
+        else None
+    )
+    try:
+        settings = app_config.effective_settings(config, workspace)
+    except app_config.ConfigError as exc:
+        raise StoreError(str(exc)) from None
+    result = {
+        "effective": settings,
+        "layers": {
+            "install": str(bridge.CONFIG_PATH),
+            "workspace": (
+                str(Path(workspace) / app_config.WORKSPACE_CONFIG_NAME)
+                if workspace
+                else None
+            ),
+            "workspace_local": (
+                str(Path(workspace) / app_config.LOCAL_WORKSPACE_CONFIG_NAME)
+                if workspace
+                else None
+            ),
+        },
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 def retry_command(args: argparse.Namespace) -> None:
@@ -3400,6 +3631,12 @@ def build_parser() -> argparse.ArgumentParser:
         "install", help="Replace Stage 0 with the durable background controller."
     )
     install_parser.set_defaults(function=install_command)
+
+    bootstrap_parser = subparsers.add_parser(
+        "bootstrap",
+        help="Check and install the complete local Mac controller after pairing.",
+    )
+    bootstrap_parser.set_defaults(function=bootstrap_command)
 
     restart_parser = subparsers.add_parser(
         "restart",
@@ -3595,7 +3832,33 @@ def build_parser() -> argparse.ArgumentParser:
     console_status_parser.add_argument("agent", help="Hierarchical managed-agent name.")
     console_status_parser.set_defaults(function=console_status_command)
 
-    doctor_parser = subparsers.add_parser("doctor", help="Check Stage 1 prerequisites.")
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Inspect validated layered Telegram Control settings.",
+    )
+    config_subparsers = config_parser.add_subparsers(
+        dest="config_command",
+        required=True,
+    )
+    config_show_parser = config_subparsers.add_parser(
+        "show",
+        help="Show effective settings and their file locations.",
+    )
+    config_show_parser.add_argument(
+        "--effective",
+        action="store_true",
+        help="Accepted for clarity; effective output is always shown.",
+    )
+    config_show_parser.add_argument(
+        "--workspace",
+        help="Include shared and local settings from this workspace.",
+    )
+    config_show_parser.set_defaults(function=config_show_command)
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Check local Mac readiness and optional capabilities.",
+    )
     doctor_parser.set_defaults(function=doctor_command)
 
     retry_parser = subparsers.add_parser("retry", help="Requeue dead items.")
