@@ -1515,6 +1515,14 @@ Both third-party actions are pinned to full commit SHAs, the workflow token is
 read-only, concurrent superseded runs are cancelled, and each job has a
 bounded timeout.
 
+The first hosted run exposed three tests that accidentally depended on the
+maintainer Mac's paired config or installed Codex binary. The voice-handler
+tests now supply the same serialized settings environment as the real worker,
+and the tmux collision test injects its provider adapter. The workflow uses the
+current Node 24/ESM GitHub-owned actions with checkout credentials explicitly
+disabled after checkout, so the dependency-free claim is exercised on a clean
+runner rather than masked by the live installation.
+
 Repository files cannot enforce GitHub permissions. The maintainer guide
 therefore records the owner-only work: confirm the proposed license; audit the
 complete history before changing visibility; create an active `main` ruleset

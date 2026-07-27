@@ -181,8 +181,19 @@ class TmuxConsoleTests(unittest.TestCase):
         self.assertIn("--effort", command)
         self.assertIn("high", command)
 
+    @mock.patch.object(
+        tmux_console.provider_adapters,
+        "adapter_for",
+        side_effect=lambda agent: provider_adapters.CodexExecAdapter(
+            binary="/bin/codex"
+        ),
+    )
     @mock.patch.object(tmux_console, "has_tmux_session", return_value=True)
-    def test_unmanaged_name_collision_fails_closed(self, _has_session):
+    def test_unmanaged_name_collision_fails_closed(
+        self,
+        _has_session,
+        _adapter_for,
+    ):
         with self.assertRaisesRegex(StoreError, "unmanaged tmux session"):
             tmux_console.open_agent_console(self.store, self.agent)
         self.assertIsNone(self.store.resolve_agent_console(self.agent.agent_id))

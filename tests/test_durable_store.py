@@ -10705,6 +10705,9 @@ class DurableIntegrationTests(unittest.TestCase):
             environment = {
                 "TELEGRAM_CONTROL_DB": str(database_path),
                 "TELEGRAM_CONTROL_JOB_ID": str(voice_job["job_id"]),
+                "TELEGRAM_CONTROL_SETTINGS_JSON": json.dumps(
+                    {"control_agent": {"enabled": True}}
+                ),
                 "TELEGRAM_CHAT_ID": "-100777",
                 "TELEGRAM_CHAT_TYPE": "supergroup",
                 "TELEGRAM_CHAT_TITLE": "Life",
@@ -10809,6 +10812,9 @@ class DurableIntegrationTests(unittest.TestCase):
             environment = {
                 "TELEGRAM_CONTROL_DB": str(database_path),
                 "TELEGRAM_CONTROL_JOB_ID": str(job["job_id"]),
+                "TELEGRAM_CONTROL_SETTINGS_JSON": json.dumps(
+                    app_config.DEFAULT_SETTINGS
+                ),
                 "TELEGRAM_CHAT_ID": "-100777",
                 "TELEGRAM_CHAT_TYPE": "supergroup",
                 "TELEGRAM_CHAT_TITLE": "Life",
