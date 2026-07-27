@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
+import app_config
 import detached_worker
 import discovery
 import provider_adapters
@@ -2220,6 +2221,7 @@ def maintain_topics_command(args: argparse.Namespace) -> None:
 def supervisor_commands(
     database_path: Path,
     agent_workers: int = DEFAULT_AGENT_WORKERS,
+    control_agent_enabled: bool = False,
 ) -> list[list[str]]:
     count = int(agent_workers)
     if count < 1 or count > MAX_AGENT_WORKERS:
@@ -2230,8 +2232,9 @@ def supervisor_commands(
     commands = [
         [*base, "collect"],
         [*base, "work"],
-        [*base, "work-router"],
     ]
+    if control_agent_enabled:
+        commands.append([*base, "work-router"])
     commands.extend([*base, "work-agents"] for _ in range(count))
     commands.append([*base, "maintain-workers"])
     commands.append([*base, "maintain-topics"])
@@ -2278,7 +2281,16 @@ def run_command(args: argparse.Namespace) -> None:
             "stale_reload_jobs_removed",
             labels=removed_reload_jobs,
         )
-    commands = supervisor_commands(args.db, args.agent_workers)
+    config = bridge.load_config()
+    try:
+        control_enabled = app_config.control_agent_enabled(config)
+    except app_config.ConfigError as exc:
+        raise StoreError(str(exc)) from None
+    commands = supervisor_commands(
+        args.db,
+        args.agent_workers,
+        control_agent_enabled=control_enabled,
+    )
     processes: list[subprocess.Popen[Any]] = []
     try:
         for command in commands:
@@ -2287,6 +2299,7 @@ def run_command(args: argparse.Namespace) -> None:
             "supervisor_started",
             child_pids=[process.pid for process in processes],
             agent_workers=int(args.agent_workers),
+            control_agent_enabled=control_enabled,
         )
         next_restart_check = time.time()
         while True:
