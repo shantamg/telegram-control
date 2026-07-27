@@ -20,9 +20,8 @@ git clone https://github.com/shantamg/telegram-control.git
 cd telegram-control
 ```
 
-If the repository is private, GitHub must already know your credentials. The
-installation itself does not require a public repository; making it public
-only changes how other people can clone and contribute.
+The repository is public, so cloning it does not require a GitHub account or
+GitHub authentication.
 
 ## 3. Create and pair a Telegram bot
 
