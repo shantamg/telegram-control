@@ -21,9 +21,24 @@ The optional conversational Control agent currently requires Codex. Enabling
 it on a Claude-only machine makes `doctor` fail clearly rather than starting a
 controller that cannot route.
 
-Set an install or workspace default with
-`telegram_control.defaults.provider`: `auto`, `claude`, or `codex`. `auto`
-uses the providers actually present on the machine.
+Set an install default at `telegram_control.defaults.provider` in the private
+bridge config. Workspace files contain the settings object directly, so the
+same field is `defaults.provider` there. Allowed values are `auto`, `claude`,
+or `codex`; `auto` uses the providers actually present on the machine.
+
+## Per-topic provider controls
+
+Use `/agent` in a managed topic to change model or effort without discarding
+the current conversation, pause or resume mailbox processing, start a fresh
+session, resume a recent dormant session from the exact workspace, or switch
+providers after confirmation. Switching providers starts a fresh conversation
+but leaves the previous provider-owned session intact.
+
+Choosing **Default** for model or effort follows the local CLI configuration:
+top-level Codex values from `~/.codex/config.toml`, or Claude user/workspace
+settings. The Telegram picker is the source of truth for the currently
+supported explicit choices. Active turns can be steered by replying to their
+progress card, and **Stop** uses the provider's native interrupt path.
 
 ## Voice input
 
@@ -44,8 +59,9 @@ independent from voice input. Spoken-reply synthesis uses the external
 text-to-speech service used by `edge-tts`; ordinary text replies remain local
 to the controller/provider path.
 
-Send `/voice` in any authorized chat or topic to inspect the global
-spoken-reply configuration. Voice and speed choices are staged first;
+Send `/voice` in the paired private chat or an ordinary authorized project
+topic to inspect the global spoken-reply configuration. Report-only detached
+worker topics do not accept commands. Voice and speed choices are staged first;
 **Preview** generates a real Microsoft TTS sample without changing the
 setting, **Confirm** applies it, and **Back** returns to the choices. The
 selected configuration is shared by Listen actions, agent-authored voice

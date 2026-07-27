@@ -15,13 +15,19 @@ simply the author's bot — read it as "your bot" throughout. Nothing in the cod
 depends on that name.
 
 Telegram Control is a phone-to-Mac control plane for local Codex and Claude
-agents. The intended experience is:
+agents. Its current default experience is:
 
-1. Send text or a voice note in Telegram.
-2. Transcribe voice locally with Handy's Parakeet V3 model.
-3. Route the request to the main Codex controller or a project agent.
-4. Receive text, a Telegram voice note, and contextual buttons that route
-   follow-up actions back to the originating agent.
+1. Bind a private Telegram forum group to an exact local workspace.
+2. Send text, a photo, a document, or an optional voice note in one of its
+   topics.
+3. Route the request directly to that topic's persisted Claude or Codex agent.
+4. Receive a formatted text answer with contextual controls and optional
+   spoken replies.
+
+The central conversational Control router remains available as an opt-in
+feature for natural-language discovery and delegation; it is disabled by
+default. The sections below are chronological, so an earlier mechanism may be
+explicitly superseded by a later section.
 
 ## Stage 0 baseline
 
@@ -644,17 +650,20 @@ on July 27, 2026.
 
 ### Restarting the controller safely
 
-Use the controller's guarded restart command:
+This subsection originally documented the delayed `restart` helper. It is
+superseded by the database-backed idle-restart request described later in
+[Restarts are queued, not timed](#restarts-are-queued-not-timed). For a live
+controller, use:
 
 ```bash
-/usr/bin/python3 ./telegram_control.py restart
+./telegram_control.py request-restart --reason "Apply updated worker code"
 ```
 
-It schedules one delayed restart, removes its helper after the first
-`kickstart`, and the replacement supervisor removes any stale matching helper
-before starting workers. Do not use `launchctl submit` directly for controller
-reloads: macOS can infer submitted jobs as `KeepAlive`, turning a one-shot
-reload into a repeated restart loop.
+The supervisor claims the request only when inbox, router, agent, and outbox
+leases are all idle, then exits so launchd's existing `KeepAlive` policy loads
+the new code. The older `restart` command remains for compatibility, but it is
+not the documented live-update path. Do not use `launchctl submit` directly for
+controller reloads.
 
 ## Live Codex worker control
 
@@ -1347,6 +1356,11 @@ useful for isolating the transport from the controller. Do not run it at the
 same time as the durable collector: Telegram permits only one long poller per
 bot.
 
+The commands in this section are historical diagnostics and rollback tools,
+not the supported live-update procedure. Current installations should use
+`telegram_control.py bootstrap` for first installation and the queued
+`request-restart` workflow for worker reloads.
+
 Computer to phone:
 
 ```sh
@@ -1667,3 +1681,33 @@ Verified with focused tests for configuration validation and persistence,
 voice/rate command arguments, command registration, and the complete
 picker → staged review → preview → back → confirm flow. Preview coverage also
 asserts that the stored setting remains unchanged until confirmation.
+
+## Documentation audit against current direct-mode behavior
+
+After merged pull requests #1–#4, the public documentation and `/help` copy
+were checked against the current command dispatcher, configuration validator,
+provider/session controls, detached-worker recovery path, teardown planners,
+CLI rollout commands, and schema v23 store.
+
+The audit corrected several historical statements that had outlived their
+implementation: provider choice happens at `/bind`, `doctor` checks CLI
+executability rather than authentication, command-menu publication is
+best-effort and retriable, detached workers no longer maintain a recovery
+inventory, busy agent reconfiguration is rejected rather than deferred, and
+the repository is already public under Apache 2.0. It also documents all nine
+registered commands, the current module map, machine-local configuration keys,
+the older `/agent create <slug>` catalog path, uninstall retention semantics,
+and the requirement to wait for durable topic deletions before removing the bot
+from a group.
+
+The `/newgroup` card now includes Telegram's separate **View as Topics** choice
+and gives the current direct-mode next step: authorize the forum, then send
+`/bind` with an exact existing folder. The private `/start` response likewise
+points to `/newgroup` and `/projects` instead of implying that ordinary private
+text will reach a disabled Control router. These are fresh-handler copy changes;
+they need no schema migration, command-menu republish, skill installation, or
+worker restart.
+
+Verified on July 27, 2026 with all 398 unit and integration tests,
+`python -m compileall`, a local Markdown-link resolution check, and
+`git diff --check`.

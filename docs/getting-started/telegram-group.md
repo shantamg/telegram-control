@@ -47,7 +47,9 @@ In the authorized group, send an exact path:
 The folder must already exist, be within the configured discovery roots, and
 be safe to use as an agent workspace. Telegram Control resolves symlinks and
 shows the exact path and available provider choices before changing anything.
-Confirm the binding.
+Confirm the binding. Discovery defaults to your home directory; for a workspace
+on another allowed volume, add an absolute path to `discovery_roots` as
+described in the [configuration reference](../reference/configuration.md).
 
 Descriptions such as “my project in Software” require the optional
 conversational Control agent. Direct mode intentionally uses deterministic
@@ -72,8 +74,8 @@ from a detached worker's report-only topic.
 
 ## Remove the project group
 
-Finish any active turns or consoles and stop the group's detached workers.
-Then send:
+Wait for queued and active turns to finish, close active consoles, and stop the
+group's detached workers. Then send:
 
 ```text
 /removegroup
@@ -86,9 +88,10 @@ history, archives the topic agents, clears provider sessions, removes stopped
 worker records and recovery files, and revokes the workspace binding, routes,
 buttons, and cards.
 
-Telegram's Bot API cannot delete the group itself. After Telegram Control
-reports that cleanup is queued, remove the bot from the group or delete the
-group in Telegram.
+Telegram's Bot API cannot delete the group itself. The first tap acknowledgment
+only says that cleanup is queued. Wait until the managed topics have actually
+disappeared and the completion message arrives before removing the bot from the
+group or deleting the group in Telegram.
 
 ## Suggested screenshot set
 

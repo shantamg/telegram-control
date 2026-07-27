@@ -958,12 +958,13 @@ def send_group_setup_card() -> None:
         "Add me to a new project group:\n\n"
         "1. Create a private Telegram group — any name.\n"
         "2. Turn on Topics in the group's settings.\n"
-        "3. Tap the button below and pick that group. Telegram adds me and "
+        "3. Choose Telegram’s separate View as Topics display mode.\n"
+        "4. Tap the button below and pick that group. Telegram adds me and "
         "asks you to grant Change group info, Delete messages, and Manage "
         "topics in the same step — no separate promotion.\n\n"
-        "Then send anything in the group and I will ask which folder it works "
-        "in. A bot cannot create the group or enable Topics itself; those two "
-        "steps are yours.\n\n"
+        "Then approve the Authorize forum card and send /bind followed by an "
+        "exact existing folder path. A bot cannot create the group, enable "
+        "Topics, or choose your display mode; those steps are yours.\n\n"
         f"{telegram_help.HELP_HINT}",
         reply_markup={
             "inline_keyboard": [
@@ -5289,7 +5290,8 @@ def main() -> int:
                     send_message(
                         "I am already paired with this chat.\n\n"
                         "Send /newgroup to add me to a project group, or "
-                        f"just tell me what you need.\n\n{telegram_help.HELP_HINT}"
+                        "send /projects to inspect existing workspaces.\n\n"
+                        f"{telegram_help.HELP_HINT}"
                     )
             elif agent_create is not None:
                 create_agent_from_catalog(agent_create.group(1))

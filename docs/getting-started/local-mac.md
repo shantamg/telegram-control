@@ -7,11 +7,14 @@ controller in a per-user LaunchAgent that starts after graphical login.
 ## 1. Install one provider
 
 Install and authenticate Claude Code, Codex, or both. Verify each provider you
-intend to use by running it directly from Terminal before continuing.
+intend to use by running it directly from Terminal before continuing. `doctor`
+can run each CLI's `--version`, but provider login remains a separate manual
+checkpoint.
 
 Telegram Control does not broker provider credentials. If only `claude` is
 available, new groups and topics use Claude and no Codex worker or central
-router is required. If both are available, setup lets you choose.
+router is required. If both are available, the `/bind` confirmation offers
+both unless a configured default selects one.
 
 ## 2. Clone the repository
 
@@ -56,7 +59,7 @@ The first part is a capability-aware doctor. It treats these as core failures:
 - not running on macOS;
 - Python older than 3.9;
 - missing or invalid pairing/Keychain state;
-- no authenticated provider CLI;
+- no runnable provider CLI;
 - a selected default provider that is unavailable;
 - enabling the optional Control agent without Codex.
 
@@ -64,9 +67,15 @@ Voice transcription, spoken replies, and tmux features are reported
 separately as optional. Missing one does not prevent text, file, and topic
 conversations from being installed.
 
-`bootstrap` then creates or verifies the database, installs the repo-owned
-skills in the shared Claude/Codex skill locations, publishes Telegram's command
-menu, writes the LaunchAgent, and starts the controller.
+`bootstrap` then creates or verifies the database, copies the repo-owned skills
+to `~/.agents/skills/`, links their Claude entries from `~/.claude/skills/`,
+attempts to publish Telegram's command menu, writes the LaunchAgent, and starts
+the controller. Codex discovers the shared skill directory directly. A network
+failure while publishing the menu is a nonfatal warning; retry it with:
+
+```sh
+./telegram_control.py sync-commands
+```
 
 Inspect it at any time:
 
@@ -95,8 +104,21 @@ model.
 
 ## Apply an update safely
 
-Pull the desired revision and run its tests. Handler changes are loaded for
-each new Telegram turn. If worker code changed, request an idle restart:
+Pull the desired revision and run its tests:
+
+```sh
+/usr/bin/python3 -m unittest discover -s tests -v
+```
+
+Then apply only the rollout steps relevant to that revision:
+
+- If `telegram_help.COMMANDS` changed, run
+  `./telegram_control.py sync-commands`; Telegram's menu is published state and
+  is not derived from the handler at runtime.
+- If a repo-owned skill under `skills/` changed, run
+  `./telegram_control.py install-skills`.
+- Handler changes are loaded by each new Telegram turn without a restart.
+- If long-running worker code changed, request an idle restart:
 
 ```sh
 ./telegram_control.py request-restart --reason "Apply the updated controller"
@@ -104,6 +126,11 @@ each new Telegram turn. If worker code changed, request an idle restart:
 
 The supervisor waits until no inbox, router, agent, or outbox work is leased.
 Do not kill the workers or use `launchctl` directly while turns are active.
+
+Schema migrations and new database payload variants create a mixed-version
+window as soon as a fresh process writes or opens them. Follow any
+revision-specific migration notes and queue the matching worker reload; do not
+assume a schema change waits for a deploy step.
 
 ## Troubleshooting
 
@@ -120,6 +147,22 @@ tail -n 100 ~/Library/Logs/telegram-control.error.log
 If a provider is reported as unavailable, make sure the same macOS user can run
 that provider from Terminal and complete its login flow. Telegram Control does
 not refresh or store those credentials itself.
+
+## Uninstall
+
+Remove the loaded LaunchAgent and stop the background controller with:
+
+```sh
+./telegram_bridge.py uninstall
+```
+
+This intentionally keeps pairing, the Keychain token, SQLite state,
+attachments, logs, and installed shared skills so reinstalling does not destroy
+history. If you want a complete removal, first preserve anything you need,
+remove the bot from its Telegram groups, and then delete the local-state paths
+listed above, the installed `telegram-*` skills in `~/.agents/skills/` and their
+matching Claude links, and the Keychain item named
+`telegram-bridge-bot-token`. Those final deletions are manual and irreversible.
 
 ## Cloud deployment
 

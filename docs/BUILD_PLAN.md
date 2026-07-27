@@ -1,5 +1,14 @@
 # Telegram Control staged build plan
 
+> **Historical design record:** this file preserves the original staged plan
+> and the checkpoints appended while it was built. Statements such as
+> “Current proof of concept,” deferred provider support, and the required main
+> router describe their point in that history, not the current product.
+> Telegram Control now defaults to direct group topics, supports Claude and
+> Codex, and keeps the conversational Control router optional. Use the
+> [README](../README.md), [documentation index](README.md), and
+> [implementation notes](IMPLEMENTATION_NOTES.md) for current behavior.
+
 ## Outcome
 
 Telegram becomes a durable mobile interface for a hierarchy of local agents:

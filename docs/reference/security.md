@@ -46,15 +46,16 @@ Voice transcription via Handy and Parakeet runs on-device. Spoken replies via
 `edge-tts` use that tool's external text-to-speech service. Claude Code and
 Codex communicate according to their own provider products and authentication.
 
-## Before making the repository public
+## Public repository hygiene
 
-Repository visibility is unrelated to runtime authorization: the software can
-be public while every installation has its own private Keychain token, pairing,
-database, and ignored local settings.
+The source repository is public, but repository visibility is unrelated to
+runtime authorization. Every installation keeps its own private Keychain token,
+pairing, database, attachments, and ignored local settings.
 
-Before changing visibility, inspect the entire Git history—not only the current
-tree—for tokens, private paths, database files, logs, attachments, and personal
-content. GitHub visibility and branch protections must be configured by a
-repository owner; source files cannot enforce them.
+Continue to inspect commits and pull requests for tokens, private paths,
+database files, logs, attachments, and personal content. If a secret ever
+enters Git history, rotate it; deleting the current file is not sufficient.
+GitHub visibility, rulesets, and collaborator permissions must be configured by
+a repository owner because source files cannot enforce them.
 
 Report a vulnerability privately using [SECURITY.md](../../SECURITY.md).

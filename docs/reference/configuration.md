@@ -28,6 +28,33 @@ value at the same key.
 Inline and file forms for the same prompt are mutually exclusive. Relative
 file paths are permitted only with a workspace and must remain inside it.
 
+## Runtime-managed spoken-reply setting
+
+The global spoken-reply voice and speed are not fields in the layered settings
+object. `/voice` stages, previews, and confirms that configuration, which is
+then stored as validated JSON in SQLite's `controller_state`. It applies to
+Listen actions, agent voice updates, and detached-worker voice reports. The
+built-in fallback is Sonia at `+10%`.
+
+## Machine-local bridge fields
+
+The generated private `config.json` also contains pairing and machine identity
+fields such as `chat_id`, `owner_user_id`, `bot_username`, and `handler_path`.
+Do not hand-edit or copy those values between installations.
+
+These optional top-level fields may be added to that same private file; they
+are not valid in workspace settings:
+
+| Field | Shape | Purpose |
+| --- | --- | --- |
+| `discovery_roots` | Array of absolute directory paths | Bounds exact-path validation and the optional Control agent's read-only workspace discovery. Defaults to the current user's home directory. |
+| `handy_binary` | Absolute executable path | Overrides Handy discovery for local voice transcription. |
+| `ffmpeg_binary` | Absolute executable path | Overrides `ffmpeg` discovery for voice input and spoken replies. |
+| `edge_tts_binary` | Absolute executable path | Overrides `edge-tts` discovery for spoken replies. |
+
+Binary resolution checks an explicit override first, then the documented common
+locations, then `PATH`.
+
 ## Intentionally not configurable
 
 The settings layer does not expose:

@@ -23,13 +23,16 @@ queues. It is omitted from the default supervisor topology.
 | `telegram_bridge.py` | Telegram API, Keychain token, pairing, private config, collection |
 | `durable_store.py` | Schema, migrations, queues, leases, routes, callbacks, agents, topic state |
 | `on_message.py` | Fresh per-update handler, authorization, commands, direct binding, cards, confirmations |
-| `provider_adapters.py` | Provider-neutral Claude and Codex execution, streaming, usage, interrupts |
+| `provider_adapters.py`, `claude_sessions.py`, `codex_sessions.py` | Provider-neutral execution plus provider session discovery and resume |
 | `app_config.py` | Validated install/workspace customization layers |
+| `provider_defaults.py` | Effective local model and effort defaults shown in status and inherited by turns |
 | `turn_guidance.py` | Non-replaceable managed-turn contract plus user customization |
 | `telegram_help.py` | Single source for Telegram's command menu and `/help` copy |
 | `router_contract.py`, `router_eval.py` | Optional Control agent tools and eval gate |
 | `discovery.py` | Bounded read-only workspace discovery |
-| `helper_paths.py`, `voice_responses.py` | Optional media capability discovery and spoken replies |
+| `workspace_catalog.py` | Path-free unified inventory for enrolled projects and bound groups |
+| `telegram_formatting.py` | Controller HTML, provider Markdown entities, chunking, and fallback rules |
+| `helper_paths.py`, `voice_responses.py`, `voice_settings.py` | Optional media discovery, synthesis, and global spoken-reply settings |
 | `agent_telegram.py`, `skills/` | Scoped helpers available inside managed turns |
 | `detached_worker.py`, `tmux_console.py` | Optional tmux-backed long-lived work and console takeover |
 | `tests/` | Dependency-free unit, integration, and fault-injection tests |
@@ -37,9 +40,13 @@ queues. It is omitted from the default supervisor topology.
 ## Durable routing model
 
 A private forum group is bound to one workspace and default provider. Each
-Telegram topic is bound to one managed agent and persisted provider session.
-Messages route by Telegram chat and thread identity, not by interpreting their
-contents. New direct-mode topics provision deterministically.
+ordinary Telegram topic is bound to one managed agent and persisted provider
+session; a detached worker instead owns a report-only topic. Messages route by
+Telegram chat and thread identity, not by interpreting their contents. New
+direct-mode topics provision deterministically. The older enrolled-project
+catalog and optional Control router remain supported, while the unified
+workspace inventory keeps those records and group-only workspaces distinct
+internally but deduplicated for display.
 
 The collector persists accepted updates before acknowledging them. Workers
 claim jobs with leases, and outbound Telegram calls are themselves durable and

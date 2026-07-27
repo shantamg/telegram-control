@@ -11052,6 +11052,8 @@ class DurableIntegrationTests(unittest.TestCase):
                 process(message_update(10, "/newgroup"), "worker-1", 100)
                 card = store.claim_outbox("sender", now=10**12)
                 self.assertIn("Add me to a new project group", card.params["text"])
+                self.assertIn("View as Topics", card.params["text"])
+                self.assertIn("/bind", card.params["text"])
                 self.assertEqual(
                     card.params["reply_markup"]["inline_keyboard"][0][0],
                     {

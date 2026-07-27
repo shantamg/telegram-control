@@ -21,8 +21,11 @@ the convention should ignore it too.
 ## Example
 
 The repository's [`config.example.json`](../../config.example.json) shows every
-setting. For a workspace file, copy only the object inside `telegram_control`
-because the workspace file itself is the settings object:
+layered behavioral setting. Machine-local discovery and binary paths are
+documented separately in the
+[configuration reference](../reference/configuration.md). For a workspace
+file, copy only the object inside `telegram_control` because the workspace file
+itself is the settings object:
 
 ```json
 {
