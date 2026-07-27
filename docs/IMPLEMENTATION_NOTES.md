@@ -1559,3 +1559,12 @@ Verified with store coverage for project/forum deduplication and active session
 aggregation, path-safe rendering coverage, router-prompt coverage for
 forum-only workspaces, and an end-to-end `/projects@bot` group-command fixture
 whose only workspace is a bound forum.
+
+The catalog is rendered as escaped Telegram HTML rather than MarkdownV2.
+Workspace names are bold, providers and durable slugs use code styling, a
+single summary line reports total workspaces/topics/sessions, and blank space
+separates entries. Every database-derived label is HTML-escaped before it
+reaches Telegram. Both the direct command and Control router set
+`parse_mode=HTML`; router fallback sends infer that formatting from the durable
+`list_projects` tool name, so a late receipt or failed edit cannot expose raw
+tags.

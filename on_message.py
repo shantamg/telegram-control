@@ -423,7 +423,10 @@ def send_message(
     include_inspect_button: bool = False,
     reply_markup: Optional[dict] = None,
     card: Optional[dict] = None,
+    parse_mode: Optional[str] = None,
 ) -> None:
+    if parse_mode not in {None, "HTML"}:
+        raise StoreError("Controller message parse mode is invalid.")
     global OUTPUT_SEQUENCE
     chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
     if chat_id_text:
@@ -449,6 +452,8 @@ def send_message(
             "message_thread_id": thread_id,
             "text": chunk,
         }
+        if parse_mode is not None:
+            params["parse_mode"] = parse_mode
         last_chunk = index == len(chunks) - 1
         if last_chunk and reply_markup is not None:
             params["reply_markup"] = reply_markup
@@ -869,7 +874,7 @@ def send_project_catalog() -> None:
             store.list_workspace_inventory(),
             store.project_alias_map(),
         )
-    send_message(text)
+    send_message(text, parse_mode="HTML")
 
 
 def send_group_setup_card() -> None:

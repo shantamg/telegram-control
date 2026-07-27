@@ -50,6 +50,7 @@ from durable_store import (
     LeaseLostError,
     SCHEMA_VERSION,
     StoreError,
+    WorkspaceInventoryEntry,
     context_usage_summary,
     extract_user_request,
 )
@@ -1549,14 +1550,34 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(telegram.active_session_count, 1)
 
         rendered = workspace_catalog.render_workspace_catalog(inventory)
-        self.assertIn("Connected workspaces", rendered)
-        self.assertIn("Life (claude)", rendered)
+        self.assertIn("<b>Connected workspaces</b>", rendered)
+        self.assertIn("2 workspaces · 3 active topics · 2 sessions", rendered)
+        self.assertIn("<b>Life</b> · <code>Claude</code>", rendered)
         self.assertIn("2 active topics · 1 session", rendered)
-        self.assertIn(
-            "telegram-control — Telegram Control (codex)",
-            rendered,
-        )
+        self.assertIn("<b>Telegram Control</b> · <code>Codex</code>", rendered)
+        self.assertIn("Slug: <code>telegram-control</code>", rendered)
         self.assertNotIn(str(root), rendered)
+
+    def test_workspace_catalog_escapes_dynamic_html(self):
+        rendered = workspace_catalog.render_workspace_catalog(
+            [
+                WorkspaceInventoryEntry(
+                    project_slug="research",
+                    display_name="R&D <Research>",
+                    providers=("codex",),
+                    forum_names=("Group > Research",),
+                    active_topic_count=1,
+                    active_session_count=1,
+                    project_agent_state="registered",
+                )
+            ],
+            {"research": ["R & D"]},
+        )
+
+        self.assertIn("<b>R&amp;D &lt;Research&gt;</b>", rendered)
+        self.assertIn("Group: Group &gt; Research", rendered)
+        self.assertIn("Alias: <code>R &amp; D</code>", rendered)
+        self.assertNotIn("<Research>", rendered)
 
     def test_project_aliases_are_durable_unique_and_resolvable(self):
         project, _ = self.store.enroll_project(
@@ -4515,6 +4536,71 @@ class DurableStoreTests(unittest.TestCase):
         )
         self.assertEqual(self._resolve_route(700, 111).target_id, agent.agent_id)
 
+    def test_router_project_catalog_edits_and_fallbacks_use_html(self):
+        self.store.ensure_surface_binding(
+            chat_id=123,
+            surface_type="control",
+            display_name="Control",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        self.store.ingest_update(message_update(20, "list projects"), now=100)
+        source_job_id = int(
+            self.store.connection.execute(
+                "SELECT job_id FROM inbox_jobs WHERE update_id = 20"
+            ).fetchone()["job_id"]
+        )
+        self.store.enqueue_router_message_with_receipt(
+            source_inbox_job_id=source_job_id,
+            input_text="list projects",
+            chat_id=123,
+            message_thread_id=None,
+            authorized_user_id=123,
+            receipt_text="routing",
+            now=101,
+        )
+        receipt = self.store.claim_outbox("sender", now=102)
+        self.store.complete_outbox(
+            receipt.message_id,
+            "sender",
+            {"message_id": 700, "chat": {"id": 123}},
+            now=103,
+        )
+        router = self.store.claim_router_mailbox("router", now=104)
+        catalog = (
+            "🎛 Control\n\n<b>Connected workspaces</b>\n"
+            "1 workspace · 1 active topic · 1 session"
+        )
+        self.store.complete_router_mailbox(
+            router.mailbox_id,
+            "router",
+            "router-session",
+            '{"tool":"list_projects","arguments":{}}',
+            "list_projects",
+            {},
+            catalog,
+            {},
+            now=105,
+        )
+
+        edit = self.store.claim_outbox("sender", now=106)
+        self.assertEqual(edit.method, "editMessageText")
+        self.assertEqual(edit.params["parse_mode"], "HTML")
+        self.assertEqual(edit.params["text"], catalog)
+
+        fallback_id = self.store.enqueue_router_response_fallback(
+            router.mailbox_id,
+            now=107,
+        )
+        fallback_row = self.store.connection.execute(
+            "SELECT params_json FROM outbox_messages WHERE message_id = ?",
+            (fallback_id,),
+        ).fetchone()
+        fallback_params = json.loads(fallback_row["params_json"])
+        self.assertEqual(fallback_params["parse_mode"], "HTML")
+        self.assertEqual(fallback_params["text"], catalog)
+
     def test_failed_final_edit_keeps_root_route_with_router(self):
         agent, _, router_mailbox_id = self._setup_routed_agent_turn()
         receipt = self.store.claim_outbox("sender", now=104)
@@ -7046,9 +7132,11 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertNotIn("/secret/local/path", text)
                 catalog = telegram_control.project_catalog_text(store)
                 self.assertIn(
-                    "telegram-control — Telegram Control (codex) · registered",
+                    "<b>Telegram Control</b> · <code>Codex</code>",
                     catalog,
                 )
+                self.assertIn("Project agent: registered", catalog)
+                self.assertIn("Slug: <code>telegram-control</code>", catalog)
                 self.assertNotIn("/secret/local/path", catalog)
 
                 unmanaged_root = (
@@ -9368,9 +9456,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 telegram_control.process_inbox_job(store, config, job, "worker")
                 catalog = store.claim_outbox("sender-2", now=10**12)
                 self.assertIn(
-                    "telegram-control — Telegram Control (codex)",
+                    "<b>Telegram Control</b> · <code>Codex</code>",
                     catalog.params["text"],
                 )
+                self.assertEqual(catalog.params["parse_mode"], "HTML")
                 self.assertNotIn("/tmp/telegram-control", catalog.params["text"])
 
     def test_ordinary_topic_message_uses_binding_not_reply_route(self):
@@ -10465,8 +10554,9 @@ class DurableIntegrationTests(unittest.TestCase):
 
             send.assert_called_once()
             text = send.call_args.args[0]
-            self.assertIn("Connected workspaces", text)
-            self.assertIn("Life (claude)", text)
+            self.assertEqual(send.call_args.kwargs, {"parse_mode": "HTML"})
+            self.assertIn("<b>Connected workspaces</b>", text)
+            self.assertIn("<b>Life</b> · <code>Claude</code>", text)
             self.assertIn("1 active topic · 1 session", text)
             self.assertNotIn(str(workspace), text)
 

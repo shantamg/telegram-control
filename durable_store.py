@@ -6181,7 +6181,7 @@ class DurableStore:
         row = self.connection.execute(
             """
             SELECT r.chat_id, r.message_thread_id,
-                r.source_inbox_job_id, o.telegram_result_json
+                r.source_inbox_job_id, r.tool_name, o.telegram_result_json
             FROM router_mailbox AS r
             JOIN outbox_messages AS o
                 ON o.operation_id =
@@ -6204,6 +6204,8 @@ class DurableStore:
             "message_id": telegram_message_id,
             "text": preview_text,
         }
+        if str(row["tool_name"] or "") == "list_projects":
+            params["parse_mode"] = "HTML"
         reply_markup = self._router_reply_markup(mailbox_id)
         if (
             reply_markup is None
@@ -7029,6 +7031,8 @@ class DurableStore:
         reply_markup = self._router_reply_markup(mailbox_id)
         if reply_markup is not None:
             params["reply_markup"] = reply_markup
+        if str(row["tool_name"] or "") == "list_projects":
+            params["parse_mode"] = "HTML"
         return self.enqueue_api_call(
             operation_id=f"router-mailbox:{int(mailbox_id)}:final-fallback",
             method="sendMessage",
