@@ -32,8 +32,8 @@ names both the tmux session and the topic.
 - `--model` and `--effort` are optional; omit them to inherit local defaults.
 - The command creates the topic (idempotent), starts the tmux session, and
   prints the session name, topic, and durable recovery-file path.
-- The harness automatically gives the worker its recovery-file contract before
-  the task brief. Do not replace that contract with a scheduler: the provider
+- The harness gives the worker its full recovery-file contract once, as the
+  launch prompt. Do not replace that contract with a scheduler: the provider
   continues to use its own native teamwork, wakeup, background, and scheduling
   features.
 
@@ -50,7 +50,12 @@ explicitly tells the worker to report at milestones (see below). Include
 anything the worker cannot discover for itself — it does not inherit your
 conversation.
 
-The harness prepends a standing instruction that the worker must update its
+Each brief is prefixed with a two-line reminder of the worker's name and
+recovery-file path, not the whole contract — the contract already arrived as the
+launch prompt, and re-pasting it on every relay wasted context and told the
+worker to wait for a brief that was already underneath it.
+
+The contract instructs the worker to update its
 durable `RECOVERY.md` whenever it creates, changes, completes, or cancels state
 that matters after process loss. This includes goals, native scheduled tasks
 and wakeups, background agents, monitors, exact restart commands, durable

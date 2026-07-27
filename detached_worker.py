@@ -159,6 +159,21 @@ Do not invent a separate scheduler. Continue using your provider's native teamwo
 Wait for the task brief after applying this contract."""
 
 
+def recovery_file_reminder(name: str, path: Path | str) -> str:
+    """A short re-anchor for briefs after the first.
+
+    The full contract is delivered once, as the launch prompt. Repeating it
+    verbatim on every relay cost about 290 tokens a time, told the worker to
+    "wait for the task brief" that was already sitting underneath it, and — by
+    sheer repetition — weighted recovery bookkeeping above the actual work.
+    A two-line reminder keeps the recency anchor without any of that.
+    """
+    return (
+        f"Reminder: you are detached worker '{name}'; keep {path} current "
+        "whenever durable state changes. Your instruction follows below."
+    )
+
+
 def create_worker(
     store: DurableStore,
     *,

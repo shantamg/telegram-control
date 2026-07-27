@@ -2533,8 +2533,11 @@ def worker_brief_command(args: argparse.Namespace) -> None:
                 recovery_file_path=str(recovery_file),
                 recovery_prompt=detached_worker.DEFAULT_RECOVERY_PROMPT,
             )
+        # The full contract is the worker's launch prompt, so every brief that
+        # reaches here is already after it. Re-anchor briefly rather than
+        # re-pasting it.
         delivered = (
-            detached_worker.recovery_file_contract(worker.name, recovery_file)
+            detached_worker.recovery_file_reminder(worker.name, recovery_file)
             + "\n\nTask brief:\n\n"
             + brief
         )

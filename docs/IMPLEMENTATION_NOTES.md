@@ -953,6 +953,30 @@ what the test proved, and invoked the generation-1 success handshake. SQLite
 ended at `recovery_state=succeeded`, `observed_state=running`, and retry count
 zero; both the started and verified-success outbox messages reached `sent`.
 
+### The contract is a launch prompt, not a per-brief header
+
+`worker-brief` used to prepend the entire recovery contract to every brief it
+delivered, including relays of the owner's follow-up instructions. Reading the
+`journey-story` transcript showed what that cost over a seven-hour run: seven of
+its thirty-seven messages carried the full block, and each one closed with "Wait
+for the task brief after applying this contract" sitting directly above the
+brief it was telling the worker to wait for. The same transcript ruled out the
+worse failure mode — the repeats did not make the worker re-read `RECOVERY.md`,
+which it opened three times all night.
+
+The token cost was never the point; roughly 290 tokens a repeat is noise in a
+200k window, and none of it deduplicates, since each copy extends the
+conversation prefix and is billed once at full input price before becoming a
+cache read. The cost was salience. Repetition is how a model decides what
+matters, so restating the bookkeeping contract seven times weighted it against
+the actual work.
+
+`create_worker` still appends the full contract to the launch command, so every
+brief that reaches `worker_brief_command` is necessarily after it. Briefs now
+carry `recovery_file_reminder` instead: two lines naming the worker and its
+recovery-file path, ending by pointing at the instruction below rather than
+asking the worker to wait for it. Verified with the 29 detached-worker tests.
+
 ## Agent-authored questions with buttons
 
 Agents could send text, voice, group icons, detached workers, and teardown
