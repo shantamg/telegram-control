@@ -70,6 +70,26 @@ An active agent can also create another ordinary conversational topic when you
 ask it to. That new topic is independent and directly steerable. This differs
 from a detached worker's report-only topic.
 
+## Remove the project group
+
+Finish any active turns or consoles and stop the group's detached workers.
+Then send:
+
+```text
+/removegroup
+```
+
+from any ordinary topic in the bound group. The confirmation card reports how
+many managed topics and detached workers belong to the group. Confirming
+permanently deletes every controller-managed Telegram topic and its message
+history, archives the topic agents, clears provider sessions, removes stopped
+worker records and recovery files, and revokes the workspace binding, routes,
+buttons, and cards.
+
+Telegram's Bot API cannot delete the group itself. After Telegram Control
+reports that cleanup is queued, remove the bot from the group or delete the
+group in Telegram.
+
 ## Suggested screenshot set
 
 The first public documentation pass intentionally avoids screenshots that

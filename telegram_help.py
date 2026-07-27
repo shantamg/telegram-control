@@ -32,6 +32,7 @@ COMMANDS = (
     BotCommand("projects", "List connected workspaces and topic sessions"),
     BotCommand("newgroup", "Get the link that adds me to a new project group"),
     BotCommand("bind", "Bind this group to an exact local folder"),
+    BotCommand("removegroup", "Safely remove this project group and all topics"),
     BotCommand("teardown", "Safely remove this managed topic and session"),
 )
 
@@ -101,6 +102,17 @@ Messages in a report-only topic do not steer the worker. Return to the main agen
 Type /teardown inside an active managed agent topic. Control opens the confirmation card directly without invoking Codex or Claude.
 
 After confirmation, Telegram Control clears the provider-session pointer, archives the agent binding, revokes routes and buttons, and removes the Telegram topic. Running detached workers that originated here must be stopped first.""",
+    ),
+    HelpTopic(
+        "removegroup",
+        "Group removal",
+        """Safe group removal
+
+Type /removegroup in any ordinary topic inside the bound project group. Control shows how many managed topics and detached workers belong to the group, then asks for confirmation without invoking Codex or Claude.
+
+Active turns and consoles must finish, and detached workers must be stopped, before removal can proceed. After confirmation, Telegram Control deletes every managed and worker topic, archives the topic agents, clears provider sessions, removes stopped worker records and recovery files, and revokes the group’s workspace binding, routes, buttons, and cards.
+
+Telegram Control cannot delete the Telegram group itself. Once cleanup finishes, remove the bot from the group or delete the group in Telegram.""",
     ),
     HelpTopic(
         "voice",

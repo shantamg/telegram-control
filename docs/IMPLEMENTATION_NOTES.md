@@ -1611,3 +1611,35 @@ existing lifecycle, session, model, effort, and provider buttons are unchanged.
 Because `/agent` is handled by a fresh `on_message.py` process, this presentation
 change takes effect on the next command without waiting for the long-running
 workers to reload.
+
+## Confirmed group teardown removes the workspace and every topic
+
+`/removegroup` is the group-level counterpart to `/newgroup`. The owner can
+send it in any ordinary topic of a bound private forum. The handler creates a
+30-minute, owner/chat/topic-bound confirmation card directly, without starting
+a Claude or Codex turn. Its summary includes the active managed-topic and
+detached-worker counts and explains that Telegram Control cannot delete the
+Telegram group itself.
+
+Confirmation re-resolves the exact active root binding inside an immediate
+transaction. A queued or leased topic turn, active console, Control router
+turn, or intended-running detached worker blocks removal and leaves the
+repeatable confirmation available. Stopped workers have only their exact
+controller-owned recovery file removed; unexpected companion files are
+preserved.
+
+Successful teardown atomically expires every callback in the group, revokes
+reply routes, stales surface cards, archives forum subjects and their managed
+agents, clears provider-session pointers, removes stopped worker records,
+revokes every topic and root surface, and marks the forum workspace revoked.
+One idempotent `deleteForumTopic` call is queued for every managed and
+report-only topic under a shared serialization key. Already-missing topics use
+the sender's existing idempotent success path. A final unthreaded message lands
+in General and tells the owner that the bot or Telegram group can now be
+removed. Historical inbox, outbox, agent, subject, and event rows remain as an
+audit trail.
+
+Verified with durable-store coverage for active-worker blocking, complete
+multi-topic/agent/worker archival, serialized Telegram deletions, and callback
+expiry; handler integration coverage exercises the direct command and its
+confirmed end-to-end teardown without creating an agent or router turn.
