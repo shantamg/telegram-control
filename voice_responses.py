@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import AbstractSet, Optional
 
 import helper_paths
+import voice_settings
 
 
 SPEECH_DIR = (
@@ -31,8 +32,6 @@ FFMPEG_BINARY = helper_paths.resolve_binary(
     Path("/usr/local/bin/ffmpeg"),
     command_name="ffmpeg",
 )
-VOICE_NAME = "en-GB-SoniaNeural"
-VOICE_RATE = "+10%"
 MAX_SPEECH_CHARACTERS = 3_500
 MAX_VOICE_BYTES = 20_000_000
 SYNTHESIS_TIMEOUT_SECONDS = 3 * 60
@@ -120,8 +119,17 @@ def synthesize_voice(
     value: str,
     operation_key: str,
     protected_paths: Optional[AbstractSet[str]] = None,
+    *,
+    voice_name: str = voice_settings.DEFAULT_VOICE_NAME,
+    rate: str = voice_settings.DEFAULT_RATE,
 ) -> Path:
     """Generate one deterministic OGG/Opus file, safe for durable retry."""
+    try:
+        configuration = voice_settings.validate_configuration(
+            {"voice_name": voice_name, "rate": rate}
+        )
+    except ValueError as exc:
+        raise VoiceResponseError(str(exc)) from None
     cleanup_stale_files(protected_paths=protected_paths)
     if not EDGE_TTS_BINARY.is_file() or not os.access(EDGE_TTS_BINARY, os.X_OK):
         raise VoiceResponseError("The speech synthesizer is unavailable.")
@@ -146,9 +154,9 @@ def synthesize_voice(
             [
                 str(EDGE_TTS_BINARY),
                 "--voice",
-                VOICE_NAME,
+                configuration.voice_name,
                 "--rate",
-                VOICE_RATE,
+                configuration.rate,
                 "--file",
                 str(text_path),
                 "--write-media",

@@ -21,6 +21,7 @@ import app_config
 import provider_defaults
 import telegram_formatting
 import telegram_help
+import voice_settings
 
 
 SCHEMA_VERSION = 23
@@ -1679,6 +1680,50 @@ class DurableStore:
         ).fetchone()
         return int(row["value"]) if row else None
 
+    def voice_configuration(self) -> voice_settings.VoiceConfiguration:
+        """Return the global spoken-reply configuration."""
+        row = self.connection.execute(
+            "SELECT value FROM controller_state "
+            "WHERE key = 'voice_configuration'"
+        ).fetchone()
+        if row is None:
+            return voice_settings.DEFAULT_CONFIGURATION
+        try:
+            value = json.loads(str(row["value"]))
+            return voice_settings.validate_configuration(value)
+        except (json.JSONDecodeError, ValueError):
+            raise StoreError(
+                "Stored voice configuration is invalid."
+            ) from None
+
+    def set_voice_configuration(
+        self,
+        configuration: voice_settings.VoiceConfiguration,
+        now: Optional[float] = None,
+    ) -> voice_settings.VoiceConfiguration:
+        """Persist one validated global spoken-reply configuration."""
+        try:
+            normalized = voice_settings.validate_configuration(configuration)
+        except ValueError as exc:
+            raise StoreError(str(exc)) from None
+        timestamp = time.time() if now is None else float(now)
+        encoded = json.dumps(
+            voice_settings.as_dict(normalized),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        self.connection.execute(
+            """
+            INSERT INTO controller_state(key, value, updated_at)
+            VALUES ('voice_configuration', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (encoded, timestamp),
+        )
+        return normalized
+
     @staticmethod
     def _update_kind(update: dict[str, Any]) -> Optional[str]:
         if isinstance(update.get("message"), dict):
@@ -2181,6 +2226,46 @@ class DurableStore:
         )
         if cursor.rowcount not in {0, 1}:
             raise StoreError("Callback snapshot retirement was ambiguous.")
+
+    def expire_voice_configuration_actions(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: Optional[int],
+        authorized_user_id: int,
+        now: Optional[float] = None,
+    ) -> int:
+        """Expire every stale picker or review action on this exact surface."""
+        timestamp = time.time() if now is None else float(now)
+        cursor = self.connection.execute(
+            """
+            UPDATE callback_actions
+            SET state = 'expired', updated_at = ?
+            WHERE chat_id = ? AND authorized_user_id = ?
+                AND (
+                    message_thread_id = ?
+                    OR (message_thread_id IS NULL AND ? IS NULL)
+                )
+                AND action_type LIKE 'voice_config_%'
+                AND state = 'active'
+            """,
+            (
+                timestamp,
+                int(chat_id),
+                int(authorized_user_id),
+                (
+                    int(message_thread_id)
+                    if message_thread_id is not None
+                    else None
+                ),
+                (
+                    int(message_thread_id)
+                    if message_thread_id is not None
+                    else None
+                ),
+            ),
+        )
+        return int(cursor.rowcount)
 
     @staticmethod
     def _telegram_mutation_from_row(row: sqlite3.Row) -> TelegramMutation:

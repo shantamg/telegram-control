@@ -44,6 +44,13 @@ independent from voice input. Spoken-reply synthesis uses the external
 text-to-speech service used by `edge-tts`; ordinary text replies remain local
 to the controller/provider path.
 
+Send `/voice` in any authorized chat or topic to inspect the global
+spoken-reply configuration. Voice and speed choices are staged first;
+**Preview** generates a real Microsoft TTS sample without changing the
+setting, **Confirm** applies it, and **Back** returns to the choices. The
+selected configuration is shared by Listen actions, agent-authored voice
+updates, and detached-worker voice reports.
+
 ## tmux
 
 tmux is used only for:

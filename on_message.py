@@ -27,6 +27,7 @@ import telegram_formatting
 import telegram_help
 import tmux_console
 import voice_responses
+import voice_settings
 import workspace_catalog
 from durable_store import (
     CallbackActionError,
@@ -1661,6 +1662,181 @@ def option_button_rows(actions, width: int = 3) -> list[list[dict]]:
     ]
 
 
+def voice_configuration_picker(
+    store: DurableStore,
+    *,
+    operation_prefix: str,
+    chat_id: int,
+    thread_id: Optional[int],
+    user_id: int,
+) -> tuple[str, dict]:
+    """Build one fresh global voice picker and retire older copies."""
+    store.expire_voice_configuration_actions(
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        authorized_user_id=user_id,
+    )
+    current = store.voice_configuration()
+    current_voice, current_rate = voice_settings.describe(current)
+    voice_actions = []
+    for index, option in enumerate(voice_settings.VOICE_OPTIONS):
+        configuration = voice_settings.VoiceConfiguration(
+            voice_name=option.name,
+            rate=current.rate,
+        )
+        action = store.create_callback_action(
+            operation_id=f"{operation_prefix}:voice-config:voice:{index}",
+            action_type="voice_config_select",
+            payload=voice_settings.as_dict(configuration),
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            authorized_user_id=user_id,
+            one_time=True,
+            ttl_seconds=15 * 60,
+        )
+        label = (
+            f"✓ {option.label}"
+            if option.name == current.voice_name
+            else option.label
+        )
+        voice_actions.append((label, action))
+
+    rate_actions = []
+    for index, option in enumerate(voice_settings.RATE_OPTIONS):
+        configuration = voice_settings.VoiceConfiguration(
+            voice_name=current.voice_name,
+            rate=option.value,
+        )
+        action = store.create_callback_action(
+            operation_id=f"{operation_prefix}:voice-config:rate:{index}",
+            action_type="voice_config_select",
+            payload=voice_settings.as_dict(configuration),
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            authorized_user_id=user_id,
+            one_time=True,
+            ttl_seconds=15 * 60,
+        )
+        label = (
+            f"✓ {option.label}"
+            if option.value == current.rate
+            else option.label
+        )
+        rate_actions.append((label, action))
+
+    return (
+        "Spoken reply settings\n\n"
+        f"Current voice: {current_voice}\n"
+        f"Current speed: {current_rate}\n\n"
+        "Choose a voice or speed below. The selection will be staged so you "
+        "can preview it before confirming.\n\n"
+        "This setting applies to Listen, agent voice updates, and detached "
+        "worker voice reports across Telegram Control.",
+        {
+            "inline_keyboard": (
+                option_button_rows(voice_actions, width=2)
+                + option_button_rows(rate_actions, width=2)
+            )
+        },
+    )
+
+
+def voice_configuration_review(
+    store: DurableStore,
+    *,
+    configuration: voice_settings.VoiceConfiguration,
+    operation_prefix: str,
+    chat_id: int,
+    thread_id: Optional[int],
+    user_id: int,
+) -> tuple[str, dict]:
+    """Build Preview / Confirm / Back controls for one staged selection."""
+    staged = voice_settings.validate_configuration(configuration)
+    store.expire_voice_configuration_actions(
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        authorized_user_id=user_id,
+    )
+    current = store.voice_configuration()
+    current_voice, current_rate = voice_settings.describe(current)
+    staged_voice, staged_rate = voice_settings.describe(staged)
+    payload = voice_settings.as_dict(staged)
+    preview = store.create_callback_action(
+        operation_id=f"{operation_prefix}:voice-config:preview",
+        action_type="voice_config_preview",
+        payload=payload,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        authorized_user_id=user_id,
+        one_time=False,
+        ttl_seconds=15 * 60,
+    )
+    confirm = store.create_callback_action(
+        operation_id=f"{operation_prefix}:voice-config:confirm",
+        action_type="voice_config_confirm",
+        payload=payload,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        authorized_user_id=user_id,
+        one_time=True,
+        ttl_seconds=15 * 60,
+    )
+    back = store.create_callback_action(
+        operation_id=f"{operation_prefix}:voice-config:back",
+        action_type="voice_config_back",
+        payload={},
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        authorized_user_id=user_id,
+        one_time=True,
+        ttl_seconds=15 * 60,
+    )
+    return (
+        "Review spoken reply settings\n\n"
+        f"Current: {current_voice} · {current_rate}\n"
+        f"Selected: {staged_voice} · {staged_rate}\n\n"
+        "Preview generates a real Microsoft TTS voice note. Confirm is the "
+        "only action that changes the global setting.",
+        {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "🔊 Preview",
+                        "callback_data": f"a:{preview.token}",
+                    },
+                    {
+                        "text": "✅ Confirm",
+                        "callback_data": f"a:{confirm.token}",
+                    },
+                    {
+                        "text": "‹ Back",
+                        "callback_data": f"a:{back.token}",
+                    },
+                ]
+            ]
+        },
+    )
+
+
+def send_voice_configuration() -> None:
+    """Open the owner-bound global spoken-reply configuration flow."""
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    user_id_text = os.environ.get("TELEGRAM_FROM_ID")
+    if not database_path or not job_id or not user_id_text:
+        raise StoreError("The /voice command requires the durable controller.")
+    chat_id, thread_id = surface_coordinates()
+    with DurableStore(Path(database_path)) as store:
+        text, reply_markup = voice_configuration_picker(
+            store,
+            operation_prefix=f"inbox:{int(job_id)}",
+            chat_id=chat_id,
+            thread_id=thread_id,
+            user_id=int(user_id_text),
+        )
+    send_message(text, reply_markup=reply_markup)
+
+
 def handle_callback(update: dict, callback_query: dict) -> None:
     callback_query_id = str(callback_query.get("id", ""))
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
@@ -1700,6 +1876,168 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 },
                 "callback-answer",
             )
+        return
+
+    if action.action_type == "voice_config_select":
+        try:
+            selected = voice_settings.validate_configuration(action.payload)
+            with DurableStore(Path(database_path)) as store:
+                text, reply_markup = voice_configuration_review(
+                    store,
+                    configuration=selected,
+                    operation_prefix=(
+                        f"inbox:{int(os.environ['TELEGRAM_CONTROL_JOB_ID'])}"
+                    ),
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                )
+        except ValueError as exc:
+            raise StoreError(str(exc)) from None
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Selection staged.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageText",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "text": speaker_labeled_text(text),
+                "reply_markup": reply_markup,
+            },
+            "voice-config-review",
+        )
+        return
+
+    if action.action_type == "voice_config_back":
+        with DurableStore(Path(database_path)) as store:
+            text, reply_markup = voice_configuration_picker(
+                store,
+                operation_prefix=(
+                    f"inbox:{int(os.environ['TELEGRAM_CONTROL_JOB_ID'])}"
+                ),
+                chat_id=chat_id,
+                thread_id=thread_id,
+                user_id=user_id,
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Choose another setting.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageText",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "text": speaker_labeled_text(text),
+                "reply_markup": reply_markup,
+            },
+            "voice-config-picker",
+        )
+        return
+
+    if action.action_type == "voice_config_preview":
+        try:
+            selected = voice_settings.validate_configuration(action.payload)
+        except ValueError as exc:
+            raise StoreError(str(exc)) from None
+        voice_label, rate_label = voice_settings.describe(selected)
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Generating preview via Microsoft TTS…",
+                },
+                "callback-answer",
+            )
+        source_job_id = int(os.environ["TELEGRAM_CONTROL_JOB_ID"])
+        voice_path = None
+        try:
+            with DurableStore(Path(database_path)) as store:
+                protected_voice_paths = store.pending_voice_file_paths()
+            voice_path = voice_responses.synthesize_voice(
+                (
+                    f"Hello. This is {voice_label.split(' ', 1)[-1]}, your "
+                    "Telegram Control voice. Spoken replies will sound like "
+                    "this."
+                ),
+                f"voice-preview-{source_job_id}",
+                protected_paths=protected_voice_paths,
+                voice_name=selected.voice_name,
+                rate=selected.rate,
+            )
+            deliver_api_call(
+                "sendVoice",
+                {
+                    "chat_id": chat_id,
+                    "message_thread_id": thread_id,
+                    "__voice_file_path": str(voice_path),
+                    "caption": (
+                        f"{CONTROL_SPEAKER}\n\nPreview: "
+                        f"{voice_label} · {rate_label}"
+                    ),
+                },
+                "voice-config-preview",
+            )
+        except (voice_responses.VoiceResponseError, StoreError):
+            if voice_path is not None:
+                voice_responses.remove_voice_file(str(voice_path))
+            send_message(
+                "I couldn’t generate that preview. The staged setting was "
+                "not changed; you can retry or go back."
+            )
+        return
+
+    if action.action_type == "voice_config_confirm":
+        try:
+            selected = voice_settings.validate_configuration(action.payload)
+        except ValueError as exc:
+            raise StoreError(str(exc)) from None
+        with DurableStore(Path(database_path)) as store:
+            configured = store.set_voice_configuration(selected)
+            store.expire_voice_configuration_actions(
+                chat_id=chat_id,
+                message_thread_id=thread_id,
+                authorized_user_id=user_id,
+            )
+        voice_label, rate_label = voice_settings.describe(configured)
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Spoken reply settings updated.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageText",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "text": speaker_labeled_text(
+                    "✅ Spoken reply settings updated.\n\n"
+                    f"Voice: {voice_label}\n"
+                    f"Speed: {rate_label}\n\n"
+                    "Future Listen actions and voice updates will use this "
+                    "configuration."
+                ),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "voice-config-confirmed",
+        )
         return
 
     if action.action_type == "help_topic":
@@ -2570,6 +2908,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     agent_id,
                 )
                 protected_voice_paths = store.pending_voice_file_paths()
+                voice_configuration = store.voice_configuration()
         except StoreError as exc:
             if callback_query_id:
                 deliver_api_call(
@@ -2607,6 +2946,8 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 response_text,
                 f"agent-{mailbox_id}-request-{source_job_id}",
                 protected_paths=protected_voice_paths,
+                voice_name=voice_configuration.voice_name,
+                rate=voice_configuration.rate,
             )
             with DurableStore(Path(database_path)) as store:
                 store.enqueue_agent_voice_response(
@@ -4920,6 +5261,8 @@ def main() -> int:
                     send_agent_status()
                 else:
                     send_status_card(update)
+            elif command.lower() == "/voice":
+                send_voice_configuration()
             elif command.lower() == "/help":
                 send_help_menu()
             elif command.lower() == "/teardown":

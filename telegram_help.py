@@ -29,6 +29,7 @@ COMMANDS = (
     BotCommand("help", "Browse the Telegram Control guide"),
     BotCommand("agent", "Inspect or manage this topic's agent"),
     BotCommand("status", "Inspect this Telegram surface"),
+    BotCommand("voice", "Choose and preview the spoken-reply voice"),
     BotCommand("projects", "List connected workspaces and topic sessions"),
     BotCommand("newgroup", "Get the link that adds me to a new project group"),
     BotCommand("bind", "Bind this group to an exact local folder"),
@@ -122,6 +123,8 @@ Telegram Control cannot delete the Telegram group itself. Once cleanup finishes,
 Send a Telegram photo or any document normally, with an optional caption. Attachments up to 20 MB are saved privately and routed to Codex or Claude by local path.
 
 Send a Telegram voice note normally; it is transcribed locally and routed like text. If Telegram briefly fails to provide the audio file, Control retries behind the same transcribing receipt and shows an error only after every durable attempt fails.
+
+Use /voice to choose the global Microsoft TTS voice and speaking speed used by Listen buttons, agent voice updates, and detached worker voice reports. Selecting an option only stages it. Preview generates a real sample voice note; Confirm applies it, and Back returns to the choices without changing anything.
 
 Reply to an exact Control or agent message to continue that routed conversation. During an active turn, a reply to its progress card can steer the work, and its Stop button interrupts the provider. If the owning worker has already exited, Stop clears the orphaned turn immediately so the next queued message can start. Agents can also send requested voice or text progress updates through scoped Telegram skills.""",
     ),

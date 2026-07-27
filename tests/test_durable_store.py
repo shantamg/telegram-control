@@ -19,6 +19,7 @@ import provider_defaults
 import router_contract
 import telegram_control
 import telegram_help
+import voice_settings
 import workspace_catalog
 from durable_store import (
     MIGRATION_1,
@@ -1847,6 +1848,8 @@ class DurableStoreTests(unittest.TestCase):
             "The durable voice response is ready.",
             f"agent-{mailbox_id}-request-{int(callback_job['job_id'])}",
             protected_paths=set(),
+            voice_name="en-GB-SoniaNeural",
+            rate="+10%",
         )
         voice = self.store.connection.execute(
             """
@@ -2265,6 +2268,12 @@ class DurableStoreTests(unittest.TestCase):
             "TELEGRAM_CONTROL_MAILBOX_ID": str(mailbox_id),
             "TELEGRAM_CONTROL_WORKER_ID": "agent-worker",
         }
+        self.store.set_voice_configuration(
+            voice_settings.VoiceConfiguration(
+                voice_name="en-US-AndrewNeural",
+                rate="-10%",
+            )
+        )
         voice_path = Path(self.temporary_directory.name) / "update.ogg"
         with mock.patch.dict(os.environ, environment, clear=True):
             with mock.patch.object(
@@ -2286,9 +2295,14 @@ class DurableStoreTests(unittest.TestCase):
                         agent_telegram.voice_responses,
                         "synthesize_voice",
                         return_value=voice_path,
-                    ):
+                    ) as synthesize:
                         with redirect_stdout(StringIO()):
                             self.assertEqual(agent_telegram.main(), 0)
+        self.assertEqual(
+            synthesize.call_args.kwargs["voice_name"],
+            "en-US-AndrewNeural",
+        )
+        self.assertEqual(synthesize.call_args.kwargs["rate"], "-10%")
         voice_row = self.store.connection.execute(
             """
             SELECT method, params_json
@@ -3270,6 +3284,7 @@ class DurableStoreTests(unittest.TestCase):
             "help",
             "agent",
             "status",
+            "voice",
             "projects",
             "newgroup",
             "bind",

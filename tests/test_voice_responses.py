@@ -68,14 +68,20 @@ class VoiceResponseTests(unittest.TestCase):
             result = voice_responses.synthesize_voice(
                 "A concise response.",
                 "agent-12-request-44",
+                voice_name="en-US-AndrewNeural",
+                rate="-10%",
             )
             repeated = voice_responses.synthesize_voice(
                 "This different text is not regenerated on retry.",
                 "agent-12-request-44",
+                voice_name="en-US-AndrewNeural",
+                rate="-10%",
             )
 
         self.assertEqual(result, repeated)
         self.assertEqual(run.call_count, 2)
+        self.assertIn("en-US-AndrewNeural", run.call_args_list[0].args[0])
+        self.assertIn("-10%", run.call_args_list[0].args[0])
         self.assertEqual(result.read_bytes(), b"voice-bytes")
         self.assertEqual(result.stat().st_mode & 0o777, 0o600)
         self.assertFalse(result.with_suffix(".txt").exists())
