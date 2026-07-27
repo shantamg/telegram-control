@@ -344,6 +344,14 @@ class ForumSubject:
 
 
 @dataclass(frozen=True)
+class ForumTeardownPlan:
+    workspace: ForumWorkspace
+    topics: tuple[SurfaceBinding, ...]
+    agents: tuple[ManagedAgent, ...]
+    workers: tuple[DetachedWorker, ...]
+
+
+@dataclass(frozen=True)
 class TelegramMutation:
     operation_id: str
     mutation_type: str
@@ -4104,6 +4112,312 @@ class DurableStore:
             (int(chat_id),),
         ).fetchone()
         return self._forum_workspace_from_row(row) if row is not None else None
+
+    def plan_forum_teardown(
+        self,
+        *,
+        chat_id: int,
+        forum_binding_id: int,
+        require_idle: bool = True,
+    ) -> ForumTeardownPlan:
+        """Resolve one exact group teardown and reject unsafe live work."""
+        workspace_row = self.connection.execute(
+            """
+            SELECT w.*
+            FROM forum_workspaces AS w
+            JOIN surface_bindings AS root
+                ON root.binding_id = w.forum_binding_id
+            WHERE w.chat_id = ? AND w.forum_binding_id = ?
+                AND w.state = 'active' AND root.state = 'active'
+                AND root.chat_id = w.chat_id
+                AND root.message_thread_id = 0
+                AND root.target_type = 'controller'
+                AND root.target_id = 'control'
+            """,
+            (int(chat_id), int(forum_binding_id)),
+        ).fetchone()
+        if workspace_row is None:
+            raise StoreError(
+                "This project group is no longer bound to Telegram Control."
+            )
+        topic_rows = self.connection.execute(
+            """
+            SELECT *
+            FROM surface_bindings
+            WHERE chat_id = ? AND message_thread_id != 0
+                AND state = 'active'
+            ORDER BY binding_id
+            """,
+            (int(chat_id),),
+        ).fetchall()
+        agent_rows = self.connection.execute(
+            """
+            SELECT a.*
+            FROM agents AS a
+            JOIN surface_bindings AS b
+                ON b.binding_id = a.surface_binding_id
+            WHERE b.chat_id = ? AND b.message_thread_id != 0
+                AND b.state = 'active'
+            ORDER BY b.binding_id
+            """,
+            (int(chat_id),),
+        ).fetchall()
+        worker_rows = self.connection.execute(
+            """
+            SELECT w.*
+            FROM detached_workers AS w
+            JOIN surface_bindings AS b ON b.binding_id = w.binding_id
+            WHERE b.chat_id = ? AND b.message_thread_id != 0
+                AND b.state = 'active'
+            ORDER BY w.worker_id
+            """,
+            (int(chat_id),),
+        ).fetchall()
+        plan = ForumTeardownPlan(
+            workspace=self._forum_workspace_from_row(workspace_row),
+            topics=tuple(
+                self._surface_binding_from_row(row) for row in topic_rows
+            ),
+            agents=tuple(
+                self._managed_agent_from_row(row) for row in agent_rows
+            ),
+            workers=tuple(self._detached_worker(row) for row in worker_rows),
+        )
+        if not require_idle:
+            return plan
+
+        active_turn = self.connection.execute(
+            """
+            SELECT b.display_name
+            FROM agent_mailbox AS m
+            JOIN agents AS a ON a.agent_id = m.agent_id
+            JOIN surface_bindings AS b
+                ON b.binding_id = a.surface_binding_id
+            WHERE b.chat_id = ? AND b.state = 'active'
+                AND m.state IN ('queued', 'leased')
+            ORDER BY m.mailbox_id
+            LIMIT 1
+            """,
+            (int(chat_id),),
+        ).fetchone()
+        if active_turn is not None:
+            raise StoreError(
+                "Wait for the active turn in "
+                f"'{str(active_turn['display_name'])}' to finish."
+            )
+        active_console = self.connection.execute(
+            """
+            SELECT b.display_name
+            FROM agent_consoles AS c
+            JOIN agents AS a ON a.agent_id = c.agent_id
+            JOIN surface_bindings AS b
+                ON b.binding_id = a.surface_binding_id
+            WHERE b.chat_id = ? AND b.state = 'active'
+                AND c.state IN ('starting', 'running')
+            ORDER BY b.binding_id
+            LIMIT 1
+            """,
+            (int(chat_id),),
+        ).fetchone()
+        if active_console is not None:
+            raise StoreError(
+                "Close the active console in "
+                f"'{str(active_console['display_name'])}' first."
+            )
+        active_router = self.connection.execute(
+            """
+            SELECT 1
+            FROM router_mailbox
+            WHERE chat_id = ? AND state IN ('queued', 'leased')
+            LIMIT 1
+            """,
+            (int(chat_id),),
+        ).fetchone()
+        if active_router is not None:
+            raise StoreError(
+                "Wait for the active Control turn in this group to finish."
+            )
+        active_worker = next(
+            (
+                worker
+                for worker in plan.workers
+                if worker.intended_state != "stopped"
+                or worker.observed_state != "stopped"
+            ),
+            None,
+        )
+        if active_worker is not None:
+            raise StoreError(
+                f"Stop detached worker '{active_worker.name}' first."
+            )
+        return plan
+
+    def teardown_forum_workspace(
+        self,
+        *,
+        chat_id: int,
+        forum_binding_id: int,
+        delete_operation_prefix: str,
+        reason: str = "Confirmed project group teardown.",
+        now: Optional[float] = None,
+    ) -> ForumTeardownPlan:
+        """Revoke one idle group and queue deletion of every managed topic."""
+        timestamp = time.time() if now is None else float(now)
+        explanation = str(reason).strip()[:1000]
+        operation_prefix = str(delete_operation_prefix).strip()
+        if not explanation or not operation_prefix:
+            raise StoreError("Project group teardown metadata is invalid.")
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            plan = self.plan_forum_teardown(
+                chat_id=int(chat_id),
+                forum_binding_id=int(forum_binding_id),
+                require_idle=True,
+            )
+            self.connection.execute(
+                """
+                UPDATE callback_actions
+                SET state = 'expired', updated_at = ?
+                WHERE chat_id = ? AND state = 'active'
+                """,
+                (timestamp, int(chat_id)),
+            )
+            self.connection.execute(
+                """
+                UPDATE telegram_message_routes
+                SET state = 'revoked', updated_at = ?
+                WHERE chat_id = ? AND state = 'active'
+                """,
+                (timestamp, int(chat_id)),
+            )
+            self.connection.execute(
+                """
+                UPDATE surface_cards
+                SET state = 'stale', updated_at = ?
+                WHERE binding_id IN (
+                    SELECT binding_id
+                    FROM surface_bindings
+                    WHERE chat_id = ?
+                )
+                    AND state != 'stale'
+                """,
+                (timestamp, int(chat_id)),
+            )
+            self.connection.execute(
+                """
+                UPDATE forum_subjects
+                SET state = 'archived', updated_at = ?
+                WHERE forum_chat_id = ? AND state = 'active'
+                """,
+                (timestamp, int(chat_id)),
+            )
+            for agent in plan.agents:
+                if agent.surface_binding_id is None:
+                    raise StoreError(
+                        "Managed group agent lost its topic before teardown."
+                    )
+                self._archive_agent_for_retired_surface(
+                    agent.agent_id,
+                    agent.surface_binding_id,
+                    explanation,
+                    timestamp,
+                )
+            if plan.workers:
+                worker_ids = tuple(worker.worker_id for worker in plan.workers)
+                placeholders = ",".join("?" for _ in worker_ids)
+                deleted_workers = self.connection.execute(
+                    f"""
+                    DELETE FROM detached_workers
+                    WHERE worker_id IN ({placeholders})
+                    """,
+                    worker_ids,
+                )
+                if deleted_workers.rowcount != len(worker_ids):
+                    raise StoreError(
+                        "Detached worker state changed during group teardown."
+                    )
+            revoked = self.connection.execute(
+                """
+                UPDATE surface_bindings
+                SET state = 'revoked', last_probe_at = ?,
+                    last_probe_error = ?, updated_at = ?
+                WHERE chat_id = ? AND state = 'active'
+                """,
+                (
+                    timestamp,
+                    explanation,
+                    timestamp,
+                    int(chat_id),
+                ),
+            )
+            if revoked.rowcount != len(plan.topics) + 1:
+                raise StoreError(
+                    "Project group surfaces changed during teardown."
+                )
+            workspace = self.connection.execute(
+                """
+                UPDATE forum_workspaces
+                SET state = 'revoked', updated_at = ?
+                WHERE chat_id = ? AND forum_binding_id = ?
+                    AND state = 'active'
+                """,
+                (
+                    timestamp,
+                    int(chat_id),
+                    int(forum_binding_id),
+                ),
+            )
+            if workspace.rowcount != 1:
+                raise StoreError(
+                    "Project group binding changed during teardown."
+                )
+            for topic in plan.topics:
+                if topic.message_thread_id is None:
+                    raise StoreError(
+                        "Project group teardown found an invalid topic."
+                    )
+                self.enqueue_api_call(
+                    operation_id=(
+                        f"{operation_prefix}:delete-forum-topic:"
+                        f"{topic.binding_id}"
+                    ),
+                    method="deleteForumTopic",
+                    params={
+                        "chat_id": int(chat_id),
+                        "message_thread_id": int(topic.message_thread_id),
+                    },
+                    serialize_key=f"forum-teardown:{int(chat_id)}",
+                    now=timestamp,
+                )
+            self.connection.execute(
+                """
+                INSERT INTO events(
+                    kind, subject_type, subject_id, details_json, created_at
+                )
+                VALUES ('forum_workspace_torn_down', 'forum', ?, ?, ?)
+                """,
+                (
+                    str(int(chat_id)),
+                    json.dumps(
+                        {
+                            "agent_count": len(plan.agents),
+                            "forum_binding_id": int(forum_binding_id),
+                            "reason": explanation,
+                            "topic_count": len(plan.topics),
+                            "worker_count": len(plan.workers),
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    timestamp,
+                ),
+            )
+            self.connection.execute("COMMIT")
+            return plan
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _forum_subject_from_row(row: sqlite3.Row) -> ForumSubject:
@@ -8948,6 +9262,133 @@ class DurableStore:
                     else None
                 ),
                 serialize_key=f"agent-notification:{int(mailbox_id)}",
+                now=timestamp,
+            )
+            self.connection.execute("COMMIT")
+            return message_id
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def enqueue_forum_teardown_prompt_for_surface(
+        self,
+        *,
+        chat_id: int,
+        message_thread_id: int,
+        authorized_user_id: int,
+        source_inbox_job_id: int,
+        now: Optional[float] = None,
+    ) -> int:
+        """Post an owner-bound confirmation card inside one group topic."""
+        timestamp = time.time() if now is None else float(now)
+        thread_id = int(message_thread_id)
+        if thread_id <= 0:
+            raise StoreError(
+                "/removegroup only works inside a bound project group."
+            )
+        operation_prefix = (
+            f"inbox:{int(source_inbox_job_id)}:forum-teardown"
+        )
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            root = self.connection.execute(
+                """
+                SELECT *
+                FROM surface_bindings
+                WHERE chat_id = ? AND message_thread_id = 0
+                    AND target_type = 'controller'
+                    AND target_id = 'control'
+                    AND state = 'active'
+                """,
+                (int(chat_id),),
+            ).fetchone()
+            if root is None:
+                raise StoreError(
+                    "/removegroup only works inside a bound project group."
+                )
+            plan = self.plan_forum_teardown(
+                chat_id=int(chat_id),
+                forum_binding_id=int(root["binding_id"]),
+                require_idle=False,
+            )
+            payload = {
+                "chat_id": int(chat_id),
+                "display_name": plan.workspace.display_name,
+                "forum_binding_id": plan.workspace.forum_binding_id,
+                "message_thread_id": thread_id,
+            }
+            confirm_operation_id = f"{operation_prefix}:confirm"
+            confirm = self.create_callback_action(
+                operation_id=confirm_operation_id,
+                action_type="forum_teardown_confirm",
+                payload=payload,
+                chat_id=int(chat_id),
+                message_thread_id=thread_id,
+                authorized_user_id=int(authorized_user_id),
+                one_time=False,
+                ttl_seconds=30 * 60,
+                now=timestamp,
+            )
+            cancel_payload = dict(payload)
+            cancel_payload["confirm_operation_id"] = confirm_operation_id
+            cancel = self.create_callback_action(
+                operation_id=f"{operation_prefix}:cancel",
+                action_type="forum_teardown_cancel",
+                payload=cancel_payload,
+                chat_id=int(chat_id),
+                message_thread_id=thread_id,
+                authorized_user_id=int(authorized_user_id),
+                one_time=True,
+                ttl_seconds=30 * 60,
+                now=timestamp,
+            )
+            message_id = self.enqueue_api_call(
+                operation_id=f"{operation_prefix}:prompt",
+                method="sendMessage",
+                params={
+                    "chat_id": int(chat_id),
+                    "message_thread_id": thread_id,
+                    "text": (
+                        "🎛 Control\n\n"
+                        "Remove this project group from Telegram Control?\n\n"
+                        f"Group: {plan.workspace.display_name}\n"
+                        f"Managed topics: {len(plan.topics)}\n"
+                        f"Detached workers: {len(plan.workers)}\n\n"
+                        "This permanently deletes every controller-managed "
+                        "Telegram topic and its message history, archives all "
+                        "topic agents, clears provider sessions, and revokes "
+                        "the group's workspace binding, routes, buttons, and "
+                        "cards.\n\n"
+                        "Active turns, consoles, and detached workers must "
+                        "be stopped first. Telegram Control cannot delete the "
+                        "Telegram group itself; after cleanup, remove the bot "
+                        "or delete the group in Telegram."
+                    ),
+                    "reply_markup": {
+                        "inline_keyboard": [
+                            [
+                                {
+                                    "text": "Remove group & all topics",
+                                    "callback_data": f"a:{confirm.token}",
+                                }
+                            ],
+                            [
+                                {
+                                    "text": "Cancel",
+                                    "callback_data": f"a:{cancel.token}",
+                                }
+                            ],
+                        ]
+                    },
+                },
+                route={
+                    "target_type": "controller",
+                    "target_id": "control",
+                    "policy": "reply",
+                    "ttl_seconds": 30 * 60,
+                },
+                serialize_key=f"forum-teardown:{int(chat_id)}",
                 now=timestamp,
             )
             self.connection.execute("COMMIT")

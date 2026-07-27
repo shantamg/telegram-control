@@ -2961,6 +2961,151 @@ class DurableStoreTests(unittest.TestCase):
             )
         self.assertIsNotNone(self.store.resolve_surface_binding(-100777, 62))
 
+    def test_forum_teardown_revokes_group_topics_agents_and_stopped_workers(self):
+        workspace = Path(self.temporary_directory.name) / "workspace"
+        workspace.mkdir()
+        root = self.store.ensure_surface_binding(
+            chat_id=-100777,
+            surface_type="control",
+            display_name="Test Project",
+            target_type="controller",
+            target_id="control",
+            now=100,
+        )
+        self.store.bind_forum_workspace(
+            chat_id=-100777,
+            forum_binding_id=root.binding_id,
+            project_path=str(workspace),
+            provider="codex",
+            now=101,
+        )
+        subjects = []
+        for thread_id, name in ((62, "First"), (63, "Second")):
+            self.store.ensure_surface_binding(
+                chat_id=-100777,
+                message_thread_id=thread_id,
+                surface_type="control",
+                display_name=name,
+                target_type="controller",
+                target_id="control",
+                now=thread_id,
+            )
+            subject, _ = self.store.ensure_forum_subject(
+                chat_id=-100777,
+                message_thread_id=thread_id,
+                display_name=name,
+                now=thread_id + 1,
+            )
+            subjects.append(subject)
+        worker_binding = self.store.ensure_surface_binding(
+            chat_id=-100777,
+            message_thread_id=64,
+            surface_type="task",
+            display_name="build updates",
+            target_type="detached_worker",
+            target_id="build",
+            now=110,
+        )
+        self.store.create_detached_worker(
+            name="build",
+            binding_id=worker_binding.binding_id,
+            origin_agent_id=subjects[0].agent_id,
+            project_path=str(workspace),
+            provider="codex",
+            tmux_session_name="detached--build",
+            now=111,
+        )
+        with self.assertRaisesRegex(StoreError, "Stop detached worker 'build'"):
+            self.store.plan_forum_teardown(
+                chat_id=-100777,
+                forum_binding_id=root.binding_id,
+            )
+        self.store.set_detached_worker_states(
+            "build",
+            intended_state="stopped",
+            observed_state="stopped",
+            now=112,
+        )
+        action = self.store.create_callback_action(
+            operation_id="test:group-remove:button",
+            action_type="test_group_remove",
+            payload={},
+            chat_id=-100777,
+            message_thread_id=None,
+            authorized_user_id=123,
+            one_time=False,
+            now=113,
+        )
+
+        result = self.store.teardown_forum_workspace(
+            chat_id=-100777,
+            forum_binding_id=root.binding_id,
+            delete_operation_prefix="test:group-remove",
+            now=114,
+        )
+
+        self.assertEqual(len(result.topics), 3)
+        self.assertEqual(len(result.agents), 2)
+        self.assertEqual(len(result.workers), 1)
+        self.assertIsNone(self.store.resolve_forum_workspace(-100777))
+        self.assertIsNone(self.store.resolve_surface_binding(-100777))
+        for thread_id in (62, 63, 64):
+            self.assertIsNone(
+                self.store.resolve_surface_binding(-100777, thread_id)
+            )
+        for subject in subjects:
+            self.assertIsNone(
+                self.store.resolve_forum_subject(
+                    -100777,
+                    subject.message_thread_id,
+                )
+            )
+            archived = self.store.resolve_agent(subject.agent_id)
+            self.assertEqual(archived.lifecycle_state, "stopped")
+            self.assertIsNone(archived.surface_binding_id)
+            self.assertIsNone(archived.provider_session_id)
+        self.assertIsNone(self.store.resolve_detached_worker("build"))
+        action_state = self.store.connection.execute(
+            "SELECT state FROM callback_actions WHERE action_id = ?",
+            (action.action_id,),
+        ).fetchone()
+        self.assertEqual(action_state["state"], "expired")
+        deletions = self.store.connection.execute(
+            """
+            SELECT method, params_json, serialize_key
+            FROM outbox_messages
+            WHERE operation_id LIKE
+                'test:group-remove:delete-forum-topic:%'
+            ORDER BY message_id
+            """
+        ).fetchall()
+        self.assertEqual(len(deletions), 3)
+        self.assertEqual(
+            {
+                json.loads(row["params_json"])["message_thread_id"]
+                for row in deletions
+            },
+            {62, 63, 64},
+        )
+        self.assertTrue(
+            all(
+                row["method"] == "deleteForumTopic"
+                and row["serialize_key"] == "forum-teardown:-100777"
+                for row in deletions
+            )
+        )
+        event = self.store.connection.execute(
+            """
+            SELECT details_json
+            FROM events
+            WHERE kind = 'forum_workspace_torn_down'
+            """
+        ).fetchone()
+        self.assertEqual(
+            json.loads(event["details_json"])["topic_count"],
+            3,
+        )
+
     def test_missing_topic_delete_result_completes_idempotently(self):
         message_id = self.store.enqueue_api_call(
             "test:delete-topic",
@@ -3128,6 +3273,7 @@ class DurableStoreTests(unittest.TestCase):
             "projects",
             "newgroup",
             "bind",
+            "removegroup",
             "teardown",
         ):
             self.assertIn(handled, [command["command"] for command in commands])
@@ -9746,6 +9892,235 @@ class DurableIntegrationTests(unittest.TestCase):
                         "SELECT COUNT(*) FROM router_mailbox"
                     ).fetchone()[0],
                     0,
+                )
+
+    def test_removegroup_command_opens_confirmation_without_agent_turn(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "workspace"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            with DurableStore(database_path) as store:
+                root = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Test Project",
+                    target_type="controller",
+                    target_id="control",
+                    now=100,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=root.binding_id,
+                    project_path=str(workspace),
+                    provider="codex",
+                    now=101,
+                )
+                update = topic_message_update(
+                    10,
+                    "/removegroup",
+                    thread_id=1,
+                )
+                update["message"]["chat"] = {
+                    "id": -100777,
+                    "type": "supergroup",
+                    "title": "Test Project",
+                    "is_forum": True,
+                }
+                update["message"]["reply_to_message"]["chat"] = dict(
+                    update["message"]["chat"]
+                )
+                store.ingest_update(update, now=102)
+                job = store.claim_job("worker", now=102)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    job,
+                    "worker",
+                )
+
+                prompt = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(prompt.method, "sendMessage")
+                self.assertEqual(prompt.params["message_thread_id"], 1)
+                self.assertIn(
+                    "Remove this project group from Telegram Control",
+                    prompt.params["text"],
+                )
+                self.assertIn("Managed topics: 0", prompt.params["text"])
+                labels = [
+                    button["text"]
+                    for row in prompt.params["reply_markup"]["inline_keyboard"]
+                    for button in row
+                ]
+                self.assertEqual(
+                    labels,
+                    ["Remove group & all topics", "Cancel"],
+                )
+                confirm = store.connection.execute(
+                    """
+                    SELECT authorized_user_id, payload_json
+                    FROM callback_actions
+                    WHERE action_type = 'forum_teardown_confirm'
+                    """
+                ).fetchone()
+                self.assertEqual(int(confirm["authorized_user_id"]), 123)
+                self.assertEqual(
+                    json.loads(confirm["payload_json"])["forum_binding_id"],
+                    root.binding_id,
+                )
+                self.assertEqual(
+                    json.loads(confirm["payload_json"])["message_thread_id"],
+                    1,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM agent_mailbox"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    store.connection.execute(
+                        "SELECT COUNT(*) FROM router_mailbox"
+                    ).fetchone()[0],
+                    0,
+                )
+
+    def test_removegroup_confirmation_tears_down_bound_forum(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "workspace"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            config = {
+                "chat_id": 123,
+                "owner_user_id": 123,
+                "handler_path": str(Path(on_message.__file__).resolve()),
+            }
+            forum_chat = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Test Project",
+                "is_forum": True,
+            }
+            with DurableStore(database_path) as store:
+                root = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Test Project",
+                    target_type="controller",
+                    target_id="control",
+                    now=100,
+                )
+                store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=root.binding_id,
+                    project_path=str(workspace),
+                    provider="codex",
+                    now=101,
+                )
+                store.ensure_surface_binding(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    surface_type="control",
+                    display_name="Work",
+                    target_type="controller",
+                    target_id="control",
+                    now=102,
+                )
+                subject, _ = store.ensure_forum_subject(
+                    chat_id=-100777,
+                    message_thread_id=62,
+                    display_name="Work",
+                    now=103,
+                )
+                command = topic_message_update(
+                    10,
+                    "/removegroup",
+                    thread_id=62,
+                )
+                command["message"]["chat"] = dict(forum_chat)
+                command["message"]["reply_to_message"]["chat"] = dict(
+                    forum_chat
+                )
+                store.ingest_update(command, now=104)
+                command_job = store.claim_job("worker-1", now=104)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    command_job,
+                    "worker-1",
+                )
+                confirm = store.connection.execute(
+                    """
+                    SELECT token
+                    FROM callback_actions
+                    WHERE action_type = 'forum_teardown_confirm'
+                    """
+                ).fetchone()
+                callback = callback_update(
+                    11,
+                    f"a:{confirm['token']}",
+                    message_id=700,
+                    message_thread_id=62,
+                )
+                callback["callback_query"]["message"]["chat"] = dict(
+                    forum_chat
+                )
+                store.ingest_update(callback, now=105)
+                callback_job = store.claim_job("worker-2", now=105)
+                telegram_control.process_inbox_job(
+                    store,
+                    config,
+                    callback_job,
+                    "worker-2",
+                )
+
+                self.assertIsNone(store.resolve_forum_workspace(-100777))
+                self.assertIsNone(
+                    store.resolve_surface_binding(-100777, 62)
+                )
+                archived = store.resolve_agent(subject.agent_id)
+                self.assertEqual(archived.lifecycle_state, "stopped")
+                self.assertIsNone(archived.surface_binding_id)
+                deletion = store.connection.execute(
+                    """
+                    SELECT method, params_json
+                    FROM outbox_messages
+                    WHERE operation_id LIKE
+                        '%:forum-teardown:confirm:delete-forum-topic:%'
+                    """
+                ).fetchone()
+                self.assertEqual(deletion["method"], "deleteForumTopic")
+                self.assertEqual(
+                    json.loads(deletion["params_json"]),
+                    {
+                        "chat_id": -100777,
+                        "message_thread_id": 62,
+                    },
+                )
+                completion = store.connection.execute(
+                    """
+                    SELECT method, params_json
+                    FROM outbox_messages
+                    WHERE operation_id LIKE
+                        'inbox:%:forum-teardown-complete'
+                    """
+                ).fetchone()
+                self.assertEqual(completion["method"], "sendMessage")
+                completion_params = json.loads(completion["params_json"])
+                self.assertEqual(completion_params["chat_id"], -100777)
+                self.assertNotIn(
+                    "message_thread_id",
+                    completion_params,
+                )
+                self.assertIn(
+                    "Removed Test Project from Telegram Control",
+                    completion_params["text"],
                 )
 
     def test_bound_forum_topic_reuses_preselected_subject_agent(self):

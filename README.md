@@ -86,6 +86,13 @@ For the human checkpoints, troubleshooting, and uninstall details, follow the
 See [Set up a Telegram project group](docs/getting-started/telegram-group.md)
 for the exact Telegram settings and why each permission is needed.
 
+To disconnect a project group, first finish active turns and consoles and stop
+its detached workers. Then send `/removegroup` in any ordinary topic and confirm
+the removal card. Telegram Control deletes every managed topic, archives its
+agents and sessions, and revokes the workspace binding. It cannot delete the
+Telegram group itself, so remove the bot or delete the group in Telegram after
+cleanup finishes.
+
 ## Everyday behavior
 
 - One project group can contain many independent topic conversations.

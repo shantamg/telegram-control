@@ -568,6 +568,32 @@ def request_topic_teardown() -> None:
         )
 
 
+def request_forum_teardown() -> None:
+    """Queue the direct /removegroup confirmation inside a bound group."""
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    job_id = os.environ.get("TELEGRAM_CONTROL_JOB_ID")
+    user_id_text = os.environ.get("TELEGRAM_FROM_ID")
+    if not database_path or not job_id or not user_id_text:
+        raise StoreError(
+            "The /removegroup command requires a managed Telegram turn."
+        )
+    chat_id, thread_id = surface_coordinates()
+    if (
+        os.environ.get("TELEGRAM_CHAT_TYPE") != "supergroup"
+        or thread_id is None
+    ):
+        raise StoreError(
+            "/removegroup only works inside a bound project group."
+        )
+    with DurableStore(Path(database_path)) as store:
+        store.enqueue_forum_teardown_prompt_for_surface(
+            chat_id=chat_id,
+            message_thread_id=thread_id,
+            authorized_user_id=int(user_id_text),
+            source_inbox_job_id=int(job_id),
+        )
+
+
 def resolve_replied_message_route():
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
     replied_message_id = os.environ.get("TELEGRAM_REPLY_TO_MESSAGE_ID")
@@ -1716,6 +1742,105 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 "reply_markup": reply_markup,
             },
             f"help-page:{topic_slug}",
+        )
+        return
+
+    if action.action_type == "forum_teardown_cancel":
+        confirm_operation_id = str(
+            action.payload.get("confirm_operation_id")
+            or action.operation_id.replace(
+                "forum-teardown:cancel",
+                "forum-teardown:confirm",
+            )
+        )
+        with DurableStore(Path(database_path)) as store:
+            store.retire_callback_action_operation(
+                confirm_operation_id,
+                "forum_teardown_confirm",
+            )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Group removal cancelled.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "editMessageReplyMarkup",
+            {
+                "chat_id": chat_id,
+                "message_id": int(os.environ["TELEGRAM_MESSAGE_ID"]),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            "forum-teardown-cancel-clear",
+        )
+        return
+
+    if action.action_type == "forum_teardown_confirm":
+        target_chat_id = int(action.payload.get("chat_id", 0))
+        forum_binding_id = int(action.payload.get("forum_binding_id", 0))
+        target_thread_id = int(action.payload.get("message_thread_id", 0))
+        if (
+            target_chat_id != chat_id
+            or forum_binding_id <= 0
+            or target_thread_id <= 0
+            or target_thread_id != int(thread_id or 0)
+        ):
+            raise StoreError("Stored project group teardown target is invalid.")
+        try:
+            with DurableStore(Path(database_path)) as store:
+                plan = store.plan_forum_teardown(
+                    chat_id=target_chat_id,
+                    forum_binding_id=forum_binding_id,
+                    require_idle=True,
+                )
+                for worker in plan.workers:
+                    detached_worker.stop_worker(store, worker.name)
+                    detached_worker.remove_recovery_file(store, worker)
+                result = store.teardown_forum_workspace(
+                    chat_id=target_chat_id,
+                    forum_binding_id=forum_binding_id,
+                    delete_operation_prefix=action.operation_id,
+                )
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Project group removal queued.",
+                },
+                "callback-answer",
+            )
+        deliver_api_call(
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": (
+                    f"{CONTROL_SPEAKER}\n\n"
+                    f"✅ Removed {result.workspace.display_name} from "
+                    "Telegram Control.\n\n"
+                    f"Deleted managed topics: {len(result.topics)}\n"
+                    f"Archived topic agents: {len(result.agents)}\n"
+                    f"Removed detached workers: {len(result.workers)}\n\n"
+                    "You can now remove the bot from this group or delete "
+                    "the group in Telegram."
+                ),
+            },
+            "forum-teardown-complete",
         )
         return
 
@@ -4799,6 +4924,8 @@ def main() -> int:
                 send_help_menu()
             elif command.lower() == "/teardown":
                 request_topic_teardown()
+            elif command.lower() == "/removegroup":
+                request_forum_teardown()
             elif command.lower() == "/projects":
                 send_project_catalog()
             elif command.lower() == "/newgroup":
