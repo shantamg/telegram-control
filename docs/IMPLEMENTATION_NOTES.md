@@ -1643,3 +1643,27 @@ Verified with durable-store coverage for active-worker blocking, complete
 multi-topic/agent/worker archival, serialized Telegram deletions, and callback
 expiry; handler integration coverage exercises the direct command and its
 confirmed end-to-end teardown without creating an agent or router turn.
+
+## Spoken replies have a preview-first configuration flow
+
+`/voice` opens an owner/chat/topic-bound inline picker for the installation's
+global spoken-reply voice and speed. The curated choices cover British,
+American, Australian, and Indian English voices plus four speaking rates.
+Selecting either value stages a complete configuration and edits the same card
+into a review screen; it does not mutate live settings. **Preview** is reusable
+for the life of the card and generates a real Microsoft TTS OGG/Opus sample,
+**Confirm** persists the staged values, and **Back** returns to fresh choices
+without applying anything. Opening a new picker or navigating between screens
+expires older voice-configuration callbacks on that exact surface.
+
+The confirmed configuration is stored as validated JSON in the existing
+`controller_state` table, so no schema migration or worker restart is needed.
+It is read at synthesis time by completed-answer Listen actions, scoped agent
+voice updates, and detached-worker voice reports. The built-in fallback
+remains Sonia at +10%; invalid stored or callback values fail closed rather
+than reaching `edge-tts`.
+
+Verified with focused tests for configuration validation and persistence,
+voice/rate command arguments, command registration, and the complete
+picker → staged review → preview → back → confirm flow. Preview coverage also
+asserts that the stored setting remains unchanged until confirmation.

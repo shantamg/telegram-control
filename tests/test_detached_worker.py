@@ -10,6 +10,7 @@ import detached_worker
 import on_message
 import provider_adapters
 import telegram_control
+import voice_settings
 from durable_store import DurableStore, StoreError
 
 
@@ -89,6 +90,42 @@ class DetachedWorkerStoreTests(unittest.TestCase):
         found = self.store.detached_worker_for_thread(-100888, 77)
         self.assertIsNotNone(found)
         self.assertEqual(found.name, worker.name)
+
+    def test_voice_report_uses_the_confirmed_global_voice_configuration(self):
+        self._create()
+        self.store.set_voice_configuration(
+            voice_settings.VoiceConfiguration(
+                voice_name="en-US-AndrewNeural",
+                rate="-10%",
+            )
+        )
+        voice_path = Path(self.directory.name) / "report.ogg"
+        with mock.patch.object(
+            detached_worker.voice_responses,
+            "synthesize_voice",
+            return_value=voice_path,
+        ) as synthesize, mock.patch.object(
+            detached_worker.telegram_bridge,
+            "read_token",
+            return_value="token",
+        ), mock.patch.object(
+            detached_worker.telegram_bridge,
+            "api_call",
+        ) as api_call:
+            detached_worker.report(
+                self.store,
+                "rails-fix",
+                key="milestone",
+                text="The migration is complete.",
+            )
+
+        synthesize.assert_called_once_with(
+            "The migration is complete.",
+            "detached-rails-fix-milestone",
+            voice_name="en-US-AndrewNeural",
+            rate="-10%",
+        )
+        self.assertEqual(api_call.call_args.args[:2], ("token", "sendVoice"))
 
     def test_a_crashed_worker_is_distinguishable_from_a_stopped_one(self):
         # The whole reason intent and observation are separate columns.

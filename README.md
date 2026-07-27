@@ -100,6 +100,7 @@ cleanup finishes.
 - `/projects` lists every connected workspace with its active topic and session
   counts, whether it came from the older project catalog or a bound group.
 - `/agent` changes provider, model, effort, or session for the current topic.
+- `/voice` previews and changes the global spoken-reply voice and speed.
 - Replying to the progress card steers the active turn; **Stop** interrupts it.
 - Attachments are saved to private local paths the agent can inspect.
 - `/help` is the in-Telegram source of truth for commands and workflows.

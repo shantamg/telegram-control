@@ -501,11 +501,14 @@ def main() -> int:
             return 0
         voice_path: Path | None = None
         if args.mode == "voice":
+            voice_configuration = store.voice_configuration()
             voice_path = voice_responses.synthesize_voice(
                 text,
                 f"mailbox-{mailbox_id}-{args.key}-"
                 f"{hashlib.sha256(text.encode('utf-8')).hexdigest()[:12]}",
                 protected_paths=store.pending_voice_file_paths(),
+                voice_name=voice_configuration.voice_name,
+                rate=voice_configuration.rate,
             )
         try:
             store.enqueue_agent_notification(

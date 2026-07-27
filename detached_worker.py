@@ -824,7 +824,13 @@ def report(
         telegram_bridge.api_call(token, "sendMessage", text=body, **params)
         return
 
-    voice_path = voice_responses.synthesize_voice(body, f"detached-{name}-{key}")
+    voice_configuration = store.voice_configuration()
+    voice_path = voice_responses.synthesize_voice(
+        body,
+        f"detached-{name}-{key}",
+        voice_name=voice_configuration.voice_name,
+        rate=voice_configuration.rate,
+    )
     telegram_bridge.api_call(
         token,
         "sendVoice",
