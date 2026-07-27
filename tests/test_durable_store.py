@@ -2278,6 +2278,224 @@ class DurableStoreTests(unittest.TestCase):
             ),
         )
 
+    def test_active_agent_turn_can_create_and_start_conversational_topic(self):
+        chat_id = -100123
+        workspace = Path(self.temporary_directory.name) / "workspace"
+        workspace.mkdir()
+        forum = self.store.ensure_surface_binding(
+            chat_id=chat_id,
+            surface_type="control",
+            display_name="Project Group",
+            target_type="controller",
+            target_id="control",
+            now=90,
+        )
+        self.store.bind_forum_workspace(
+            chat_id=chat_id,
+            forum_binding_id=forum.binding_id,
+            project_path=str(workspace),
+            provider="codex",
+            provider_config={
+                "model": "gpt-5.6-sol",
+                "effort": "high",
+            },
+            now=91,
+        )
+        self.store.ensure_surface_binding(
+            chat_id=chat_id,
+            message_thread_id=62,
+            surface_type="project",
+            display_name="Current work",
+            target_type="controller",
+            target_id="control",
+            now=92,
+        )
+        origin, _ = self.store.register_project_agent(
+            chat_id=chat_id,
+            surface_name="Current work",
+            slug="telegram-control",
+            provider="codex",
+            project_path=str(workspace),
+            now=93,
+        )
+        update = topic_message_update(
+            10,
+            "Create a separate topic for the API audit.",
+            62,
+        )
+        update["message"]["chat"] = {
+            "id": chat_id,
+            "type": "supergroup",
+            "title": "Project Group",
+            "is_forum": True,
+        }
+        update["message"]["reply_to_message"]["chat"] = update["message"]["chat"]
+        self.store.ingest_update(update, now=100)
+        inbox = self.store.connection.execute(
+            "SELECT job_id FROM inbox_jobs WHERE update_id = 10"
+        ).fetchone()
+        origin_mailbox_id = self.store.enqueue_agent_message(
+            origin.agent_id,
+            int(inbox["job_id"]),
+            "Create a separate topic for the API audit.",
+            now=101,
+        )
+        self.store.claim_agent_mailbox(
+            "agent-worker",
+            now=102,
+            lease_seconds=10**12,
+        )
+        environment = {
+            "TELEGRAM_CONTROL_DB": str(self.database_path),
+            "TELEGRAM_CONTROL_AGENT_ID": origin.agent_id,
+            "TELEGRAM_CONTROL_MAILBOX_ID": str(origin_mailbox_id),
+            "TELEGRAM_CONTROL_WORKER_ID": "agent-worker",
+        }
+        argv = [
+            "agent_telegram.py",
+            "topic-create",
+            "--key",
+            "api-audit",
+            "--name",
+            "API audit",
+        ]
+        first_prompt = (
+            "Inspect the API implementation, identify the issue surfaced in "
+            "the current work, and propose the smallest safe fix."
+        )
+        calls = []
+
+        def api_call(_token, method, **params):
+            calls.append((method, params))
+            if method == "getMe":
+                return {"id": 77}
+            if method == "getChatMember":
+                return {
+                    "status": "administrator",
+                    "can_manage_topics": True,
+                }
+            if method == "createForumTopic":
+                return {"message_thread_id": 88}
+            self.fail(f"Unexpected Telegram method: {method}")
+
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with mock.patch.object(agent_telegram.sys, "argv", argv):
+                with mock.patch.object(
+                    agent_telegram.sys,
+                    "stdin",
+                    StringIO(first_prompt),
+                ):
+                    with mock.patch.object(
+                        agent_telegram.telegram_bridge,
+                        "read_token",
+                        return_value="token",
+                    ):
+                        with mock.patch.object(
+                            agent_telegram.telegram_bridge,
+                            "api_call",
+                            side_effect=api_call,
+                        ):
+                            output = StringIO()
+                            with redirect_stdout(output):
+                                self.assertEqual(agent_telegram.main(), 0)
+        result = json.loads(output.getvalue())
+        self.assertTrue(result["created"])
+        self.assertTrue(result["first_prompt_queued"])
+        self.assertEqual(result["message_thread_id"], 88)
+        self.assertEqual(
+            result["topic_url"],
+            "https://t.me/c/123/88",
+        )
+        self.assertEqual(calls[-1][0], "createForumTopic")
+        self.assertEqual(
+            calls[-1][1],
+            {"chat_id": chat_id, "name": "API audit"},
+        )
+
+        subject = self.store.resolve_forum_subject(chat_id, 88)
+        self.assertIsNotNone(subject)
+        new_agent = self.store.resolve_agent(subject.agent_id)
+        self.assertEqual(new_agent.provider, "codex")
+        self.assertEqual(
+            new_agent.provider_config,
+            {"model": "gpt-5.6-sol", "effort": "high"},
+        )
+        generated = self.store.connection.execute(
+            """
+            SELECT m.input_text, m.state, i.update_id, i.state AS inbox_state,
+                i.payload_json
+            FROM agent_mailbox AS m
+            JOIN inbox_jobs AS i ON i.job_id = m.source_inbox_job_id
+            WHERE m.agent_id = ?
+            """,
+            (subject.agent_id,),
+        ).fetchone()
+        self.assertEqual(generated["input_text"], first_prompt)
+        self.assertEqual(generated["state"], "queued")
+        self.assertLess(int(generated["update_id"]), 0)
+        self.assertEqual(generated["inbox_state"], "succeeded")
+        self.assertEqual(
+            json.loads(generated["payload_json"])[
+                "_telegram_control_internal"
+            ]["source"],
+            "agent_topic_create",
+        )
+        intro = self.store.connection.execute(
+            """
+            SELECT params_json, route_json, card_json
+            FROM outbox_messages
+            WHERE operation_id = ?
+            """,
+            (
+                "agent-topic-create:100123:api-audit:intro",
+            ),
+        ).fetchone()
+        self.assertEqual(
+            json.loads(intro["params_json"])["message_thread_id"],
+            88,
+        )
+        self.assertEqual(
+            json.loads(intro["route_json"])["target_id"],
+            subject.agent_id,
+        )
+        self.assertEqual(
+            json.loads(intro["card_json"])["kind"],
+            "topic_intro",
+        )
+
+        # Replaying the same scoped operation resumes the durable local work
+        # without creating another Telegram topic or another first turn.
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with mock.patch.object(agent_telegram.sys, "argv", argv):
+                with mock.patch.object(
+                    agent_telegram.sys,
+                    "stdin",
+                    StringIO(first_prompt),
+                ):
+                    with mock.patch.object(
+                        agent_telegram.telegram_bridge,
+                        "api_call",
+                        side_effect=AssertionError(
+                            "Telegram topic creation was repeated"
+                        ),
+                    ):
+                        with redirect_stdout(StringIO()):
+                            self.assertEqual(agent_telegram.main(), 0)
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM forum_subjects WHERE forum_chat_id = ?",
+                (chat_id,),
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.store.connection.execute(
+                "SELECT COUNT(*) FROM agent_mailbox WHERE agent_id = ?",
+                (subject.agent_id,),
+            ).fetchone()[0],
+            1,
+        )
+
     def test_active_agent_turn_can_request_confirmed_topic_teardown(self):
         agent, mailbox_id = self._leased_topic_agent()
         environment = {

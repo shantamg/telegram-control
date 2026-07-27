@@ -1,0 +1,4 @@
+interface:
+  display_name: "Create Telegram Topic"
+  short_description: "Create and start a conversational topic"
+  default_prompt: "Use $telegram-create-topic to create a new conversational topic and start it with my first prompt."

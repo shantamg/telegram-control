@@ -595,6 +595,52 @@ Because skill metadata is loaded when a provider session starts, restart an
 existing Codex or Claude session before expecting a newly installed skill to
 appear.
 
+### Agent-created conversational topics
+
+The implicitly triggered `telegram-create-topic` skill lets any active managed
+topic create another ordinary conversational topic in its own bound private
+forum. This is deliberately separate from `telegram-detached-worker`: the new
+topic has a normal managed-agent mailbox, accepts user messages directly, and
+starts an independent provider conversation rather than a report-only tmux
+worker.
+
+`agent_telegram.py topic-create` accepts a stable key and topic name, plus
+optional provider, model, and effort overrides. Omitting them inherits the
+forum workspace's exact defaults. Standard input is optional; when present, it
+is a self-contained first prompt that is queued immediately after the topic is
+attached, so the new session can begin while the originating turn is still
+running. The provider session itself remains lazy until that mailbox item is
+claimed. Empty standard input creates a ready-to-chat topic without starting a
+provider.
+
+The helper accepts no Telegram coordinates. It validates the originating
+mailbox lease, follows the agent's durable home binding rather than any
+temporary reply route, requires an active bound forum, resolves the authorized
+owner from the source inbox job, and checks the bot's **Manage topics**
+administrator permission immediately before `createForumTopic`. The durable
+subject stores the creation operation and canonical plan digest in its existing
+memory JSON. Replaying the same key and plan reuses the attached topic; a
+different key, prompt, provider configuration, or pre-existing topic with the
+same name fails closed.
+
+First prompts preserve the existing agent-mailbox provenance invariant without
+a schema change. A deterministic negative update ID — a namespace Telegram
+updates never use — records a completed internal inbox source whose payload
+contains the owner, target topic, exact prompt, and originating operation.
+`source_inbox_job_id` therefore remains a real foreign key, stop controls
+remain owner-bound, and ordinary receipt, progress, steering, response, and
+retry paths need no special case. The opening topic-intro card uses the already
+supported `topic_intro` outbox kind, so no new mixed-version sender payload was
+introduced and no controller restart is required.
+
+Verified with a helper-level integration test that creates a bound forum and
+leased originating agent, mocks the Bot API permission and topic-creation
+calls, asserts inherited provider settings, the managed subject and route,
+opening intro card, negative internal source job, and queued first prompt, then
+replays the same request and proves that neither the Telegram mutation nor the
+mailbox turn is duplicated. The final repository-wide run passed all 359 tests
+on July 27, 2026.
+
 ### Restarting the controller safely
 
 Use the controller's guarded restart command:

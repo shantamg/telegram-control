@@ -106,7 +106,7 @@ login:
 
 **4. Install the agent-facing skills** so managed Codex and Claude turns can
 send progress updates, voice notes, questions with buttons, group icons,
-detached workers, and topic teardown:
+new conversational topics, detached workers, and topic teardown:
 
 ```sh
 ./telegram_control.py install-skills
@@ -142,6 +142,14 @@ needs resending. Every topic opens with one message listing its agent, model,
 effort, and context used, edited in place as those change, so it is always the
 current status of that topic. Commands themselves come from Telegram's own menu:
 type `/` in any chat or topic.
+
+An active topic agent can also create and start another regular conversational
+topic for you. Ask naturally — for example, *"Create a topic called API audit
+and have it inspect the issue we just surfaced."* The new topic inherits the
+group's provider, model, and effort unless you explicitly override them, and
+the originating agent turns the task into the new topic's first prompt so it
+can begin working immediately. This is separate from a detached worker: the
+new topic is an ordinary independent conversation that you steer directly.
 
 If you know the path up front, the first message can still do both at once:
 *"Set up this group for /absolute/workspace/path using Claude"* offers a single

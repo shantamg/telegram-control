@@ -198,6 +198,14 @@ class AgentNotificationTarget:
 
 
 @dataclass(frozen=True)
+class AgentTopicCreationContext:
+    chat_id: int
+    message_thread_id: int
+    authorized_user_id: int
+    source_inbox_job_id: int
+
+
+@dataclass(frozen=True)
 class AgentMailboxJob:
     mailbox_id: int
     agent_id: str
@@ -4115,6 +4123,27 @@ class DurableStore:
         ).fetchone()
         return self._forum_subject_from_row(row) if row is not None else None
 
+    def resolve_forum_subject_creation(
+        self,
+        chat_id: int,
+        creation_operation_id: str,
+    ) -> Optional[ForumSubject]:
+        row = self.connection.execute(
+            """
+            SELECT *
+            FROM forum_subjects
+            WHERE forum_chat_id = ? AND state = 'active'
+                AND json_extract(
+                    memory_json,
+                    '$.creation_operation_id'
+                ) = ?
+            ORDER BY created_at
+            LIMIT 1
+            """,
+            (int(chat_id), str(creation_operation_id)),
+        ).fetchone()
+        return self._forum_subject_from_row(row) if row is not None else None
+
     def ensure_forum_subject(
         self,
         chat_id: int,
@@ -4123,6 +4152,8 @@ class DurableStore:
         purpose_text: Optional[str] = None,
         provider: Optional[str] = None,
         provider_config: Optional[dict[str, Any]] = None,
+        creation_operation_id: Optional[str] = None,
+        creation_plan_digest: Optional[str] = None,
         now: Optional[float] = None,
     ) -> tuple[ForumSubject, bool]:
         """Provision one durable conversational subject for a bound topic.
@@ -4139,6 +4170,15 @@ class DurableStore:
             raise StoreError(
                 "Forum subject provider is required with model settings."
             )
+        if (creation_operation_id is None) != (creation_plan_digest is None):
+            raise StoreError(
+                "Forum subject creation identity is incomplete."
+            )
+        if creation_operation_id is not None and (
+            not re.fullmatch(r"[a-z0-9][a-z0-9:.-]{0,199}", creation_operation_id)
+            or not re.fullmatch(r"[0-9a-f]{16,64}", creation_plan_digest or "")
+        ):
+            raise StoreError("Forum subject creation identity is invalid.")
         requested_provider_config = (
             validate_provider_config(provider, provider_config)
             if provider is not None and provider_config is not None
@@ -4219,6 +4259,16 @@ class DurableStore:
             ).fetchone()
             if existing_row is not None:
                 existing = self._forum_subject_from_row(existing_row)
+                if creation_operation_id is not None:
+                    if (
+                        existing.memory.get("creation_operation_id")
+                        != creation_operation_id
+                        or existing.memory.get("creation_plan_digest")
+                        != creation_plan_digest
+                    ):
+                        raise StoreError(
+                            "This topic belongs to a different creation request."
+                        )
                 binding_row = self.connection.execute(
                     """
                     SELECT *
@@ -4417,7 +4467,7 @@ class DurableStore:
                     surface_binding_id, agent_id, display_name,
                     purpose_text, memory_json, state, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, '{}', 'active', ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
                 """,
                 (
                     subject_id,
@@ -4427,6 +4477,18 @@ class DurableStore:
                     agent_id,
                     name,
                     purpose,
+                    json.dumps(
+                        (
+                            {
+                                "creation_operation_id": creation_operation_id,
+                                "creation_plan_digest": creation_plan_digest,
+                            }
+                            if creation_operation_id is not None
+                            else {}
+                        ),
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
                     timestamp,
                     timestamp,
                 ),
@@ -7187,6 +7249,52 @@ class DurableStore:
             ),
         )
 
+    def enqueue_forum_subject_intro(
+        self,
+        agent_id: str,
+        operation_id: str,
+        *,
+        started: bool,
+        now: Optional[float] = None,
+    ) -> int:
+        """Queue the standing header for an agent-created forum subject."""
+        timestamp = time.time() if now is None else float(now)
+        row = self.connection.execute(
+            """
+            SELECT forum_chat_id, message_thread_id, display_name
+            FROM forum_subjects
+            WHERE agent_id = ? AND state = 'active'
+            """,
+            (str(agent_id),),
+        ).fetchone()
+        if row is None:
+            raise StoreError("The new conversational topic is unavailable.")
+        chat_id = int(row["forum_chat_id"])
+        thread_id = int(row["message_thread_id"])
+        text = "🎛 Control\n\n" + self.topic_intro_text(
+            agent_id,
+            str(row["display_name"]),
+            started,
+        )
+        return self.enqueue_api_call(
+            operation_id=f"{operation_id}:intro",
+            method="sendMessage",
+            params={
+                "chat_id": chat_id,
+                "message_thread_id": thread_id,
+                "text": text,
+            },
+            route={
+                "target_type": "agent",
+                "target_id": str(agent_id),
+                "policy": "reply",
+                "ttl_seconds": 30 * 24 * 60 * 60,
+            },
+            card={"kind": "topic_intro", "mode": "record"},
+            serialize_key=f"topic-intro:{chat_id}:{thread_id}",
+            now=timestamp,
+        )
+
     def enqueue_topic_intro_refresh(
         self,
         agent_id: str,
@@ -8534,6 +8642,66 @@ class DurableStore:
             ),
         )
 
+    def agent_topic_creation_context(
+        self,
+        *,
+        agent_id: str,
+        mailbox_id: int,
+        worker_id: str,
+        now: Optional[float] = None,
+    ) -> AgentTopicCreationContext:
+        """Resolve the bound group and owner for one live managed turn.
+
+        Topic creation deliberately follows the agent's home surface rather
+        than a temporary reply route, so a reply relayed elsewhere can never
+        redirect this group-scoped mutation.
+        """
+        timestamp = time.time() if now is None else float(now)
+        row = self.connection.execute(
+            """
+            SELECT b.chat_id, b.message_thread_id, m.source_inbox_job_id,
+                i.payload_json
+            FROM agent_mailbox AS m
+            JOIN agents AS a ON a.agent_id = m.agent_id
+            JOIN surface_bindings AS b
+                ON b.binding_id = a.surface_binding_id
+                AND b.target_type = 'agent' AND b.target_id = a.agent_id
+                AND b.state = 'active'
+            JOIN inbox_jobs AS i ON i.job_id = m.source_inbox_job_id
+            WHERE m.mailbox_id = ? AND m.agent_id = ?
+                AND m.state = 'leased' AND m.lease_owner = ?
+                AND m.lease_expires_at > ?
+            """,
+            (
+                int(mailbox_id),
+                str(agent_id),
+                str(worker_id),
+                timestamp,
+            ),
+        ).fetchone()
+        if row is None:
+            raise LeaseLostError(
+                "Telegram topic creation is only available to the active "
+                "managed turn."
+            )
+        try:
+            payload = json.loads(row["payload_json"])
+            sender = (
+                payload.get("message", {}).get("from")
+                or payload.get("callback_query", {}).get("from")
+            )
+            authorized_user_id = int(sender["id"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise StoreError(
+                "The active turn's authorized Telegram owner is unavailable."
+            ) from None
+        return AgentTopicCreationContext(
+            chat_id=int(row["chat_id"]),
+            message_thread_id=int(row["message_thread_id"] or 0),
+            authorized_user_id=authorized_user_id,
+            source_inbox_job_id=int(row["source_inbox_job_id"]),
+        )
+
     def outbox_operation_state(self, operation_id: str) -> Optional[str]:
         row = self.connection.execute(
             """
@@ -9134,6 +9302,150 @@ class DurableStore:
         except BaseException:
             self.connection.execute("ROLLBACK")
             raise
+
+    def enqueue_agent_generated_prompt(
+        self,
+        *,
+        agent_id: str,
+        operation_id: str,
+        input_text: str,
+        chat_id: int,
+        message_thread_id: int,
+        authorized_user_id: int,
+        receipt_text: str,
+        receipt_parse_mode: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> int:
+        """Queue a prompt authored by another active agent into a new topic.
+
+        Agent mailboxes retain their existing foreign-key provenance. A
+        deterministic negative update ID occupies a namespace Telegram never
+        uses and creates a completed internal inbox source. Replaying the same
+        operation therefore finds the same source job and mailbox turn.
+        """
+        text = str(input_text).strip()
+        if not text or len(text) > 8_000:
+            raise StoreError(
+                "A new topic's first prompt must contain 1 to 8,000 characters."
+            )
+        if (
+            not re.fullmatch(r"[a-z0-9][a-z0-9:.-]{0,199}", operation_id)
+            or int(chat_id) >= 0
+            or int(message_thread_id) <= 0
+            or int(authorized_user_id) <= 0
+        ):
+            raise StoreError("The generated topic prompt route is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        digest = hashlib.sha256(operation_id.encode("utf-8")).digest()
+        internal_update_id = -(int.from_bytes(digest[:7], "big") + 1)
+        payload = {
+            "_telegram_control_internal": {
+                "operation_id": operation_id,
+                "source": "agent_topic_create",
+            },
+            "message": {
+                "chat": {
+                    "id": int(chat_id),
+                    "is_forum": True,
+                    "type": "supergroup",
+                },
+                "from": {
+                    "id": int(authorized_user_id),
+                    "is_bot": False,
+                },
+                "is_topic_message": True,
+                "message_id": internal_update_id,
+                "message_thread_id": int(message_thread_id),
+                "text": text,
+            },
+            "update_id": internal_update_id,
+        }
+        payload_json = json.dumps(
+            payload,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            self.connection.execute(
+                """
+                INSERT INTO telegram_updates(
+                    update_id, raw_json, received_at, ingest_state
+                )
+                VALUES (?, ?, ?, 'accepted')
+                ON CONFLICT(update_id) DO NOTHING
+                """,
+                (internal_update_id, payload_json, timestamp),
+            )
+            update_row = self.connection.execute(
+                """
+                SELECT raw_json, ingest_state
+                FROM telegram_updates
+                WHERE update_id = ?
+                """,
+                (internal_update_id,),
+            ).fetchone()
+            if (
+                update_row is None
+                or str(update_row["raw_json"]) != payload_json
+                or str(update_row["ingest_state"]) != "accepted"
+            ):
+                raise StoreError(
+                    "The generated topic prompt operation collided with "
+                    "different durable input."
+                )
+            self.connection.execute(
+                """
+                INSERT INTO inbox_jobs(
+                    update_id, kind, payload_json, state, attempts,
+                    available_at, created_at, updated_at
+                )
+                VALUES (?, 'message', ?, 'succeeded', 0, ?, ?, ?)
+                ON CONFLICT(update_id) DO NOTHING
+                """,
+                (
+                    internal_update_id,
+                    payload_json,
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            job_row = self.connection.execute(
+                """
+                SELECT job_id, kind, payload_json, state
+                FROM inbox_jobs
+                WHERE update_id = ?
+                """,
+                (internal_update_id,),
+            ).fetchone()
+            if (
+                job_row is None
+                or str(job_row["kind"]) != "message"
+                or str(job_row["payload_json"]) != payload_json
+                or str(job_row["state"]) != "succeeded"
+            ):
+                raise StoreError(
+                    "The generated topic prompt has inconsistent provenance."
+                )
+            source_inbox_job_id = int(job_row["job_id"])
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+        return self.enqueue_agent_message_with_receipt(
+            agent_id=agent_id,
+            source_inbox_job_id=source_inbox_job_id,
+            input_text=text,
+            chat_id=int(chat_id),
+            message_thread_id=int(message_thread_id),
+            receipt_text=receipt_text,
+            receipt_parse_mode=receipt_parse_mode,
+            authorized_user_id=int(authorized_user_id),
+            now=timestamp,
+        )
 
     def _validate_agent_reply_route(
         self,
