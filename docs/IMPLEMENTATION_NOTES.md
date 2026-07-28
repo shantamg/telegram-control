@@ -1838,3 +1838,39 @@ Verified on July 27, 2026 with focused seed, General-normalization,
 starter-topic, and matching-group tests. The complete 409-test run passed every
 feature test and exposed one pre-existing concurrent-first-open locking flake;
 that isolated test passed immediately on rerun.
+
+## Native Telegram UI showcase and scoped composer menus
+
+`/showcase` exercises Telegram-native UI without a Mini App. Its first message
+uses `sendRichMessage` with headings, a striped table, a divider, and a
+collapsible details block, plus side-effect-free copy buttons using Telegram's
+`primary`, `success`, and `danger` styles. A rejected rich-message call falls
+back to ordinary HTML. In a group, the command also tries an owner-only
+ephemeral hint, reacts to the command with 👀, and opens a selective ForceReply
+composer with a descriptive placeholder. In the paired private chat, where
+ephemeral group messages do not apply, it instead offers Telegram's native
+forum-group picker with the bot's required administrator rights.
+
+The same primitives now improve normal setup and lifecycle flows. Unbound-group
+path prompts use ForceReply with a folder-path placeholder, add/bind actions use
+the primary button style, and destructive group/topic teardown confirmations
+use Telegram's red danger style. Ordinary text accepted by an agent or the
+optional Control router also queues a 👀 reaction on the source message while
+retaining the durable progress card. Styling and reactions add no callback
+authority: every mutating button still resolves its existing
+owner/chat/topic-bound durable action.
+
+The composer menu is now scoped with `all_private_chats` and
+`all_group_chats`. Private chat omits group-only lifecycle commands, while
+groups omit `/newgroup`; Telegram does not expose a forum-topic command scope,
+so General and ordinary topics still share the group list.
+
+No schema migration or new outbox card variant is involved. The showcase is
+also available as the scoped `agent_telegram.py ui-showcase` helper so a live
+managed turn can render the exact preview in its current topic.
+
+Verified live on July 27, 2026: Telegram accepted the rich message, all three
+button styles, copy actions, reaction, ephemeral group hint, and ForceReply in
+the current managed topic. `getMyCommands` returned the intended private and
+group scopes after publication. All 413 tests passed with the repository's
+`/usr/bin/python3` interpreter, followed by compilation and `git diff --check`.

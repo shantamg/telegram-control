@@ -25,6 +25,7 @@ import router_contract
 import telegram_bridge as bridge
 import telegram_formatting
 import telegram_help
+import telegram_native_ui
 import tmux_console
 import voice_responses
 import voice_settings
@@ -197,6 +198,23 @@ def surface_display_name() -> str:
         os.environ.get("TELEGRAM_TOPIC_NAME")
         or os.environ.get("TELEGRAM_CHAT_TITLE")
         or "Control"
+    )
+
+
+def react_to_current_message(emoji: str) -> None:
+    """Queue a low-clutter lifecycle marker on the accepted user message."""
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    message_id_text = os.environ.get("TELEGRAM_MESSAGE_ID")
+    if not chat_id_text or not message_id_text:
+        return
+    deliver_api_call(
+        "setMessageReaction",
+        telegram_native_ui.reaction_params(
+            int(chat_id_text),
+            int(message_id_text),
+            emoji,
+        ),
+        f"message-reaction:{emoji}",
     )
 
 
@@ -686,6 +704,7 @@ def enqueue_agent_reply_input(
             receipt_parse_mode="HTML",
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
         )
+    react_to_current_message("👀")
 
 
 def try_enqueue_agent_steer(route, text: str) -> bool:
@@ -706,6 +725,8 @@ def try_enqueue_agent_steer(route, text: str) -> bool:
             message_thread_id=thread_id,
             replied_message_id=route.telegram_message_id,
         )
+    if control is not None:
+        react_to_current_message("👀")
     return control is not None
 
 
@@ -981,10 +1002,50 @@ def send_group_setup_card() -> None:
         f"{telegram_help.HELP_HINT}",
         reply_markup={
             "inline_keyboard": [
-                [{"text": "Add me to a group", "url": link}]
+                [
+                    {
+                        "text": "Add me to a group",
+                        "url": link,
+                        "style": "primary",
+                    }
+                ]
             ]
         },
     )
+
+
+def send_native_ui_showcase() -> None:
+    """Send a side-effect-free preview of Telegram's native bot surfaces."""
+    chat_id, thread_id = surface_coordinates()
+    user_id_text = os.environ.get("TELEGRAM_FROM_ID")
+    message_id_text = os.environ.get("TELEGRAM_MESSAGE_ID")
+    if not user_id_text:
+        raise StoreError("The native UI showcase requires a Telegram user.")
+    token = bridge.read_token()
+    result = telegram_native_ui.send_showcase(
+        token,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        receiver_user_id=int(user_id_text),
+        source_message_id=(
+            int(message_id_text) if message_id_text is not None else None
+        ),
+    )
+    unavailable = [
+        label.replace("_", " ")
+        for label, available in result.items()
+        if not available
+        and not (
+            (label == "chat_picker" and chat_id < 0)
+            or (label == "ephemeral_hint" and chat_id > 0)
+        )
+    ]
+    if unavailable:
+        send_message(
+            "Some preview surfaces were unavailable here: "
+            + ", ".join(unavailable)
+            + ". The ordinary-message fallbacks remain usable."
+        )
 
 
 def create_agent_from_catalog(project_slug: str) -> None:
@@ -1059,6 +1120,7 @@ def enqueue_agent_input(
             receipt_parse_mode="HTML",
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
         )
+    react_to_current_message("👀")
 
 
 def enqueue_router_input(
@@ -1098,6 +1160,7 @@ def enqueue_router_input(
             receipt_parse_mode="HTML",
             replied_message_id=replied_message_id,
         )
+    react_to_current_message("👀")
 
 
 def proposed_forum_setup(
@@ -1251,6 +1314,7 @@ def send_forum_binding_prompt(
                             else f"Use {provider_name}"
                         ),
                         "callback_data": f"a:{action.token}",
+                        "style": "primary",
                     }
                 ]
             )
@@ -1378,7 +1442,10 @@ def prompt_direct_forum_binding(text: str) -> bool:
             "Send /bind followed by a path, for example:\n"
             "/bind ~/Software/my-project\n\n"
             "Folder descriptions are available only when the optional Control "
-            "agent is enabled."
+            "agent is enabled.",
+            reply_markup=telegram_native_ui.force_reply_markup(
+                "Paste an exact local folder path"
+            ),
         )
         return True
     return send_forum_binding_prompt(
@@ -5432,7 +5499,10 @@ def send_direct_mode_home() -> None:
         send_message(
             "This group does not have a workspace yet.\n\n"
             "Send /bind followed by an exact folder path, for example:\n"
-            "/bind ~/Software/my-project"
+            "/bind ~/Software/my-project",
+            reply_markup=telegram_native_ui.force_reply_markup(
+                "Paste an exact local folder path"
+            ),
         )
         return
     send_message(
@@ -5551,6 +5621,8 @@ def main() -> int:
                 send_project_catalog()
             elif command.lower() == "/newgroup":
                 send_group_setup_card()
+            elif command.lower() == "/showcase":
+                send_native_ui_showcase()
             elif command.lower().startswith("/bind"):
                 if not prompt_direct_forum_binding(text):
                     send_message(

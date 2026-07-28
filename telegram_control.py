@@ -2918,12 +2918,44 @@ def registered_bot_commands() -> list[dict[str, str]]:
     return commands
 
 
+def registered_bot_command_scopes(
+) -> list[tuple[dict[str, str], list[dict[str, str]]]]:
+    """Render Telegram's private/group composer menus from the command catalog."""
+    commands = registered_bot_commands()
+    by_name = {command["command"]: command for command in commands}
+    scopes = []
+    for scope_type, names in (
+        ("all_private_chats", telegram_help.PRIVATE_COMMAND_NAMES),
+        ("all_group_chats", telegram_help.GROUP_COMMAND_NAMES),
+    ):
+        unknown = [name for name in names if name not in by_name]
+        if unknown:
+            raise StoreError(
+                f"Telegram {scope_type} command scope is invalid: "
+                + ", ".join(unknown)
+            )
+        scopes.append(
+            (
+                {"type": scope_type},
+                [by_name[name] for name in names],
+            )
+        )
+    return scopes
+
+
 def sync_commands_command(_: argparse.Namespace) -> None:
-    """Publish the command menu so every command is tappable, pin or not."""
+    """Publish scoped command menus so the composer stays context-relevant."""
     token = bridge.read_token()
     commands = registered_bot_commands()
     bridge.api_call(token, "setMyCommands", commands=commands)
-    print(f"Registered {len(commands)} Telegram commands:")
+    for scope, scoped_commands in registered_bot_command_scopes():
+        bridge.api_call(
+            token,
+            "setMyCommands",
+            commands=scoped_commands,
+            scope=scope,
+        )
+    print(f"Registered {len(commands)} Telegram commands with private/group scopes:")
     for command in commands:
         print(f"- /{command['command']} — {command['description']}")
 

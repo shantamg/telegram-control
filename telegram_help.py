@@ -32,9 +32,34 @@ COMMANDS = (
     BotCommand("voice", "Choose and preview the spoken-reply voice"),
     BotCommand("projects", "List connected workspaces and topic sessions"),
     BotCommand("newgroup", "Get the link that adds me to a new project group"),
+    BotCommand("showcase", "Preview Telegram's native bot interface controls"),
     BotCommand("bind", "Bind this group to an exact local folder"),
     BotCommand("removegroup", "Safely remove this project group and all topics"),
     BotCommand("teardown", "Safely remove this managed topic and session"),
+)
+
+# Telegram can scope the composer command menu by chat type, though not by
+# individual forum topic. Keep setup-only commands out of project groups and
+# group-only lifecycle commands out of the bot's private administration chat.
+PRIVATE_COMMAND_NAMES = (
+    "help",
+    "status",
+    "voice",
+    "projects",
+    "newgroup",
+    "showcase",
+)
+
+GROUP_COMMAND_NAMES = (
+    "help",
+    "agent",
+    "status",
+    "voice",
+    "projects",
+    "showcase",
+    "bind",
+    "removegroup",
+    "teardown",
 )
 
 
@@ -158,6 +183,8 @@ For an older enrolled catalog project, use /agent create project-slug in a Contr
 Setting up a new group: send /newgroup in the bot’s private chat, create a private group, enable Topics, choose Telegram’s separate “View as Topics” display mode, then tap the link. Telegram adds the bot with the rights it needs in one step and automatically posts a welcome card in General with the remaining steps. A group named Telegram Control is offered the repository checkout seeded during installation; confirm it without typing a path. Other groups authorize first, then use /bind with an exact existing folder path and confirm the workspace and provider.
 
 General is the group’s setup and administration topic. It accepts authorization, /bind, /help, /status, /projects, and /removegroup, but it does not become a disposable agent conversation because Telegram gives General special lifecycle rules. When binding finishes in General, Telegram Control creates Start Here automatically. Binding from an ordinary topic reuses that topic instead.
+
+Use /showcase to preview Telegram-native rich content, colored and copy buttons, reactions, private group hints, and a guided reply composer. In the paired private chat it can also show Telegram’s native existing-group picker. The preview is side-effect-free apart from copying button labels and sending its own messages.
 
 By default, each new topic in a bound group starts immediately with the group’s provider, model, and effort. If per-topic confirmation is enabled, your first request is held while you accept those defaults or choose a different agent, then runs as the first turn—you do not resend it. Use /agent to inspect or change that topic’s conversation.
 

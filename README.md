@@ -126,6 +126,8 @@ the bot or delete the group in Telegram after cleanup finishes.
   **Stop** remains independently available while work is active and interrupts
   it. A failed agent worker is recovered without restarting unrelated active
   topics.
+- Accepted text requests receive a lightweight 👀 reaction in addition to
+  their durable progress card.
 - Photos and documents up to 20 MB are saved to private local paths the agent
   can inspect.
 - `/help` is the in-Telegram source of truth for commands and workflows.
@@ -138,8 +140,10 @@ the bot or delete the group in Telegram after cleanup finishes.
 ## Telegram commands
 
 Telegram publishes these from `telegram_help.COMMANDS`, so typing `/` shows the
-same menu in every chat and topic. Report-only detached-worker topics display
-the menu but do not accept commands.
+relevant subset in private bot chats and project groups. Telegram has no
+topic-level command scope, so General and ordinary topics in one group share
+the group menu. Report-only detached-worker topics display that menu but do not
+accept commands.
 
 | Command | Where to use it | What it does |
 | --- | --- | --- |
@@ -149,6 +153,7 @@ the menu but do not accept commands.
 | `/voice` | Paired chat or ordinary project topic | Stages, previews, and confirms the global spoken-reply voice and speed. |
 | `/projects` | Paired chat or ordinary project topic | Lists connected workspaces without exposing local paths. |
 | `/newgroup` | Paired private chat | Creates the link for adding the bot to a private project group. |
+| `/showcase` | Paired chat or ordinary project topic | Previews rich messages, styled buttons, reactions, guided replies, and other native Telegram UI. |
 | `/bind <path>` | Authorized, unbound private project group | Confirms an exact existing workspace and available provider. |
 | `/removegroup` | Ordinary topic in a bound project group | Confirms safe removal of the binding and every managed topic. |
 | `/teardown` | Managed agent topic | Confirms removal of that topic and its agent binding. |

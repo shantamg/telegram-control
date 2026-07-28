@@ -3349,11 +3349,28 @@ class DurableStoreTests(unittest.TestCase):
             "voice",
             "projects",
             "newgroup",
+            "showcase",
             "bind",
             "removegroup",
             "teardown",
         ):
             self.assertIn(handled, [command["command"] for command in commands])
+        scopes = dict(
+            (scope["type"], scoped)
+            for scope, scoped in telegram_control.registered_bot_command_scopes()
+        )
+        self.assertNotIn(
+            "removegroup",
+            [command["command"] for command in scopes["all_private_chats"]],
+        )
+        self.assertNotIn(
+            "newgroup",
+            [command["command"] for command in scopes["all_group_chats"]],
+        )
+        self.assertIn(
+            "showcase",
+            [command["command"] for command in scopes["all_group_chats"]],
+        )
 
     def _leased_forum_subject(self, workspace):
         """A topic in a bound group, mid-turn — the surface that has an intro."""
@@ -11479,6 +11496,7 @@ class DurableIntegrationTests(unittest.TestCase):
                             "https://t.me/example_bot?startgroup=true"
                             "&admin=change_info+delete_messages+manage_topics"
                         ),
+                        "style": "primary",
                     },
                 )
                 # /newgroup is deterministic controller work, not a router turn.

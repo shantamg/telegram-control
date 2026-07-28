@@ -9496,6 +9496,7 @@ class DurableStore:
                                 {
                                     "text": "Remove group & all topics",
                                     "callback_data": f"a:{confirm.token}",
+                                    "style": "danger",
                                 }
                             ],
                             [
@@ -9592,6 +9593,7 @@ class DurableStore:
                             {
                                 "text": "Delete topic & session",
                                 "callback_data": f"a:{confirm.token}",
+                                "style": "danger",
                             }
                         ],
                         [
