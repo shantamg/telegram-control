@@ -58,10 +58,13 @@ After the foreground echo test succeeds, press Control-C and run:
 ```
 
 `bootstrap` runs the readiness checks, initializes the durable database,
+seeds this checkout as the default **Telegram Control** group workspace,
 installs the shared agent skills, attempts to publish the Telegram command
-menu, and installs the login LaunchAgent. A transient menu-publication failure
-is reported as a warning without aborting installation; retry it with
-`./telegram_control.py sync-commands`. Confirm the result with:
+menu, and installs the login LaunchAgent. The seed uses the checkout's resolved
+path, so cloning somewhere else requires no path edit. A transient
+menu-publication failure is reported as a warning without aborting
+installation; retry it with `./telegram_control.py sync-commands`. Confirm the
+result with:
 
 ```sh
 ./telegram_control.py status
@@ -84,23 +87,30 @@ For the human checkpoints, troubleshooting, and uninstall details, follow the
    /bind ~/Software/my-project
    ```
 
-6. Confirm the folder and provider. Then create a topic and send a message.
-   The topic agent is created automatically and the message becomes its first
-   turn.
+6. Confirm the folder and provider. Telegram Control reuses the ordinary topic
+   where binding happened, or creates **Start Here** when setup happened in
+   General. Send a message there to begin.
+
+The first private group named **Telegram Control** is a shortcut: installation
+has already seeded this repository's checkout, so adding the bot offers that
+exact folder for confirmation without requiring `/bind`.
 
 See [Set up a Telegram project group](docs/getting-started/telegram-group.md)
 for the exact Telegram settings and why each permission is needed.
 
 To disconnect a project group, first finish active turns and consoles and stop
-its detached workers. Then send `/removegroup` in any ordinary topic and confirm
-the removal card. Telegram Control deletes every managed topic, archives its
-topic agents, clears their provider-session pointers, and revokes the workspace
-binding. It cannot delete the Telegram group itself, so remove the bot or
-delete the group in Telegram after cleanup finishes.
+its detached workers. Then send `/removegroup` in General or any ordinary topic
+and confirm the removal card. Telegram Control deletes every managed topic,
+archives its topic agents, clears their provider-session pointers, and revokes
+the workspace binding. It cannot delete the Telegram group itself, so remove
+the bot or delete the group in Telegram after cleanup finishes.
 
 ## Everyday behavior
 
 - One project group can contain many independent topic conversations.
+- General is the group's setup and administration surface. Telegram sometimes
+  omits its thread ID, so Telegram Control normalizes it to Telegram's reserved
+  topic ID 1; General is never turned into a disposable agent topic.
 - Topic sessions and queues survive controller restarts.
 - `/projects` lists every connected workspace with its active topic and session
   counts, whether it came from the older project catalog or a bound group.

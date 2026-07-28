@@ -2928,6 +2928,24 @@ def sync_commands_command(_: argparse.Namespace) -> None:
         print(f"- /{command['command']} — {command['description']}")
 
 
+def seed_install_workspace(store: DurableStore) -> dict[str, Any]:
+    """Seed this checkout as the default Telegram Control group workspace."""
+    checkout = SCRIPT_PATH.parent.resolve()
+    workspace, working_directory, git_repository_root = (
+        discovery.validate_agent_workspace(
+            str(checkout),
+            str(checkout),
+            discovery.exact_git_root(str(checkout)),
+        )
+    )
+    return store.seed_install_workspace(
+        display_name="Telegram Control",
+        project_path=workspace,
+        working_directory=working_directory,
+        git_repository_root=git_repository_root,
+    )
+
+
 def install_command(args: argparse.Namespace) -> None:
     config = bridge.load_config()
     bridge.read_token()
@@ -2935,8 +2953,12 @@ def install_command(args: argparse.Namespace) -> None:
     if not handler_path.is_file():
         raise StoreError(f"Handler does not exist: {handler_path}")
     bridge.handler_command(handler_path)
-    with open_store(args.db):
-        pass
+    with open_store(args.db) as store:
+        install_workspace = seed_install_workspace(store)
+    print(
+        "Seeded the Telegram Control group workspace at "
+        f"{install_workspace['project_path']}."
+    )
     install_managed_skills()
     try:
         sync_commands_command(args)

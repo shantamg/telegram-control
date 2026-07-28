@@ -13551,7 +13551,155 @@ class DurableStore:
             )
         return int(cursor.rowcount)
 
+    INSTALL_WORKSPACE_KEY = "install_workspace"
     RESTART_REQUEST_KEY = "restart_requested"
+
+    def seed_install_workspace(
+        self,
+        *,
+        display_name: str,
+        project_path: str,
+        working_directory: Optional[str] = None,
+        git_repository_root: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Remember the checkout that should back the first matching group.
+
+        A Telegram chat ID does not exist until the owner creates a group and
+        adds the bot. Installation can still durably seed the local half of
+        that future binding. When a private forum with the matching product
+        name arrives, the handler can offer the exact checkout as a one-tap,
+        confirmation-gated workspace instead of asking the owner to type it.
+        """
+        name = " ".join(str(display_name).strip().split())
+        workspace = str(project_path)
+        workdir = str(working_directory or project_path)
+        git_root = (
+            str(git_repository_root)
+            if git_repository_root is not None
+            else None
+        )
+        if (
+            not name
+            or len(name) > 128
+            or not Path(workspace).is_absolute()
+            or not Path(workdir).is_absolute()
+            or (git_root is not None and not Path(git_root).is_absolute())
+        ):
+            raise StoreError("Install workspace seed is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        existing_binding = self.connection.execute(
+            """
+            SELECT chat_id
+            FROM forum_workspaces
+            WHERE project_path = ? AND working_directory = ?
+                AND state = 'active'
+            ORDER BY created_at
+            LIMIT 1
+            """,
+            (workspace, workdir),
+        ).fetchone()
+        seed = {
+            "display_name": name,
+            "project_path": workspace,
+            "working_directory": workdir,
+            "git_repository_root": git_root,
+            "chat_id": (
+                int(existing_binding["chat_id"])
+                if existing_binding is not None
+                else None
+            ),
+        }
+        self.connection.execute(
+            """
+            INSERT INTO controller_state(key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (
+                self.INSTALL_WORKSPACE_KEY,
+                json.dumps(seed, separators=(",", ":"), sort_keys=True),
+                timestamp,
+            ),
+        )
+        return seed
+
+    def install_workspace_for_forum(
+        self,
+        *,
+        chat_id: int,
+        display_name: str,
+    ) -> Optional[dict[str, Any]]:
+        """Return the seeded checkout when this forum is allowed to claim it."""
+        row = self.connection.execute(
+            "SELECT value FROM controller_state WHERE key = ?",
+            (self.INSTALL_WORKSPACE_KEY,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            seed = json.loads(str(row["value"]))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(seed, dict):
+            return None
+        seeded_name = " ".join(str(seed.get("display_name", "")).split())
+        requested_name = " ".join(str(display_name).split())
+        claimed_chat_id = seed.get("chat_id")
+        if (
+            not seeded_name
+            or seeded_name.casefold() != requested_name.casefold()
+            or (
+                claimed_chat_id is not None
+                and int(claimed_chat_id) != int(chat_id)
+            )
+        ):
+            return None
+        return seed
+
+    def mark_install_workspace_bound(
+        self,
+        *,
+        chat_id: int,
+        project_path: str,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Attach the install seed to its confirmed Telegram forum once."""
+        row = self.connection.execute(
+            "SELECT value FROM controller_state WHERE key = ?",
+            (self.INSTALL_WORKSPACE_KEY,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            seed = json.loads(str(row["value"]))
+        except (TypeError, ValueError):
+            return False
+        if (
+            not isinstance(seed, dict)
+            or str(seed.get("project_path", "")) != str(project_path)
+            or (
+                seed.get("chat_id") is not None
+                and int(seed["chat_id"]) != int(chat_id)
+            )
+        ):
+            return False
+        seed["chat_id"] = int(chat_id)
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute(
+            """
+            UPDATE controller_state
+            SET value = ?, updated_at = ?
+            WHERE key = ?
+            """,
+            (
+                json.dumps(seed, separators=(",", ":"), sort_keys=True),
+                timestamp,
+                self.INSTALL_WORKSPACE_KEY,
+            ),
+        )
+        return True
 
     def request_controller_restart(
         self,

@@ -69,6 +69,8 @@ CONTROL_WORKSPACE_QUESTION = (
     "~/Software/my-project, or describe the project and Control will find it "
     "and confirm before binding anything."
 )
+GENERAL_FORUM_TOPIC_ID = 1
+STARTER_TOPIC_NAME = "Start Here"
 
 
 def effective_app_settings(workspace_path: Optional[str] = None) -> dict:
@@ -270,16 +272,24 @@ def send_status_card(update: dict) -> None:
         send_message("Durable status requires the Stage 2 controller.")
         return
     chat_id, thread_id = surface_coordinates()
+    binding_thread_id = (
+        None
+        if (
+            os.environ.get("TELEGRAM_CHAT_TYPE") == "supergroup"
+            and thread_id == GENERAL_FORUM_TOPIC_ID
+        )
+        else thread_id
+    )
     user_id = int(os.environ["TELEGRAM_FROM_ID"])
     with DurableStore(Path(database_path)) as store:
         binding = store.resolve_surface_binding(
             chat_id=chat_id,
-            message_thread_id=thread_id,
+            message_thread_id=binding_thread_id,
         )
         if binding is None:
             binding = store.ensure_surface_binding(
                 chat_id=chat_id,
-                message_thread_id=thread_id,
+                message_thread_id=binding_thread_id,
                 surface_type="control",
                 display_name=surface_display_name(),
                 target_type="controller",
@@ -1214,6 +1224,7 @@ def send_forum_binding_prompt(
                 "provider": provider,
                 "provider_config": {},
                 "already_authorized": already_authorized,
+                "install_seed": bool(setup.get("install_seed")),
             }
             action = store.create_callback_action(
                 operation_id=(
@@ -1275,6 +1286,11 @@ def send_forum_binding_prompt(
         f"Workspace: {setup['project_path']}\n"
         f"{provider_line}\n\n"
         + (
+            "This checkout was seeded by the Telegram Control installer.\n\n"
+            if setup.get("install_seed")
+            else ""
+        )
+        + (
             "The forum is already authorized. Nothing is bound until you confirm."
             if already_authorized
             else "This authorizes the private forum and binds its topics to "
@@ -1284,6 +1300,45 @@ def send_forum_binding_prompt(
         reply_markup={"inline_keyboard": buttons},
     )
     return True
+
+
+def install_seeded_forum_setup(
+    *,
+    chat_id: int,
+    display_name: str,
+) -> Optional[dict]:
+    """Resolve the install-time checkout for its first matching project group."""
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    if not database_path:
+        return None
+    with DurableStore(Path(database_path)) as store:
+        seed = store.install_workspace_for_forum(
+            chat_id=chat_id,
+            display_name=display_name,
+        )
+    if seed is None:
+        return None
+    try:
+        workspace_root, working_directory, git_repository_root = (
+            discovery.validate_agent_workspace(
+                str(seed["project_path"]),
+                str(seed["working_directory"]),
+                (
+                    str(seed["git_repository_root"])
+                    if seed.get("git_repository_root") is not None
+                    else None
+                ),
+            )
+        )
+    except (KeyError, StoreError):
+        return None
+    return {
+        "project_path": workspace_root,
+        "working_directory": working_directory,
+        "git_repository_root": git_repository_root,
+        "requested_provider": None,
+        "install_seed": True,
+    }
 
 
 def prompt_direct_forum_binding(text: str) -> bool:
@@ -1349,6 +1404,11 @@ def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
                 raise StoreError("Private forum authorization is invalid.")
             return True
         setup = proposed_forum_setup(text) if text else None
+        if setup is None:
+            setup = install_seeded_forum_setup(
+                chat_id=chat_id,
+                display_name=display_name,
+            )
         if setup is not None:
             return not send_forum_binding_prompt(
                 setup,
@@ -1403,6 +1463,11 @@ def ensure_bound_forum_subject():
         )
     chat_id = int(chat_id_text)
     thread_id = int(thread_id_text)
+    if thread_id == GENERAL_FORUM_TOPIC_ID:
+        # General is the group's durable setup/admin surface. Telegram does
+        # not allow deleting it with deleteForumTopic, so it must never become
+        # an ordinary disposable agent conversation.
+        return None
     with DurableStore(Path(database_path)) as store:
         if store.resolve_forum_workspace(chat_id) is None:
             # Until the forum is bound, its topics remain Control surfaces so
@@ -1491,6 +1556,8 @@ def forum_subject_setup_pending() -> bool:
         return False
     chat_id = int(chat_id_text)
     thread_id = int(thread_id_text)
+    if thread_id == GENERAL_FORUM_TOPIC_ID:
+        return False
     with DurableStore(Path(database_path)) as store:
         if store.resolve_forum_workspace(chat_id) is None:
             return False
@@ -1530,6 +1597,125 @@ def provision_direct_forum_subject(*, first_turn_queued: bool = False):
     return subject
 
 
+def provision_bound_forum_starter(
+    *,
+    workspace,
+    operation_id: str,
+) -> dict:
+    """Make the binding topic usable, or create a normal first topic.
+
+    General stays an administrative surface because Telegram gives it special
+    lifecycle rules. If binding happened there, create one ordinary topic that
+    can safely use the normal agent and teardown machinery. If the owner bound
+    the group from an ordinary topic, reuse that topic instead.
+    """
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    if not database_path or not chat_id_text or not thread_id_text:
+        raise StoreError("Starter topic provisioning requires a forum topic.")
+    chat_id = int(chat_id_text)
+    current_thread_id = int(thread_id_text)
+    topic_name = " ".join(
+        os.environ.get("TELEGRAM_TOPIC_NAME", "").strip().split()
+    )
+    created_in_telegram = False
+
+    with DurableStore(Path(database_path)) as store:
+        existing_topics = store.list_topic_surfaces(chat_id)
+        if current_thread_id == GENERAL_FORUM_TOPIC_ID and existing_topics:
+            return {
+                "created": False,
+                "message_thread_id": existing_topics[0].message_thread_id,
+                "display_name": existing_topics[0].display_name,
+            }
+
+    target_thread_id = current_thread_id
+    display_name = topic_name or STARTER_TOPIC_NAME
+    if current_thread_id == GENERAL_FORUM_TOPIC_ID:
+        try:
+            topic = bridge.api_call(
+                bridge.read_token(),
+                "createForumTopic",
+                chat_id=chat_id,
+                name=STARTER_TOPIC_NAME,
+            )
+            target_thread_id = int(topic["message_thread_id"])
+        except bridge.BridgeError as exc:
+            return {
+                "created": False,
+                "error": (
+                    "The group is bound, but Telegram could not create its "
+                    f"first topic: {exc}"
+                ),
+            }
+        except (KeyError, TypeError, ValueError):
+            return {
+                "created": False,
+                "error": (
+                    "The group is bound, but Telegram returned no usable ID "
+                    "for its first topic."
+                ),
+            }
+        if target_thread_id <= GENERAL_FORUM_TOPIC_ID:
+            return {
+                "created": False,
+                "error": (
+                    "The group is bound, but Telegram returned an invalid "
+                    "first-topic ID."
+                ),
+            }
+        display_name = STARTER_TOPIC_NAME
+        created_in_telegram = True
+
+    confirm_agent = bool(
+        effective_app_settings(workspace.project_path)["topics"][
+            "confirm_agent"
+        ]
+    )
+    with DurableStore(Path(database_path)) as store:
+        if confirm_agent:
+            store.ensure_surface_binding(
+                chat_id=chat_id,
+                message_thread_id=target_thread_id,
+                surface_type="task",
+                display_name=display_name,
+                target_type="controller",
+                target_id="control",
+            )
+            store.enqueue_api_call(
+                operation_id=f"{operation_id}:starter-prompt",
+                method="sendMessage",
+                params={
+                    "chat_id": chat_id,
+                    "message_thread_id": target_thread_id,
+                    "text": (
+                        "🎛 Control\n\n"
+                        "Send your first request here. Telegram Control will "
+                        "confirm this topic’s agent before it starts."
+                    ),
+                },
+                serialize_key=f"topic-intro:{chat_id}:{target_thread_id}",
+            )
+        else:
+            subject, subject_created = store.ensure_forum_subject(
+                chat_id=chat_id,
+                message_thread_id=target_thread_id,
+                display_name=display_name,
+            )
+            if subject_created:
+                store.enqueue_forum_subject_intro(
+                    subject.agent_id,
+                    f"{operation_id}:starter",
+                    started=False,
+                )
+    return {
+        "created": created_in_telegram,
+        "message_thread_id": target_thread_id,
+        "display_name": display_name,
+    }
+
+
 def prompt_forum_subject_provider_selection(
     request_was_already_sent: bool = False,
     pending_request: Optional[str] = None,
@@ -1564,6 +1750,8 @@ def prompt_forum_subject_provider_selection(
         )
     chat_id = int(chat_id_text)
     thread_id = int(thread_id_text)
+    if thread_id == GENERAL_FORUM_TOPIC_ID:
+        return False
     display_name = " ".join(surface_display_name().strip().split())
     if not display_name or len(display_name) > 128:
         raise StoreError("Forum topic display name is invalid.")
@@ -2817,6 +3005,15 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 provider=str(action.payload["provider"]),
                 provider_config=provider_config,
             )
+            if bool(action.payload.get("install_seed")):
+                store.mark_install_workspace_bound(
+                    chat_id=target_chat_id,
+                    project_path=workspace.project_path,
+                )
+        starter = provision_bound_forum_starter(
+            workspace=workspace,
+            operation_id=action.operation_id,
+        )
         if callback_query_id:
             deliver_api_call(
                 "answerCallbackQuery",
@@ -2835,6 +3032,22 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             },
             "forum-setup-clear",
         )
+        starter_detail = (
+            "\n\n"
+            + str(starter["error"])
+            + " Create a normal topic manually and send a message there."
+            if starter.get("error")
+            else (
+                "\n\n"
+                + (
+                    f"Created {starter['display_name']}. Open it and start "
+                    "talking."
+                    if starter.get("created")
+                    else f"{starter['display_name']} is ready for your first "
+                    "request."
+                )
+            )
+        )
         send_message(
             f"✅ {workspace.display_name} is "
             + (
@@ -2842,10 +3055,11 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 if bool(action.payload.get("already_authorized"))
                 else "authorized and bound"
             )
-            + ".\n\n"
-            "Create or open any topic and send your request. Its agent starts "
-            "automatically with this group’s defaults; use /agent inside a "
-            "topic whenever you want different settings.\n\n"
+            + "."
+            + starter_detail
+            + "\n\n"
+            "New topics also start automatically with this group’s defaults; "
+            "use /agent inside a topic whenever you want different settings.\n\n"
             f"{telegram_help.HELP_HINT}"
         )
         return
@@ -3404,6 +3618,10 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 provider=str(action.payload["provider"]),
                 provider_config=provider_config,
             )
+        starter = provision_bound_forum_starter(
+            workspace=workspace,
+            operation_id=action.operation_id,
+        )
         if callback_query_id:
             deliver_api_call(
                 "answerCallbackQuery",
@@ -3430,7 +3648,18 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "🎛 Control\n\n"
             f"✅ {workspace.display_name} is now bound to "
             f"{workspace.workspace_root}.\n\n"
-            "New topics can now become workspace-scoped subjects."
+            + (
+                str(starter["error"])
+                if starter.get("error")
+                else (
+                    f"Created {starter['display_name']}; it is ready for the "
+                    "first request."
+                    if starter.get("created")
+                    else f"{starter['display_name']} is ready for the first "
+                    "request."
+                )
+            )
+            + "\n\nNew topics can also become workspace-scoped subjects."
         )
         return
     if action.action_type in {
@@ -5152,6 +5381,26 @@ def route_user_input(
 def send_direct_mode_home() -> None:
     """Explain the deterministic surface instead of silently invoking Control."""
     if os.environ.get("TELEGRAM_CHAT_TYPE") == "supergroup":
+        database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+        chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+        if database_path and chat_id_text:
+            with DurableStore(Path(database_path)) as store:
+                workspace = store.resolve_forum_workspace(int(chat_id_text))
+                topics = store.list_topic_surfaces(int(chat_id_text))
+            if workspace is not None:
+                destination = (
+                    topics[0].display_name
+                    if topics
+                    else "any regular topic"
+                )
+                send_message(
+                    "General is this project group’s setup and administration "
+                    "topic.\n\n"
+                    f"Open {destination} or another regular topic for an agent "
+                    "conversation. New topics start automatically with this "
+                    "group’s defaults."
+                )
+                return
         send_message(
             "This group does not have a workspace yet.\n\n"
             "Send /bind followed by an exact folder path, for example:\n"

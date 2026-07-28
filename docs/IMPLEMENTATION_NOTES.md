@@ -1790,3 +1790,42 @@ were left running.
 Verified with two new Claude adapter regressions covering delayed steering
 acknowledgment and Stop delivery behind an unacknowledged steer, the complete
 405-test suite, Python compilation, and `git diff --check`.
+
+## Install-time workspace seed and General-topic onboarding
+
+Installation now stores one `install_workspace` record in the existing
+`controller_state` table. It contains the symlink-resolved checkout,
+working-directory and optional Git-root paths for the repository that ran
+`bootstrap`, plus the portable display name **Telegram Control**. No chat ID is
+hardcoded: if an active forum already uses that exact workspace the seed adopts
+its chat ID, otherwise the first matching private forum can claim it only after
+the paired owner confirms the setup card. A newly added private forum named
+**Telegram Control** therefore offers the cloned checkout and provider choices
+immediately instead of requiring the owner to type `/bind`.
+
+Telegram's General topic is normalized to reserved topic ID 1 when a private
+forum update omits `message_thread_id`. General remains the root setup and
+administration surface rather than a `forum_subject`: Telegram exposes special
+General lifecycle methods and does not allow deleting it through the ordinary
+`deleteForumTopic` contract used by agent teardown. `/bind`, authorization,
+`/help`, `/status`, `/projects`, and `/removegroup` consequently work from
+General without placing it in the managed-topic deletion set.
+
+After a workspace binding succeeds, the handler reuses the ordinary topic
+where binding happened. If binding happened in General and the database has no
+ordinary topic surface yet, it calls `createForumTopic` once for **Start Here**,
+creates the normal durable subject/agent route, and queues its standing intro.
+Installations that require per-topic confirmation receive the normal
+first-request prompt instead. A Telegram creation failure does not roll back
+the already-confirmed workspace binding; the General response explains that a
+normal topic must be created manually.
+
+This uses existing tables and outbox card variants, so there is no schema
+migration. General normalization runs in the long-lived inbox worker and
+therefore needs one idle-safe controller reload; checkout seeding and the
+remaining onboarding behavior need no new daemon protocol.
+
+Verified on July 27, 2026 with focused seed, General-normalization,
+starter-topic, and matching-group tests. The complete 409-test run passed every
+feature test and exposed one pre-existing concurrent-first-open locking flake;
+that isolated test passed immediately on rerun.

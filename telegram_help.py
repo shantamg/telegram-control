@@ -109,7 +109,7 @@ After confirmation, Telegram Control clears the provider-session pointer, archiv
         "Group removal",
         """Safe group removal
 
-Type /removegroup in any ordinary topic inside the bound project group. Control shows how many managed topics and detached workers belong to the group, then asks for confirmation without invoking Codex or Claude.
+Type /removegroup in General or any ordinary topic inside the bound project group. Control shows how many managed topics and detached workers belong to the group, then asks for confirmation without invoking Codex or Claude.
 
 Queued or active topic turns, active consoles, an active optional Control turn, and running detached workers block removal. Fix the named blocker and tap the same confirmation again before the 30-minute card expires. After confirmation, Telegram Control deletes every managed and worker topic, archives the topic agents, clears provider sessions, removes stopped worker records and recovery files, and revokes the group’s workspace binding, routes, buttons, and cards.
 
@@ -155,7 +155,9 @@ Use /projects to list every connected workspace, including group-only workspaces
 
 For an older enrolled catalog project, use /agent create project-slug in a Control-bound topic; /projects shows the available slug. Directly bound groups do not need this legacy attach step.
 
-Setting up a new group: send /newgroup in the bot’s private chat, create a private group, enable Topics, choose Telegram’s separate “View as Topics” display mode, then tap the link. Telegram adds the bot with the rights it needs in one step. Authorize the forum, then send /bind followed by an exact existing folder path and confirm the workspace and provider.
+Setting up a new group: send /newgroup in the bot’s private chat, create a private group, enable Topics, choose Telegram’s separate “View as Topics” display mode, then tap the link. Telegram adds the bot with the rights it needs in one step. A group named Telegram Control is offered the repository checkout seeded during installation; confirm it without typing a path. Other groups authorize first, then use /bind with an exact existing folder path and confirm the workspace and provider.
+
+General is the group’s setup and administration topic. It accepts authorization, /bind, /help, /status, /projects, and /removegroup, but it does not become a disposable agent conversation because Telegram gives General special lifecycle rules. When binding finishes in General, Telegram Control creates Start Here automatically. Binding from an ordinary topic reuses that topic instead.
 
 By default, each new topic in a bound group starts immediately with the group’s provider, model, and effort. If per-topic confirmation is enabled, your first request is held while you accept those defaults or choose a different agent, then runs as the first turn—you do not resend it. Use /agent to inspect or change that topic’s conversation.
 

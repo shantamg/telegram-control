@@ -67,8 +67,12 @@ Voice transcription, spoken replies, and tmux features are reported
 separately as optional. Missing one does not prevent text, file, and topic
 conversations from being installed.
 
-`bootstrap` then creates or verifies the database, copies the repo-owned skills
-to `~/.agents/skills/`, links their Claude entries from `~/.claude/skills/`,
+`bootstrap` then creates or verifies the database and records the resolved
+checkout as the install-time **Telegram Control** workspace. That durable seed
+lets the first private forum group named **Telegram Control** offer this repo
+for one-tap confirmation even when it was cloned somewhere other than the
+example path. Bootstrap also copies the repo-owned skills to
+`~/.agents/skills/`, links their Claude entries from `~/.claude/skills/`,
 attempts to publish Telegram's command menu, writes the LaunchAgent, and starts
 the controller. Codex discovers the shared skill directory directly. A network
 failure while publishing the menu is a nonfatal warning; retry it with:

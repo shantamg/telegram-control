@@ -177,6 +177,68 @@ class DurableStoreTests(unittest.TestCase):
         self.store.close()
         self.temporary_directory.cleanup()
 
+    def test_install_workspace_seed_is_claimed_by_one_matching_forum(self):
+        workspace = Path(self.temporary_directory.name).resolve()
+        seed = self.store.seed_install_workspace(
+            display_name="Telegram Control",
+            project_path=str(workspace),
+            working_directory=str(workspace),
+            git_repository_root=None,
+            now=100,
+        )
+        self.assertIsNone(seed["chat_id"])
+        self.assertIsNone(
+            self.store.install_workspace_for_forum(
+                chat_id=-1001,
+                display_name="Another Project",
+            )
+        )
+        candidate = self.store.install_workspace_for_forum(
+            chat_id=-1001,
+            display_name="telegram control",
+        )
+        self.assertEqual(candidate["project_path"], str(workspace))
+        self.assertTrue(
+            self.store.mark_install_workspace_bound(
+                chat_id=-1001,
+                project_path=str(workspace),
+                now=101,
+            )
+        )
+        self.assertIsNotNone(
+            self.store.install_workspace_for_forum(
+                chat_id=-1001,
+                display_name="Telegram Control",
+            )
+        )
+        self.assertIsNone(
+            self.store.install_workspace_for_forum(
+                chat_id=-1002,
+                display_name="Telegram Control",
+            )
+        )
+
+    def test_general_forum_message_without_thread_id_normalizes_to_one(self):
+        message = {
+            "chat": {
+                "id": -1001,
+                "type": "supergroup",
+                "title": "Telegram Control",
+                "is_forum": True,
+            },
+            "from": {"id": 123},
+            "message_id": 99,
+            "text": "/start true",
+        }
+        self.assertEqual(
+            telegram_control.bridge.forum_message_thread_id(message),
+            1,
+        )
+        message["chat"]["username"] = "public_forum"
+        self.assertIsNone(
+            telegram_control.bridge.forum_message_thread_id(message)
+        )
+
     def _completed_agent_response_with_voice_button(self):
         self.store.ensure_surface_binding(
             chat_id=123,
@@ -11252,6 +11314,124 @@ class DurableIntegrationTests(unittest.TestCase):
             self.assertIn("<b>Life</b> · <code>Claude</code>", text)
             self.assertIn("1 active topic · 1 session", text)
             self.assertNotIn(str(workspace), text)
+
+    def test_general_binding_creates_a_normal_starter_topic(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "telegram-control"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Telegram Control",
+                    target_type="controller",
+                    target_id="control",
+                    now=100,
+                )
+                bound, _ = store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace.resolve()),
+                    provider="codex",
+                    now=101,
+                )
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CHAT_ID": "-100777",
+                "TELEGRAM_CHAT_TYPE": "supergroup",
+                "TELEGRAM_MESSAGE_THREAD_ID": "1",
+                "TELEGRAM_TOPIC_NAME": "General",
+                "TELEGRAM_CONTROL_SETTINGS_JSON": "{}",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    on_message.bridge,
+                    "read_token",
+                    return_value="token",
+                ), mock.patch.object(
+                    on_message.bridge,
+                    "api_call",
+                    return_value={"message_thread_id": 77},
+                ) as api_call:
+                    result = on_message.provision_bound_forum_starter(
+                        workspace=bound,
+                        operation_id="inbox:1:bind",
+                    )
+
+            self.assertTrue(result["created"])
+            self.assertEqual(result["message_thread_id"], 77)
+            api_call.assert_called_once_with(
+                "token",
+                "createForumTopic",
+                chat_id=-100777,
+                name="Start Here",
+            )
+            with DurableStore(database_path) as store:
+                subject = store.resolve_forum_subject(-100777, 77)
+                self.assertIsNotNone(subject)
+                self.assertEqual(subject.display_name, "Start Here")
+                intro = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(intro.method, "sendMessage")
+                self.assertEqual(intro.params["message_thread_id"], 77)
+                self.assertEqual(intro.card["kind"], "topic_intro")
+                self.assertIsNone(
+                    store.resolve_surface_binding(-100777, 1)
+                )
+
+    def test_seeded_checkout_is_offered_to_matching_new_group(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "telegram-control"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            with DurableStore(database_path) as store:
+                store.seed_install_workspace(
+                    display_name="Telegram Control",
+                    project_path=str(workspace.resolve()),
+                    working_directory=str(workspace.resolve()),
+                    now=90,
+                )
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": "1",
+                "TELEGRAM_CHAT_ID": "-100777",
+                "TELEGRAM_CHAT_TYPE": "supergroup",
+                "TELEGRAM_CHAT_TITLE": "Telegram Control",
+                "TELEGRAM_MESSAGE_THREAD_ID": "1",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_CONTROL_SETTINGS_JSON": "{}",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    on_message.provider_adapters,
+                    "provider_availability",
+                    return_value={"claude": None, "codex": "/bin/codex"},
+                ):
+                    self.assertFalse(
+                        on_message.forum_is_authorized_or_prompt()
+                    )
+
+            with DurableStore(database_path) as store:
+                prompt = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(prompt.params["message_thread_id"], 1)
+                self.assertIn(
+                    str(workspace.resolve()),
+                    prompt.params["text"],
+                )
+                self.assertIn(
+                    "seeded by the Telegram Control installer",
+                    prompt.params["text"],
+                )
+                action = store.connection.execute(
+                    """
+                    SELECT payload_json
+                    FROM callback_actions
+                    WHERE action_type = 'authorize_bind_forum'
+                    """
+                ).fetchone()
+                self.assertTrue(
+                    json.loads(action["payload_json"])["install_seed"]
+                )
 
     def test_newgroup_offers_the_one_tap_link_and_start_only_authorizes(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
