@@ -62,11 +62,10 @@ For a later correction or follow-up, write the new instruction to another file
 and deliver it with `worker-brief` again. Do not keep the parent turn open while
 the detached worker processes it.
 
-Recovery is deliberately thin. Resuming the exact provider session ID restores
-the conversation and its scheduled work, so the recovery turn only asks the
-worker to check that its scheduled tasks, wakeups, loops, and monitors are still
-active, recreate anything missing, and confirm success or failure; the
-controller sends the result through its durable Telegram outbox.
+Recovery involves no agent at all. Resuming the exact provider session ID is
+itself what restores the conversation and its scheduled work, so the controller
+reopens the session with no prompt, checks the process came up, and posts that
+the worker recovered. Nothing is asked of the worker and nothing is waited for.
 
 ## Making the worker report
 

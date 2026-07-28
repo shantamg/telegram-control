@@ -368,12 +368,13 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
         self.assertFalse(self.recovery_file.exists())
         self.assertTrue(companion.exists())
 
-    def test_stopped_worker_resumes_exact_session_and_waits_for_confirmation(self):
+    def test_stopped_worker_resumes_exact_session_without_a_prompt(self):
         with (
             mock.patch.object(
                 detached_worker.tmux_console,
                 "has_tmux_session",
-                return_value=False,
+                # Stopped when reconciled, up again once the resume has run.
+                side_effect=[False, True],
             ),
             mock.patch.object(
                 detached_worker,
@@ -393,14 +394,19 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
                 now=1_700_000_100,
             )
 
-        self.assertEqual(result, "started")
-        self.assertEqual(worker.recovery_state, "recovering")
+        # Recovery completes in one pass: resuming the session ID is what
+        # restores the worker, so there is nothing to wait for an agent to say.
+        self.assertEqual(result, "recovered")
+        self.assertEqual(worker.recovery_state, "succeeded")
         self.assertEqual(worker.recovery_generation, 1)
-        self.assertEqual(worker.restart_count, 1)
-        recovery_prompt = resume_command.call_args.args[1]
-        self.assertNotIn(str(self.recovery_file), recovery_prompt)
-        self.assertIn("recreate anything that is missing", recovery_prompt)
-        self.assertIn("worker-recovery-confirm recover-me", recovery_prompt)
+        # Succeeding clears the attempt counter, so the backoff ladder starts
+        # fresh for the next unrelated crash rather than inheriting this one.
+        self.assertEqual(worker.restart_count, 0)
+        self.assertEqual(worker.observed_state, "running")
+        # One argument: the worker, and no prompt after it.
+        self.assertEqual(len(resume_command.call_args.args), 1)
+        self.assertEqual(resume_command.call_args.args[0].name, worker.name)
+        self.assertEqual(resume_command.call_args.kwargs, {})
         start_session.assert_called_once_with(
             "detached--recover-me",
             self.directory.name,
@@ -411,11 +417,11 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
             SELECT method, params_json
             FROM outbox_messages
             WHERE operation_id =
-                'detached-worker:1:recovery:1:started'
+                'detached-worker:1:recovery:1:succeeded'
             """
         ).fetchone()
         self.assertEqual(report["method"], "sendMessage")
-        self.assertIn("waiting for the agent to verify success", report["params_json"])
+        self.assertIn("running again", report["params_json"])
 
     def test_agent_confirmation_marks_success_and_queues_verified_report(self):
         self.store.begin_detached_worker_recovery(

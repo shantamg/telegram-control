@@ -1108,7 +1108,39 @@ generations, and the confirm/fail handshake all stay. Removing them means a
 schema migration on a live system for no behavioral gain, so the columns simply
 go quiet and `RECOVERY.md` is created but never mentioned to the worker.
 
-## Agent-authored questions with buttons
+### Recovery needs no agent
+
+A longer experiment removed the remaining reason to prompt on recovery. A worker
+was launched, given a cron job writing a timestamp every two minutes and a
+`/loop` writing another every three, and left alone for six minutes: four cron
+lines, three loop lines, all on schedule. Killing its tmux session froze both
+files for four minutes — the control that distinguishes recovery working from
+something else doing the writing. Resuming the session ID **with no prompt at
+all** restarted both within seconds, and they kept firing correctly for another
+seven minutes. `ps` confirmed the original process was gone and the resumed one
+was doing the work. The loop is the sharper case: Claude Code prints "Runs until
+you close this session" when one starts, and it came back anyway.
+
+So `recover_worker` now calls `resume_command_for(worker)` with no prompt,
+checks the tmux session came up, calls `complete_detached_worker_recovery`, and
+posts one message. It returns `"recovered"` instead of `"started"`; there is no
+`awaiting_confirmation` phase in the normal path and nothing waits on
+`RECOVERY_CONFIRM_TIMEOUT_SECONDS`. Dropping the prompt is also marginally
+*better* than keeping it: scheduled jobs fire only while the session is idle, so
+asking the worker to narrate its own recovery briefly delays what recovery is
+for.
+
+`_recovery_prompt` is deleted. `DEFAULT_RECOVERY_PROMPT`, the `recovery_prompt`
+column, and the `worker-recovery-confirm` / `worker-recovery-fail` commands stay
+in place but dormant, as does the `recovery_state == "recovering"` branch, which
+is now reachable only if a process dies between starting and being checked.
+
+Two limits worth stating. This was verified for scheduled jobs and `/loop`, not
+for background subagents or monitors — those are child processes rather than
+schedule entries, and a replayed transcript can describe them but cannot re-run
+them. And a process check is a weaker signal than an agent's confirmation about
+*what* was restored, though a confused agent could always confirm success just
+as easily as a healthy one, so little was actually given up.
 
 Agents could send text, voice, group icons, detached workers, and teardown
 cards, but they could not ask a question with choices — only Control could,

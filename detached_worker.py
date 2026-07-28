@@ -26,7 +26,6 @@ Claude or Codex.
 from __future__ import annotations
 
 import re
-import shlex
 import subprocess
 import time
 import uuid
@@ -392,7 +391,15 @@ def validate_provider_session(worker: DetachedWorker) -> bool:
     return False
 
 
-def resume_command_for(worker: DetachedWorker, prompt: str) -> list[str]:
+def resume_command_for(
+    worker: DetachedWorker,
+    prompt: Optional[str] = None,
+) -> list[str]:
+    """Argv that reopens the worker's exact conversation.
+
+    The prompt is optional because recovery no longer needs one: resuming the
+    session ID is itself what restores the worker's scheduled work.
+    """
     if not worker.provider_session_id:
         raise StoreError("Detached worker has no persisted provider session.")
     adapter = provider_adapters.adapter_for(_detached_agent_stub(worker))
@@ -400,7 +407,8 @@ def resume_command_for(worker: DetachedWorker, prompt: str) -> list[str]:
         command = adapter.console_command(_detached_agent_stub(worker))
     except provider_adapters.ProviderAdapterError as error:
         raise StoreError(str(error)) from error
-    command.append(prompt)
+    if prompt:
+        command.append(prompt)
     return command
 
 
@@ -452,32 +460,6 @@ def reconcile_worker(store: DurableStore, name: str) -> Optional[DetachedWorker]
     if not alive and worker.observed_state != "stopped":
         return store.set_detached_worker_states(name, observed_state="stopped")
     return worker
-
-
-def _recovery_prompt(store: DurableStore, worker: DetachedWorker) -> str:
-    generation = worker.recovery_generation
-    controller = Path(__file__).resolve().with_name("telegram_control.py")
-    prefix = (
-        f"/usr/bin/python3 {shlex.quote(str(controller))} "
-        f"--db {shlex.quote(str(store.path))}"
-    )
-    confirm = (
-        f"{prefix} worker-recovery-confirm {worker.name} "
-        f"--generation {generation}"
-    )
-    fail = (
-        f"{prefix} worker-recovery-fail {worker.name} "
-        f"--generation {generation}"
-    )
-    base = worker.recovery_prompt.strip() or DEFAULT_RECOVERY_PROMPT
-    return (
-        f"{base}\n\n"
-        f"Recovery generation: {generation}\n\n"
-        "Success command (summary on standard input):\n"
-        f"{confirm}\n\n"
-        "Failure command (reason on standard input):\n"
-        f"{fail}"
-    )
 
 
 def enqueue_recovery_report(
@@ -653,7 +635,11 @@ def recover_worker(
 
     worker = store.begin_detached_worker_recovery(worker.name, now=timestamp)
     try:
-        command = resume_command_for(worker, _recovery_prompt(store, worker))
+        # No prompt. Resuming the session ID is what restores the worker's
+        # scheduled work, and a prompt would only make the session busy —
+        # scheduled jobs fire while it is idle, so asking it to describe its
+        # own recovery briefly delays the thing being recovered.
+        command = resume_command_for(worker)
         _start_session(
             worker.tmux_session_name,
             worker.working_directory,
@@ -677,18 +663,40 @@ def recover_worker(
         )
         return "failed", worker
 
+    if not tmux_console.has_tmux_session(worker.tmux_session_name):
+        worker = store.fail_detached_worker_recovery(
+            worker.name,
+            worker.recovery_generation,
+            "The resumed provider process exited immediately.",
+            now=timestamp,
+        )
+        enqueue_recovery_report(
+            store,
+            worker,
+            phase="process-exited",
+            text=(
+                f"⚠️ Recovery attempt {worker.restart_count} for "
+                f"'{worker.name}' failed because the resumed provider process "
+                "exited immediately."
+            ),
+        )
+        return "failed", worker
+
+    worker = store.complete_detached_worker_recovery(
+        worker.name,
+        worker.recovery_generation,
+    )
     enqueue_recovery_report(
         store,
         worker,
-        phase="started",
+        phase="succeeded",
         text=(
-            f"♻️ Recovering detached worker '{worker.name}' after its tmux "
-            f"session stopped. The exact {worker.provider} conversation was "
-            "resumed and is restoring its own native background work. Telegram "
-            "Control is waiting for the agent to verify success."
+            f"♻️ Detached worker '{worker.name}' stopped and was recovered. Its "
+            f"exact {worker.provider} conversation is running again, with the "
+            "scheduled work it had before."
         ),
     )
-    return "started", worker
+    return "recovered", worker
 
 
 def confirm_recovery(
