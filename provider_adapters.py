@@ -774,6 +774,7 @@ class CodexExecAdapter:
                 start_new_session=True,
             )
             try:
+                _emit_progress(on_progress, "process_started", str(process.pid))
                 if process.stdout is None:
                     raise ProviderAdapterError(
                         "Codex app-server output stream is unavailable."
@@ -1520,6 +1521,7 @@ class ClaudePrintAdapter:
                 start_new_session=True,
             )
             try:
+                _emit_progress(on_progress, "process_started", str(process.pid))
                 if process.stdout is None:
                     raise ProviderAdapterError(
                         "Claude output stream is unavailable."

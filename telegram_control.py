@@ -314,7 +314,13 @@ def process_agent_mailbox_job(
         adapter = provider_adapters.adapter_for(agent)
 
         def on_progress(stage: str, detail: str) -> None:
-            if stage == "turn_started":
+            if stage == "process_started":
+                store.attach_agent_mailbox_process(
+                    job.mailbox_id,
+                    worker_id,
+                    int(detail),
+                )
+            elif stage == "turn_started":
                 store.attach_agent_mailbox_turn(
                     job.mailbox_id,
                     worker_id,
@@ -2277,6 +2283,39 @@ def supervisor_commands(
     return commands
 
 
+def _spawn_supervisor_child(command: list[str]) -> subprocess.Popen[Any]:
+    """Start one worker as a process-group leader for bounded cleanup."""
+
+    return subprocess.Popen(command, start_new_session=True)
+
+
+def _terminate_process_group(process_group_id: int, timeout: float = 3.0) -> None:
+    """Terminate one owned process group without affecting sibling workers."""
+
+    pgid = int(process_group_id)
+    if pgid <= 0 or pgid == os.getpgrp():
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        return
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def cleanup_reload_jobs() -> list[str]:
     """Remove stale one-shot reload jobs before controller workers start."""
     result = bridge.launchctl("list", check=False)
@@ -2328,8 +2367,25 @@ def run_command(args: argparse.Namespace) -> None:
     )
     processes: list[subprocess.Popen[Any]] = []
     try:
+        with open_store(args.db) as store:
+            gone_worker_pids = store.gone_local_agent_worker_pids()
+        for worker_pid in gone_worker_pids:
+            with open_store(args.db) as store:
+                provider_pids = (
+                    store.provider_process_pids_for_agent_worker(worker_pid)
+                )
+            for provider_pid in provider_pids:
+                _terminate_process_group(provider_pid)
+            with open_store(args.db) as store:
+                recovered = store.recover_agent_worker_leases(worker_pid)
+            log_event(
+                "startup_agent_worker_lease_recovered",
+                worker_pid=worker_pid,
+                provider_process_pids=provider_pids,
+                recovered_mailbox_ids=recovered,
+            )
         for command in commands:
-            processes.append(subprocess.Popen(command))
+            processes.append(_spawn_supervisor_child(command))
         log_event(
             "supervisor_started",
             child_pids=[process.pid for process in processes],
@@ -2338,11 +2394,54 @@ def run_command(args: argparse.Namespace) -> None:
         )
         next_restart_check = time.time()
         while True:
-            for process in processes:
+            for index, process in enumerate(processes):
                 return_code = process.poll()
                 if return_code is not None:
-                    raise StoreError(
-                        f"Controller child {process.pid} exited with status {return_code}."
+                    command = commands[index]
+                    role = str(command[-1])
+                    recovered_mailbox_ids: list[int] = []
+                    provider_process_pids: list[int] = []
+                    if role == "work-agents":
+                        try:
+                            with open_store(args.db) as store:
+                                provider_process_pids = (
+                                    store.provider_process_pids_for_agent_worker(
+                                        process.pid
+                                    )
+                                )
+                        except (OSError, StoreError) as exc:
+                            log_event(
+                                "agent_provider_process_lookup_failed",
+                                worker_pid=process.pid,
+                                error=str(exc),
+                            )
+                    for provider_pid in provider_process_pids:
+                        _terminate_process_group(provider_pid)
+                    _terminate_process_group(process.pid)
+                    if role == "work-agents":
+                        try:
+                            with open_store(args.db) as store:
+                                recovered_mailbox_ids = (
+                                    store.recover_agent_worker_leases(
+                                        process.pid
+                                    )
+                                )
+                        except (OSError, StoreError) as exc:
+                            log_event(
+                                "agent_worker_lease_recovery_failed",
+                                worker_pid=process.pid,
+                                error=str(exc),
+                            )
+                    replacement = _spawn_supervisor_child(command)
+                    processes[index] = replacement
+                    log_event(
+                        "controller_child_restarted",
+                        old_pid=process.pid,
+                        new_pid=replacement.pid,
+                        role=role,
+                        return_code=return_code,
+                        provider_process_pids=provider_process_pids,
+                        recovered_mailbox_ids=recovered_mailbox_ids,
                     )
             if time.time() >= next_restart_check:
                 next_restart_check = time.time() + 5
@@ -2361,14 +2460,25 @@ def run_command(args: argparse.Namespace) -> None:
                     raise SystemExit(0)
             time.sleep(1)
     finally:
-        for process in processes:
-            if process.poll() is None:
-                process.terminate()
+        for index, process in enumerate(processes):
+            if index < len(commands) and commands[index][-1] == "work-agents":
+                try:
+                    with open_store(args.db) as store:
+                        provider_pids = (
+                            store.provider_process_pids_for_agent_worker(
+                                process.pid
+                            )
+                        )
+                except (OSError, StoreError):
+                    provider_pids = []
+                for provider_pid in provider_pids:
+                    _terminate_process_group(provider_pid)
+            _terminate_process_group(process.pid)
         for process in processes:
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                process.kill()
+                _terminate_process_group(process.pid, timeout=0)
         signal.signal(signal.SIGTERM, previous_sigterm)
 
 
@@ -3530,9 +3640,18 @@ def config_show_command(args: argparse.Namespace) -> None:
 
 
 def retry_command(args: argparse.Namespace) -> None:
+    item_id = getattr(args, "item_id", None)
+    retry_all = bool(getattr(args, "retry_all", False))
+    if args.queue == "agent" and item_id is None and not retry_all:
+        raise StoreError(
+            "Agent retry requires --id MAILBOX_ID or an explicit --all."
+        )
+    if args.queue != "agent" and item_id is not None:
+        raise StoreError("--id is currently supported only for the agent queue.")
     with open_store(args.db) as store:
-        count = store.retry_dead(args.queue)
-    print(f"Requeued {count} dead {args.queue} item(s).")
+        count = store.retry_dead(args.queue, item_id=item_id)
+    target = f" mailbox {int(item_id)}" if item_id is not None else ""
+    print(f"Requeued {count} dead {args.queue} item(s){target}.")
 
 
 def add_loop_arguments(parser: argparse.ArgumentParser, lease_seconds: float) -> None:
@@ -3891,6 +4010,19 @@ def build_parser() -> argparse.ArgumentParser:
     retry_parser.add_argument(
         "queue",
         choices=("inbox", "outbox", "agent", "router"),
+    )
+    retry_scope = retry_parser.add_mutually_exclusive_group()
+    retry_scope.add_argument(
+        "--id",
+        dest="item_id",
+        type=int,
+        help="Retry one exact agent mailbox ID.",
+    )
+    retry_scope.add_argument(
+        "--all",
+        dest="retry_all",
+        action="store_true",
+        help="Explicitly retry every eligible dead item in this queue.",
     )
     retry_parser.set_defaults(function=retry_command)
     return parser

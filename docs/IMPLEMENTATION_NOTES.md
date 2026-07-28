@@ -700,6 +700,50 @@ ID and adds a durable control queue for active worker turns:
   inline keyboard, preventing an old `Working` or `Stop` state from
   overwriting a final response.
 
+### Agent worker exits are isolated and reconciled
+
+The Reservations incident on July 27, 2026 exposed three interacting failure
+paths. A manual rescue correctly closed one stale lease, then used the global
+`retry agent` command. That requeued two unrelated dead turns from July 24 and
+reset their attempt counters. One replay therefore reused
+`agent-mailbox:42:retry-1` after status-card formatting had changed; the
+outbox's strict idempotency check correctly rejected the changed payload. The
+error escaped the agent worker, and the supervisor's original all-or-nothing
+policy terminated every sibling worker. Two newly leased Reservations turns
+were left owned by dead worker PIDs. Claude's provider CLI runs in its own
+process group, so one provider survived as useful but untrackable orphaned
+work, while the other turn had only a stale database lease.
+
+The repair has four layers:
+
+- Provider adapters report their process-group leader immediately after
+  launch. The durable event log ties that PID to the exact mailbox lease and
+  worker owner without a schema change.
+- Each supervised child is now its own process-group leader. An unexpected
+  child exit terminates the provider process groups recorded for that worker,
+  releases only that worker's leases, and restarts only that child. Other
+  active topics continue uninterrupted. Supervisor startup performs the same
+  reconciliation for same-host lease owners proven to be gone.
+- Manual agent retries preserve the monotonic attempt counter, so retry status
+  and failure operations receive a fresh attempt namespace. The CLI requires
+  either `retry agent --id MAILBOX_ID` or an explicit `retry agent --all`, and
+  stopped agents are not resurrected by a bulk retry.
+- Agent heartbeats extend the Stop callback beyond the renewed worker lease.
+  If an old Stop callback is tapped while its mailbox is still queued or
+  leased, callback consumption renews it instead of reporting a false expiry.
+  Terminal recovery edits remove the keyboard normally.
+
+The live repair left the working Postmortem provider untouched, cleared the
+dead Watch Monday lease and the two unrelated replays, expired their callback
+actions, and queued terminal Telegram edits. Three visible stale keyboards
+were removed; the fourth target message was already absent in Telegram.
+
+Verified on July 27, 2026 with 403 passing tests, including new coverage for
+monotonic manual retry operation IDs, long-turn Stop renewal, consumption of an
+expired-but-still-live Stop callback, exact worker/provider PID recording,
+single-worker lease recovery, explicit agent retry scope, and supervised
+process-group creation.
+
 ## One bot across private forum groups
 
 Slam Paws is the single Telegram identity. The paired owner may add it as an

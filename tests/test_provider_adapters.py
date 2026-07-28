@@ -70,7 +70,7 @@ class FakeProcess:
         self.stdout = FakeStdout()
         self.stdin = FakeStdin(self)
         self.returncode = None
-        self.pid = None
+        self.pid = 98765
         self.terminated = False
         self.killed = False
 

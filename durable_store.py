@@ -2716,20 +2716,60 @@ class DurableStore:
                     "This button was already used.",
                 )
             if float(row["expires_at"]) <= timestamp:
-                if row["state"] == "active":
-                    self.connection.execute(
+                if str(row["action_type"]) == "agent_turn_stop":
+                    try:
+                        mailbox_id = int(
+                            json.loads(str(row["payload_json"]))["mailbox_id"]
+                        )
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        mailbox_id = 0
+                    mailbox = self.connection.execute(
                         """
-                        UPDATE callback_actions
-                        SET state = 'expired', updated_at = ?
-                        WHERE action_id = ? AND state = 'active'
+                        SELECT state
+                        FROM agent_mailbox
+                        WHERE mailbox_id = ?
                         """,
-                        (timestamp, int(row["action_id"])),
-                    )
-                self.connection.execute("COMMIT")
-                raise CallbackActionError(
-                    "expired",
-                    "This button has expired.",
-                )
+                        (mailbox_id,),
+                    ).fetchone()
+                    if (
+                        mailbox is not None
+                        and str(mailbox["state"]) in {"queued", "leased"}
+                    ):
+                        self.connection.execute(
+                            """
+                            UPDATE callback_actions
+                            SET expires_at = ?, updated_at = ?
+                            WHERE action_id = ? AND state = 'active'
+                            """,
+                            (
+                                timestamp + 2 * 60 * 60,
+                                timestamp,
+                                int(row["action_id"]),
+                            ),
+                        )
+                        row = self.connection.execute(
+                            """
+                            SELECT *
+                            FROM callback_actions
+                            WHERE action_id = ?
+                            """,
+                            (int(row["action_id"]),),
+                        ).fetchone()
+                if row["state"] == "active":
+                    if float(row["expires_at"]) <= timestamp:
+                        self.connection.execute(
+                            """
+                            UPDATE callback_actions
+                            SET state = 'expired', updated_at = ?
+                            WHERE action_id = ? AND state = 'active'
+                            """,
+                            (timestamp, int(row["action_id"])),
+                        )
+                        self.connection.execute("COMMIT")
+                        raise CallbackActionError(
+                            "expired",
+                            "This button has expired.",
+                        )
             if row["state"] != "active":
                 raise CallbackActionError(
                     str(row["state"]),
@@ -12248,24 +12288,367 @@ class DurableStore:
         now: Optional[float] = None,
     ) -> None:
         timestamp = time.time() if now is None else float(now)
-        cursor = self.connection.execute(
+        lease_expires_at = timestamp + float(lease_seconds)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self.connection.execute(
+                """
+                UPDATE agent_mailbox
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE mailbox_id = ? AND state = 'leased'
+                    AND lease_owner = ?
+                """,
+                (
+                    lease_expires_at,
+                    timestamp,
+                    int(mailbox_id),
+                    worker_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LeaseLostError(
+                    f"Agent mailbox lease for {mailbox_id} is no longer owned."
+                )
+            self.connection.execute(
+                """
+                UPDATE callback_actions
+                SET expires_at = MAX(expires_at, ?), updated_at = ?
+                WHERE operation_id = ?
+                    AND action_type = 'agent_turn_stop'
+                    AND state = 'active'
+                """,
+                (
+                    lease_expires_at + 5 * 60,
+                    timestamp,
+                    f"agent-mailbox:{int(mailbox_id)}:stop",
+                ),
+            )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def attach_agent_mailbox_process(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        provider_process_pid: int,
+        now: Optional[float] = None,
+    ) -> None:
+        """Record the provider process group that belongs to this lease."""
+
+        pid = int(provider_process_pid)
+        if pid <= 0:
+            raise StoreError("Provider process PID must be positive.")
+        timestamp = time.time() if now is None else float(now)
+        row = self.connection.execute(
             """
-            UPDATE agent_mailbox
-            SET lease_expires_at = ?, updated_at = ?
+            SELECT 1
+            FROM agent_mailbox
             WHERE mailbox_id = ? AND state = 'leased'
                 AND lease_owner = ?
             """,
-            (
-                timestamp + float(lease_seconds),
-                timestamp,
-                int(mailbox_id),
-                worker_id,
-            ),
-        )
-        if cursor.rowcount != 1:
+            (int(mailbox_id), worker_id),
+        ).fetchone()
+        if row is None:
             raise LeaseLostError(
                 f"Agent mailbox lease for {mailbox_id} is no longer owned."
             )
+        self.connection.execute(
+            """
+            INSERT INTO events(
+                kind, subject_type, subject_id, details_json, created_at
+            )
+            VALUES (
+                'agent_provider_process_started',
+                'agent_mailbox', ?, ?, ?
+            )
+            """,
+            (
+                str(int(mailbox_id)),
+                json.dumps(
+                    {
+                        "lease_owner": worker_id,
+                        "provider_process_pid": pid,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                timestamp,
+            ),
+        )
+
+    def provider_process_pids_for_agent_worker(
+        self,
+        worker_pid: int,
+    ) -> list[int]:
+        """Return provider process groups recorded for a leased local worker."""
+
+        host = socket.gethostname()
+        rows = self.connection.execute(
+            """
+            SELECT m.mailbox_id, m.lease_owner
+            FROM agent_mailbox AS m
+            WHERE m.state = 'leased'
+            """
+        ).fetchall()
+        result: list[int] = []
+        for row in rows:
+            owner = str(row["lease_owner"] or "")
+            match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(owner)
+            if (
+                match is None
+                or match.group(1) != host
+                or int(match.group(2)) != int(worker_pid)
+            ):
+                continue
+            events = self.connection.execute(
+                """
+                SELECT details_json
+                FROM events
+                WHERE kind = 'agent_provider_process_started'
+                    AND subject_type = 'agent_mailbox'
+                    AND subject_id = ?
+                ORDER BY event_id DESC
+                """,
+                (str(int(row["mailbox_id"])),),
+            ).fetchall()
+            for event in events:
+                try:
+                    details = json.loads(str(event["details_json"]))
+                    if str(details.get("lease_owner", "")) != owner:
+                        continue
+                    pid = int(details["provider_process_pid"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if pid > 0:
+                    result.append(pid)
+                break
+        return sorted(set(result))
+
+    def gone_local_agent_worker_pids(self) -> list[int]:
+        """Return leased same-host agent workers proven to have exited."""
+
+        host = socket.gethostname()
+        result: set[int] = set()
+        rows = self.connection.execute(
+            """
+            SELECT DISTINCT lease_owner
+            FROM agent_mailbox
+            WHERE state = 'leased'
+            """
+        ).fetchall()
+        for row in rows:
+            owner = str(row["lease_owner"] or "")
+            match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(owner)
+            if match is None or match.group(1) != host:
+                continue
+            pid = int(match.group(2))
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                result.add(pid)
+            except OSError:
+                continue
+        return sorted(result)
+
+    def recover_agent_worker_leases(
+        self,
+        worker_pid: int,
+        now: Optional[float] = None,
+    ) -> list[int]:
+        """Immediately recover turns owned by a local worker that exited.
+
+        The supervisor calls this only after terminating the exited worker's
+        process group, so any provider child from that attempt is gone before
+        the turn becomes claimable again.
+        """
+
+        timestamp = time.time() if now is None else float(now)
+        host = socket.gethostname()
+        recovered: list[int] = []
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT mailbox_id, agent_id, lease_owner, attempts
+                FROM agent_mailbox
+                WHERE state = 'leased'
+                """
+            ).fetchall()
+            for row in rows:
+                owner = str(row["lease_owner"] or "")
+                match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(owner)
+                if (
+                    match is None
+                    or match.group(1) != host
+                    or int(match.group(2)) != int(worker_pid)
+                ):
+                    continue
+                mailbox_id = int(row["mailbox_id"])
+                agent_id = str(row["agent_id"])
+                attempts = int(row["attempts"])
+                durable_stop = self.connection.execute(
+                    """
+                    SELECT 1
+                    FROM agent_turn_controls
+                    WHERE mailbox_id = ? AND control_type = 'cancel'
+                        AND state IN (
+                            'queued', 'delivery_in_flight', 'applied'
+                        )
+                    LIMIT 1
+                    """,
+                    (mailbox_id,),
+                ).fetchone()
+                if durable_stop is not None:
+                    self.connection.execute(
+                        """
+                        UPDATE agent_turn_controls
+                        SET state = 'applied',
+                            result_text =
+                                'Stop completed while recovering an exited worker.',
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND control_type = 'cancel'
+                            AND state IN ('queued', 'delivery_in_flight')
+                        """,
+                        (timestamp, mailbox_id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE agent_turn_controls
+                        SET state = 'rejected',
+                            result_text =
+                                'The provider turn stopped before this guidance was applied.',
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND control_type = 'steer'
+                            AND state IN ('queued', 'delivery_in_flight')
+                        """,
+                        (timestamp, mailbox_id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE agent_mailbox
+                        SET state = 'cancelled', lease_owner = NULL,
+                            lease_expires_at = NULL, provider_turn_id = NULL,
+                            last_error =
+                                'Recovered Stop after agent worker exit.',
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND state = 'leased'
+                            AND lease_owner = ?
+                        """,
+                        (timestamp, mailbox_id, owner),
+                    )
+                    self._expire_agent_stop_action(mailbox_id, timestamp)
+                    self._enqueue_finished_agent_control_edits(
+                        mailbox_id,
+                        timestamp,
+                    )
+                    self._enqueue_agent_status_edit(
+                        mailbox_id,
+                        f"worker-exit-cancelled-{int(worker_pid)}",
+                        self.label_text(
+                            self.agent_card_header(mailbox_id, agent_id),
+                            "⏹ Cancelled after the worker exited.",
+                        ),
+                        timestamp,
+                        terminal=True,
+                    )
+                else:
+                    self.connection.execute(
+                        """
+                        UPDATE agent_turn_controls
+                        SET state = 'rejected',
+                            result_text =
+                                'The provider turn ended when its worker exited.',
+                            updated_at = ?
+                        WHERE mailbox_id = ?
+                            AND state IN ('queued', 'delivery_in_flight')
+                        """,
+                        (timestamp, mailbox_id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE agent_mailbox
+                        SET state = 'queued', available_at = ?,
+                            lease_owner = NULL, lease_expires_at = NULL,
+                            provider_turn_id = NULL,
+                            last_error =
+                                'Agent worker exited; turn queued for recovery.',
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND state = 'leased'
+                            AND lease_owner = ?
+                        """,
+                        (timestamp, timestamp, mailbox_id, owner),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE callback_actions
+                        SET state = 'active', consumed_at = NULL,
+                            consumed_by_update_id = NULL,
+                            expires_at = MAX(expires_at, ?), updated_at = ?
+                        WHERE operation_id = ?
+                            AND action_type = 'agent_turn_stop'
+                        """,
+                        (
+                            timestamp + 2 * 60 * 60,
+                            timestamp,
+                            f"agent-mailbox:{mailbox_id}:stop",
+                        ),
+                    )
+                    self._enqueue_finished_agent_control_edits(
+                        mailbox_id,
+                        timestamp,
+                    )
+                    self._enqueue_agent_status_edit(
+                        mailbox_id,
+                        f"worker-exit-retry-{int(worker_pid)}",
+                        self.label_text(
+                            self.agent_card_header(mailbox_id, agent_id),
+                            "🔄 Worker exited; retrying this turn.",
+                        ),
+                        timestamp,
+                    )
+                self.connection.execute(
+                    """
+                    UPDATE agents
+                    SET lifecycle_state = 'registered', updated_at = ?
+                    WHERE agent_id = ? AND lifecycle_state = 'running'
+                    """,
+                    (timestamp, agent_id),
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO events(
+                        kind, subject_type, subject_id, details_json, created_at
+                    )
+                    VALUES (
+                        'agent_worker_lease_recovered',
+                        'agent_mailbox', ?, ?, ?
+                    )
+                    """,
+                    (
+                        str(mailbox_id),
+                        json.dumps(
+                            {
+                                "agent_id": agent_id,
+                                "attempts": attempts,
+                                "lease_owner": owner,
+                                "worker_pid": int(worker_pid),
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        timestamp,
+                    ),
+                )
+                recovered.append(mailbox_id)
+            self.connection.execute("COMMIT")
+            return recovered
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
 
     def complete_agent_mailbox(
         self,
@@ -12576,7 +12959,10 @@ class DurableStore:
                 else:
                     self._enqueue_agent_status_edit(
                         mailbox_id,
-                        "failed",
+                        self._agent_attempt_operation_suffix(
+                            "failed",
+                            attempts,
+                        ),
                         (
                             self.label_text(
                                 self.agent_card_header(
@@ -13070,7 +13456,12 @@ class DurableStore:
                 self.connection.execute("ROLLBACK")
             raise
 
-    def retry_dead(self, queue: str, now: Optional[float] = None) -> int:
+    def retry_dead(
+        self,
+        queue: str,
+        now: Optional[float] = None,
+        item_id: Optional[int] = None,
+    ) -> int:
         timestamp = time.time() if now is None else float(now)
         if queue == "inbox":
             cursor = self.connection.execute(
@@ -13095,19 +13486,37 @@ class DurableStore:
         elif queue == "agent":
             dead_mailboxes = self.connection.execute(
                 """
-                SELECT mailbox_id
-                FROM agent_mailbox
-                WHERE state = 'dead'
-                """
+                SELECT m.mailbox_id
+                FROM agent_mailbox AS m
+                JOIN agents AS a ON a.agent_id = m.agent_id
+                WHERE m.state = 'dead' AND a.lifecycle_state != 'stopped'
+                    AND (? IS NULL OR m.mailbox_id = ?)
+                """,
+                (
+                    int(item_id) if item_id is not None else None,
+                    int(item_id) if item_id is not None else None,
+                ),
             ).fetchall()
             cursor = self.connection.execute(
                 """
                 UPDATE agent_mailbox
-                SET state = 'queued', attempts = 0, available_at = ?,
+                SET state = 'queued', available_at = ?,
                     last_error = NULL, updated_at = ?
-                WHERE state = 'dead'
+                WHERE mailbox_id IN (
+                    SELECT m.mailbox_id
+                    FROM agent_mailbox AS m
+                    JOIN agents AS a ON a.agent_id = m.agent_id
+                    WHERE m.state = 'dead'
+                        AND a.lifecycle_state != 'stopped'
+                        AND (? IS NULL OR m.mailbox_id = ?)
+                )
                 """,
-                (timestamp, timestamp),
+                (
+                    timestamp,
+                    timestamp,
+                    int(item_id) if item_id is not None else None,
+                    int(item_id) if item_id is not None else None,
+                ),
             )
             for row in dead_mailboxes:
                 self.connection.execute(

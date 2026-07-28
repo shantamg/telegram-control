@@ -109,7 +109,9 @@ delete the group in Telegram after cleanup finishes.
 - `/agent` can pause or resume the topic agent, change provider, model, or
   effort, and start or resume a provider session.
 - `/voice` previews and changes the global spoken-reply voice and speed.
-- Replying to the progress card steers the active turn; **Stop** interrupts it.
+- Replying to the progress card steers the active turn; **Stop** remains
+  available while work is active and interrupts it. A failed agent worker is
+  recovered without restarting unrelated active topics.
 - Photos and documents up to 20 MB are saved to private local paths the agent
   can inspect.
 - `/help` is the in-Telegram source of truth for commands and workflows.

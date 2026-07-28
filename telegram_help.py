@@ -126,7 +126,7 @@ Send a Telegram voice note there normally; it is transcribed locally and routed 
 
 Use /voice to choose the global Microsoft TTS voice and speaking speed used by Listen buttons, agent voice updates, and detached worker voice reports. Selecting an option only stages it. Preview generates a real sample voice note; Confirm applies it, and Back returns to the choices without changing anything.
 
-Reply to an exact agent-routed message to continue that agent. A Control-routed reply continues the optional conversational Control agent only when it is enabled. During an active turn, a reply to its progress card can steer the work, and its Stop button interrupts the provider. If the owning worker has already exited, Stop clears the orphaned turn immediately so the next queued message can start. Agents can also send requested voice or text progress updates through scoped Telegram skills.""",
+Reply to an exact agent-routed message to continue that agent. A Control-routed reply continues the optional conversational Control agent only when it is enabled. During an active turn, a reply to its progress card can steer the work, and its Stop button interrupts the provider. Stop remains valid while the turn is active. If an owning worker exits, Control terminates that attempt’s provider process, restarts only the failed worker, and immediately retries or completes a queued Stop without disturbing other topics. Agents can also send requested voice or text progress updates through scoped Telegram skills.""",
     ),
     HelpTopic(
         "skills",

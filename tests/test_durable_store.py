@@ -4197,6 +4197,138 @@ class DurableStoreTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(reactivated["state"], "active")
         self.assertGreater(float(reactivated["expires_at"]), 122)
+        attempts_after_retry = self.store.connection.execute(
+            """
+            SELECT attempts
+            FROM agent_mailbox
+            WHERE mailbox_id = ?
+            """,
+            (mailbox_id,),
+        ).fetchone()["attempts"]
+        self.assertEqual(attempts_after_retry, 2)
+        third = self.store.claim_agent_mailbox(
+            "manual-retry-worker",
+            now=123,
+        )
+        self.assertEqual(third.mailbox_id, mailbox_id)
+        self.assertEqual(third.attempts, 3)
+        self.store.enqueue_agent_voice_status(
+            source_job_id,
+            "working",
+            third.input_text,
+            now=124,
+        )
+        self.store.attach_agent_mailbox_turn(
+            mailbox_id,
+            "manual-retry-worker",
+            "claude-third-turn",
+            now=125,
+        )
+        self.assertEqual(
+            self.store.fail_agent_mailbox(
+                mailbox_id,
+                "manual-retry-worker",
+                "manual retry failed",
+                now=126,
+                max_attempts=3,
+            ),
+            "dead",
+        )
+        manual_retry_operations = {
+            str(row["operation_id"])
+            for row in self.store.connection.execute(
+                """
+                SELECT operation_id
+                FROM outbox_messages
+                WHERE operation_id LIKE ?
+                """,
+                (f"agent-mailbox:{mailbox_id}:%attempt-3",),
+            ).fetchall()
+        }
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:voice-working-attempt-3",
+            manual_retry_operations,
+        )
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:turn-started-attempt-3",
+            manual_retry_operations,
+        )
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:failed-attempt-3",
+            manual_retry_operations,
+        )
+
+    def test_heartbeat_keeps_stop_available_for_a_long_turn(self):
+        agent, _, _ = self._setup_routed_agent_turn()
+        mailbox = self.store.claim_agent_mailbox(
+            "agent-worker",
+            now=109,
+            lease_seconds=10,
+        )
+        operation_id = f"agent-mailbox:{mailbox.mailbox_id}:stop"
+        self.store.connection.execute(
+            """
+            UPDATE callback_actions
+            SET expires_at = 110
+            WHERE operation_id = ?
+            """,
+            (operation_id,),
+        )
+
+        self.store.heartbeat_agent_mailbox(
+            mailbox.mailbox_id,
+            "agent-worker",
+            lease_seconds=120,
+            now=111,
+        )
+
+        refreshed = self.store.connection.execute(
+            """
+            SELECT expires_at
+            FROM callback_actions
+            WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        self.assertGreaterEqual(float(refreshed["expires_at"]), 531)
+        self.assertEqual(agent.agent_id, mailbox.agent_id)
+
+    def test_expired_stop_reactivates_while_turn_is_still_active(self):
+        _agent, _, _ = self._setup_routed_agent_turn()
+        mailbox = self.store.claim_agent_mailbox("agent-worker", now=109)
+        action = self.store.resolve_callback_action_operation(
+            f"agent-mailbox:{mailbox.mailbox_id}:stop"
+        )
+        self.store.connection.execute(
+            """
+            UPDATE callback_actions
+            SET expires_at = 110
+            WHERE action_id = ?
+            """,
+            (action.action_id,),
+        )
+
+        consumed = self.store.consume_callback_action(
+            f"a:{action.token}",
+            chat_id=action.chat_id,
+            message_thread_id=action.message_thread_id,
+            authorized_user_id=action.authorized_user_id,
+            update_id=999,
+            now=111,
+        )
+
+        self.assertEqual(consumed.action_id, action.action_id)
+        self.assertEqual(
+            self.store.connection.execute(
+                """
+                SELECT state
+                FROM callback_actions
+                WHERE action_id = ?
+                """,
+                (action.action_id,),
+            ).fetchone()["state"],
+            "consumed",
+        )
 
     def test_stop_queued_during_start_attaches_to_exact_turn_and_cancels(self):
         agent, source_job_id, _ = self._setup_routed_agent_turn()
@@ -4435,6 +4567,73 @@ class DurableStoreTests(unittest.TestCase):
             now=114,
         )
         self.assertEqual(replacement.mailbox_id, next_mailbox_id)
+
+    def test_supervisor_recovery_requeues_only_the_exited_workers_turn(self):
+        agent, _, _ = self._setup_routed_agent_turn()
+        dead_owner = (
+            f"{telegram_control.socket.gethostname()}:999999:"
+            "agent:deadbeef"
+        )
+        mailbox = self.store.claim_agent_mailbox(dead_owner, now=109)
+        self.store.attach_agent_mailbox_process(
+            mailbox.mailbox_id,
+            dead_owner,
+            888888,
+            now=110,
+        )
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            dead_owner,
+            "turn-orphaned",
+            now=111,
+        )
+
+        self.assertEqual(
+            self.store.provider_process_pids_for_agent_worker(999999),
+            [888888],
+        )
+        recovered = self.store.recover_agent_worker_leases(
+            999999,
+            now=112,
+        )
+
+        self.assertEqual(recovered, [mailbox.mailbox_id])
+        row = self.store.connection.execute(
+            """
+            SELECT state, lease_owner, lease_expires_at, provider_turn_id,
+                last_error
+            FROM agent_mailbox
+            WHERE mailbox_id = ?
+            """,
+            (mailbox.mailbox_id,),
+        ).fetchone()
+        self.assertEqual(row["state"], "queued")
+        self.assertIsNone(row["lease_owner"])
+        self.assertIsNone(row["lease_expires_at"])
+        self.assertIsNone(row["provider_turn_id"])
+        self.assertIn("queued for recovery", row["last_error"])
+        self.assertEqual(
+            self.store.connection.execute(
+                """
+                SELECT lifecycle_state
+                FROM agents
+                WHERE agent_id = ?
+                """,
+                (agent.agent_id,),
+            ).fetchone()["lifecycle_state"],
+            "registered",
+        )
+        event = self.store.connection.execute(
+            """
+            SELECT details_json
+            FROM events
+            WHERE kind = 'agent_worker_lease_recovered'
+            """
+        ).fetchone()
+        self.assertEqual(
+            json.loads(event["details_json"])["worker_pid"],
+            999999,
+        )
 
     def test_stop_does_not_clear_live_local_worker(self):
         agent, _, _ = self._setup_routed_agent_turn()
@@ -6995,6 +7194,28 @@ class SchemaCompatibilityTests(unittest.TestCase):
 
 
 class DurableIntegrationTests(unittest.TestCase):
+    def test_supervisor_children_are_process_group_leaders(self):
+        command = ["/usr/bin/python3", "telegram_control.py", "work-agents"]
+        fake_process = mock.Mock()
+        with mock.patch.object(
+            telegram_control.subprocess,
+            "Popen",
+            return_value=fake_process,
+        ) as popen:
+            result = telegram_control._spawn_supervisor_child(command)
+
+        self.assertIs(result, fake_process)
+        popen.assert_called_once_with(command, start_new_session=True)
+
+    def test_agent_retry_cli_requires_an_explicit_scope(self):
+        args = argparse.Namespace(
+            queue="agent",
+            item_id=None,
+            retry_all=False,
+        )
+        with self.assertRaisesRegex(StoreError, "--id MAILBOX_ID"):
+            telegram_control.retry_command(args)
+
     def test_durable_launch_agent_uses_supervisor_and_existing_label(self):
         plist = telegram_control.launch_agent_plist()
 
