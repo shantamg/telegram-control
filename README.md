@@ -109,16 +109,19 @@ delete the group in Telegram after cleanup finishes.
 - `/agent` can pause or resume the topic agent, change provider, model, or
   effort, and start or resume a provider session.
 - `/voice` previews and changes the global spoken-reply voice and speed.
-- Replying to the progress card steers the active turn; **Stop** remains
-  available while work is active and interrupts it. A failed agent worker is
-  recovered without restarting unrelated active topics.
+- Replying to the progress card steers the active turn; guidance sent while
+  Claude is inside a tool call stays pending until Claude acknowledges it.
+  **Stop** remains independently available while work is active and interrupts
+  it. A failed agent worker is recovered without restarting unrelated active
+  topics.
 - Photos and documents up to 20 MB are saved to private local paths the agent
   can inspect.
 - `/help` is the in-Telegram source of truth for commands and workflows.
 - Agents can create more conversational topics when asked.
-- Optional detached workers use tmux for work that must outlive one turn. After
-  a reboot, Telegram Control resumes the exact provider session and has it
-  verify its native scheduled and background work.
+- Optional detached workers use tmux for work that must outlive one turn. The
+  parent starts and briefs a worker, then finishes instead of polling its tmux
+  pane. After a reboot, Telegram Control resumes the exact provider session and
+  has it verify its native scheduled and background work.
 
 ## Telegram commands
 

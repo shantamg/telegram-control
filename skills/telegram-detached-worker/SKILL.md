@@ -51,6 +51,17 @@ conversation.
 
 The brief is delivered verbatim, with nothing prepended.
 
+After the brief command succeeds, the detached worker owns the long-running
+task. You may capture its pane once for an immediate sanity check, but **do not
+wait or poll for a milestone from the managed parent turn**. In particular,
+never run an `until tmux capture-pane ...` loop waiting for report text. The
+worker's durable `worker-report` message is the confirmation; finish the parent
+turn so it remains conversational and steerable.
+
+For a later correction or follow-up, write the new instruction to another file
+and deliver it with `worker-brief` again. Do not keep the parent turn open while
+the detached worker processes it.
+
 Recovery is deliberately thin. Resuming the exact provider session ID restores
 the conversation and its scheduled work, so the recovery turn only asks the
 worker to check that its scheduled tasks, wakeups, loops, and monitors are still
@@ -116,4 +127,7 @@ unexpected companion file is preserved rather than recursively deleted.
   something destructive to run unattended.
 - Do not tell the user to reply in the worker's topic — nothing there reaches
   the worker. Relay their instructions yourself.
+- A parent turn must never block on a detached worker's tmux pane. Report the
+  worker as started after the start and brief commands succeed, then finish the
+  parent turn.
 - Report a worker as started only after the command succeeds.

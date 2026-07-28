@@ -1755,3 +1755,38 @@ worker restart.
 Verified on July 27, 2026 with all 398 unit and integration tests,
 `python -m compileall`, a local Markdown-link resolution check, and
 `git diff --check`.
+
+## Claude steering survives long foreground tool calls
+
+The July 27 Reservations release-watch setup exposed a second live-control
+failure after worker-exit recovery was deployed. The managed parent Claude turn
+started a foreground `until tmux capture-pane ...` loop waiting for text that
+the detached worker never printed. Claude and its controller worker remained
+healthy, and the detached worker reported successfully, but the Claude SDK did
+not echo a later steering message while the Bash tool call was still active.
+The adapter treated the missing echo after 30 seconds as a rejection even
+though the message had already been written to Claude's input stream and could
+still be processed after the tool returned.
+
+Claude steering is now tracked by message UUID for the lifetime of the provider
+turn. It no longer expires on the interrupt timeout: each steer remains
+`delivery_in_flight` until Claude echoes that exact UUID or the turn finishes.
+Multiple pending steers do not prevent Control from claiming a later Stop;
+interrupts retain their 30-second process-group fallback. This keeps the
+Telegram receipt truthful during a long tool call and preserves independent
+Stop delivery.
+
+The detached-worker skill also forbids parent-turn polling. After
+`worker-start` and `worker-brief` succeed, the parent may take one immediate
+pane snapshot but must finish instead of waiting for a milestone. Durable
+`worker-report` messages provide progress, and later corrections are relayed
+with another file-backed `worker-brief`.
+
+For the live incident, the release-watch correction was delivered directly to
+the healthy detached worker. Only the parent turn's polling shell process group
+was terminated; the Claude provider, detached worker, and its scheduled work
+were left running.
+
+Verified with two new Claude adapter regressions covering delayed steering
+acknowledgment and Stop delivery behind an unacknowledged steer, the complete
+405-test suite, Python compilation, and `git diff --check`.

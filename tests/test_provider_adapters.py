@@ -1074,6 +1074,152 @@ class LiveControlContractTests(unittest.TestCase):
         self.assertNotIn("SECRET", repr(progress))
         self.assertNotIn("/private/project", repr(progress))
 
+    def test_claude_keeps_steer_in_flight_during_a_long_tool_call(self):
+        process = FakeProcess(lambda payload: None)
+        user_messages = []
+        heartbeats_after_steer = 0
+        emitted_result = False
+
+        def handle(payload):
+            self.claude_initialize(process, payload)
+            if payload.get("type") != "user":
+                return
+            user_messages.append(payload)
+            if len(user_messages) == 1:
+                process.stdout.emit(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": payload["session_id"],
+                    }
+                )
+
+        def heartbeat():
+            nonlocal heartbeats_after_steer, emitted_result
+            if len(user_messages) < 2 or emitted_result:
+                return
+            heartbeats_after_steer += 1
+            if heartbeats_after_steer < 5:
+                return
+            emitted_result = True
+            process.stdout.emit(dict(user_messages[1]))
+            self.emit_claude_result(
+                process,
+                user_messages[1]["session_id"],
+            )
+
+        process.on_payload = handle
+        controls = [
+            provider_adapters.ProviderControl(
+                42,
+                "steer",
+                "Apply this after the current tool call.",
+            )
+        ]
+        outcomes = []
+        adapter = provider_adapters.ClaudePrintAdapter(
+            binary="/bin/claude",
+            poll_interval_seconds=0.01,
+            control_timeout_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        )
+
+        result = adapter.run_turn(
+            claude_agent(),
+            "Start a long tool call.",
+            None,
+            lambda _session: None,
+            heartbeat,
+            poll_control=lambda: controls.pop(0) if controls else None,
+            on_control=lambda control, outcome, detail: outcomes.append(
+                (control.control_id, outcome, detail)
+            ),
+        )
+
+        self.assertGreaterEqual(heartbeats_after_steer, 5)
+        self.assertEqual(len(user_messages), 2)
+        self.assertEqual(
+            outcomes,
+            [
+                (
+                    42,
+                    "applied",
+                    "Guidance was accepted by the active Claude turn.",
+                )
+            ],
+        )
+        self.assertEqual(result.final_text, "Claude final")
+
+    def test_claude_unacknowledged_steer_does_not_block_stop(self):
+        process = FakeProcess(lambda payload: None)
+        user_messages = []
+
+        def handle(payload):
+            self.claude_initialize(process, payload)
+            if payload.get("type") == "user":
+                user_messages.append(payload)
+                if len(user_messages) == 1:
+                    process.stdout.emit(
+                        {
+                            "type": "system",
+                            "subtype": "init",
+                            "session_id": payload["session_id"],
+                        }
+                    )
+                return
+            request = payload.get("request")
+            if (
+                payload.get("type") == "control_request"
+                and isinstance(request, dict)
+                and request.get("subtype") == "interrupt"
+            ):
+                process.stdout.emit(
+                    {
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": payload["request_id"],
+                            "response": {},
+                        },
+                    }
+                )
+
+        process.on_payload = handle
+        controls = [
+            provider_adapters.ProviderControl(
+                43,
+                "steer",
+                "Apply this after the current tool call.",
+            ),
+            provider_adapters.ProviderControl(44, "cancel"),
+        ]
+        outcomes = []
+        adapter = provider_adapters.ClaudePrintAdapter(
+            binary="/bin/claude",
+            poll_interval_seconds=0.01,
+            control_timeout_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        )
+
+        with self.assertRaises(provider_adapters.ProviderTurnCancelled):
+            adapter.run_turn(
+                claude_agent(),
+                "Start a long tool call.",
+                None,
+                lambda _session: None,
+                lambda: None,
+                poll_control=lambda: controls.pop(0) if controls else None,
+                on_control=lambda control, outcome, detail: outcomes.append(
+                    (control.control_id, outcome, detail)
+                ),
+            )
+
+        self.assertEqual(len(user_messages), 2)
+        self.assertEqual(
+            outcomes,
+            [(44, "applied", "Claude acknowledged the interrupt.")],
+        )
+
     def test_claude_streams_visible_text_blocks_as_incremental_progress(self):
         process = FakeProcess(lambda payload: None)
 

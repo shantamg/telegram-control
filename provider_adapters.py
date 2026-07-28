@@ -1562,16 +1562,17 @@ class ClaudePrintAdapter:
                 completed_text_parts: list[str] = []
                 active_text_blocks: dict[int, str] = {}
                 visible_progress = _UserFacingProgress(on_progress)
-                pending: Optional[
+                pending_interrupt: Optional[
                     tuple[ProviderControl, str, float]
                 ] = None
+                pending_steers: dict[str, ProviderControl] = {}
                 while True:
                     now = time.monotonic()
                     if now >= deadline:
                         raise ProviderAdapterError("Claude turn timed out.")
                     heartbeat()
 
-                    if pending is None and poll_control is not None:
+                    if pending_interrupt is None and poll_control is not None:
                         candidate_control = poll_control()
                         if candidate_control is not None:
                             control = _validate_control(candidate_control)
@@ -1600,11 +1601,7 @@ class ClaudePrintAdapter:
                                         steer_message_id,
                                     ),
                                 )
-                                pending = (
-                                    control,
-                                    steer_message_id,
-                                    now + self.control_timeout_seconds,
-                                )
+                                pending_steers[steer_message_id] = control
                             else:
                                 control_request_id = (
                                     f"tc-control-{control.control_id}"
@@ -1622,43 +1619,41 @@ class ClaudePrintAdapter:
                                         "request": {"subtype": "interrupt"},
                                     },
                                 )
-                                pending = (
+                                pending_interrupt = (
                                     control,
                                     control_request_id,
                                     now + self.control_timeout_seconds,
                                 )
 
-                    if pending is not None and now >= pending[2]:
-                        control = pending[0]
-                        if control.kind == "cancel":
-                            _terminate_process_group(process)
-                            _emit_control(
-                                on_control,
-                                control,
-                                "applied",
-                                "Claude did not acknowledge interrupt; "
-                                "its local process group was terminated.",
-                            )
-                            raise ProviderTurnCancelled(
-                                "Claude turn was cancelled by local fallback."
-                            )
+                    if (
+                        pending_interrupt is not None
+                        and now >= pending_interrupt[2]
+                    ):
+                        control = pending_interrupt[0]
+                        _terminate_process_group(process)
                         _emit_control(
                             on_control,
                             control,
-                            "rejected",
-                            "Claude did not acknowledge steering before timeout.",
+                            "applied",
+                            "Claude did not acknowledge interrupt; "
+                            "its local process group was terminated.",
                         )
-                        pending = None
+                        raise ProviderTurnCancelled(
+                            "Claude turn was cancelled by local fallback."
+                        )
 
                     wait_for = min(self.poll_interval_seconds, deadline - now)
-                    if pending is not None:
-                        wait_for = min(wait_for, max(0.0, pending[2] - now))
+                    if pending_interrupt is not None:
+                        wait_for = min(
+                            wait_for,
+                            max(0.0, pending_interrupt[2] - now),
+                        )
                     event = _read_json_line(lines, wait_for)
                     if event is _NO_LINE:
                         continue
                     if event is _END_OF_STREAM:
-                        if pending is not None and pending[0].kind == "cancel":
-                            control = pending[0]
+                        if pending_interrupt is not None:
+                            control = pending_interrupt[0]
                             _emit_control(
                                 on_control,
                                 control,
@@ -1694,13 +1689,13 @@ class ClaudePrintAdapter:
                     if event.get("type") == "control_response":
                         response = event.get("response")
                         if (
-                            pending is None
-                            or pending[0].kind != "cancel"
+                            pending_interrupt is None
                             or not isinstance(response, dict)
-                            or response.get("request_id") != pending[1]
+                            or response.get("request_id")
+                            != pending_interrupt[1]
                         ):
                             continue
-                        control = pending[0]
+                        control = pending_interrupt[0]
                         if response.get("subtype") == "success":
                             _emit_control(
                                 on_control,
@@ -1738,13 +1733,13 @@ class ClaudePrintAdapter:
                         )
                         notified_session = True
 
-                    if (
-                        pending is not None
-                        and pending[0].kind == "steer"
-                        and event.get("type") == "user"
-                        and event.get("uuid") == pending[1]
-                    ):
-                        control = pending[0]
+                    steer_message_id = (
+                        str(event.get("uuid", ""))
+                        if event.get("type") == "user"
+                        else ""
+                    )
+                    if steer_message_id in pending_steers:
+                        control = pending_steers.pop(steer_message_id)
                         _emit_control(
                             on_control,
                             control,
@@ -1760,8 +1755,6 @@ class ClaudePrintAdapter:
                             "working",
                             "Claude is continuing with the new guidance.",
                         )
-                        pending = None
-
                     events.append(event)
                     event_type = str(event.get("type", ""))
                     if event_type == "assistant":
@@ -1885,21 +1878,19 @@ class ClaudePrintAdapter:
                             "Claude is working.",
                         )
                     elif event_type == "result":
-                        if pending is not None:
-                            control = pending[0]
-                            if control.kind == "steer":
-                                _emit_control(
-                                    on_control,
-                                    control,
-                                    "rejected",
-                                    "The Claude turn completed before steering "
-                                    "acknowledgment.",
-                                )
-                                pending = None
-                            else:
-                                # The SDK control response can follow the turn's
-                                # result; keep stdin open until it is definitive.
-                                continue
+                        for control in pending_steers.values():
+                            _emit_control(
+                                on_control,
+                                control,
+                                "rejected",
+                                "The Claude turn completed before steering "
+                                "acknowledgment.",
+                            )
+                        pending_steers.clear()
+                        if pending_interrupt is not None:
+                            # The SDK control response can follow the turn's
+                            # result; keep stdin open until it is definitive.
+                            continue
                         result = consume_claude_events(
                             events,
                             existing_session_id=persisted_session,

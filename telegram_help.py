@@ -80,7 +80,7 @@ TOPICS = (
 
 Use /agent inside a managed topic to inspect a grouped Runtime, Workspace, and Usage card covering its provider, model, effort, state, session, console, and context usage. In a managed topic, /status opens this same agent card; on a Control or setup surface, /status shows durable transport status with a Refresh button.
 
-The /agent controls can change the current model and effort while preserving the existing conversation, pause or resume the agent, start a fresh session, resume a previous session, or switch providers. Codex and Claude each expose their own supported choices, and switching requires the destination CLI to be installed and authenticated. Conflicting changes are rejected while a turn or console is active; wait for it to finish, close the console, and try again. Session and provider changes also require the topic’s queue to be empty. Ordinary messages in the topic go to its bound agent.
+The /agent controls can change the current model and effort while preserving the existing conversation, pause or resume the agent, start a fresh session, resume a previous session, or switch providers. Codex and Claude each expose their own supported choices, and switching requires the destination CLI to be installed and authenticated. Conflicting changes are rejected while a turn or console is active; wait for it to finish, close the console, and try again. Session and provider changes also require the topic’s queue to be empty. Ordinary messages in the topic go to its bound agent. A reply sent while Claude is inside a long tool call remains queued until Claude acknowledges it; Stop remains independently available.
 
 Claude and Codex answers use safe native Telegram formatting for common Markdown such as headings, emphasis, links, lists, quotes, and code. If formatting cannot be validated or Telegram rejects it, Control falls back to plain text rather than losing the answer.""",
     ),
@@ -89,7 +89,7 @@ Claude and Codex answers use safe native Telegram formatting for common Markdown
         "Detached workers",
         """Detached workers
 
-Ask the main topic agent to start long-running work in a detached session. The worker receives its own report-only topic in the same group and can post text or voice milestones there.
+Ask the main topic agent to start long-running work in a detached session. The worker receives its own report-only topic in the same group and can post text or voice milestones there. Once the worker is started and briefed, the main turn finishes instead of polling the worker, so the conversational topic remains responsive.
 
 If tmux disappears, Telegram Control resumes the exact provider conversation. The resumed session retains its native scheduled work, so Control asks it to verify wakeups, loops, monitors, and background work, recreate anything missing, and explicitly report recovery success or failure. The worker is not asked to maintain a separate recovery inventory.
 
