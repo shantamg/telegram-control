@@ -179,14 +179,18 @@ class DurableStoreTests(unittest.TestCase):
 
     def test_install_workspace_seed_is_claimed_by_one_matching_forum(self):
         workspace = Path(self.temporary_directory.name).resolve()
+        icon_path = workspace / "group-icon.png"
+        icon_path.write_bytes(b"\x89PNG\r\n\x1a\nicon")
         seed = self.store.seed_install_workspace(
             display_name="Telegram Control",
             project_path=str(workspace),
             working_directory=str(workspace),
             git_repository_root=None,
+            group_icon_path=str(icon_path),
             now=100,
         )
         self.assertIsNone(seed["chat_id"])
+        self.assertEqual(seed["group_icon_path"], str(icon_path))
         self.assertIsNone(
             self.store.install_workspace_for_forum(
                 chat_id=-1001,
@@ -11400,12 +11404,15 @@ class DurableIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             workspace = Path(temporary_directory) / "telegram-control"
             workspace.mkdir()
+            icon_path = workspace / "group-icon.png"
+            icon_path.write_bytes(b"\x89PNG\r\n\x1a\nicon")
             database_path = Path(temporary_directory) / "controller.sqlite3"
             with DurableStore(database_path) as store:
                 store.seed_install_workspace(
                     display_name="Telegram Control",
                     project_path=str(workspace.resolve()),
                     working_directory=str(workspace.resolve()),
+                    group_icon_path=str(icon_path),
                     now=90,
                 )
             environment = {
@@ -11453,13 +11460,70 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
                 action = store.connection.execute(
                     """
-                    SELECT payload_json
+                    SELECT token, payload_json
                     FROM callback_actions
                     WHERE action_type = 'authorize_bind_forum'
                     """
                 ).fetchone()
-                self.assertTrue(
-                    json.loads(action["payload_json"])["install_seed"]
+                action_payload = json.loads(action["payload_json"])
+                self.assertTrue(action_payload["install_seed"])
+                self.assertEqual(
+                    action_payload["group_icon_path"],
+                    str(icon_path.resolve()),
+                )
+
+            confirmation = callback_update(
+                11,
+                data=f"a:{str(action['token'])}",
+                message_id=700,
+                message_thread_id=1,
+            )
+            confirmation["callback_query"]["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Telegram Control",
+                "is_forum": True,
+            }
+            callback_environment = dict(environment)
+            callback_environment.update(
+                {
+                    "TELEGRAM_CONTROL_JOB_ID": "2",
+                    "TELEGRAM_MESSAGE_ID": "700",
+                }
+            )
+            with mock.patch.dict(
+                os.environ,
+                callback_environment,
+                clear=False,
+            ):
+                with mock.patch.object(
+                    on_message,
+                    "provision_bound_forum_starter",
+                    return_value={
+                        "created": True,
+                        "display_name": "Start Here",
+                    },
+                ):
+                    on_message.handle_callback(
+                        confirmation,
+                        confirmation["callback_query"],
+                    )
+
+            with DurableStore(database_path) as store:
+                icon_call = store.connection.execute(
+                    """
+                    SELECT params_json
+                    FROM outbox_messages
+                    WHERE method = 'setChatPhoto'
+                    """
+                ).fetchone()
+                self.assertIsNotNone(icon_call)
+                self.assertEqual(
+                    json.loads(icon_call["params_json"]),
+                    {
+                        "chat_id": -100777,
+                        "__photo_file_path": str(icon_path.resolve()),
+                    },
                 )
 
     def test_newgroup_offers_the_one_tap_link_and_start_only_authorizes(self):

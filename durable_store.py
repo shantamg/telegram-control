@@ -13563,6 +13563,7 @@ class DurableStore:
         project_path: str,
         working_directory: Optional[str] = None,
         git_repository_root: Optional[str] = None,
+        group_icon_path: Optional[str] = None,
         now: Optional[float] = None,
     ) -> dict[str, Any]:
         """Remember the checkout that should back the first matching group.
@@ -13581,12 +13582,24 @@ class DurableStore:
             if git_repository_root is not None
             else None
         )
+        try:
+            icon_path = (
+                str(Path(group_icon_path).resolve(strict=True))
+                if group_icon_path is not None
+                else None
+            )
+        except OSError:
+            raise StoreError("Install workspace seed icon is unavailable.") from None
         if (
             not name
             or len(name) > 128
             or not Path(workspace).is_absolute()
             or not Path(workdir).is_absolute()
             or (git_root is not None and not Path(git_root).is_absolute())
+            or (
+                icon_path is not None
+                and Path(icon_path).suffix.casefold() not in {".png", ".jpg", ".jpeg"}
+            )
         ):
             raise StoreError("Install workspace seed is invalid.")
         timestamp = time.time() if now is None else float(now)
@@ -13606,6 +13619,7 @@ class DurableStore:
             "project_path": workspace,
             "working_directory": workdir,
             "git_repository_root": git_root,
+            "group_icon_path": icon_path,
             "chat_id": (
                 int(existing_binding["chat_id"])
                 if existing_binding is not None

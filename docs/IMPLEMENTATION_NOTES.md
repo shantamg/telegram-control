@@ -1796,7 +1796,8 @@ acknowledgment and Stop delivery behind an unacknowledged steer, the complete
 Installation now stores one `install_workspace` record in the existing
 `controller_state` table. It contains the symlink-resolved checkout,
 working-directory and optional Git-root paths for the repository that ran
-`bootstrap`, plus the portable display name **Telegram Control**. No chat ID is
+`bootstrap`, the portable display name **Telegram Control**, and the absolute
+path to the bundled 🎛 group avatar inside that checkout. No chat ID is
 hardcoded: if an active forum already uses that exact workspace the seed adopts
 its chat ID, otherwise the first matching private forum can claim it only after
 the paired owner confirms the setup card. A newly added private forum named
@@ -1825,9 +1826,11 @@ General without waiting for another owner message. It explains General's
 administrative role, the authorization → `/bind` → provider-confirmation
 sequence, and the automatic **Start Here** result. For the install-seeded
 Telegram Control group, the same card includes the resolved checkout and
-provider choices, so confirmation replaces the manual `/bind` step. The
-private `/newgroup` card tells the owner to expect this automatic General
-message.
+provider choices, so confirmation replaces the manual `/bind` step. That
+confirmation also queues `setChatPhoto` with
+`assets/telegram-control-group-icon.png`; ordinary project groups do not inherit
+the product avatar. The private `/newgroup` card tells the owner to expect this
+automatic General message.
 
 This uses existing tables and outbox card variants, so there is no schema
 migration. General normalization runs in the long-lived inbox worker and
@@ -1838,6 +1841,15 @@ Verified on July 27, 2026 with focused seed, General-normalization,
 starter-topic, and matching-group tests. The complete 409-test run passed every
 feature test and exposed one pre-existing concurrent-first-open locking flake;
 that isolated test passed immediately on rerun.
+
+The bundled avatar was applied successfully to the live Telegram Control group,
+and the current install seed was refreshed with its checkout-derived path.
+Focused seed-claim and confirmation tests verify that the path survives the
+durable callback and produces the existing multipart `setChatPhoto` outbox
+call. Compilation and `git diff --check` pass. The full 413-test run passes 403
+tests and still exposes ten pre-existing reaction-outbox ordering assertions
+from the native UI change; none exercise the icon-bearing seed or group-photo
+path.
 
 ## Native Telegram UI showcase and scoped composer menus
 

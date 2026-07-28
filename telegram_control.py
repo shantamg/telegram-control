@@ -53,6 +53,9 @@ from durable_store import (
 DATABASE_PATH = bridge.CONFIG_DIR / "controller.sqlite3"
 SCRIPT_PATH = Path(__file__).resolve()
 SKILLS_SOURCE_DIR = SCRIPT_PATH.parent / "skills"
+INSTALL_GROUP_ICON_PATH = (
+    SCRIPT_PATH.parent / "assets" / "telegram-control-group-icon.png"
+)
 # Skill sources are checkout-relative: they refer to this repository through a
 # placeholder that installation resolves to wherever the checkout actually is.
 SKILL_ROOT_PLACEHOLDER = "{{TELEGRAM_CONTROL_ROOT}}"
@@ -2975,6 +2978,7 @@ def seed_install_workspace(store: DurableStore) -> dict[str, Any]:
         project_path=workspace,
         working_directory=working_directory,
         git_repository_root=git_repository_root,
+        group_icon_path=str(INSTALL_GROUP_ICON_PATH.resolve(strict=True)),
     )
 
 

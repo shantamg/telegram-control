@@ -31,8 +31,9 @@ Installation seeds the resolved repository checkout in the durable database
 under the name **Telegram Control**. When the first unclaimed private forum
 with that exact name adds the bot, its setup card offers the seeded checkout
 and available provider choices immediately. Confirming the card both authorizes
-the group and binds it; no path needs to be typed. The seed is claimed by that
-chat ID, so another group with the same title cannot silently reuse it.
+the group and binds it; no path needs to be typed. Confirmation also applies
+the bundled 🎛 group avatar. The seed is claimed by that chat ID, so another
+group with the same title cannot silently reuse its checkout or default icon.
 
 Telegram's Bot API still cannot create the group or enable Topics. The seed
 removes the local-folder step after those two human actions; it does not

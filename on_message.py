@@ -1292,6 +1292,8 @@ def send_forum_binding_prompt(
                 "already_authorized": already_authorized,
                 "install_seed": bool(setup.get("install_seed")),
             }
+            if setup.get("group_icon_path") is not None:
+                payload["group_icon_path"] = str(setup["group_icon_path"])
             action = store.create_callback_action(
                 operation_id=(
                     f"inbox:{job_id}:direct-bind-forum:{provider}"
@@ -1422,6 +1424,7 @@ def install_seeded_forum_setup(
         "git_repository_root": git_repository_root,
         "requested_provider": None,
         "install_seed": True,
+        "group_icon_path": seed.get("group_icon_path"),
     }
 
 
@@ -3090,6 +3093,26 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             raise StoreError(
                 "The forum workspace changed before confirmation."
             )
+        install_group_icon_path = None
+        if bool(action.payload.get("install_seed")):
+            raw_icon_path = action.payload.get("group_icon_path")
+            if raw_icon_path is not None:
+                try:
+                    install_group_icon_path = Path(
+                        str(raw_icon_path)
+                    ).resolve(strict=True)
+                except OSError:
+                    raise StoreError(
+                        "The install-seeded Telegram group icon is unavailable."
+                    ) from None
+                if (
+                    not install_group_icon_path.is_file()
+                    or install_group_icon_path.suffix.casefold()
+                    not in {".png", ".jpg", ".jpeg"}
+                ):
+                    raise StoreError(
+                        "The install-seeded Telegram group icon is invalid."
+                    )
         with DurableStore(Path(database_path)) as store:
             workspace, _created = store.authorize_and_bind_forum_workspace(
                 chat_id=target_chat_id,
@@ -3105,6 +3128,15 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     chat_id=target_chat_id,
                     project_path=workspace.project_path,
                 )
+        if install_group_icon_path is not None:
+            deliver_api_call(
+                "setChatPhoto",
+                {
+                    "chat_id": target_chat_id,
+                    "__photo_file_path": str(install_group_icon_path),
+                },
+                "install-seed-group-icon",
+            )
         starter = provision_bound_forum_starter(
             workspace=workspace,
             operation_id=action.operation_id,

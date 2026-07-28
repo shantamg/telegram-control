@@ -95,7 +95,8 @@ For the human checkpoints, troubleshooting, and uninstall details, follow the
 
 The first private group named **Telegram Control** is a shortcut: installation
 has already seeded this repository's checkout, so adding the bot offers that
-exact folder for confirmation without requiring `/bind`.
+exact folder for confirmation without requiring `/bind`. Confirming that seeded
+setup also applies the bundled 🎛 group avatar.
 
 See [Set up a Telegram project group](docs/getting-started/telegram-group.md)
 for the exact Telegram settings and why each permission is needed.
@@ -211,6 +212,7 @@ policy. In particular:
 | Help, formatting, inventory, and voice UI | `telegram_help.py`, `telegram_formatting.py`, `workspace_catalog.py`, `voice_settings.py`, `voice_responses.py` |
 | Optional Control router | `router_contract.py`, `router_eval.py`, `discovery.py` |
 | Agent-scoped Telegram capabilities | `agent_telegram.py`, `skills/` |
+| Default Telegram group artwork | `assets/telegram-control-group-icon.png` |
 | Tests and exact mechanism history | `tests/`, `docs/IMPLEMENTATION_NOTES.md` |
 
 ## Contributing
