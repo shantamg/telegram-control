@@ -11422,6 +11422,18 @@ class DurableIntegrationTests(unittest.TestCase):
                     "seeded by the Telegram Control installer",
                     prompt.params["text"],
                 )
+                self.assertIn(
+                    "Welcome to Telegram Control",
+                    prompt.params["text"],
+                )
+                self.assertIn(
+                    "General is this group’s setup and administration topic",
+                    prompt.params["text"],
+                )
+                self.assertIn(
+                    "I’ll create Start Here automatically",
+                    prompt.params["text"],
+                )
                 action = store.connection.execute(
                     """
                     SELECT payload_json
@@ -11455,6 +11467,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 self.assertIn("Add me to a new project group", card.params["text"])
                 self.assertIn("View as Topics", card.params["text"])
                 self.assertIn("/bind", card.params["text"])
+                self.assertIn(
+                    "welcome card in General",
+                    card.params["text"],
+                )
                 self.assertEqual(
                     card.params["reply_markup"]["inline_keyboard"][0][0],
                     {
@@ -11472,7 +11488,8 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
 
                 # Telegram delivers /start with a payload once the link adds the
-                # bot. That is an arrival, so it authorizes and nothing more.
+                # bot. General may omit message_thread_id, so the bridge
+                # normalizes it to 1 and posts deterministic onboarding there.
                 arrival = message_update(11, "/start true")
                 arrival["message"]["chat"] = {
                     "id": -100777,
@@ -11480,14 +11497,13 @@ class DurableIntegrationTests(unittest.TestCase):
                     "title": "Meet Without Fear",
                     "is_forum": True,
                 }
-                arrival["message"]["message_thread_id"] = 2
                 process(arrival, "worker-2", 101)
                 self.assertEqual(
                     store.status_counts().get("router_mailbox", {}),
                     {},
                 )
                 prompts = [
-                    json.loads(row["params_json"])["text"]
+                    json.loads(row["params_json"])
                     for row in store.connection.execute(
                         """
                         SELECT params_json FROM outbox_messages
@@ -11497,10 +11513,31 @@ class DurableIntegrationTests(unittest.TestCase):
                     ).fetchall()
                 ]
                 self.assertTrue(
-                    any("Authorize this private forum" in text for text in prompts)
+                    any(
+                        "Authorize this private forum" in params["text"]
+                        for params in prompts
+                    )
                 )
                 self.assertTrue(
-                    any("Which folder should this group work in" in text for text in prompts)
+                    any(
+                        "Which folder should this group work in"
+                        in params["text"]
+                        for params in prompts
+                    )
+                )
+                welcome = next(
+                    params
+                    for params in prompts
+                    if "Welcome to Telegram Control" in params["text"]
+                )
+                self.assertEqual(welcome["message_thread_id"], 1)
+                self.assertIn(
+                    "General is this group’s setup and administration topic",
+                    welcome["text"],
+                )
+                self.assertIn(
+                    "I’ll create Start Here automatically",
+                    welcome["text"],
                 )
 
     def test_bound_forum_status_is_read_only_and_does_not_create_subject(self):

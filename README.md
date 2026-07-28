@@ -81,7 +81,9 @@ For the human checkpoints, troubleshooting, and uninstall details, follow the
    This is a separate per-account display choice and makes each agent
    conversation feel like its own chat.
 4. Tap the link from `/newgroup` to add the bot with the requested admin rights.
-5. In the group, send `/bind` followed by an exact existing folder:
+5. The bot automatically posts a welcome card in General explaining the next
+   steps. For an ordinary project group, send `/bind` followed by an exact
+   existing folder:
 
    ```text
    /bind ~/Software/my-project

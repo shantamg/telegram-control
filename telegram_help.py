@@ -155,7 +155,7 @@ Use /projects to list every connected workspace, including group-only workspaces
 
 For an older enrolled catalog project, use /agent create project-slug in a Control-bound topic; /projects shows the available slug. Directly bound groups do not need this legacy attach step.
 
-Setting up a new group: send /newgroup in the bot’s private chat, create a private group, enable Topics, choose Telegram’s separate “View as Topics” display mode, then tap the link. Telegram adds the bot with the rights it needs in one step. A group named Telegram Control is offered the repository checkout seeded during installation; confirm it without typing a path. Other groups authorize first, then use /bind with an exact existing folder path and confirm the workspace and provider.
+Setting up a new group: send /newgroup in the bot’s private chat, create a private group, enable Topics, choose Telegram’s separate “View as Topics” display mode, then tap the link. Telegram adds the bot with the rights it needs in one step and automatically posts a welcome card in General with the remaining steps. A group named Telegram Control is offered the repository checkout seeded during installation; confirm it without typing a path. Other groups authorize first, then use /bind with an exact existing folder path and confirm the workspace and provider.
 
 General is the group’s setup and administration topic. It accepts authorization, /bind, /help, /status, /projects, and /removegroup, but it does not become a disposable agent conversation because Telegram gives General special lifecycle rules. When binding finishes in General, Telegram Control creates Start Here automatically. Binding from an ordinary topic reuses that topic instead.
 

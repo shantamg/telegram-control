@@ -1820,6 +1820,15 @@ first-request prompt instead. A Telegram creation failure does not roll back
 the already-confirmed workspace binding; the General response explains that a
 normal topic must be created manually.
 
+The add-to-group `/start` arrival now produces an explicit welcome card in
+General without waiting for another owner message. It explains General's
+administrative role, the authorization → `/bind` → provider-confirmation
+sequence, and the automatic **Start Here** result. For the install-seeded
+Telegram Control group, the same card includes the resolved checkout and
+provider choices, so confirmation replaces the manual `/bind` step. The
+private `/newgroup` card tells the owner to expect this automatic General
+message.
+
 This uses existing tables and outbox card variants, so there is no schema
 migration. General normalization runs in the long-lived inbox worker and
 therefore needs one idle-safe controller reload; checkout seeding and the

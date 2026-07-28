@@ -10,12 +10,18 @@ agent conversation.
 3. Open the group's settings and enable **Topics**.
 4. Return to the bot's private chat and tap the add-to-group link.
 5. Choose the new group and approve the requested admin rights.
-6. Confirm the bot's setup card.
+6. The bot automatically posts a welcome card in General. Follow its setup
+   steps and confirm the requested changes.
 
 Telegram's Bot API cannot create a group or enable Topics, so those remain
 human steps. The bot requests Change group info, Delete messages, and Manage
 topics. Admin access also ensures Telegram's default Group Privacy setting does
 not hide ordinary messages from the bot.
+
+The welcome card explains that General is for setup and administration, shows
+the authorization and workspace-binding sequence, and tells the owner where
+the first agent conversation will appear. It is generated from the
+add-to-group `/start` arrival; no extra message or command is required.
 
 Public groups and groups with a public username are rejected by design.
 

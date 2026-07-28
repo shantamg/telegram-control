@@ -972,9 +972,12 @@ def send_group_setup_card() -> None:
         "4. Tap the button below and pick that group. Telegram adds me and "
         "asks you to grant Change group info, Delete messages, and Manage "
         "topics in the same step — no separate promotion.\n\n"
-        "Then approve the Authorize forum card and send /bind followed by an "
-        "exact existing folder path. A bot cannot create the group, enable "
-        "Topics, or choose your display mode; those steps are yours.\n\n"
+        "Once I’m added, I’ll post a welcome card in General with the exact "
+        "next steps. A group named Telegram Control is offered this installed "
+        "checkout automatically; other groups use /bind followed by an exact "
+        "existing folder path.\n\n"
+        "A bot cannot create the group, enable Topics, or choose your display "
+        "mode; those steps are yours.\n\n"
         f"{telegram_help.HELP_HINT}",
         reply_markup={
             "inline_keyboard": [
@@ -1281,8 +1284,24 @@ def send_forum_binding_prompt(
         question = (
             f"Choose {display_name}’s default agent and bind this workspace."
         )
+    welcome = (
+        "Welcome to Telegram Control.\n\n"
+        "General is this group’s setup and administration topic. Agent "
+        "conversations run in normal topics, so they can be managed and "
+        "removed independently.\n\n"
+        if not already_authorized
+        else ""
+    )
+    starter_guidance = (
+        "After confirmation, I’ll create Start Here automatically. Open it "
+        "and send your first request."
+        if thread_id == GENERAL_FORUM_TOPIC_ID
+        else "After confirmation, this topic becomes the first agent "
+        "conversation. Send your first request here."
+    )
     send_message(
-        f"{question}\n\n"
+        welcome
+        + f"{question}\n\n"
         f"Workspace: {setup['project_path']}\n"
         f"{provider_line}\n\n"
         + (
@@ -1296,6 +1315,7 @@ def send_forum_binding_prompt(
             else "This authorizes the private forum and binds its topics to "
             "that workspace. Nothing changes until you confirm."
         )
+        + f"\n\n{starter_guidance}"
         + f"\n\n{telegram_help.HELP_HINT}",
         reply_markup={"inline_keyboard": buttons},
     )
@@ -1429,6 +1449,14 @@ def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
             ttl_seconds=60 * 60,
         )
     send_message(
+        "Welcome to Telegram Control.\n\n"
+        "General is this group’s setup and administration topic. Agent "
+        "conversations will run in normal topics so they can be managed and "
+        "removed independently.\n\n"
+        "To get started:\n"
+        "1. Authorize this private group below.\n"
+        "2. Send /bind followed by its exact local folder path.\n"
+        "3. Confirm the provider. I’ll create Start Here automatically.\n\n"
         f"Authorize this private forum for {bot_label()}?\n\n"
         f"Forum: {display_name}\n\n"
         f"Only your paired Telegram account will be accepted. Add {bot_label()} "
