@@ -1368,7 +1368,7 @@ def validate_provider_config(
         raise StoreError("Agent provider is invalid.")
     value = dict(config or {})
     allowed = (
-        {"model", "effort", "sandbox"}
+        {"model", "effort", "sandbox", "model_provider"}
         if provider == "codex"
         else {"model", "effort", "permission_mode"}
     )
@@ -1391,6 +1391,9 @@ def validate_provider_config(
     ):
         raise StoreError(f"Agent effort is invalid for {provider}.")
     if provider == "codex":
+        model_provider = value.get("model_provider")
+        if model_provider is not None and model_provider != "ollama":
+            raise StoreError("Codex model provider is invalid.")
         sandbox = value.get("sandbox")
         if sandbox is not None and (
             not isinstance(sandbox, str)
@@ -7742,7 +7745,10 @@ class DurableStore:
         agent = self.resolve_agent(agent_id)
         if agent is None:
             raise StoreError("Managed agent was not found.")
-        provider_name = "Claude" if agent.provider == "claude" else "Codex"
+        provider_name = provider_defaults.provider_display_name(
+            agent.provider,
+            agent.provider_config,
+        )
         model_name, effort_name = provider_defaults.describe_provider_config(
             agent.provider,
             agent.provider_config,
@@ -8984,7 +8990,9 @@ class DurableStore:
         updates: dict[str, Optional[str]],
         now: Optional[float] = None,
     ) -> ManagedAgent:
-        if not updates or not set(updates).issubset({"model", "effort"}):
+        if not updates or not set(updates).issubset(
+            {"model", "effort", "model_provider"}
+        ):
             raise StoreError("Agent model configuration update is invalid.")
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
@@ -9012,20 +9020,30 @@ class DurableStore:
                     "Wait for the active agent turn or console before reconfiguring it."
                 )
             config = dict(agent.provider_config)
+            previous_model_provider = config.get("model_provider")
             for key, value in updates.items():
                 if value is None:
                     config.pop(key, None)
                 else:
                     config[key] = value
             config = validate_provider_config(agent.provider, config)
+            model_provider_changed = (
+                config.get("model_provider") != previous_model_provider
+            )
             self.connection.execute(
                 """
                 UPDATE agents
-                SET provider_config_json = ?, updated_at = ?
+                SET provider_config_json = ?,
+                    provider_session_id = CASE
+                        WHEN ? THEN NULL
+                        ELSE provider_session_id
+                    END,
+                    updated_at = ?
                 WHERE agent_id = ?
                 """,
                 (
                     json.dumps(config, separators=(",", ":"), sort_keys=True),
+                    int(model_provider_changed),
                     timestamp,
                     agent_id,
                 ),

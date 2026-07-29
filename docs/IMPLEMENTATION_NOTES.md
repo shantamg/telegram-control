@@ -1933,3 +1933,44 @@ protocol variant, so it does not require a controller restart.
 Verified on July 28, 2026 with a regression assertion that accepted agent
 messages queue only their durable receipt, the complete 413-test suite, Python
 compilation, and `git diff --check`.
+
+## Configurable local Ollama backend
+
+Codex topic agents can now select **Ollama local** as a model backend from
+`/agent` without introducing a third database-level provider. The persisted
+agent remains `provider = "codex"` and stores
+`model_provider = "ollama"` plus the selected model in its existing
+`provider_config_json`. The model picker queries Ollama's bounded local
+`/api/tags` endpoint each time it opens, sorts the installed results by size,
+and stores the exact selected name; no local model identifier is hardcoded.
+`OLLAMA_HOST` can override the default loopback endpoint.
+
+Codex app-server receives `modelProvider: "ollama"` on both `thread/start` and
+`thread/resume`, so local turns retain the provider-neutral thread checkpoint,
+incremental visible-text events, usage accounting, steering, interruption, and
+console contract. Interactive and detached Codex commands carry the equivalent
+`--oss --local-provider ollama` flags. An Ollama-backed topic defaults to the
+read-only sandbox unless its provider configuration explicitly selects another
+mode.
+
+Changing between OpenAI cloud and Ollama clears Telegram Control's session
+pointer and starts a fresh conversation; changing a model within the same
+backend preserves the current session. `/agent`, topic intros, and transient
+turn cards identify the runtime as **Codex (Ollama)**. The dormant-session
+picker is hidden for local topics because the current Codex session index does
+not expose enough model-provider metadata to safely distinguish cloud and
+Ollama candidates.
+
+This adds no schema migration, command, or outbox card variant. The fresh
+handler exposes the picker immediately, while the long-running agent workers
+need one idle-safe controller reload before they can pass the new backend field
+to Codex.
+
+Verified on July 28, 2026 against the live Ollama 0.32.4 service. The picker
+discovered eight installed models dynamically. A real `llama3.2:1b` turn ran
+through `CodexExecAdapter`, checkpointed a thread, reported usage, and emitted
+two incremental response callbacks before completion; a second turn resumed
+the same thread ID. The 1B model did not follow exact-output instructions
+reliably, confirming that small-model quality remains experimental even though
+transport and streaming work. All 419 unit and integration tests passed,
+followed by Python compilation and `git diff --check`.

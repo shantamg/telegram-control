@@ -116,6 +116,14 @@ def describe_provider_config(
 ) -> tuple[str, str]:
     """Return status labels that preserve and explain a Default selection."""
     explicit = dict(provider_config or {})
+    if provider == "codex" and explicit.get("model_provider") == "ollama":
+        model = explicit.get("model")
+        model_label = (
+            str(model).strip()
+            if isinstance(model, str) and model.strip()
+            else "Ollama default"
+        )
+        return model_label, "Model-controlled"
     effective = effective_provider_config(
         provider,
         explicit,
@@ -141,6 +149,15 @@ def provider_turn_summary(
 ) -> str:
     """Return compact effective provider metadata for transient turn cards."""
 
+    explicit = dict(provider_config or {})
+    if provider == "codex" and explicit.get("model_provider") == "ollama":
+        model, _effort = describe_provider_config(
+            provider,
+            explicit,
+            working_directory,
+            home_directory=home_directory,
+        )
+        return f"Codex · Ollama · {model}"
     effective = effective_provider_config(
         provider,
         provider_config,
@@ -152,3 +169,16 @@ def provider_turn_summary(
         f"{provider_name} · {effective['model']} · "
         f"{effective['effort']} effort"
     )
+
+
+def provider_display_name(
+    provider: str,
+    provider_config: Optional[dict[str, Any]] = None,
+) -> str:
+    """Return the human provider/backend label used by Telegram surfaces."""
+    if (
+        provider == "codex"
+        and dict(provider_config or {}).get("model_provider") == "ollama"
+    ):
+        return "Codex (Ollama)"
+    return "Claude" if provider == "claude" else "Codex"

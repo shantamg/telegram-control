@@ -39,6 +39,25 @@ class ProviderDefaultsTests(unittest.TestCase):
                 "Codex · gpt-5.6-sol · high effort",
             )
 
+    def test_ollama_backend_uses_its_configured_model_without_cloud_effort(self):
+        config = {
+            "model_provider": "ollama",
+            "model": "small:1b",
+        }
+
+        self.assertEqual(
+            provider_defaults.describe_provider_config("codex", config),
+            ("small:1b", "Model-controlled"),
+        )
+        self.assertEqual(
+            provider_defaults.provider_turn_summary("codex", config),
+            "Codex · Ollama · small:1b",
+        )
+        self.assertEqual(
+            provider_defaults.provider_display_name("codex", config),
+            "Codex (Ollama)",
+        )
+
     def test_claude_defaults_follow_user_and_project_settings(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             home = Path(temporary_directory)

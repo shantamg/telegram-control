@@ -1468,6 +1468,46 @@ class DurableStoreTests(unittest.TestCase):
         self.assertNotIn("model", reset.provider_config)
         self.assertEqual(reset.provider_config["effort"], "max")
 
+        self.store.connection.execute(
+            """
+            UPDATE agents
+            SET provider_session_id = 'cloud-session'
+            WHERE agent_id = ?
+            """,
+            (agent.agent_id,),
+        )
+        local = self.store.configure_agent_provider(
+            agent.agent_id,
+            {
+                "model_provider": "ollama",
+                "model": "small:1b",
+                "effort": None,
+            },
+            now=105,
+        )
+        self.assertEqual(
+            local.provider_config,
+            {"model_provider": "ollama", "model": "small:1b"},
+        )
+        self.assertIsNone(local.provider_session_id)
+        self.store.connection.execute(
+            """
+            UPDATE agents
+            SET provider_session_id = 'local-session'
+            WHERE agent_id = ?
+            """,
+            (agent.agent_id,),
+        )
+        changed_model = self.store.configure_agent_provider(
+            agent.agent_id,
+            {"model": "other:3b"},
+            now=106,
+        )
+        self.assertEqual(
+            changed_model.provider_session_id,
+            "local-session",
+        )
+
         with self.assertRaises(StoreError):
             self.store.register_project_agent(
                 chat_id=123,
@@ -12704,12 +12744,56 @@ class DurableIntegrationTests(unittest.TestCase):
                                 json.loads(row["params_json"]) for row in rows
                             ]
 
-                        model_messages = invoke_callback(11, configure_data)
+                        next_update_id = 11
+                        if provider == "codex":
+                            backend_messages = invoke_callback(
+                                next_update_id,
+                                configure_data,
+                            )
+                            next_update_id += 1
+                            backend_prompt = next(
+                                params
+                                for params in backend_messages
+                                if "Change Codex backend"
+                                in str(params.get("text", ""))
+                            )
+                            cloud_data = next(
+                                button["callback_data"]
+                                for row in backend_prompt["reply_markup"][
+                                    "inline_keyboard"
+                                ]
+                                for button in row
+                                if "OpenAI cloud" in button["text"]
+                            )
+                            local_data = next(
+                                button["callback_data"]
+                                for row in backend_prompt["reply_markup"][
+                                    "inline_keyboard"
+                                ]
+                                for button in row
+                                if "Ollama local" in button["text"]
+                            )
+                            model_messages = invoke_callback(
+                                next_update_id,
+                                cloud_data,
+                            )
+                            next_update_id += 1
+                        else:
+                            model_messages = invoke_callback(
+                                next_update_id,
+                                configure_data,
+                            )
+                            next_update_id += 1
                         model_prompt = next(
                             params
                             for params in model_messages
-                            if "Change " in str(params.get("text", ""))
-                            and " model" in str(params.get("text", ""))
+                            if "reply_markup" in params
+                            if "model" in str(params.get("text", "")).lower()
+                            and (
+                                "Change " in str(params.get("text", ""))
+                                or "Choose a model"
+                                in str(params.get("text", ""))
+                            )
                         )
                         model_data = next(
                             button["callback_data"]
@@ -12720,7 +12804,11 @@ class DurableIntegrationTests(unittest.TestCase):
                             if button["text"] == model_label
                         )
 
-                        effort_messages = invoke_callback(12, model_data)
+                        effort_messages = invoke_callback(
+                            next_update_id,
+                            model_data,
+                        )
+                        next_update_id += 1
                         effort_prompt = next(
                             params
                             for params in effort_messages
@@ -12735,7 +12823,11 @@ class DurableIntegrationTests(unittest.TestCase):
                             if button["text"] == effort_label
                         )
 
-                        result_messages = invoke_callback(13, effort_data)
+                        result_messages = invoke_callback(
+                            next_update_id,
+                            effort_data,
+                        )
+                        next_update_id += 1
                         configured = store.resolve_agent(agent.agent_id)
                         self.assertEqual(
                             configured.provider_config["model"],
@@ -12768,6 +12860,68 @@ class DurableIntegrationTests(unittest.TestCase):
                             ).fetchone()[0],
                             0,
                         )
+                        if provider == "codex":
+                            with mock.patch.object(
+                                provider_adapters,
+                                "ollama_models",
+                                return_value=(("Tiny local", "tiny:1b"),),
+                            ):
+                                local_model_messages = invoke_callback(
+                                    next_update_id,
+                                    local_data,
+                                )
+                                next_update_id += 1
+                                local_model_prompt = next(
+                                    params
+                                    for params in local_model_messages
+                                    if "reply_markup" in params
+                                    and "Choose a model"
+                                    in str(params.get("text", ""))
+                                )
+                                local_model_data = next(
+                                    button["callback_data"]
+                                    for row in local_model_prompt[
+                                        "reply_markup"
+                                    ]["inline_keyboard"]
+                                    for button in row
+                                    if button["text"] == "Tiny local"
+                                )
+                                local_effort_messages = invoke_callback(
+                                    next_update_id,
+                                    local_model_data,
+                                )
+                                next_update_id += 1
+                                local_effort_prompt = next(
+                                    params
+                                    for params in local_effort_messages
+                                    if "reply_markup" in params
+                                    and "Choose effort"
+                                    in str(params.get("text", ""))
+                                )
+                                local_effort_data = local_effort_prompt[
+                                    "reply_markup"
+                                ]["inline_keyboard"][0][0]["callback_data"]
+                                local_result_messages = invoke_callback(
+                                    next_update_id,
+                                    local_effort_data,
+                                )
+
+                            local = store.resolve_agent(agent.agent_id)
+                            self.assertEqual(
+                                local.provider_config,
+                                {
+                                    "model": "tiny:1b",
+                                    "model_provider": "ollama",
+                                },
+                            )
+                            self.assertIsNone(local.provider_session_id)
+                            self.assertTrue(
+                                any(
+                                    "Codex (Ollama)"
+                                    in str(params.get("text", ""))
+                                    for params in local_result_messages
+                                )
+                            )
 
     def test_agent_can_confirm_switching_from_codex_to_claude(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

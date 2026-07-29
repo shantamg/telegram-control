@@ -135,6 +135,68 @@ def claude_agent(**overrides):
 
 
 class CodexEventTests(unittest.TestCase):
+    def test_ollama_models_are_discovered_and_sorted_by_installed_size(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _size=-1):
+                return json.dumps(
+                    {
+                        "models": [
+                            {"name": "larger:latest", "size": 4 * 1024**3},
+                            {"name": "small:1b", "size": 1 * 1024**3},
+                        ]
+                    }
+                ).encode("utf-8")
+
+        requests = []
+
+        def urlopen(request, timeout):
+            requests.append((request.full_url, timeout))
+            return Response()
+
+        models = provider_adapters.ollama_models(
+            base_url="http://localhost:11434",
+            urlopen=urlopen,
+        )
+
+        self.assertEqual(
+            models,
+            (
+                ("small:1b · 1.0 GB", "small:1b"),
+                ("larger:latest · 4.0 GB", "larger:latest"),
+            ),
+        )
+        self.assertEqual(
+            requests,
+            [("http://localhost:11434/api/tags", 3.0)],
+        )
+
+    def test_ollama_is_a_configurable_codex_backend_not_a_hardcoded_model(self):
+        self.assertIn(
+            ("Ollama local", "ollama"),
+            provider_adapters.model_provider_options("codex"),
+        )
+        with mock.patch.object(
+            provider_adapters,
+            "ollama_models",
+            return_value=(("Tiny", "tiny:1b"), ("Coder", "coder:7b")),
+        ):
+            options = provider_adapters.configuration_options(
+                "codex",
+                "ollama",
+            )
+
+        self.assertEqual(
+            options.models,
+            (("Tiny", "tiny:1b"), ("Coder", "coder:7b")),
+        )
+        self.assertEqual(options.efforts, (("Default", None),))
+
     def test_provider_availability_reports_each_cli_independently(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             claude = Path(temporary_directory) / "claude"
@@ -175,6 +237,28 @@ class CodexEventTests(unittest.TestCase):
                 "developerInstructions": turn_guidance.TURN_GUIDANCE,
             },
         )
+
+    def test_local_codex_threads_select_ollama_and_default_to_read_only(self):
+        agent = codex_agent(
+            provider_config={
+                "model_provider": "ollama",
+                "model": "tiny:1b",
+            }
+        )
+        self.assertEqual(
+            provider_adapters.CodexExecAdapter._sandbox_mode(agent),
+            "read-only",
+        )
+        method, params = provider_adapters.CodexExecAdapter._thread_request(
+            None,
+            "/tmp/project",
+            "tiny:1b",
+            "read-only",
+            model_provider="ollama",
+        )
+        self.assertEqual(method, "thread/start")
+        self.assertEqual(params["model"], "tiny:1b")
+        self.assertEqual(params["modelProvider"], "ollama")
 
     def test_consumes_persistent_session_final_message_and_usage(self):
         sessions = []
@@ -457,6 +541,28 @@ class ConsoleCommandTests(unittest.TestCase):
         self.assertIn('model_reasoning_effort="high"', command)
         self.assertEqual(command[-1], self.SESSION)
 
+    def test_codex_console_resumes_a_configured_ollama_session(self):
+        adapter = provider_adapters.CodexExecAdapter(binary="/bin/codex")
+        command = adapter.console_command(
+            codex_agent(
+                provider_session_id=self.SESSION,
+                provider_config={
+                    "model_provider": "ollama",
+                    "model": "small:1b",
+                },
+            )
+        )
+
+        self.assertIn("--oss", command)
+        self.assertEqual(
+            command[command.index("--local-provider") + 1],
+            "ollama",
+        )
+        self.assertEqual(
+            command[command.index("--sandbox") + 1],
+            "read-only",
+        )
+
     def test_claude_console_resumes_the_persisted_session(self):
         adapter = provider_adapters.ClaudePrintAdapter(binary="/bin/claude")
         agent = claude_agent(
@@ -721,6 +827,99 @@ class LiveControlContractTests(unittest.TestCase):
         rendered_progress = repr(progress)
         self.assertNotIn("SECRET", rendered_progress)
         self.assertNotIn("/private/project", rendered_progress)
+
+    def test_codex_ollama_uses_the_same_incremental_progress_path(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "turn/start":
+                process.stdout.emit(
+                    {
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "local-message",
+                                "type": "agentMessage",
+                                "text": "",
+                                "phase": "final_answer",
+                            },
+                        },
+                    }
+                )
+                process.stdout.emit(
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "itemId": "local-message",
+                            "delta": "LOCAL",
+                        },
+                    }
+                )
+                process.stdout.emit(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "local-message",
+                                "type": "agentMessage",
+                                "text": "LOCAL STREAM",
+                                "phase": "final_answer",
+                            },
+                        },
+                    }
+                )
+                process.stdout.emit(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turn": {
+                                "id": "turn-1",
+                                "items": [],
+                                "status": "completed",
+                            },
+                        },
+                    }
+                )
+
+        process.on_payload = handle
+        progress = []
+        result = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex",
+            poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        ).run_turn(
+            codex_agent(
+                provider_config={
+                    "model_provider": "ollama",
+                    "model": "small:1b",
+                }
+            ),
+            "Use the local model.",
+            None,
+            lambda _session_id: None,
+            lambda: None,
+            lambda stage, detail: progress.append((stage, detail)),
+        )
+
+        self.assertEqual(
+            process.payloads[2]["params"]["modelProvider"],
+            "ollama",
+        )
+        self.assertEqual(
+            process.payloads[2]["params"]["sandbox"],
+            "read-only",
+        )
+        self.assertIn(("response", "LOCAL"), progress)
+        self.assertIn(("response", "LOCAL STREAM"), progress)
+        self.assertEqual(result.final_text, "LOCAL STREAM")
 
     def test_codex_streams_commentary_and_final_answer_as_visible_progress(self):
         process = FakeProcess(lambda payload: None)

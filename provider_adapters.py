@@ -14,6 +14,9 @@ import tempfile
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Literal, Optional, Protocol
 
@@ -37,6 +40,15 @@ PROVIDER_BINARY_CANDIDATES = {
     ),
 }
 
+CODEX_MODEL_PROVIDER_OPTIONS = (
+    ("OpenAI cloud", None),
+    ("Ollama local", "ollama"),
+)
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+MAX_OLLAMA_RESPONSE_BYTES = 256 * 1024
+MAX_OLLAMA_MODELS = 30
+MAX_TELEGRAM_BUTTON_CHARACTERS = 64
+
 
 def provider_binary(provider: str) -> Optional[str]:
     """Return an installed provider CLI without constructing an adapter."""
@@ -57,6 +69,94 @@ def provider_availability() -> dict[str, Optional[str]]:
         provider: provider_binary(provider)
         for provider in ("claude", "codex")
     }
+
+
+def model_provider_options(
+    provider: str,
+) -> tuple[tuple[str, Optional[str]], ...]:
+    """Return runtime backends selectable for one provider."""
+    if provider == "codex":
+        return CODEX_MODEL_PROVIDER_OPTIONS
+    if provider == "claude":
+        return (("Anthropic cloud", None),)
+    raise ProviderAdapterError(f"Unknown provider: {provider}")
+
+
+def ollama_base_url(environment: Optional[dict[str, str]] = None) -> str:
+    """Resolve Ollama's local endpoint without baking a model into code."""
+    values = os.environ if environment is None else environment
+    configured = str(values.get("OLLAMA_HOST", "")).strip()
+    if not configured:
+        return DEFAULT_OLLAMA_URL
+    if "://" not in configured:
+        configured = f"http://{configured}"
+    parsed = urllib.parse.urlsplit(configured)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ProviderAdapterError("OLLAMA_HOST is not a valid HTTP endpoint.")
+    return configured.rstrip("/")
+
+
+def ollama_models(
+    *,
+    base_url: Optional[str] = None,
+    timeout_seconds: float = 3.0,
+    urlopen: Callable[..., Any] = urllib.request.urlopen,
+) -> tuple[tuple[str, str], ...]:
+    """Discover installed Ollama models through its local API."""
+    endpoint = f"{(base_url or ollama_base_url()).rstrip('/')}/api/tags"
+    request = urllib.request.Request(
+        endpoint,
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=max(0.1, float(timeout_seconds))) as response:
+            raw_payload = response.read(MAX_OLLAMA_RESPONSE_BYTES + 1)
+            if len(raw_payload) > MAX_OLLAMA_RESPONSE_BYTES:
+                raise ProviderAdapterError(
+                    "Ollama returned an oversized model list."
+                )
+            payload = json.loads(raw_payload.decode("utf-8"))
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        urllib.error.URLError,
+    ) as exc:
+        raise ProviderAdapterError(
+            "Ollama is unavailable. Start Ollama and try again."
+        ) from exc
+    rows = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise ProviderAdapterError("Ollama returned an invalid model list.")
+    discovered: list[tuple[str, str, int]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name") or row.get("model")
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 100
+            or not all(character.isalnum() or character in "._:/-" for character in name)
+        ):
+            continue
+        size = row.get("size")
+        byte_size = int(size) if type(size) is int and size >= 0 else 0
+        gibibytes = byte_size / (1024**3)
+        label = f"{name} · {gibibytes:.1f} GB" if byte_size else name
+        if len(label) > MAX_TELEGRAM_BUTTON_CHARACTERS:
+            label = label[: MAX_TELEGRAM_BUTTON_CHARACTERS - 1].rstrip() + "…"
+        discovered.append((label, name, byte_size))
+    if not discovered:
+        raise ProviderAdapterError(
+            "Ollama has no installed models. Pull one and try again."
+        )
+    discovered.sort(key=lambda item: (item[2], item[1].casefold()))
+    return tuple(
+        (label, name)
+        for label, name, _size in discovered[:MAX_OLLAMA_MODELS]
+    )
 
 
 class ProviderTurnCancelled(ProviderAdapterError):
@@ -578,6 +678,8 @@ class CodexExecAdapter:
             "--cd",
             launch_directory,
         ]
+        if agent.provider_config.get("model_provider") == "ollama":
+            command.extend(["--oss", "--local-provider", "ollama"])
         model = agent.provider_config.get("model")
         if model:
             command.extend(["--model", str(model)])
@@ -600,8 +702,19 @@ class CodexExecAdapter:
             "--cd",
             str(working_directory),
             "--sandbox",
-            str(provider_config.get("sandbox", "danger-full-access")),
+            str(
+                provider_config.get(
+                    "sandbox",
+                    (
+                        "read-only"
+                        if provider_config.get("model_provider") == "ollama"
+                        else "danger-full-access"
+                    ),
+                )
+            ),
         ]
+        if provider_config.get("model_provider") == "ollama":
+            command.extend(["--oss", "--local-provider", "ollama"])
         model = provider_config.get("model")
         if model:
             command.extend(["--model", str(model)])
@@ -617,7 +730,14 @@ class CodexExecAdapter:
     @staticmethod
     def _sandbox_mode(agent: ManagedAgent) -> str:
         return str(
-            agent.provider_config.get("sandbox", "danger-full-access")
+            agent.provider_config.get(
+                "sandbox",
+                (
+                    "read-only"
+                    if agent.provider_config.get("model_provider") == "ollama"
+                    else "danger-full-access"
+                ),
+            )
         )
 
     @staticmethod
@@ -627,6 +747,7 @@ class CodexExecAdapter:
         model: Optional[Any],
         sandbox: str,
         guidance: str = TURN_GUIDANCE,
+        model_provider: Optional[Any] = None,
     ) -> tuple[str, dict[str, Any]]:
         params: dict[str, Any] = {
             "cwd": launch_directory,
@@ -636,6 +757,8 @@ class CodexExecAdapter:
         }
         if model:
             params["model"] = str(model)
+        if model_provider:
+            params["modelProvider"] = str(model_provider)
         if persisted_session:
             params["threadId"] = persisted_session
             return "thread/resume", params
@@ -745,6 +868,7 @@ class CodexExecAdapter:
         launch_directory = agent.working_directory or agent.project_path
         model = agent.provider_config.get("model")
         effort = agent.provider_config.get("effort")
+        model_provider = agent.provider_config.get("model_provider")
         sandbox = self._sandbox_mode(agent)
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
@@ -811,6 +935,7 @@ class CodexExecAdapter:
                     model,
                     sandbox,
                     effective_turn_guidance(agent.project_path),
+                    model_provider=model_provider,
                 )
                 _write_json_line(
                     process,
@@ -1916,9 +2041,21 @@ def adapter_for(agent: ManagedAgent) -> ProviderAdapter:
     )
 
 
-def configuration_options(provider: str) -> ProviderConfigurationOptions:
+def configuration_options(
+    provider: str,
+    model_provider: Optional[str] = None,
+) -> ProviderConfigurationOptions:
     """Return selectable settings without constructing a provider process."""
     if provider == "codex":
+        if model_provider == "ollama":
+            return ProviderConfigurationOptions(
+                models=ollama_models(),
+                efforts=(("Default", None),),
+            )
+        if model_provider is not None:
+            raise ProviderAdapterError(
+                f"Codex model provider is not implemented: {model_provider}"
+            )
         return CodexExecAdapter.configuration_options()
     if provider == "claude":
         return ClaudePrintAdapter.configuration_options()

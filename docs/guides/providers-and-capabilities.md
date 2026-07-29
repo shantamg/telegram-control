@@ -40,6 +40,30 @@ settings. The Telegram picker is the source of truth for the currently
 supported explicit choices. Active turns can be steered by replying to their
 progress card, and **Stop** uses the provider's native interrupt path.
 
+## Local Ollama models through Codex
+
+A Codex topic can use Ollama as its model backend while retaining Telegram
+Control's Codex app-server integration. Start Ollama, open `/agent`, choose
+**Change model / effort…**, select **Ollama local**, and then choose one of the
+models currently returned by Ollama. Model names are discovered from the local
+`/api/tags` endpoint; none are compiled into Telegram Control.
+
+The selected configuration is stored per topic as `model_provider: "ollama"`
+plus the chosen model name. Moving between OpenAI cloud and Ollama starts a
+fresh provider session so conversation state cannot cross backends. Later turns
+on the same local backend resume the persisted Codex thread. Local turns use a
+read-only sandbox unless an explicit provider configuration overrides it.
+
+Visible model text streams through the same editable Telegram progress card as
+cloud Codex output. Small local models may follow instructions and tool
+protocols much less reliably than hosted coding models; treat the backend as
+experimental and inspect its work before granting write access.
+
+Ollama defaults to `http://127.0.0.1:11434`. Set `OLLAMA_HOST` in the
+controller's environment when the local service uses another HTTP endpoint.
+The Codex CLI remains required because it supplies structured events, session
+persistence, steering, interruption, and console integration around Ollama.
+
 ## Voice input
 
 Voice-note transcription requires all three:

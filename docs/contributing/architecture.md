@@ -8,6 +8,7 @@ Telegram
   │
   ▼
 collector ──▶ durable SQLite queues ──▶ agent workers ──▶ Claude or Codex
+                                                           └─▶ Ollama backend
   ▲                    │                       │
   └──── outbox sender ◀┴───────────────────────┘
 ```

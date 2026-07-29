@@ -31,6 +31,7 @@ discovery and delegation.
 | macOS and Python 3.9+ at `/usr/bin/python3` | Yes | Installation stops with a specific readiness error. |
 | A private Telegram bot | Yes | `SETUP.command` walks you through BotFather and pairing. |
 | Claude Code **or** Codex CLI | Yes, one or both | Install and authenticate at least one CLI, then verify it manually in Terminal. `doctor` checks the executable and version, not login state. A Claude-only installation does not need Codex. |
+| Ollama | No | Codex topics can use locally installed Ollama models; cloud providers remain available without it. |
 | Handy + Parakeet V3 + ffmpeg | No | Text and file messages work; local voice transcription is unavailable. |
 | edge-tts + ffmpeg | No | Text replies work; the Listen button cannot create spoken replies. |
 | tmux | No | Normal topic conversations work; console takeover and detached workers are unavailable. |
@@ -119,8 +120,9 @@ the bot or delete the group in Telegram after cleanup finishes.
   counts, whether it came from the older project catalog or a bound group.
 - `/status` inspects the current Control surface; in an agent topic it opens
   the same runtime card as `/agent`.
-- `/agent` can pause or resume the topic agent, change provider, model, or
-  effort, and start or resume a provider session.
+- `/agent` can pause or resume the topic agent, change provider, backend,
+  model, or effort, and start or resume a provider session. Codex topics can
+  choose dynamically discovered local Ollama models.
 - `/voice` previews and changes the global spoken-reply voice and speed.
 - Replying to the progress card steers the active turn; guidance sent while
   Claude is inside a tool call stays pending until Claude acknowledges it.
