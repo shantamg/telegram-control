@@ -13,6 +13,21 @@ The requested work is finished and verified.
 EOF
 ```
 
+Run this as a foreground task and keep the process attached until it exits.
+Speech synthesis happens before the durable Telegram outbox entry is created,
+so ending the turn while synthesis is still running can prevent the note from
+being queued at all.
+
+If the command runner yields a process or session ID, that is **not** delivery
+confirmation. Resume or poll that same process until it exits and prints
+`Telegram voice update queued.` (or an idempotent `already sent` result). Never
+end the turn with that process still running.
+
+Before telling the user that delivery succeeded, verify the durable outbox row
+reached `sent` and that Telegram returned the current topic's thread ID. A
+queued row, a shell session ID, or successful TTS generation alone is not proof
+of Telegram delivery.
+
 Choose a stable lowercase key describing this distinct message. Repeating the
 same key and content is idempotent.
 
