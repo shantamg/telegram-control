@@ -19,6 +19,7 @@ import codex_sessions
 import detached_worker
 import discovery
 import helper_paths
+import local_actions
 import provider_adapters
 import provider_defaults
 import router_contract
@@ -5048,6 +5049,25 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             f"✅ This topic will continue the selected {provider_name} session on its "
             "next message."
         )
+        return
+    if action.action_type == "local_action_run":
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Running check now…",
+                },
+                "callback-answer",
+            )
+        try:
+            output = local_actions.run_local_action(
+                str(action.payload.get("key", ""))
+            )
+        except local_actions.LocalActionError as exc:
+            send_message(f"❌ {exc}")
+            return
+        send_message(output)
         return
     if action.action_type == "refresh_status":
         chat_id, thread_id = surface_coordinates()

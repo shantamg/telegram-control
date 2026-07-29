@@ -179,6 +179,20 @@ replaced through these settings.
 Start with [Customization and configuration](docs/guides/customization.md) and
 inspect the resolved result with:
 
+### Allowlisted local-action buttons
+
+An owner-authorized durable callback can run a local command that has been
+explicitly allowlisted in
+`~/.config/telegram-control/local-actions.json`. Telegram carries only an
+opaque callback token and an action key; it never receives the command or local
+paths. Commands run directly without a shell, have a maximum two-minute
+timeout, and return bounded stdout to the originating topic.
+
+The configuration file must be owned by the current macOS user and must not be
+group- or world-writable. A local action is not exposed automatically: a
+trusted local integration must also create a reusable `local_action_run`
+callback action for the exact chat, topic, and authorized Telegram owner.
+
 ```sh
 ./telegram_control.py config show
 ```

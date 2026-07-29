@@ -29,6 +29,19 @@ feature for natural-language discovery and delegation; it is disabled by
 default. The sections below are chronological, so an earlier mechanism may be
 explicitly superseded by a later section.
 
+## Allowlisted local-action callbacks
+
+Reusable `local_action_run` callbacks can invoke owner-configured commands from
+`~/.config/telegram-control/local-actions.json`. The callback remains subject
+to the durable action table's chat, topic, owner, expiry, and replay checks.
+The handler resolves only a short allowlist key; executable arguments and the
+working directory stay in the owner-only local configuration.
+
+The runner does not invoke a shell, requires an absolute executable and
+working directory, limits execution to 120 seconds, bounds returned stdout,
+and reports failures without echoing command output. Focused tests cover
+successful execution, unknown keys, and unsafe configuration permissions.
+
 ## Stage 0 baseline
 
 - Computer → phone text messages.
