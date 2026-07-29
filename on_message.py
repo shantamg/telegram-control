@@ -4318,7 +4318,10 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             f"Backend: {backend_name}\n\nChoose a model.\n\n"
             "Installed Ollama models are discovered at runtime.",
             reply_markup={
-                "inline_keyboard": option_button_rows(model_actions),
+                "inline_keyboard": option_button_rows(
+                    model_actions,
+                    width=1 if model_provider == "ollama" else 3,
+                ),
             },
         )
         return

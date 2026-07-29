@@ -1942,7 +1942,9 @@ agent remains `provider = "codex"` and stores
 `model_provider = "ollama"` plus the selected model in its existing
 `provider_config_json`. The model picker queries Ollama's bounded local
 `/api/tags` endpoint each time it opens, sorts the installed results by size,
-and stores the exact selected name; no local model identifier is hardcoded.
+and renders one full-width button per model so names remain distinguishable on
+narrow Telegram clients. It stores the exact selected name; no local model
+identifier is hardcoded.
 `OLLAMA_HOST` can override the default loopback endpoint.
 
 Codex app-server receives `modelProvider: "ollama"` on both `thread/start` and

@@ -12878,6 +12878,14 @@ class DurableIntegrationTests(unittest.TestCase):
                                     and "Choose a model"
                                     in str(params.get("text", ""))
                                 )
+                                self.assertTrue(
+                                    all(
+                                        len(row) == 1
+                                        for row in local_model_prompt[
+                                            "reply_markup"
+                                        ]["inline_keyboard"]
+                                    )
+                                )
                                 local_model_data = next(
                                     button["callback_data"]
                                     for row in local_model_prompt[
