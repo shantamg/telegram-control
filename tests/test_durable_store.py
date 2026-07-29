@@ -12894,24 +12894,16 @@ class DurableIntegrationTests(unittest.TestCase):
                                     for button in row
                                     if button["text"] == "Tiny local"
                                 )
-                                local_effort_messages = invoke_callback(
+                                local_result_messages = invoke_callback(
                                     next_update_id,
                                     local_model_data,
                                 )
-                                next_update_id += 1
-                                local_effort_prompt = next(
-                                    params
-                                    for params in local_effort_messages
-                                    if "reply_markup" in params
-                                    and "Choose effort"
-                                    in str(params.get("text", ""))
-                                )
-                                local_effort_data = local_effort_prompt[
-                                    "reply_markup"
-                                ]["inline_keyboard"][0][0]["callback_data"]
-                                local_result_messages = invoke_callback(
-                                    next_update_id,
-                                    local_effort_data,
+                                self.assertFalse(
+                                    any(
+                                        "Choose effort"
+                                        in str(params.get("text", ""))
+                                        for params in local_result_messages
+                                    )
                                 )
 
                             local = store.resolve_agent(agent.agent_id)

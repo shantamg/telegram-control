@@ -4349,6 +4349,61 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         model_labels = {value: label for label, value in options.models}
         if model not in model_labels:
             raise StoreError("Stored agent model selection is invalid.")
+        if model_provider == "ollama":
+            try:
+                with DurableStore(Path(database_path)) as store:
+                    bound_agent = store.resolve_agent_for_surface(
+                        chat_id,
+                        thread_id,
+                    )
+                    if bound_agent is None or bound_agent.agent_id != agent_id:
+                        raise StoreError("Managed agent surface changed.")
+                    if bound_agent.provider != provider:
+                        raise StoreError("Managed agent provider changed.")
+                    configured = store.configure_agent_provider(
+                        agent_id,
+                        {
+                            "model": str(model),
+                            "effort": None,
+                            "model_provider": "ollama",
+                        },
+                    )
+                    store.enqueue_topic_intro_refresh(agent_id)
+            except StoreError as exc:
+                if callback_query_id:
+                    deliver_api_call(
+                        "answerCallbackQuery",
+                        {
+                            "callback_query_id": callback_query_id,
+                            "text": str(exc),
+                            "show_alert": True,
+                        },
+                        "callback-answer",
+                    )
+                return
+            model_name, effort_name = (
+                provider_defaults.describe_provider_config(
+                    configured.provider,
+                    configured.provider_config,
+                    configured.project_path,
+                )
+            )
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": f"Using {model_name} locally.",
+                    },
+                    "callback-answer",
+                )
+            send_message(
+                "✅ Updated Codex (Ollama) settings.\n"
+                f"Model: {model_name}\n"
+                f"Effort: {effort_name}\n\n"
+                "The next message will start a fresh local conversation."
+            )
+            return
         try:
             with DurableStore(Path(database_path)) as store:
                 bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)

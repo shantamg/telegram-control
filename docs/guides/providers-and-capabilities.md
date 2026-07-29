@@ -46,7 +46,8 @@ A Codex topic can use Ollama as its model backend while retaining Telegram
 Control's Codex app-server integration. Start Ollama, open `/agent`, choose
 **Change model / effort…**, select **Ollama local**, and then choose one of the
 models currently returned by Ollama. Model names are discovered from the local
-`/api/tags` endpoint; none are compiled into Telegram Control.
+`/api/tags` endpoint; none are compiled into Telegram Control. Choosing a local
+model applies it immediately because Ollama has no separate effort selection.
 
 The selected configuration is stored per topic as `model_provider: "ollama"`
 plus the chosen model name. Moving between OpenAI cloud and Ollama starts a

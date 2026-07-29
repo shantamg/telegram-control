@@ -1957,7 +1957,8 @@ agent remains `provider = "codex"` and stores
 `/api/tags` endpoint each time it opens, sorts the installed results by size,
 and renders one full-width button per model so names remain distinguishable on
 narrow Telegram clients. It stores the exact selected name; no local model
-identifier is hardcoded.
+identifier is hardcoded. Selecting an Ollama model applies it immediately
+instead of opening a redundant one-option effort screen.
 `OLLAMA_HOST` can override the default loopback endpoint.
 
 Codex app-server receives `modelProvider: "ollama"` on both `thread/start` and
@@ -1987,5 +1988,5 @@ through `CodexExecAdapter`, checkpointed a thread, reported usage, and emitted
 two incremental response callbacks before completion; a second turn resumed
 the same thread ID. The 1B model did not follow exact-output instructions
 reliably, confirming that small-model quality remains experimental even though
-transport and streaming work. All 419 unit and integration tests passed,
+transport and streaming work. All 422 unit and integration tests passed,
 followed by Python compilation and `git diff --check`.
