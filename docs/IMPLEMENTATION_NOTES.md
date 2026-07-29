@@ -563,7 +563,13 @@ to the durable outbox. It does not receive the Telegram bot token. Stable
 caller-provided keys and a content hash make retries idempotent. Canonical
 skill definitions live under `skills/` and are installed in both the Codex and
 Claude user skill directories. Voice messages send their bounded text to
-Microsoft Edge TTS.
+Microsoft Edge TTS. The voice helper performs synthesis synchronously before
+creating the durable outbox row. Its skill therefore requires agents to keep
+the helper in the foreground through its explicit queued result, resume any
+yielded command session instead of treating the session ID as success, and
+verify the outbox's Telegram `sent` result before claiming delivery. Ending a
+managed turn during synthesis tears down the helper before anything durable
+exists.
 
 The repo also owns the implicitly triggered `telegram-group-icon` skill.
 Inside an active managed turn it can create or select a square PNG/JPEG and
