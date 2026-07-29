@@ -39,8 +39,11 @@ working directory stay in the owner-only local configuration.
 
 The runner does not invoke a shell, requires an absolute executable and
 working directory, limits execution to 120 seconds, bounds returned stdout,
-and reports failures without echoing command output. Focused tests cover
-successful execution, unknown keys, and unsafe configuration permissions.
+and reports failures without echoing command output. A callback payload may set
+`suppress_output: true` for commands that update an existing Telegram message;
+successful stdout is then discarded while failures still produce an error
+message. Focused tests cover successful execution, unknown keys, unsafe
+configuration permissions, and callback output suppression.
 
 ## Stage 0 baseline
 

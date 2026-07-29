@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 import local_actions
+import on_message
 
 
 class LocalActionTests(unittest.TestCase):
@@ -76,7 +77,19 @@ class LocalActionTests(unittest.TestCase):
                     config_path=path,
                 )
 
+    def test_callback_can_suppress_success_output(self) -> None:
+        self.assertFalse(
+            on_message.should_send_local_action_output(
+                {"suppress_output": True}
+            )
+        )
+        self.assertTrue(
+            on_message.should_send_local_action_output(
+                {"suppress_output": False}
+            )
+        )
+        self.assertTrue(on_message.should_send_local_action_output({}))
+
 
 if __name__ == "__main__":
     unittest.main()
-

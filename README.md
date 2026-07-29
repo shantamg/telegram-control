@@ -186,7 +186,10 @@ explicitly allowlisted in
 `~/.config/telegram-control/local-actions.json`. Telegram carries only an
 opaque callback token and an action key; it never receives the command or local
 paths. Commands run directly without a shell, have a maximum two-minute
-timeout, and return bounded stdout to the originating topic.
+timeout, and normally return bounded stdout to the originating topic. A trusted
+integration can set `suppress_output: true` on the durable callback payload
+when the command updates an existing Telegram card itself; failures are still
+posted to the topic.
 
 The configuration file must be owned by the current macOS user and must not be
 group- or world-writable. A local action is not exposed automatically: a

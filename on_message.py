@@ -109,6 +109,12 @@ def workspace_question() -> str:
         if control_agent_enabled()
         else WORKSPACE_QUESTION
     )
+
+
+def should_send_local_action_output(payload: dict) -> bool:
+    return payload.get("suppress_output") is not True
+
+
 def deliver_api_call(
     method: str,
     params: dict,
@@ -5122,7 +5128,8 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         except local_actions.LocalActionError as exc:
             send_message(f"❌ {exc}")
             return
-        send_message(output)
+        if should_send_local_action_output(action.payload):
+            send_message(output)
         return
     if action.action_type == "refresh_status":
         chat_id, thread_id = surface_coordinates()
