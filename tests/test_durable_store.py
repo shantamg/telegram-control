@@ -10560,6 +10560,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 receipt = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(receipt.params["message_thread_id"], 62)
                 self.assertIn("📨 <b>Queued</b>", receipt.params["text"])
+                self.assertIsNone(
+                    store.claim_outbox("sender-2", now=10**12),
+                    "accepted agent messages must not queue a reaction",
+                )
 
                 followup = forum_update(
                     11,

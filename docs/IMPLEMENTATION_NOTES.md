@@ -1895,13 +1895,13 @@ composer with a descriptive placeholder. In the paired private chat, where
 ephemeral group messages do not apply, it instead offers Telegram's native
 forum-group picker with the bot's required administrator rights.
 
-The same primitives now improve normal setup and lifecycle flows. Unbound-group
+The same primitives improved normal setup and lifecycle flows. Unbound-group
 path prompts use ForceReply with a folder-path placeholder, add/bind actions use
 the primary button style, and destructive group/topic teardown confirmations
-use Telegram's red danger style. Ordinary text accepted by an agent or the
-optional Control router also queues a 👀 reaction on the source message while
-retaining the durable progress card. Styling and reactions add no callback
-authority: every mutating button still resolves its existing
+use Telegram's red danger style. This release also initially queued a 👀
+reaction on ordinary text accepted by an agent or the optional Control router;
+that automatic reaction was later removed. Styling adds no callback authority:
+every mutating button still resolves its existing
 owner/chat/topic-bound durable action.
 
 The composer menu is now scoped with `all_private_chats` and
@@ -1918,3 +1918,18 @@ button styles, copy actions, reaction, ephemeral group hint, and ForceReply in
 the current managed topic. `getMyCommands` returned the intended private and
 group scopes after publication. All 413 tests passed with the repository's
 `/usr/bin/python3` interpreter, followed by compilation and `git diff --check`.
+
+## Remove automatic eyes reactions
+
+Ordinary accepted messages no longer receive an automatic 👀 reaction. This
+applies to agent turns, active-turn steering, optional Control-router input, and
+messages accepted by report-only detached-worker topics. Their durable progress
+cards and queue receipts remain unchanged. `/showcase` still demonstrates an
+explicit reaction because reactions are part of that opt-in UI preview.
+
+This is a fresh-handler-only change: it adds no schema migration or daemon-side
+protocol variant, so it does not require a controller restart.
+
+Verified on July 28, 2026 with a regression assertion that accepted agent
+messages queue only their durable receipt, the complete 413-test suite, Python
+compilation, and `git diff --check`.

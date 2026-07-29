@@ -201,23 +201,6 @@ def surface_display_name() -> str:
     )
 
 
-def react_to_current_message(emoji: str) -> None:
-    """Queue a low-clutter lifecycle marker on the accepted user message."""
-    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
-    message_id_text = os.environ.get("TELEGRAM_MESSAGE_ID")
-    if not chat_id_text or not message_id_text:
-        return
-    deliver_api_call(
-        "setMessageReaction",
-        telegram_native_ui.reaction_params(
-            int(chat_id_text),
-            int(message_id_text),
-            emoji,
-        ),
-        f"message-reaction:{emoji}",
-    )
-
-
 def handle_report_only_topic() -> bool:
     """Answer worker-topic input by policy before any conversational routing."""
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
@@ -704,9 +687,6 @@ def enqueue_agent_reply_input(
             receipt_parse_mode="HTML",
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
         )
-    react_to_current_message("👀")
-
-
 def try_enqueue_agent_steer(route, text: str) -> bool:
     """Treat a reply to the exact active turn card as live guidance."""
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
@@ -725,8 +705,6 @@ def try_enqueue_agent_steer(route, text: str) -> bool:
             message_thread_id=thread_id,
             replied_message_id=route.telegram_message_id,
         )
-    if control is not None:
-        react_to_current_message("👀")
     return control is not None
 
 
@@ -1120,9 +1098,6 @@ def enqueue_agent_input(
             receipt_parse_mode="HTML",
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
         )
-    react_to_current_message("👀")
-
-
 def enqueue_router_input(
     text: str,
     replied_message_id: Optional[int] = None,
@@ -1160,9 +1135,6 @@ def enqueue_router_input(
             receipt_parse_mode="HTML",
             replied_message_id=replied_message_id,
         )
-    react_to_current_message("👀")
-
-
 def proposed_forum_setup(
     text: str,
     *,

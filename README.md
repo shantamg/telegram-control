@@ -127,8 +127,6 @@ the bot or delete the group in Telegram after cleanup finishes.
   **Stop** remains independently available while work is active and interrupts
   it. A failed agent worker is recovered without restarting unrelated active
   topics.
-- Accepted text requests receive a lightweight 👀 reaction in addition to
-  their durable progress card.
 - Photos and documents up to 20 MB are saved to private local paths the agent
   can inspect.
 - `/help` is the in-Telegram source of truth for commands and workflows.
