@@ -832,20 +832,22 @@ Live setup:
 For immediate clean removal, send `/teardown` in the managed topic and confirm
 its Telegram card. If a topic is instead deleted directly in Telegram, the
 durable supervisor's `maintain-topics` loop repairs the stale state on its next
-check, at most once per day. The Bot API has no read-only topic lookup, so the
-check sends one silent invisible message and deletes it immediately.
-Telegram's explicit `message thread not found` (or equivalent invalid-topic
-response) atomically revokes the topic route, callbacks, reply routes, and
-status card, archives the forum subject and managed agent, frees the original
-slug, and forgets the controller's resumable provider-session
-pointer. Historical inbox/outbox and event rows remain as a compact audit
-trail. Network failures, permission errors, closed topics, and all ambiguous
-responses leave the binding active and retry on a later cycle; active agent
-work or a running console also defers cleanup. A crash in the narrow interval
-between the probe send and delete may leave an empty, silent message, which is
-recorded for diagnosis rather than risking deletion of a valid topic. The
-maintenance process starts and restarts with the same LaunchAgent-backed
-supervisor as the rest of Telegram Control. For a one-time diagnostic run:
+check, at most once per day. The Bot API has no read-only topic lookup, but a
+non-General topic's ID is also the ID of its non-editable topic-creation
+service message. The check attempts to edit that root message without sending
+anything: an open or closed topic returns `message can't be edited`, while a
+deleted topic returns `message to edit not found`. General is non-deletable and
+requires no API probe. A definitive missing-root response atomically revokes
+the topic route, callbacks, reply routes, and status card, archives the forum
+subject and managed agent, frees the original slug, and forgets the
+controller's resumable provider-session pointer. Historical inbox/outbox and
+event rows remain as a compact audit trail. Network failures, permission
+errors, unexpected edit success, and all ambiguous responses leave the binding
+active and retry on a later cycle; active agent work or a running console also
+defers cleanup. The probe creates no Telegram message, notification, or unread
+state. The maintenance process starts and restarts with the same
+LaunchAgent-backed supervisor as the rest of Telegram Control. For a one-time
+diagnostic run:
 
 ```sh
 /usr/bin/python3 telegram_control.py maintain-topics --once

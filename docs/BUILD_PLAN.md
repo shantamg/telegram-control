@@ -294,10 +294,11 @@ delivery.
   or one small supervisor with separately observable loops.
 - The deployed supervisor also runs a daily topic-maintenance reconciler.
   Because the Bot API does not emit ordinary topic-deletion updates or expose
-  a read-only topic lookup, it sends and immediately deletes a silent invisible
-  probe. It retires local routes only after Telegram explicitly reports the
-  topic missing. Ambiguous failures fail closed, active work defers cleanup,
-  and ordinary Telegram deletion remains the primary user workflow.
+  a read-only topic lookup, it attempts to edit each non-General topic's
+  non-editable root service message. `message can't be edited` proves an open
+  or closed topic is alive, while `message to edit not found` proves its root
+  was deleted. Ambiguous failures fail closed, active work defers cleanup, and
+  ordinary Telegram deletion remains the primary user workflow.
 - Use atomic database transactions; never store critical state only in memory.
 - Add a startup self-check for Keychain, database integrity, free disk space,
   Handy, ffmpeg, Codex, Claude, and tmux.

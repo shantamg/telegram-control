@@ -74,7 +74,7 @@ DEFAULT_AGENT_WORKERS = 8
 MAX_AGENT_WORKERS = 16
 TOPIC_PROBE_INTERVAL_SECONDS = 24 * 60 * 60
 TOPIC_PROBE_BATCH_SIZE = 100
-TOPIC_PROBE_TEXT = "\u2063"
+TOPIC_ROOT_PROBE_TEXT = "Telegram Control topic existence probe"
 ROUTER_MAX_COMPLETED_TURNS = 12
 ROUTER_MAX_INPUT_TOKENS = 180_000
 ROUTER_MAX_DISCOVERY_STEPS = 6
@@ -85,6 +85,14 @@ MISSING_TOPIC_ERROR_MARKERS = (
     "message thread not found",
     "topic_id_invalid",
     "topic id invalid",
+)
+EXISTING_TOPIC_ROOT_ERROR_MARKERS = (
+    "message can't be edited",
+    "message cannot be edited",
+)
+MISSING_TOPIC_ROOT_ERROR_MARKERS = (
+    "message to edit not found",
+    *MISSING_TOPIC_ERROR_MARKERS,
 )
 RELOAD_JOB_PREFIX = "local.telegram-control.reload"
 DEFAULT_RESTART_DELAY_SECONDS = 20.0
@@ -2123,6 +2131,16 @@ def telegram_reports_missing_topic(error: str) -> bool:
     return any(marker in normalized for marker in MISSING_TOPIC_ERROR_MARKERS)
 
 
+def telegram_topic_root_probe_result(error: str) -> str:
+    """Classify an attempted edit of a topic-creation service message."""
+    normalized = " ".join(str(error).casefold().split())
+    if any(marker in normalized for marker in EXISTING_TOPIC_ROOT_ERROR_MARKERS):
+        return "alive"
+    if any(marker in normalized for marker in MISSING_TOPIC_ROOT_ERROR_MARKERS):
+        return "missing"
+    return "inconclusive"
+
+
 def probe_due_topics_once(
     store: DurableStore,
     token: str,
@@ -2133,12 +2151,14 @@ def probe_due_topics_once(
 ) -> dict[str, int]:
     """Reconcile active local routes against Telegram topic existence.
 
-    Telegram's Bot API has no read-only topic lookup, and no-op topic edits
-    return success even for nonexistent IDs. A silent invisible message is
-    therefore sent to each due topic and deleted immediately. Only an
-    explicit missing-thread response retires local state. Permission, network,
-    closed-topic, malformed-result, and all other failures remain
-    inconclusive.
+    Telegram's Bot API has no read-only topic lookup. For every non-General
+    forum topic, however, the topic ID is also the ID of its non-editable
+    topic-creation service message. Attempting to edit that root message is a
+    non-mutating existence check: an existing open or closed topic reports
+    that the message cannot be edited, while a deleted topic reports that the
+    message was not found. Only a definitive missing-root response retires
+    local state. General cannot be deleted, and permission, network, and all
+    other failures remain inconclusive.
     """
     timestamp = time.time() if now is None else float(now)
     counts = {"probed": 0, "alive": 0, "retired": 0, "deferred": 0}
@@ -2149,19 +2169,30 @@ def probe_due_topics_once(
     )
     for candidate in candidates:
         counts["probed"] += 1
-        try:
-            result = bridge.api_call(
-                token,
-                "sendMessage",
+        if candidate.message_thread_id == 1:
+            store.record_topic_probe(candidate.binding_id, now=timestamp)
+            counts["alive"] += 1
+            log_event(
+                "topic_probe_result",
+                binding_id=candidate.binding_id,
                 chat_id=candidate.chat_id,
                 message_thread_id=candidate.message_thread_id,
-                text=TOPIC_PROBE_TEXT,
-                disable_notification=True,
-                protect_content=True,
+                result="alive",
+                probe="non_deletable_general",
+            )
+            continue
+        try:
+            bridge.api_call(
+                token,
+                "editMessageText",
+                chat_id=candidate.chat_id,
+                message_id=candidate.message_thread_id,
+                text=TOPIC_ROOT_PROBE_TEXT,
             )
         except bridge.BridgeError as exc:
             error = str(exc)
-            if telegram_reports_missing_topic(error):
+            probe_result = telegram_topic_root_probe_result(error)
+            if probe_result == "missing":
                 retired = store.retire_missing_topic(
                     candidate.binding_id,
                     reason=error,
@@ -2174,6 +2205,17 @@ def probe_due_topics_once(
                     chat_id=candidate.chat_id,
                     message_thread_id=candidate.message_thread_id,
                     retired=retired,
+                )
+            elif probe_result == "alive":
+                store.record_topic_probe(candidate.binding_id, now=timestamp)
+                counts["alive"] += 1
+                log_event(
+                    "topic_probe_result",
+                    binding_id=candidate.binding_id,
+                    chat_id=candidate.chat_id,
+                    message_thread_id=candidate.message_thread_id,
+                    result="alive",
+                    probe="topic_root_service_message",
                 )
             else:
                 store.record_topic_probe(
@@ -2190,56 +2232,22 @@ def probe_due_topics_once(
                     result="inconclusive",
                 )
         else:
-            probe_message_id = (
-                int(result["message_id"])
-                if isinstance(result, dict)
-                and isinstance(result.get("message_id"), int)
-                else None
+            error = (
+                "Telegram unexpectedly allowed editing a topic-creation "
+                "service message; topic existence is inconclusive."
             )
-            if probe_message_id is None:
-                error = "Telegram returned no message ID for the topic probe."
-                store.record_topic_probe(
-                    candidate.binding_id,
-                    error=error,
-                    now=timestamp,
-                )
-                counts["deferred"] += 1
-                log_event(
-                    "topic_probe_result",
-                    binding_id=candidate.binding_id,
-                    chat_id=candidate.chat_id,
-                    message_thread_id=candidate.message_thread_id,
-                    result="inconclusive",
-                )
-                continue
-            cleanup_error = None
-            try:
-                bridge.api_call(
-                    token,
-                    "deleteMessage",
-                    chat_id=candidate.chat_id,
-                    message_id=probe_message_id,
-                )
-            except bridge.BridgeError as exc:
-                # The successful send already proved that the topic exists.
-                # Record a possible orphaned invisible probe for diagnostics.
-                cleanup_error = (
-                    f"Topic exists, but its probe message could not be "
-                    f"deleted: {exc}"
-                )
             store.record_topic_probe(
                 candidate.binding_id,
-                error=cleanup_error,
+                error=error,
                 now=timestamp,
             )
-            counts["alive"] += 1
+            counts["deferred"] += 1
             log_event(
                 "topic_probe_result",
                 binding_id=candidate.binding_id,
                 chat_id=candidate.chat_id,
                 message_thread_id=candidate.message_thread_id,
-                result="alive",
-                probe_deleted=cleanup_error is None,
+                result="inconclusive",
             )
     return counts
 
