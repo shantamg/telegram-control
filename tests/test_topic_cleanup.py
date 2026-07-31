@@ -176,18 +176,19 @@ class TopicCleanupTests(unittest.TestCase):
         live = self.create_topic(thread_id=64, now=100)
 
         def api_call(_token, method, **params):
-            if method == "deleteMessage":
-                return True
-            thread_id = params["message_thread_id"]
+            self.assertEqual(method, "editMessageText")
+            thread_id = params["message_id"]
             if thread_id == 62:
                 raise telegram_bridge.BridgeError(
-                    "Bad Request: message thread not found"
+                    "Bad Request: message to edit not found"
                 )
             if thread_id == 63:
                 raise telegram_bridge.BridgeError(
                     "Could not reach Telegram. Check this Mac's internet connection."
                 )
-            return {"message_id": 700 + thread_id}
+            raise telegram_bridge.BridgeError(
+                "Bad Request: message can't be edited"
+            )
 
         with mock.patch.object(telegram_control.bridge, "api_call", side_effect=api_call):
             counts = telegram_control.probe_due_topics_once(
@@ -220,15 +221,16 @@ class TopicCleanupTests(unittest.TestCase):
             )
         )
 
-    def test_probe_delete_failure_does_not_retire_a_live_topic(self):
+    def test_probe_edits_the_noneditable_topic_root_without_sending(self):
         topic = self.create_topic(now=100)
 
-        def api_call(_token, method, **_params):
-            if method == "sendMessage":
-                return {"message_id": 700}
-            raise telegram_bridge.BridgeError("Could not delete probe")
-
-        with mock.patch.object(telegram_control.bridge, "api_call", side_effect=api_call):
+        with mock.patch.object(
+            telegram_control.bridge,
+            "api_call",
+            side_effect=telegram_bridge.BridgeError(
+                "Bad Request: message can't be edited"
+            ),
+        ) as api_call:
             counts = telegram_control.probe_due_topics_once(
                 self.store,
                 "token",
@@ -237,6 +239,64 @@ class TopicCleanupTests(unittest.TestCase):
             )
 
         self.assertEqual(counts["alive"], 1)
+        api_call.assert_called_once_with(
+            "token",
+            "editMessageText",
+            chat_id=topic.chat_id,
+            message_id=topic.message_thread_id,
+            text=telegram_control.TOPIC_ROOT_PROBE_TEXT,
+        )
+        self.assertIsNotNone(
+            self.store.resolve_surface_binding(
+                topic.chat_id,
+                topic.message_thread_id,
+            )
+        )
+
+    def test_unexpected_success_is_inconclusive(self):
+        topic = self.create_topic(now=100)
+
+        with mock.patch.object(
+            telegram_control.bridge,
+            "api_call",
+            return_value={"message_id": topic.message_thread_id},
+        ):
+            counts = telegram_control.probe_due_topics_once(
+                self.store,
+                "token",
+                interval_seconds=100,
+                now=200,
+            )
+
+        self.assertEqual(
+            counts,
+            {"probed": 1, "alive": 0, "retired": 0, "deferred": 1},
+        )
+        row = self.store.connection.execute(
+            """
+            SELECT last_probe_error FROM surface_bindings
+            WHERE binding_id = ?
+            """,
+            (topic.binding_id,),
+        ).fetchone()
+        self.assertIn("unexpectedly allowed editing", row["last_probe_error"])
+
+    def test_general_topic_is_alive_without_an_api_call(self):
+        topic = self.create_topic(thread_id=1, now=100)
+
+        with mock.patch.object(telegram_control.bridge, "api_call") as api_call:
+            counts = telegram_control.probe_due_topics_once(
+                self.store,
+                "token",
+                interval_seconds=100,
+                now=200,
+            )
+
+        self.assertEqual(
+            counts,
+            {"probed": 1, "alive": 1, "retired": 0, "deferred": 0},
+        )
+        api_call.assert_not_called()
         self.assertIsNotNone(
             self.store.resolve_surface_binding(
                 topic.chat_id,
