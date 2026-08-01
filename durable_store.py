@@ -148,14 +148,6 @@ class SurfaceBinding:
 
 
 @dataclass(frozen=True)
-class TopicProbe:
-    binding_id: int
-    chat_id: int
-    message_thread_id: int
-    display_name: str
-
-
-@dataclass(frozen=True)
 class SurfaceCard:
     card_id: int
     binding_id: int
@@ -1010,11 +1002,10 @@ MIGRATION_19 = (
 )
 
 MIGRATION_20 = (
-    # The Bot API does not emit ordinary topic-deletion updates. A supervised
-    # maintenance loop therefore sends and immediately deletes a silent,
-    # invisible probe periodically and records its schedule here. Only a
-    # definitive "thread not found" result retires local routing metadata;
-    # all other Telegram failures fail closed.
+    # These columns originally scheduled proactive topic-existence probes.
+    # Probing was retired because even rejected Bot API calls can create
+    # unread topic activity in Telegram clients. Keep the additive schema for
+    # compatibility and use the fields only for explicit retirement details.
     """
     ALTER TABLE surface_bindings
     ADD COLUMN last_probe_at REAL
@@ -3770,64 +3761,6 @@ class DurableStore:
             (int(chat_id),),
         ).fetchall()
         return [self._surface_binding_from_row(row) for row in rows]
-
-    def list_due_topic_probes(
-        self,
-        *,
-        now: Optional[float] = None,
-        interval_seconds: float = 24 * 60 * 60,
-        limit: int = 100,
-    ) -> list[TopicProbe]:
-        """Return active Telegram topics whose quiet existence check is due."""
-        timestamp = time.time() if now is None else float(now)
-        interval = float(interval_seconds)
-        if interval <= 0:
-            raise StoreError("Topic probe interval must be positive.")
-        count = int(limit)
-        if count < 1 or count > 1000:
-            raise StoreError("Topic probe batch size must be between 1 and 1000.")
-        cutoff = timestamp - interval
-        rows = self.connection.execute(
-            """
-            SELECT binding_id, chat_id, message_thread_id, display_name
-            FROM surface_bindings
-            WHERE state = 'active' AND message_thread_id != 0
-                AND COALESCE(last_probe_at, updated_at) <= ?
-            ORDER BY COALESCE(last_probe_at, updated_at), binding_id
-            LIMIT ?
-            """,
-            (cutoff, count),
-        ).fetchall()
-        return [
-            TopicProbe(
-                binding_id=int(row["binding_id"]),
-                chat_id=int(row["chat_id"]),
-                message_thread_id=int(row["message_thread_id"]),
-                display_name=str(row["display_name"]),
-            )
-            for row in rows
-        ]
-
-    def record_topic_probe(
-        self,
-        binding_id: int,
-        *,
-        error: Optional[str] = None,
-        now: Optional[float] = None,
-    ) -> bool:
-        """Record one conclusive-live or inconclusive topic probe."""
-        timestamp = time.time() if now is None else float(now)
-        message = str(error)[:1000] if error else None
-        cursor = self.connection.execute(
-            """
-            UPDATE surface_bindings
-            SET last_probe_at = ?, last_probe_error = ?
-            WHERE binding_id = ? AND state = 'active'
-                AND message_thread_id != 0
-            """,
-            (timestamp, message, int(binding_id)),
-        )
-        return cursor.rowcount == 1
 
     def retire_missing_topic(
         self,

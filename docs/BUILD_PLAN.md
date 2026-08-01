@@ -292,13 +292,11 @@ delivery.
 - Add exponential network retry instead of a fixed tight loop.
 - Start the collector, worker, sender, and reconciler as supervised processes
   or one small supervisor with separately observable loops.
-- The deployed supervisor also runs a daily topic-maintenance reconciler.
-  Because the Bot API does not emit ordinary topic-deletion updates or expose
-  a read-only topic lookup, it attempts to edit each non-General topic's
-  non-editable root service message. `message can't be edited` proves an open
-  or closed topic is alive, while `message to edit not found` proves its root
-  was deleted. Ambiguous failures fail closed, active work defers cleanup, and
-  ordinary Telegram deletion remains the primary user workflow.
+- Do not proactively probe topics for existence. The Bot API does not expose a
+  read-only topic lookup, and even a rejected edit of a topic's root service
+  message can make the topic appear unread in Telegram clients. Prefer
+  explicit `/teardown` and `/removegroup`; direct deletion in Telegram may
+  leave harmless stale local metadata.
 - Use atomic database transactions; never store critical state only in memory.
 - Add a startup self-check for Keychain, database integrity, free disk space,
   Handy, ffmpeg, Codex, Claude, and tmux.

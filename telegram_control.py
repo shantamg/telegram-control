@@ -72,9 +72,6 @@ MANAGED_SHARED_SKILLS = (
 )
 DEFAULT_AGENT_WORKERS = 8
 MAX_AGENT_WORKERS = 16
-TOPIC_PROBE_INTERVAL_SECONDS = 24 * 60 * 60
-TOPIC_PROBE_BATCH_SIZE = 100
-TOPIC_ROOT_PROBE_TEXT = "Telegram Control topic existence probe"
 ROUTER_MAX_COMPLETED_TURNS = 12
 ROUTER_MAX_INPUT_TOKENS = 180_000
 ROUTER_MAX_DISCOVERY_STEPS = 6
@@ -85,14 +82,6 @@ MISSING_TOPIC_ERROR_MARKERS = (
     "message thread not found",
     "topic_id_invalid",
     "topic id invalid",
-)
-EXISTING_TOPIC_ROOT_ERROR_MARKERS = (
-    "message can't be edited",
-    "message cannot be edited",
-)
-MISSING_TOPIC_ROOT_ERROR_MARKERS = (
-    "message to edit not found",
-    *MISSING_TOPIC_ERROR_MARKERS,
 )
 RELOAD_JOB_PREFIX = "local.telegram-control.reload"
 DEFAULT_RESTART_DELAY_SECONDS = 20.0
@@ -2131,145 +2120,6 @@ def telegram_reports_missing_topic(error: str) -> bool:
     return any(marker in normalized for marker in MISSING_TOPIC_ERROR_MARKERS)
 
 
-def telegram_topic_root_probe_result(error: str) -> str:
-    """Classify an attempted edit of a topic-creation service message."""
-    normalized = " ".join(str(error).casefold().split())
-    if any(marker in normalized for marker in EXISTING_TOPIC_ROOT_ERROR_MARKERS):
-        return "alive"
-    if any(marker in normalized for marker in MISSING_TOPIC_ROOT_ERROR_MARKERS):
-        return "missing"
-    return "inconclusive"
-
-
-def probe_due_topics_once(
-    store: DurableStore,
-    token: str,
-    *,
-    interval_seconds: float = TOPIC_PROBE_INTERVAL_SECONDS,
-    batch_size: int = TOPIC_PROBE_BATCH_SIZE,
-    now: Optional[float] = None,
-) -> dict[str, int]:
-    """Reconcile active local routes against Telegram topic existence.
-
-    Telegram's Bot API has no read-only topic lookup. For every non-General
-    forum topic, however, the topic ID is also the ID of its non-editable
-    topic-creation service message. Attempting to edit that root message is a
-    non-mutating existence check: an existing open or closed topic reports
-    that the message cannot be edited, while a deleted topic reports that the
-    message was not found. Only a definitive missing-root response retires
-    local state. General cannot be deleted, and permission, network, and all
-    other failures remain inconclusive.
-    """
-    timestamp = time.time() if now is None else float(now)
-    counts = {"probed": 0, "alive": 0, "retired": 0, "deferred": 0}
-    candidates = store.list_due_topic_probes(
-        now=timestamp,
-        interval_seconds=interval_seconds,
-        limit=batch_size,
-    )
-    for candidate in candidates:
-        counts["probed"] += 1
-        if candidate.message_thread_id == 1:
-            store.record_topic_probe(candidate.binding_id, now=timestamp)
-            counts["alive"] += 1
-            log_event(
-                "topic_probe_result",
-                binding_id=candidate.binding_id,
-                chat_id=candidate.chat_id,
-                message_thread_id=candidate.message_thread_id,
-                result="alive",
-                probe="non_deletable_general",
-            )
-            continue
-        try:
-            bridge.api_call(
-                token,
-                "editMessageText",
-                chat_id=candidate.chat_id,
-                message_id=candidate.message_thread_id,
-                text=TOPIC_ROOT_PROBE_TEXT,
-            )
-        except bridge.BridgeError as exc:
-            error = str(exc)
-            probe_result = telegram_topic_root_probe_result(error)
-            if probe_result == "missing":
-                retired = store.retire_missing_topic(
-                    candidate.binding_id,
-                    reason=error,
-                    now=timestamp,
-                )
-                counts["retired" if retired else "deferred"] += 1
-                log_event(
-                    "topic_probe_missing",
-                    binding_id=candidate.binding_id,
-                    chat_id=candidate.chat_id,
-                    message_thread_id=candidate.message_thread_id,
-                    retired=retired,
-                )
-            elif probe_result == "alive":
-                store.record_topic_probe(candidate.binding_id, now=timestamp)
-                counts["alive"] += 1
-                log_event(
-                    "topic_probe_result",
-                    binding_id=candidate.binding_id,
-                    chat_id=candidate.chat_id,
-                    message_thread_id=candidate.message_thread_id,
-                    result="alive",
-                    probe="topic_root_service_message",
-                )
-            else:
-                store.record_topic_probe(
-                    candidate.binding_id,
-                    error=error,
-                    now=timestamp,
-                )
-                counts["deferred"] += 1
-                log_event(
-                    "topic_probe_result",
-                    binding_id=candidate.binding_id,
-                    chat_id=candidate.chat_id,
-                    message_thread_id=candidate.message_thread_id,
-                    result="inconclusive",
-                )
-        else:
-            error = (
-                "Telegram unexpectedly allowed editing a topic-creation "
-                "service message; topic existence is inconclusive."
-            )
-            store.record_topic_probe(
-                candidate.binding_id,
-                error=error,
-                now=timestamp,
-            )
-            counts["deferred"] += 1
-            log_event(
-                "topic_probe_result",
-                binding_id=candidate.binding_id,
-                chat_id=candidate.chat_id,
-                message_thread_id=candidate.message_thread_id,
-                result="inconclusive",
-            )
-    return counts
-
-
-def maintain_topics_command(args: argparse.Namespace) -> None:
-    """Periodically retire routes for topics deleted directly in Telegram."""
-    token = bridge.read_token()
-    with open_store(args.db) as store:
-        while True:
-            counts = probe_due_topics_once(
-                store,
-                token,
-                interval_seconds=args.interval_seconds,
-                batch_size=args.batch_size,
-            )
-            if counts["probed"]:
-                log_event("topic_maintenance_cycle", **counts)
-            if args.once:
-                return
-            time.sleep(args.idle_sleep)
-
-
 def supervisor_commands(
     database_path: Path,
     agent_workers: int = DEFAULT_AGENT_WORKERS,
@@ -2289,7 +2139,6 @@ def supervisor_commands(
         commands.append([*base, "work-router"])
     commands.extend([*base, "work-agents"] for _ in range(count))
     commands.append([*base, "maintain-workers"])
-    commands.append([*base, "maintain-topics"])
     commands.append([*base, "send-outbox"])
     return commands
 
@@ -3775,36 +3624,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_loop_arguments(outbox_parser, lease_seconds=90)
     outbox_parser.set_defaults(function=send_outbox_command)
-
-    topic_maintenance_parser = subparsers.add_parser(
-        "maintain-topics",
-        help="Retire controller routes for topics deleted directly in Telegram.",
-    )
-    topic_maintenance_parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Probe one due batch and exit.",
-    )
-    topic_maintenance_parser.add_argument(
-        "--interval-seconds",
-        type=float,
-        default=TOPIC_PROBE_INTERVAL_SECONDS,
-        help="Minimum seconds between existence checks for a topic.",
-    )
-    topic_maintenance_parser.add_argument(
-        "--batch-size",
-        type=int,
-        choices=range(1, 1001),
-        default=TOPIC_PROBE_BATCH_SIZE,
-        help="Maximum topics checked in one maintenance cycle.",
-    )
-    topic_maintenance_parser.add_argument(
-        "--idle-sleep",
-        type=float,
-        default=5 * 60,
-        help="Seconds between checks for newly due topics.",
-    )
-    topic_maintenance_parser.set_defaults(function=maintain_topics_command)
 
     worker_maintenance_parser = subparsers.add_parser(
         "maintain-workers",

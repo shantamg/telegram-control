@@ -829,29 +829,19 @@ Live setup:
    session; later requests continue it. Send `/status` in that topic to inspect
    or control its managed agent.
 
-For immediate clean removal, send `/teardown` in the managed topic and confirm
-its Telegram card. If a topic is instead deleted directly in Telegram, the
-durable supervisor's `maintain-topics` loop repairs the stale state on its next
-check, at most once per day. The Bot API has no read-only topic lookup, but a
-non-General topic's ID is also the ID of its non-editable topic-creation
-service message. The check attempts to edit that root message without sending
-anything: an open or closed topic returns `message can't be edited`, while a
-deleted topic returns `message to edit not found`. General is non-deletable and
-requires no API probe. A definitive missing-root response atomically revokes
-the topic route, callbacks, reply routes, and status card, archives the forum
-subject and managed agent, frees the original slug, and forgets the
-controller's resumable provider-session pointer. Historical inbox/outbox and
-event rows remain as a compact audit trail. Network failures, permission
-errors, unexpected edit success, and all ambiguous responses leave the binding
-active and retry on a later cycle; active agent work or a running console also
-defers cleanup. The probe creates no Telegram message, notification, or unread
-state. The maintenance process starts and restarts with the same
-LaunchAgent-backed supervisor as the rest of Telegram Control. For a one-time
-diagnostic run:
-
-```sh
-/usr/bin/python3 telegram_control.py maintain-topics --once
-```
+For clean removal, send `/teardown` in the managed topic and confirm its
+Telegram card, or use `/removegroup` for the whole project group. Telegram's
+Bot API emits no ordinary topic-deletion update and exposes no read-only topic
+lookup. An earlier daily reconciler tried both a send-and-delete probe and a
+rejected edit of each topic's root service message; in practice these calls
+could still create notification or unread activity in Telegram clients. The
+supervisor and CLI therefore perform no proactive topic-existence probes.
+Deleting a topic directly in Telegram may leave harmless stale local routing
+metadata and its provider-session pointer until a later explicit group
+removal. This is an intentional tradeoff to keep inactive topics completely
+quiet. The additive `last_probe_*` schema columns remain for compatibility and
+for recording explicit missing-topic retirement details; no schema downgrade
+is required.
 
 Replies that legitimately remain with the main router (receipts, direct
 responses, relayed continuation chunks, fallback deliveries) now carry bounded
