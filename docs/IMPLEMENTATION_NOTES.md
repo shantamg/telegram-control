@@ -1116,6 +1116,27 @@ generations, and the confirm/fail handshake all stay. Removing them means a
 schema migration on a live system for no behavioral gain, so the columns simply
 go quiet and `RECOVERY.md` is created but never mentioned to the worker.
 
+### Delivering a brief is verified, not assumed
+
+`send_brief` sends the text and the Enter as separate `send-keys` calls, because
+combining them swallows the Enter and parks the whole brief in the composer. It
+turns out separating them is necessary but not sufficient: interactive providers
+process bracketed paste asynchronously, so an Enter can arrive before the paste
+is submit-ready and be lost the same way. The old code slept 0.2 s and returned,
+printing "Brief delivered" whether or not anything had been.
+
+It now checks. `pane_text` captures the pane and `_still_in_composer` looks for a
+prompt line (`❯` or `>`) whose typed text matches the opening of the brief —
+comparing on whatever both actually have, since a long brief wraps and the
+prompt line holds only its start, with an eight-character floor so a short
+unrelated line cannot match by accident. While the brief is still sitting there,
+another bare Enter goes out, up to four times; if it never clears, `send_brief`
+raises instead of claiming a delivery that did not happen.
+
+The same trap catches agents steering a pane by hand, so the skill now
+documents the send / Enter / verify sequence and `C-u` for clearing a stale
+composer.
+
 ### Recovery needs no agent
 
 A longer experiment removed the remaining reason to prompt on recovery. A worker

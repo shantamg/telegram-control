@@ -51,6 +51,9 @@ RECOVERY_CONFIRM_TIMEOUT_SECONDS = 30 * 60
 SESSION_DISCOVERY_TIMEOUT_SECONDS = 15
 SESSION_DISCOVERY_POLL_SECONDS = 0.25
 BRIEF_SUBMIT_DELAY_SECONDS = 0.2
+BRIEF_SUBMIT_ATTEMPTS = 4
+BRIEF_SUBMIT_POLL_SECONDS = 0.75
+_COMPOSER_MATCH_CHARS = 8
 
 DEFAULT_RECOVERY_PROMPT = """You have been automatically resumed after the host or detached session stopped unexpectedly.
 
@@ -412,12 +415,62 @@ def resume_command_for(
     return command
 
 
+def pane_text(session: str) -> str:
+    """What the session's pane is currently showing."""
+    result = subprocess.run(
+        [tmux_console.tmux_binary(), "capture-pane", "-p", "-t", session],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout or ""
+
+
+def _still_in_composer(pane: str, text: str) -> bool:
+    """Is `text` sitting at a prompt, typed but never submitted?
+
+    Providers draw the composer as a prompt marker followed by whatever has
+    been typed. Once submitted the text moves into the transcript above and no
+    prompt line carries it any more, so a prompt line that still starts with
+    the opening words is the signature of an Enter that did not land.
+    """
+    probe = " ".join(text.split())
+    if len(probe) < _COMPOSER_MATCH_CHARS:
+        return False
+    # Only the *last* prompt line is the composer. Providers echo submitted
+    # messages back into the transcript behind a marker of their own — Claude
+    # uses "> " — so scanning every line finds the successful delivery and
+    # reads it as a failure.
+    typed = None
+    for line in reversed(pane.splitlines()):
+        stripped = line.strip()
+        if stripped[:1] in {"❯", ">"}:
+            typed = " ".join(stripped[1:].split())
+            break
+    if not typed:
+        return False
+    # A long brief wraps, so the composer line holds only its opening. Compare
+    # on whatever both actually have, floored so a stray short line cannot
+    # match by accident.
+    shared = min(len(typed), len(probe), 40)
+    if shared < _COMPOSER_MATCH_CHARS:
+        return False
+    return typed[:shared] == probe[:shared]
+
+
 def send_brief(name: str, brief: str) -> None:
     """Type a brief into the worker's session and submit it.
 
     Sent as a separate step from the launch so the provider has finished
     starting before it receives instructions, and so a caller can send further
     guidance later through the same path.
+
+    The submit is verified rather than assumed. Sending the text and Enter
+    together loses the Enter outright, and even sent separately it can arrive
+    while the paste is still being processed, leaving the whole brief parked in
+    the composer while the caller is told it was delivered. So this checks the
+    pane, re-sends a bare Enter while the text is still sitting there, and
+    raises rather than reporting a delivery that did not happen.
     """
     session = tmux_session_name(_validate_name(name))
     if not tmux_console.has_tmux_session(session):
@@ -433,11 +486,19 @@ def send_brief(name: str, brief: str) -> None:
     # small gap, Enter can arrive before the pasted brief becomes submit-ready
     # and leave the entire task sitting unsent in the prompt.
     time.sleep(BRIEF_SUBMIT_DELAY_SECONDS)
-    subprocess.run(
-        [tmux, "send-keys", "-t", session, "Enter"],
-        capture_output=True,
-        text=True,
-        check=False,
+    for _ in range(BRIEF_SUBMIT_ATTEMPTS):
+        subprocess.run(
+            [tmux, "send-keys", "-t", session, "Enter"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        time.sleep(BRIEF_SUBMIT_POLL_SECONDS)
+        if not _still_in_composer(pane_text(session), brief):
+            return
+    raise StoreError(
+        "The brief stayed in the worker's composer after "
+        f"{BRIEF_SUBMIT_ATTEMPTS} attempts to submit it. Nothing was delivered."
     )
 
 

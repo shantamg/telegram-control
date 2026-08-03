@@ -268,12 +268,87 @@ class DetachedWorkerLaunchTests(unittest.TestCase):
             mock.patch.object(detached_worker.subprocess, "run") as run,
             mock.patch.object(detached_worker.time, "sleep") as sleep,
         ):
-            detached_worker.send_brief("rails-fix", "Do the work.")
+            with mock.patch.object(
+                detached_worker,
+                "pane_text",
+                return_value="⏺ Working on it.\n❯ ",
+            ):
+                detached_worker.send_brief("rails-fix", "Do the work now.")
         self.assertEqual(run.call_count, 2)
-        sleep.assert_called_once_with(
-            detached_worker.BRIEF_SUBMIT_DELAY_SECONDS
+        self.assertEqual(
+            sleep.call_args_list[0].args,
+            (detached_worker.BRIEF_SUBMIT_DELAY_SECONDS,),
         )
+        self.assertEqual(run.call_args_list[0].args[0][-1], "Do the work now.")
         self.assertEqual(run.call_args_list[1].args[0][-1], "Enter")
+
+    def test_brief_left_in_the_composer_gets_another_bare_enter(self):
+        # First check still shows the brief typed but unsent; the second is
+        # clear, so exactly one extra Enter should have been needed.
+        panes = ["❯ Do the work now.", "⏺ Working on it.\n❯ "]
+        with (
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "has_tmux_session",
+                return_value=True,
+            ),
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "tmux_binary",
+                return_value="/bin/tmux",
+            ),
+            mock.patch.object(detached_worker.subprocess, "run") as run,
+            mock.patch.object(detached_worker.time, "sleep"),
+            mock.patch.object(
+                detached_worker,
+                "pane_text",
+                side_effect=panes,
+            ),
+        ):
+            detached_worker.send_brief("rails-fix", "Do the work now.")
+        enters = [
+            call for call in run.call_args_list if call.args[0][-1] == "Enter"
+        ]
+        self.assertEqual(len(enters), 2)
+
+    def test_delivered_brief_echoed_in_the_transcript_is_not_read_as_stuck(self):
+        # Claude echoes a submitted message back behind "> ", so scanning every
+        # prompt-marked line mistook a successful delivery for a failed one.
+        # Only the last such line is the composer.
+        brief = "Write the single word delivered into the proof file."
+        pane = (
+            "> Write the single word delivered into the proof file.\n"
+            "⏺ Done.\n"
+            "❯ "
+        )
+        self.assertFalse(detached_worker._still_in_composer(pane, brief))
+        self.assertTrue(
+            detached_worker._still_in_composer(f"⏺ idle\n❯ {brief}", brief)
+        )
+
+    def test_brief_that_never_submits_is_reported_not_claimed(self):
+        with (
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "has_tmux_session",
+                return_value=True,
+            ),
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "tmux_binary",
+                return_value="/bin/tmux",
+            ),
+            mock.patch.object(detached_worker.subprocess, "run"),
+            mock.patch.object(detached_worker.time, "sleep"),
+            mock.patch.object(
+                detached_worker,
+                "pane_text",
+                return_value="❯ Do the work now.",
+            ),
+            self.assertRaises(Exception) as caught,
+        ):
+            detached_worker.send_brief("rails-fix", "Do the work now.")
+        self.assertIn("Nothing was delivered", str(caught.exception))
 
 
 class ReportOnlyNoticeTests(unittest.TestCase):

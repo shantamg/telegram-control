@@ -102,6 +102,35 @@ tmux capture-pane -p -t detached--<name> | tail -40
 When polling a pane, do not grep for text you typed into it — your own prompt
 is in the buffer and will match. Check for a real artifact instead.
 
+## Typing into a pane yourself
+
+`worker-brief` already does this correctly and verifies it landed, so prefer it.
+When you must drive a pane directly — a confirmation dialog, a slash command,
+another tmux session entirely — the submit is the part that goes wrong:
+
+```bash
+tmux send-keys -t <session> 'your text'      # 1. the text, alone
+sleep 1
+tmux send-keys -t <session> Enter            # 2. Enter, as its own call
+sleep 1
+tmux capture-pane -p -t <session> | tail -5  # 3. check it actually went
+```
+
+Three rules, each of which has already bitten:
+
+- **Never put the text and `Enter` in one `send-keys`.** The Enter is swallowed
+  and the text sits in the composer unsent.
+- **Even sent separately, one Enter is not always enough.** Interactive
+  providers process bracketed paste asynchronously, so an Enter arriving too
+  early lands before the paste is submit-ready. A second bare `Enter` fixes it.
+- **Verify, do not assume.** A submitted message moves out of the composer into
+  the transcript and the pane shows the provider working — `esc to interrupt` or
+  similar. Your text still sitting on the `❯` prompt line means it never went.
+  Send another bare `Enter` and check again.
+
+Clear a stale composer with `tmux send-keys -t <session> C-u` before typing, or
+your text is appended to whatever was already there.
+
 ## Tearing a worker down
 
 When the user says the work is finished:
