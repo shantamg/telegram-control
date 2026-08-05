@@ -4693,10 +4693,10 @@ class DurableStoreTests(unittest.TestCase):
 
     def test_supervisor_recovery_requeues_only_the_exited_workers_turn(self):
         agent, _, _ = self._setup_routed_agent_turn()
-        dead_owner = (
-            f"{telegram_control.socket.gethostname()}:999999:"
-            "agent:deadbeef"
-        )
+        # macOS can change its hostname after a network transition. The
+        # single-Mac controller must still recover a lease created under the
+        # previous hostname.
+        dead_owner = "previous-host.local:999999:agent:deadbeef"
         mailbox = self.store.claim_agent_mailbox(dead_owner, now=109)
         self.store.attach_agent_mailbox_process(
             mailbox.mailbox_id,

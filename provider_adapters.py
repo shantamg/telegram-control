@@ -503,6 +503,7 @@ def consume_claude_events(
     events: Iterable[dict[str, Any]],
     existing_session_id: Optional[str] = None,
     on_session: Optional[Callable[[str], None]] = None,
+    empty_success_text: Optional[str] = None,
 ) -> ProviderTurnResult:
     session_id = existing_session_id
     final_text = ""
@@ -511,6 +512,7 @@ def consume_claude_events(
     notified_session = False
     latest_context_usage: dict[str, Any] = {}
     latest_context_model = ""
+    completed_successfully = False
     for event in events:
         candidate_value = event.get("session_id")
         if candidate_value is not None:
@@ -554,6 +556,8 @@ def consume_claude_events(
                     or event.get("error")
                     or "Claude reported a failed turn."
                 )
+            else:
+                completed_successfully = True
             result_text = event.get("result")
             if isinstance(result_text, str) and result_text.strip():
                 final_text = result_text.strip()
@@ -601,6 +605,8 @@ def consume_claude_events(
         raise ProviderAdapterError(failure)
     if not session_id:
         raise ProviderAdapterError("Claude did not provide a persistent session ID.")
+    if not final_text and completed_successfully and empty_success_text:
+        final_text = str(empty_success_text)
     if not final_text:
         raise ProviderAdapterError("Claude completed without a final agent message.")
     return ProviderTurnResult(
@@ -1618,10 +1624,11 @@ class ClaudePrintAdapter:
         launch_directory = agent.working_directory or agent.project_path
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
+        native_compact = prompt.strip().lower() == "/compact"
         session_id = persisted_session or str(uuid.uuid4())
         command = self.command(agent, persisted_session, session_id)
         effective_prompt = prompt
-        if recovery:
+        if recovery and not native_compact:
             effective_prompt = (
                 "The controller lost the completion status for the previous "
                 "delivery of this request. Inspect the existing conversation "
@@ -2019,6 +2026,12 @@ class ClaudePrintAdapter:
                         result = consume_claude_events(
                             events,
                             existing_session_id=persisted_session,
+                            empty_success_text=(
+                                "Context compacted successfully. This topic will "
+                                "continue in the same Claude session."
+                                if native_compact
+                                else None
+                            ),
                         )
                         _emit_progress(
                             on_progress,

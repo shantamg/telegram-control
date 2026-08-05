@@ -123,6 +123,8 @@ the bot or delete the group in Telegram after cleanup finishes.
 - `/agent` can pause or resume the topic agent, change provider, backend,
   model, or effort, and start or resume a provider session. Codex topics can
   choose dynamically discovered local Ollama models.
+- Sending `/compact` by itself in a Claude topic runs Claude's native context
+  compaction and keeps the topic bound to the same provider session.
 - `/voice` previews and changes the global spoken-reply voice and speed.
 - Replying to the progress card steers the active turn; guidance sent while
   Claude is inside a tool call stays pending until Claude acknowledges it.

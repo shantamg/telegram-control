@@ -34,10 +34,16 @@ _LOCAL_AGENT_LEASE_OWNER = re.compile(
 
 
 def _local_agent_lease_owner_is_gone(lease_owner: Optional[str]) -> bool:
-    """Prove that a standard local agent lease no longer has a worker process."""
+    """Prove that a standard single-Mac lease no longer has a worker process.
+
+    The hostname embedded in a lease is diagnostic, not stable identity: macOS
+    can change it when the network changes while the controller is running.
+    Telegram Control currently supports one local Mac, so the PID remains the
+    authoritative liveness check even when that hostname has changed.
+    """
 
     match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(str(lease_owner or ""))
-    if match is None or match.group(1) != socket.gethostname():
+    if match is None:
         return False
     try:
         os.kill(int(match.group(2)), 0)
@@ -12338,7 +12344,6 @@ class DurableStore:
     ) -> list[int]:
         """Return provider process groups recorded for a leased local worker."""
 
-        host = socket.gethostname()
         rows = self.connection.execute(
             """
             SELECT m.mailbox_id, m.lease_owner
@@ -12352,7 +12357,6 @@ class DurableStore:
             match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(owner)
             if (
                 match is None
-                or match.group(1) != host
                 or int(match.group(2)) != int(worker_pid)
             ):
                 continue
@@ -12381,9 +12385,8 @@ class DurableStore:
         return sorted(set(result))
 
     def gone_local_agent_worker_pids(self) -> list[int]:
-        """Return leased same-host agent workers proven to have exited."""
+        """Return leased local agent workers proven to have exited."""
 
-        host = socket.gethostname()
         result: set[int] = set()
         rows = self.connection.execute(
             """
@@ -12395,7 +12398,7 @@ class DurableStore:
         for row in rows:
             owner = str(row["lease_owner"] or "")
             match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(owner)
-            if match is None or match.group(1) != host:
+            if match is None:
                 continue
             pid = int(match.group(2))
             try:
@@ -12419,7 +12422,6 @@ class DurableStore:
         """
 
         timestamp = time.time() if now is None else float(now)
-        host = socket.gethostname()
         recovered: list[int] = []
         self.connection.execute("BEGIN IMMEDIATE")
         try:
@@ -12435,7 +12437,6 @@ class DurableStore:
                 match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(owner)
                 if (
                     match is None
-                    or match.group(1) != host
                     or int(match.group(2)) != int(worker_pid)
                 ):
                     continue

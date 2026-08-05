@@ -681,6 +681,31 @@ the new code. The older `restart` command remains for compatibility, but it is
 not the documented live-update path. Do not use `launchctl submit` directly for
 controller reloads.
 
+## Native Claude compaction survives empty results and hostname changes
+
+Claude Code's native `/compact` command is a successful state-changing command,
+but its stream-JSON result intentionally contains no final assistant message.
+The generic Claude adapter previously interpreted that empty result as a failed
+turn. A retry was worse: recovery wrapping turned the slash command into prose,
+so Claude described prior work instead of compacting the session. The adapter
+now recognizes an exact, standalone `/compact`, sends it unchanged even during
+turn recovery, and converts only a successful empty provider result into a
+short Telegram confirmation. The provider session ID is preserved.
+
+Worker leases also no longer treat macOS's current hostname as durable machine
+identity. macOS can change its hostname after a network transition while old
+leases still contain the previous value. Because Telegram Control supports one
+local Mac, worker and provider recovery now use the PID encoded in the standard
+lease owner as the liveness identity and retain the hostname for diagnostics.
+This lets startup and supervisor recovery clear or retry the exact orphaned
+turn instead of leaving it leased until the two-hour timeout.
+
+Verified with Claude event-consumer coverage for a successful empty native
+command and durable-store coverage that recovers a worker lease created under
+a previous hostname. The live Lovely / Big Picture session was then compacted
+in place, its stale mailbox completed without changing the topic's provider
+session ID, and a resumed health-check turn confirmed the compacted session.
+
 ## Live Codex worker control
 
 Schema v17 persists the provider turn ID separately from the provider session

@@ -396,6 +396,24 @@ class ClaudeEventTests(unittest.TestCase):
                 [{"type": "system", "session_id": "session-one"}]
             )
 
+    def test_accepts_empty_success_for_native_compact_command(self):
+        result = provider_adapters.consume_claude_events(
+            [
+                {"type": "system", "session_id": "session-one"},
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "session_id": "session-one",
+                    "result": "",
+                },
+            ],
+            empty_success_text="Context compacted successfully.",
+        )
+
+        self.assertEqual(result.provider_session_id, "session-one")
+        self.assertEqual(result.final_text, "Context compacted successfully.")
+
     def test_command_uses_structured_resume_and_validated_permissions(self):
         adapter = provider_adapters.ClaudePrintAdapter(binary="/bin/claude")
         fresh = adapter.command(self.agent, None)
@@ -1684,6 +1702,49 @@ class LiveControlContractTests(unittest.TestCase):
             lambda: None,
         )
         self.assertEqual(result.final_text, "Claude final")
+
+    def test_claude_compact_stays_native_during_recovery_and_accepts_empty_result(self):
+        process = FakeProcess(lambda payload: None)
+        user_messages = []
+
+        def handle(payload):
+            self.claude_initialize(process, payload)
+            if payload.get("type") == "user":
+                user_messages.append(payload)
+                process.stdout.emit(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": payload["session_id"],
+                    }
+                )
+                process.stdout.emit(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "session_id": payload["session_id"],
+                        "result": "",
+                        "usage": {},
+                    }
+                )
+
+        process.on_payload = handle
+        result = provider_adapters.ClaudePrintAdapter(
+            binary="/bin/claude",
+            poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        ).run_turn(
+            claude_agent(provider_session_id="session-existing"),
+            "/compact",
+            "session-existing",
+            lambda _session: None,
+            lambda: None,
+        )
+
+        self.assertEqual(user_messages[0]["message"]["content"], "/compact")
+        self.assertEqual(result.provider_session_id, "session-existing")
+        self.assertIn("Context compacted successfully", result.final_text)
 
 
 if __name__ == "__main__":
