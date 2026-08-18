@@ -427,7 +427,7 @@ class ClaudeEventTests(unittest.TestCase):
             **{
                 **self.agent.__dict__,
                 "provider_config": {
-                    "model": "sonnet",
+                    "model": "claude-opus-4-8",
                     "effort": "high",
                     "permission_mode": "acceptEdits",
                 },
@@ -435,7 +435,8 @@ class ClaudeEventTests(unittest.TestCase):
         )
         resumed = adapter.command(configured, "session-123")
         self.assertIn("--model", resumed)
-        self.assertIn("sonnet", resumed)
+        model_index = resumed.index("--model")
+        self.assertEqual(resumed[model_index + 1], "claude-opus-4-8")
         self.assertIn("--effort", resumed)
         self.assertIn("high", resumed)
         self.assertEqual(resumed[-2:], ["--resume", "session-123"])
@@ -513,6 +514,7 @@ class TurnGuidanceCapabilityTests(unittest.TestCase):
         self.assertIn(("GPT-5.6 Terra", "gpt-5.6-terra"), codex.models)
         self.assertIn(("Ultra", "ultra"), codex.efforts)
         self.assertIn(("Opus", "opus"), claude.models)
+        self.assertIn(("Opus 4.8", "claude-opus-4-8"), claude.models)
         self.assertIn(("Max", "max"), claude.efforts)
         self.assertEqual(codex.models[0], ("Default", None))
         self.assertEqual(claude.models[0], ("Default", None))

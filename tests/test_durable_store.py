@@ -10775,7 +10775,13 @@ class DurableIntegrationTests(unittest.TestCase):
                         json.loads(row["payload_json"])["model"]
                         for row in model_rows
                     ],
-                    [None, "opus", "sonnet", "fable"],
+                    [
+                        None,
+                        "opus",
+                        "claude-opus-4-8",
+                        "sonnet",
+                        "fable",
+                    ],
                 )
                 sonnet = next(
                     row
@@ -12622,8 +12628,8 @@ class DurableIntegrationTests(unittest.TestCase):
             (
                 "claude",
                 {"model": "sonnet", "effort": "high"},
-                "Opus",
-                "opus",
+                "Opus 4.8",
+                "claude-opus-4-8",
                 "Max",
                 "max",
             ),

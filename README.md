@@ -122,7 +122,8 @@ the bot or delete the group in Telegram after cleanup finishes.
   the same runtime card as `/agent`.
 - `/agent` can pause or resume the topic agent, change provider, backend,
   model, or effort, and start or resume a provider session. Codex topics can
-  choose dynamically discovered local Ollama models.
+  choose dynamically discovered local Ollama models; Claude topics include a
+  pinned Opus 4.8 choice alongside the moving Opus alias.
 - Sending `/compact` by itself in a Claude topic runs Claude's native context
   compaction and keeps the topic bound to the same provider session.
 - `/voice` previews and changes the global spoken-reply voice and speed.

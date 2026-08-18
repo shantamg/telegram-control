@@ -1402,6 +1402,7 @@ class ClaudePrintAdapter:
         models=(
             ("Default", None),
             ("Opus", "opus"),
+            ("Opus 4.8", "claude-opus-4-8"),
             ("Sonnet", "sonnet"),
             ("Fable", "fable"),
         ),

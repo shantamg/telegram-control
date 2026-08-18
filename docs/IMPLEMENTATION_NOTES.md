@@ -2031,3 +2031,20 @@ the same thread ID. The 1B model did not follow exact-output instructions
 reliably, confirming that small-model quality remains experimental even though
 transport and streaming work. All 422 unit and integration tests passed,
 followed by Python compilation and `git diff --check`.
+
+## Pinned Claude Opus 4.8 model choice
+
+Claude topic model pickers now offer **Opus 4.8** with the full Claude Code
+model identifier `claude-opus-4-8`. The existing **Opus** choice remains the
+moving `opus` alias, so users can deliberately choose either the pinned 4.8
+release or Claude Code's current Opus default. The selected identifier flows
+through the adapter's existing `--model` argument for streamed turns,
+interactive consoles, and detached launches.
+
+This is a fresh-handler catalog change with no schema migration, Telegram
+command change, new outbox variant, or worker protocol change, so no controller
+restart is required.
+
+Verified on August 18, 2026 with focused adapter and durable Telegram-menu
+tests, the complete 425-test suite, Python compilation, and
+`git diff --check`.
