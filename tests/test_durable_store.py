@@ -7292,6 +7292,9 @@ class DurableIntegrationTests(unittest.TestCase):
                     project_fake.agent.runtime_environment,
                     {
                         "TELEGRAM_CONTROL_DB": str(database_path),
+                        "TELEGRAM_CONTROL_CODEX_HOME": str(
+                            database_path.parent / "codex-home"
+                        ),
                         "TELEGRAM_CONTROL_AGENT_ID": project_agent.agent_id,
                         "TELEGRAM_CONTROL_MAILBOX_ID": str(agent_job.mailbox_id),
                         "TELEGRAM_CONTROL_WORKER_ID": "agent-worker",
