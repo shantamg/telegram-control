@@ -2081,3 +2081,35 @@ succeeds while another connection owns the SQLite writer lock, ordinary opens
 do not invoke the full health scan, and concurrent first opens still migrate
 exactly once. All 427 tests passed, followed by Python compilation and
 `git diff --check`.
+
+## Isolated Codex app-server state for managed turns
+
+On August 27, 2026 a managed Telegram topic turn failed three times while
+Codex app-server initialized. Its stderr reported that Codex could not
+initialize its SQLite state runtime under `~/.codex`. Multiple Telegram turns,
+detached workers, terminals, and the desktop app were opening the same large
+Codex state database, so a transient failure in that shared runtime could make
+an otherwise healthy controller mark a mailbox message dead.
+
+Codex app-server processes launched for controller and managed-agent mailboxes
+now receive a controller-owned `CODEX_HOME` beside the durable controller
+database. Authentication, configuration, session transcripts, memories,
+plugins, rules, and skills remain symlinked to the user's canonical Codex home,
+so existing sessions still resume and capabilities remain available. Mutable
+Codex runtime databases are not linked and are therefore isolated from desktop
+and detached-worker state. Controller app-server startup and initialization
+also take a short process-safe lock in that isolated home; the lock is released
+before thread resume and turn execution, so independent turns still run
+concurrently.
+
+The isolated directory and lock fail closed on unexpected ownership, symlinks,
+or unmanaged shared entries. The behavior is enabled only when Telegram
+Control supplies `TELEGRAM_CONTROL_CODEX_HOME`, leaving direct adapter callers
+and detached workers unchanged.
+
+This changes long-running agent and router worker behavior without changing the
+database schema or durable payload formats. It requires one idle-safe
+controller reload. Verified with isolated-home, session-input linking, launch
+environment, and mailbox-runtime regressions; the adapter and durable-store
+test suites pass with `/usr/bin/python3`. All 430 tests passed, followed by
+compilation and `git diff --check`.

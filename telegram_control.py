@@ -303,6 +303,9 @@ def process_agent_mailbox_job(
             agent,
             runtime_environment={
                 "TELEGRAM_CONTROL_DB": str(store.path),
+                "TELEGRAM_CONTROL_CODEX_HOME": str(
+                    store.path.parent / "codex-home"
+                ),
                 "TELEGRAM_CONTROL_AGENT_ID": agent.agent_id,
                 "TELEGRAM_CONTROL_MAILBOX_ID": str(job.mailbox_id),
                 "TELEGRAM_CONTROL_WORKER_ID": worker_id,
@@ -1299,6 +1302,14 @@ def process_router_mailbox_job(
             main_agent,
             project_path=str(SCRIPT_PATH.parent),
             provider_config={"sandbox": "read-only"},
+            runtime_environment={
+                "TELEGRAM_CONTROL_DB": str(store.path),
+                "TELEGRAM_CONTROL_CODEX_HOME": str(
+                    store.path.parent / "codex-home"
+                ),
+                "TELEGRAM_CONTROL_MAILBOX_ID": str(job.mailbox_id),
+                "TELEGRAM_CONTROL_WORKER_ID": worker_id,
+            },
         )
         projects = store.list_projects()
         workspace_inventory = store.list_workspace_inventory()

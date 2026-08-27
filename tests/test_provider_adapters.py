@@ -710,6 +710,112 @@ class LiveControlContractTests(unittest.TestCase):
                 }
             )
 
+    def test_controller_codex_home_isolates_state_and_links_shared_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            user_home = root / "user"
+            canonical_home = user_home / ".codex"
+            canonical_home.mkdir(parents=True)
+            (canonical_home / "auth.json").write_text("{}", encoding="utf-8")
+            (canonical_home / "config.toml").write_text("", encoding="utf-8")
+            (canonical_home / "sessions").mkdir()
+            (canonical_home / "plugins").mkdir()
+            (canonical_home / "logs_2.sqlite").write_bytes(b"shared-state")
+            runtime_home = root / "controller" / "codex-home"
+
+            with mock.patch.object(
+                provider_adapters.Path,
+                "home",
+                return_value=user_home,
+            ):
+                prepared = provider_adapters._prepare_codex_runtime_home(
+                    {"TELEGRAM_CONTROL_CODEX_HOME": str(runtime_home)}
+                )
+
+            self.assertEqual(prepared, runtime_home)
+            self.assertEqual(runtime_home.stat().st_mode & 0o777, 0o700)
+            for name in ("auth.json", "config.toml", "sessions", "plugins"):
+                self.assertTrue((runtime_home / name).is_symlink())
+                self.assertEqual(
+                    (runtime_home / name).resolve(),
+                    (canonical_home / name).resolve(),
+                )
+            self.assertFalse((runtime_home / "logs_2.sqlite").exists())
+
+    def test_controller_codex_home_rejects_unmanaged_shared_entry(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            user_home = root / "user"
+            canonical_home = user_home / ".codex"
+            canonical_home.mkdir(parents=True)
+            (canonical_home / "auth.json").write_text("{}", encoding="utf-8")
+            runtime_home = root / "codex-home"
+            runtime_home.mkdir()
+            (runtime_home / "auth.json").write_text("{}", encoding="utf-8")
+
+            with mock.patch.object(
+                provider_adapters.Path,
+                "home",
+                return_value=user_home,
+            ), self.assertRaisesRegex(
+                provider_adapters.ProviderAdapterError,
+                "unmanaged auth.json",
+            ):
+                provider_adapters._prepare_codex_runtime_home(
+                    {"TELEGRAM_CONTROL_CODEX_HOME": str(runtime_home)}
+                )
+
+    def test_codex_app_server_uses_controller_runtime_home(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "turn/start":
+                self.emit_codex_completion(process)
+
+        process.on_payload = handle
+        factory = FakePopenFactory(process)
+        adapter = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex",
+            poll_interval_seconds=0.01,
+            _popen_factory=factory,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            user_home = root / "user"
+            canonical_home = user_home / ".codex"
+            canonical_home.mkdir(parents=True)
+            (canonical_home / "auth.json").write_text("{}", encoding="utf-8")
+            runtime_home = root / "codex-home"
+            with mock.patch.object(
+                provider_adapters.Path,
+                "home",
+                return_value=user_home,
+            ):
+                result = adapter.run_turn(
+                    codex_agent(
+                        runtime_environment={
+                            "TELEGRAM_CONTROL_CODEX_HOME": str(runtime_home)
+                        }
+                    ),
+                    "Inspect the worker.",
+                    None,
+                    lambda _session: None,
+                    lambda: None,
+                )
+
+            self.assertEqual(result.final_text, "Codex final")
+            self.assertEqual(
+                factory.kwargs["env"]["CODEX_HOME"],
+                str(runtime_home),
+            )
+            self.assertTrue(
+                (
+                    runtime_home / ".telegram-control-app-server-start.lock"
+                ).is_file()
+            )
+            self.assertTrue((runtime_home / "auth.json").is_symlink())
+
     def test_provider_control_validation_and_capabilities(self):
         control = provider_adapters.ProviderControl(
             control_id=4,
