@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 from pathlib import Path
 import queue
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -36,6 +39,130 @@ PROVIDER_BINARY_CANDIDATES = {
         Path("/usr/local/bin/claude"),
     ),
 }
+
+CODEX_SHARED_HOME_ENTRIES = (
+    "AGENTS.md",
+    "auth.json",
+    "config.toml",
+    "memories",
+    "plugins",
+    "rules",
+    "sessions",
+    "skills",
+)
+
+
+def _prepare_codex_runtime_home(
+    environment: dict[str, str],
+) -> Optional[Path]:
+    """Create a controller-owned Codex state home with shared read-mostly inputs."""
+    configured = str(environment.get("TELEGRAM_CONTROL_CODEX_HOME", "")).strip()
+    if not configured:
+        return None
+    runtime_home = Path(configured).expanduser()
+    if not runtime_home.is_absolute():
+        raise ProviderAdapterError(
+            "TELEGRAM_CONTROL_CODEX_HOME must be an absolute path."
+        )
+    canonical_home = Path.home() / ".codex"
+    if runtime_home.exists() and runtime_home.is_symlink():
+        raise ProviderAdapterError(
+            "Telegram Control's Codex home cannot be a symlink."
+        )
+    runtime_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if runtime_home.is_symlink() or not runtime_home.is_dir():
+        raise ProviderAdapterError(
+            "Telegram Control's Codex home must be a real directory."
+        )
+    if runtime_home.resolve() == canonical_home.resolve():
+        raise ProviderAdapterError(
+            "Telegram Control's Codex home must be isolated from ~/.codex."
+        )
+    runtime_stat = runtime_home.stat()
+    if runtime_stat.st_uid != os.getuid():
+        raise ProviderAdapterError(
+            "Telegram Control's Codex home is not owned by the current user."
+        )
+    runtime_home.chmod(0o700)
+
+    for name in CODEX_SHARED_HOME_ENTRIES:
+        source = canonical_home / name
+        if not source.exists():
+            continue
+        destination = runtime_home / name
+        if destination.is_symlink():
+            if destination.resolve() != source.resolve():
+                raise ProviderAdapterError(
+                    f"Telegram Control's Codex home has an unexpected {name} link."
+                )
+            continue
+        if destination.exists():
+            raise ProviderAdapterError(
+                f"Telegram Control's Codex home has an unmanaged {name} entry."
+            )
+        try:
+            destination.symlink_to(source)
+        except FileExistsError:
+            if (
+                not destination.is_symlink()
+                or destination.resolve() != source.resolve()
+            ):
+                raise ProviderAdapterError(
+                    f"Telegram Control's Codex home raced on an unsafe {name} entry."
+                )
+    return runtime_home
+
+
+@contextlib.contextmanager
+def _codex_startup_lock(
+    runtime_home: Optional[Path],
+    deadline: float,
+    heartbeat: Callable[[], None],
+    poll_interval: float,
+) -> Iterable[None]:
+    """Serialize controller app-server initialization without serializing turns."""
+    if runtime_home is None:
+        yield
+        return
+    lock_path = runtime_home / ".telegram-control-app-server-start.lock"
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise ProviderAdapterError(
+            "Could not open Telegram Control's Codex startup lock."
+        ) from exc
+    try:
+        lock_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(lock_stat.st_mode)
+            or lock_stat.st_uid != os.getuid()
+            or lock_stat.st_nlink != 1
+        ):
+            raise ProviderAdapterError(
+                "Telegram Control's Codex startup lock is unsafe."
+            )
+        os.fchmod(descriptor, 0o600)
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                now = time.monotonic()
+                if now >= deadline:
+                    raise ProviderAdapterError(
+                        "Timed out waiting to initialize Codex app-server."
+                    )
+                heartbeat()
+                time.sleep(min(max(0.01, poll_interval), 0.25, deadline - now))
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
 
 
 def provider_binary(provider: str) -> Optional[str]:
@@ -760,48 +887,59 @@ class CodexExecAdapter:
 
         deadline = time.monotonic() + self.timeout_seconds
         command = [self.binary, "app-server", "--stdio"]
+        process_environment = {**os.environ, **agent.runtime_environment}
+        runtime_home = _prepare_codex_runtime_home(process_environment)
+        if runtime_home is not None:
+            process_environment["CODEX_HOME"] = str(runtime_home)
         _emit_progress(on_progress, "starting", "Starting Codex.")
         with tempfile.TemporaryFile(mode="w+t") as stderr_file:
-            process = self._popen_factory(
-                command,
-                cwd=launch_directory,
-                env={**os.environ, **agent.runtime_environment},
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=stderr_file,
-                text=True,
-                bufsize=1,
-                start_new_session=True,
-            )
+            process = None
             try:
-                if process.stdout is None:
-                    raise ProviderAdapterError(
-                        "Codex app-server output stream is unavailable."
-                    )
-                lines = _start_line_reader(process.stdout)
-                request_id = 1
-                _write_json_line(
-                    process,
-                    {
-                        "id": request_id,
-                        "method": "initialize",
-                        "params": {
-                            "clientInfo": {
-                                "name": "telegram-control",
-                                "title": "Telegram Control",
-                                "version": "1",
-                            }
-                        },
-                    },
-                )
-                self._wait_for_rpc(
-                    process,
-                    lines,
-                    request_id,
+                with _codex_startup_lock(
+                    runtime_home,
                     deadline,
                     heartbeat,
-                )
-                _write_json_line(process, {"method": "initialized"})
+                    self.poll_interval_seconds,
+                ):
+                    process = self._popen_factory(
+                        command,
+                        cwd=launch_directory,
+                        env=process_environment,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=stderr_file,
+                        text=True,
+                        bufsize=1,
+                        start_new_session=True,
+                    )
+                    if process.stdout is None:
+                        raise ProviderAdapterError(
+                            "Codex app-server output stream is unavailable."
+                        )
+                    lines = _start_line_reader(process.stdout)
+                    request_id = 1
+                    _write_json_line(
+                        process,
+                        {
+                            "id": request_id,
+                            "method": "initialize",
+                            "params": {
+                                "clientInfo": {
+                                    "name": "telegram-control",
+                                    "title": "Telegram Control",
+                                    "version": "1",
+                                }
+                            },
+                        },
+                    )
+                    self._wait_for_rpc(
+                        process,
+                        lines,
+                        request_id,
+                        deadline,
+                        heartbeat,
+                    )
+                    _write_json_line(process, {"method": "initialized"})
 
                 request_id += 1
                 thread_method, thread_params = self._thread_request(
@@ -1259,7 +1397,8 @@ class CodexExecAdapter:
                     usage=usage,
                 )
             finally:
-                _finish_process(process)
+                if process is not None:
+                    _finish_process(process)
         return result
 
 
