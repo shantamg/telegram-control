@@ -341,6 +341,32 @@ class DurableStoreTests(unittest.TestCase):
             "wal",
         )
 
+    def test_current_schema_open_does_not_wait_for_sqlite_writer(self):
+        self.store.connection.execute("BEGIN IMMEDIATE")
+        try:
+            with DurableStore(self.database_path) as concurrent_store:
+                self.assertEqual(
+                    concurrent_store.connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+        finally:
+            self.store.connection.execute("ROLLBACK")
+
+    def test_open_store_does_not_run_full_health_check(self):
+        with mock.patch.object(
+            telegram_control.bridge,
+            "read_offset",
+            return_value=None,
+        ), mock.patch.object(
+            DurableStore,
+            "quick_check",
+            side_effect=AssertionError("ordinary opens must stay lightweight"),
+        ):
+            with telegram_control.open_store(self.database_path):
+                pass
+
     def test_context_usage_summary_requires_provider_reported_window(self):
         self.assertEqual(
             context_usage_summary(

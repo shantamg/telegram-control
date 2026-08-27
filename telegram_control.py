@@ -120,9 +120,6 @@ def open_store(path: Path) -> DurableStore:
     store = DurableStore(path)
     try:
         store.initialize_poll_offset(bridge.read_offset())
-        check = store.quick_check()
-        if check != "ok":
-            raise StoreError(f"SQLite quick_check returned: {check}")
         return store
     except BaseException:
         store.close()

@@ -2048,3 +2048,36 @@ restart is required.
 Verified on August 18, 2026 with focused adapter and durable Telegram-menu
 tests, the complete 425-test suite, Python compilation, and
 `git diff --check`.
+
+## Current-schema opens do not take the migration lock
+
+On August 26–27, 2026 the live controller entered a SQLite lock convoy. Each
+collector, worker, sender, handler, and supervisor connection called the schema
+migrator, which unconditionally took `BEGIN IMMEDIATE` and ran
+`PRAGMA foreign_key_check` even when `user_version` was already current. Every
+ordinary open then ran `PRAGMA quick_check` as well. Under heavy disk I/O, one
+startup scan held SQLite's single writer slot long enough for the other
+controller children to exhaust their five-second busy timeout. The supervisor
+restarted those children together, creating another simultaneous-open wave.
+Telegram collection and delivery repeatedly disappeared even though an
+isolated CLI `status` could still report a healthy database.
+
+`DurableStore` now reads `user_version` before entering migration machinery and
+returns immediately for the current schema. Actual migration contenders still
+take the writer lock, re-read the version after acquiring it, apply any missing
+migrations, and audit foreign keys before committing. A contender that waited
+while another process completed the migration commits without repeating the
+full audit. Ordinary `open_store` calls no longer run a database-wide
+`quick_check`; explicit `status`, `doctor`, and initialization paths retain
+their health checks.
+
+This changes worker startup behavior without changing the schema or durable
+payload formats, so existing database contents remain compatible. It requires
+one idle-safe controller reload for the long-running supervisor and workers to
+pick up the fix.
+
+Verified on August 27, 2026 with regressions proving that a current-schema open
+succeeds while another connection owns the SQLite writer lock, ordinary opens
+do not invoke the full health scan, and concurrent first opens still migrate
+exactly once. All 427 tests passed, followed by Python compilation and
+`git diff --check`.

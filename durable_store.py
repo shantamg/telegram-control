@@ -1451,6 +1451,22 @@ class DurableStore:
         self.close()
 
     def _migrate(self) -> None:
+        current = int(
+            self.connection.execute("PRAGMA user_version").fetchone()[0]
+        )
+        if current > SCHEMA_VERSION:
+            raise IncompatibleSchemaError(
+                f"Database schema {current} is newer than supported schema "
+                f"{SCHEMA_VERSION}."
+            )
+        # Every collector, queue worker, sender, and short-lived handler opens
+        # its own connection. Taking SQLite's single writer lock just to prove
+        # that an already-current schema is still current turns simultaneous
+        # process startup into a lock convoy. Only migration contenders need
+        # the write transaction below; _run_migrations() rechecks the version
+        # after acquiring it so concurrent first-open races remain safe.
+        if current == SCHEMA_VERSION:
+            return
         # Table rebuilds (schema v14) must run without foreign-key
         # enforcement; the pragma only takes effect outside a transaction,
         # and referential integrity is verified explicitly afterwards.
@@ -1469,6 +1485,7 @@ class DurableStore:
                     f"Database schema {current} is newer than supported schema "
                     f"{SCHEMA_VERSION}."
                 )
+            migration_needed = current < SCHEMA_VERSION
             if current < 1:
                 for statement in MIGRATION_1:
                     self.connection.execute(statement)
@@ -1603,16 +1620,19 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 23
                 self.connection.execute("PRAGMA user_version = 23")
-            # Referential integrity is audited before the commit so a failed
-            # check rolls the whole migration back instead of stranding an
-            # upgraded-but-broken database.
-            violations = self.connection.execute(
-                "PRAGMA foreign_key_check"
-            ).fetchall()
-            if violations:
-                raise IncompatibleSchemaError(
-                    "Migration left foreign-key violations behind."
-                )
+            if migration_needed:
+                # Referential integrity is audited before the commit so a
+                # failed migration rolls back instead of stranding an
+                # upgraded-but-broken database. A concurrent process may have
+                # completed the migration while this connection waited for the
+                # writer lock; in that case there is nothing here to audit.
+                violations = self.connection.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall()
+                if violations:
+                    raise IncompatibleSchemaError(
+                        "Migration left foreign-key violations behind."
+                    )
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
