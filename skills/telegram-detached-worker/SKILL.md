@@ -104,29 +104,41 @@ is in the buffer and will match. Check for a real artifact instead.
 
 ## Typing into a pane yourself
 
-`worker-brief` already does this correctly and verifies it landed, so prefer it.
+`worker-brief` already does this correctly — it types the text, submits it, and
+verifies the composer emptied — so prefer it. **Never send Enter, or any other
+key, after `worker-brief` reports the brief delivered.** The message is already
+submitted at that point; a follow-up Enter arrives in a live session and
+presses whatever happens to be focused — accepting a permission or trust
+prompt, choosing a dialog's highlighted default, or submitting a stray empty
+message. Stray "just in case" Enters are the most common way agents break a
+worker that was doing fine.
+
 When you must drive a pane directly — a confirmation dialog, a slash command,
-another tmux session entirely — the submit is the part that goes wrong:
+another tmux session entirely — the loop is send, verify, and press Enter
+again *only* while the text is visibly stuck:
 
 ```bash
 tmux send-keys -t <session> 'your text'      # 1. the text, alone
 sleep 1
 tmux send-keys -t <session> Enter            # 2. Enter, as its own call
 sleep 1
-tmux capture-pane -p -t <session> | tail -5  # 3. check it actually went
+tmux capture-pane -p -t <session> | tail -5  # 3. verify before any more keys
 ```
 
 Three rules, each of which has already bitten:
 
 - **Never put the text and `Enter` in one `send-keys`.** The Enter is swallowed
   and the text sits in the composer unsent.
-- **Even sent separately, one Enter is not always enough.** Interactive
+- **A second Enter is a recovery step, never a routine one.** Interactive
   providers process bracketed paste asynchronously, so an Enter arriving too
-  early lands before the paste is submit-ready. A second bare `Enter` fixes it.
-- **Verify, do not assume.** A submitted message moves out of the composer into
-  the transcript and the pane shows the provider working — `esc to interrupt` or
-  similar. Your text still sitting on the `❯` prompt line means it never went.
-  Send another bare `Enter` and check again.
+  early can land before the paste is submit-ready. If — and only if — the
+  capture still shows your text on the prompt line, send one more bare `Enter`
+  and check again.
+- **Verify, then stop.** Text still sitting on the `❯` prompt line means the
+  submit never landed: send another Enter and re-check. Text gone from the
+  prompt — moved into the transcript, the provider showing `esc to interrupt`
+  or similar — means it submitted: you are done, and any further key you send
+  goes to a working agent's UI, not to your message.
 
 Clear a stale composer with `tmux send-keys -t <session> C-u` before typing, or
 your text is appended to whatever was already there.

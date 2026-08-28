@@ -2565,7 +2565,12 @@ def worker_brief_command(args: argparse.Namespace) -> None:
     # is usually a relay of something the owner just said, so anything prepended
     # here is a standing instruction repeated for no one's benefit.
     detached_worker.send_brief(args.name, brief)
-    print(f"Brief delivered to {detached_worker.tmux_session_name(args.name)}")
+    print(
+        f"Brief delivered to {detached_worker.tmux_session_name(args.name)} "
+        "and verified submitted. Do not send Enter or any other keys to the "
+        "session — the composer is empty, and extra keys land in the worker's "
+        "live UI."
+    )
 
 
 def worker_report_command(args: argparse.Namespace) -> None:
