@@ -270,6 +270,7 @@ class DetachedWorker:
     recovery_started_at: Optional[float]
     last_recovered_at: Optional[float]
     last_recovery_error: Optional[str]
+    created_at: float = 0.0
 
     @property
     def needs_restart(self) -> bool:
@@ -8227,6 +8228,7 @@ class DurableStore:
                 else None
             ),
             last_recovery_error=row["last_recovery_error"],
+            created_at=float(row["created_at"]),
         )
 
     def create_detached_worker(

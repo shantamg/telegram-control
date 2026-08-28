@@ -60,6 +60,27 @@ class DetachedWorkerStoreTests(unittest.TestCase):
         self.assertEqual(worker.observed_state, "starting")
         self.assertEqual(worker.restart_count, 0)
 
+    def test_worker_creation_refuses_past_the_running_cap(self):
+        # Finished-but-never-stopped workers accumulate silently and are all
+        # resurrected on reboot; the cap turns that into an actionable error
+        # naming what to stop.
+        for index in range(detached_worker.MAX_RUNNING_WORKERS):
+            binding = self._active_binding(
+                chat_id=-100900 - index,
+                thread_id=index + 1,
+            )
+            self._create(name=f"worker-{index}", binding_id=binding)
+        with self.assertRaises(StoreError) as caught:
+            detached_worker.create_worker(
+                self.store,
+                name="one-too-many",
+                binding_id=self.binding_id,
+                project_path="/tmp/project",
+                provider="claude",
+            )
+        self.assertIn("worker-stop", str(caught.exception))
+        self.assertIn("worker-0", str(caught.exception))
+
     def test_names_and_sessions_are_unique(self):
         self._create()
         with self.assertRaisesRegex(StoreError, "already uses that name"):
@@ -498,6 +519,47 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(report["method"], "sendMessage")
         self.assertIn("running again", report["params_json"])
 
+    def test_live_worker_stalled_at_a_dialog_is_unwedged_and_reported(self):
+        # A session can survive recovery yet sit at a provider startup dialog
+        # doing nothing. Every maintenance pass over a live worker checks for
+        # the known dialogs and answers them.
+        self.store.set_detached_worker_states(
+            self.worker.name,
+            observed_state="running",
+        )
+        with (
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "has_tmux_session",
+                return_value=True,
+            ),
+            mock.patch.object(
+                detached_worker,
+                "pane_text",
+                return_value=StartupDialogTests.CLAUDE_DIALOG,
+            ),
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "tmux_binary",
+                return_value="/bin/tmux",
+            ),
+            mock.patch.object(detached_worker.subprocess, "run") as run,
+        ):
+            result, _ = detached_worker.recover_worker(
+                self.store,
+                self.worker.name,
+                now=1_700_000_100,
+            )
+        self.assertEqual(result, "running")
+        self.assertEqual(run.call_args.args[0][-1], "Enter")
+        report = self.store.connection.execute(
+            """
+            SELECT params_json FROM outbox_messages
+            WHERE operation_id LIKE '%dialog-claude-resume-summary'
+            """
+        ).fetchone()
+        self.assertIn("stalled", report["params_json"])
+
     def test_agent_confirmation_marks_success_and_queues_verified_report(self):
         self.store.begin_detached_worker_recovery(
             self.worker.name,
@@ -547,6 +609,58 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(result, "unavailable")
         self.assertEqual(worker.restart_count, 0)
         self.assertIn("No provider session ID", worker.last_recovery_error)
+
+
+class StartupDialogTests(unittest.TestCase):
+    CLAUDE_DIALOG = (
+        "  Resuming the full session will consume a substantial portion of your"
+        " usage limits. We recommend resuming from a summary.\n"
+        "  ❯ 1. Resume from summary (recommended)\n"
+        "    2. Resume full session as-is\n"
+        "    3. Don't ask me again\n"
+        "  Enter to confirm · Esc to cancel\n"
+    )
+    CODEX_DIALOG = (
+        "  ✨ Update available! 0.144.5 -> 0.147.0\n"
+        "› 1. Update now (runs `npm install -g @openai/codex`)\n"
+        "  2. Skip\n"
+        "  3. Skip until next version\n"
+        "  Press enter to continue\n"
+    )
+
+    def _answer(self, pane):
+        with (
+            mock.patch.object(
+                detached_worker, "pane_text", return_value=pane
+            ),
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "tmux_binary",
+                return_value="/bin/tmux",
+            ),
+            mock.patch.object(detached_worker.subprocess, "run") as run,
+        ):
+            answered = detached_worker.answer_startup_dialog("detached--x")
+        return answered, run
+
+    def test_claude_resume_dialog_is_confirmed_with_enter(self):
+        # The recommended option is already highlighted; Enter takes it. A
+        # worker wedged here does nothing while looking recovered.
+        answered, run = self._answer(self.CLAUDE_DIALOG)
+        self.assertEqual(answered, "claude-resume-summary")
+        self.assertEqual(run.call_args.args[0][-1:], ["Enter"])
+
+    def test_codex_update_offer_is_skipped_not_taken(self):
+        # The highlighted default would run npm install inside the worker;
+        # moving down one lands on "Skip".
+        answered, run = self._answer(self.CODEX_DIALOG)
+        self.assertEqual(answered, "codex-update-offer")
+        self.assertEqual(run.call_args.args[0][-2:], ["Down", "Enter"])
+
+    def test_a_working_composer_is_left_alone(self):
+        answered, run = self._answer("⏺ Working on it.\n❯ ")
+        self.assertIsNone(answered)
+        run.assert_not_called()
 
 
 class DetachedWorkerTopicTests(unittest.TestCase):

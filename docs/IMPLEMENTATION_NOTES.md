@@ -1196,6 +1196,44 @@ them. And a process check is a weaker signal than an agent's confirmation about
 *what* was restored, though a confused agent could always confirm success just
 as easily as a healthy one, so little was actually given up.
 
+## Startup-dialog unwedging and the running-worker cap
+
+Two failure modes surfaced together on August 28, 2026, after the machine had
+been up for two weeks following its August 14 reboot.
+
+First, a resumed provider CLI can stall on an interactive startup dialog
+instead of reaching its composer: Claude offers "Resume from summary
+(recommended)" before opening a large session, and Codex offers to update
+itself. Recovery declares success the moment the tmux session is up, so the
+worker *looked* recovered while doing nothing. Nine workers sat at these
+dialogs from the reboot until they were found — each one pinning a full
+provider process, which is what drove the machine to 28 GB of swap, starved
+disk I/O, and produced the "database is locked" convoy that stalled inbox
+turns.
+
+`answer_startup_dialog` in `detached_worker.py` now recognises the known
+dialogs by pane text and answers them: Enter for Claude's resume dialog (the
+recommended option is already highlighted), Down + Enter for Codex's update
+offer (landing on "Skip" rather than running an npm install inside a worker).
+`recover_worker` calls it on every maintenance pass over a live session, so a
+dialog that renders after recovery completes is still caught on the next
+cycle, and a one-line report is posted to the worker's topic when one is
+dismissed. The dialog table is additive — an unrecognised pane is left alone.
+
+Second, nothing ever reaped a worker whose task had finished: workers whose
+final report had been delivered stayed `intended_state = running`
+indefinitely, and reboot recovery faithfully resurrected all of them.
+`create_worker` now refuses to create a new worker while `MAX_RUNNING_WORKERS`
+(12) are already intended running, and the error names the running workers and
+`worker-stop` so the caller can clean up. `worker-status` also reports
+`created_at` and `age_days` per worker so staleness is visible at a glance.
+
+Verified with the detached-worker suite (39 tests, including the new dialog,
+recover-path, and cap tests) and the full 435-test run. The cap and
+`worker-status` fields are handler-side and live immediately; the dialog
+answering runs inside `maintain-workers`, so it takes effect at the next
+supervisor restart.
+
 Agents could send text, voice, group icons, detached workers, and teardown
 cards, but they could not ask a question with choices — only Control could,
 through `ask_user`. The `telegram-ask-owner` skill closes that gap with

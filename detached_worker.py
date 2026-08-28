@@ -46,6 +46,13 @@ MAX_REPORT_CHARACTERS = 3_500
 # A worker that dies immediately should not be respawned forever. Restarting
 # is a recovery mechanism, not a supervisor loop.
 MAX_RESTARTS = 3
+
+# Every intended-running worker holds a full provider CLI in memory whether or
+# not it is doing anything, and recovery faithfully resurrects all of them on
+# every reboot. Unbounded accumulation of finished-but-never-stopped workers
+# once swapped a 16 GB machine to a standstill, so creation refuses past this
+# point and names the workers to stop instead.
+MAX_RUNNING_WORKERS = 12
 RESTART_BACKOFF_SECONDS = 30
 RECOVERY_CONFIRM_TIMEOUT_SECONDS = 30 * 60
 SESSION_DISCOVERY_TIMEOUT_SECONDS = 15
@@ -183,6 +190,19 @@ def create_worker(
     leaves an orphan tmux session nothing knows about.
     """
     _validate_name(name)
+    running = [
+        existing
+        for existing in store.list_detached_workers()
+        if existing.intended_state == "running" and existing.name != name
+    ]
+    if len(running) >= MAX_RUNNING_WORKERS:
+        roster = ", ".join(sorted(existing.name for existing in running))
+        raise StoreError(
+            f"{len(running)} detached workers are already intended running "
+            f"({roster}). Each one keeps a full provider process resident and "
+            "is resurrected on every reboot, so stop the finished ones with "
+            "worker-stop before starting another."
+        )
     directory = working_directory or project_path
     if not Path(directory).is_dir():
         raise StoreError("Detached worker working directory is unavailable.")
@@ -426,6 +446,54 @@ def pane_text(session: str) -> str:
     return result.stdout or ""
 
 
+# A resumed provider CLI can stall on an interactive startup dialog instead of
+# reaching its composer: Claude offers to condense a large session before
+# resuming it, and Codex offers to update itself. The tmux session then looks
+# recovered while the agent does nothing — after the August 14, 2026 reboot,
+# nine workers sat at these dialogs for two weeks, each pinning a full
+# provider process. Each entry: identifier, pane substrings that identify the
+# dialog, and the tmux keys that dismiss it without side effects.
+_STARTUP_DIALOGS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        "claude-resume-summary",
+        ("Resume from summary (recommended)", "Enter to confirm"),
+        ("Enter",),
+    ),
+    (
+        "codex-update-offer",
+        ("Update available!", "Press enter to continue"),
+        # The highlighted default is "Update now"; move down onto "Skip"
+        # rather than running an npm install inside a worker.
+        ("Down", "Enter"),
+    ),
+)
+
+
+def answer_startup_dialog(session_name: str) -> Optional[str]:
+    """Dismiss a known startup dialog so a resumed worker reaches its composer.
+
+    Returns the dialog's identifier when one was answered, None when the pane
+    shows anything else. Called from every maintenance pass over a live
+    session, so a dialog that takes a moment to render is still caught.
+    """
+    pane = pane_text(session_name)
+    for dialog_id, markers, keys in _STARTUP_DIALOGS:
+        if all(marker in pane for marker in markers):
+            subprocess.run(
+                [
+                    tmux_console.tmux_binary(),
+                    "send-keys",
+                    "-t",
+                    f"={session_name}",
+                    *keys,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            return dialog_id
+    return None
+
+
 def _still_in_composer(pane: str, text: str) -> bool:
     """Is `text` sitting at a prompt, typed but never submitted?
 
@@ -610,6 +678,18 @@ def recover_worker(
         return "failed", worker
 
     if alive:
+        dialog = answer_startup_dialog(worker.tmux_session_name)
+        if dialog is not None:
+            enqueue_recovery_report(
+                store,
+                worker,
+                phase=f"dialog-{dialog}",
+                text=(
+                    f"⏯️ Detached worker '{worker.name}' was stalled at a "
+                    f"provider startup dialog ({dialog}). It was dismissed so "
+                    "the session can reach its composer and continue."
+                ),
+            )
         if worker.observed_state != "running":
             worker = store.set_detached_worker_states(
                 worker.name,

@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -2601,6 +2602,12 @@ def worker_status_command(args: argparse.Namespace) -> None:
                     "last_recovery_error": current.last_recovery_error,
                     "tmux_session": current.tmux_session_name,
                     "project_path": current.project_path,
+                    "created_at": datetime.fromtimestamp(
+                        current.created_at
+                    ).isoformat(timespec="seconds"),
+                    "age_days": round(
+                        (time.time() - current.created_at) / 86400, 1
+                    ),
                 }
             )
     print(json.dumps(rows, indent=2, sort_keys=True))
