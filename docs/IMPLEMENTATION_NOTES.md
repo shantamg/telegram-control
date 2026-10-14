@@ -2151,3 +2151,31 @@ controller reload. Verified with isolated-home, session-input linking, launch
 environment, and mailbox-runtime regressions; the adapter and durable-store
 test suites pass with `/usr/bin/python3`. All 430 tests passed, followed by
 compilation and `git diff --check`.
+
+## Spoken replies use macOS `say` (October 14, 2026)
+
+On October 14, 2026 an agent voice update failed with "Speech synthesis
+failed." because `edge-tts` (the external Microsoft text-to-speech service)
+could not produce audio. A macOS `say` voice was used as a one-off fallback, and
+the owner preferred it, so `edge-tts` was removed entirely.
+
+`voice_responses.synthesize_voice` now runs `say [-v VOICE] -r RATE -f TEXT -o
+AIFF` and encodes the AIFF with the same `ffmpeg` OGG/Opus step as before, so
+the durable outbox, file validation, retry idempotency and deterministic paths
+did not change. Synthesis is on-device; nothing is sent to an external service.
+`say_binary` replaces the `edge_tts_binary` config override, and `doctor` now
+reports "Spoken replies need macOS say and ffmpeg."
+
+`voice_settings` now lists macOS voices. The special `system` voice passes no
+`-v` flag, so it uses the Mac's own system voice, and it is the default. Rates
+are `say` words per minute (165/185/205/225), with 185 as the default. Stored
+configurations from the edge-tts era (neural voice names, percentage rates)
+are mapped to the defaults by `voice_settings.upgrade_legacy` when read, so an
+existing install keeps speaking instead of failing closed. User-facing "via
+Microsoft TTS" labels became plain "Listen" / "Replay" / "Try voice again".
+
+No schema or durable payload change. Handlers pick this up on their next turn.
+Detached workers import the synthesizer at start, so they use `say` once the
+controller reloads. Verified with the full suite under `/usr/bin/python3`
+(435 tests) and a real `say` synthesis for both the `system` and `Daniel`
+voices.

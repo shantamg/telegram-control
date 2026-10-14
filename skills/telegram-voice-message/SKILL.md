@@ -17,5 +17,5 @@ Choose a stable lowercase key describing this distinct message. Repeating the
 same key and content is idempotent.
 
 Use this only inside a Telegram Control-managed turn. Keep the message short
-and never include secrets or unreviewed sensitive data. Voice text is submitted
-to Microsoft Edge TTS. Continue to provide the normal final response.
+and never include secrets or unreviewed sensitive data. Voice text is spoken
+locally by the macOS `say` voice. Continue to provide the normal final response.

@@ -116,8 +116,8 @@ class DetachedWorkerStoreTests(unittest.TestCase):
         self._create()
         self.store.set_voice_configuration(
             voice_settings.VoiceConfiguration(
-                voice_name="en-US-AndrewNeural",
-                rate="-10%",
+                voice_name="Daniel",
+                rate="165",
             )
         )
         voice_path = Path(self.directory.name) / "report.ogg"
@@ -143,8 +143,8 @@ class DetachedWorkerStoreTests(unittest.TestCase):
         synthesize.assert_called_once_with(
             "The migration is complete.",
             "detached-rails-fix-milestone",
-            voice_name="en-US-AndrewNeural",
-            rate="-10%",
+            voice_name="Daniel",
+            rate="165",
         )
         self.assertEqual(api_call.call_args.args[:2], ("token", "sendVoice"))
 

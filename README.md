@@ -33,7 +33,7 @@ discovery and delegation.
 | Claude Code **or** Codex CLI | Yes, one or both | Install and authenticate at least one CLI, then verify it manually in Terminal. `doctor` checks the executable and version, not login state. A Claude-only installation does not need Codex. |
 | Ollama | No | Codex topics can use locally installed Ollama models; cloud providers remain available without it. |
 | Handy + Parakeet V3 + ffmpeg | No | Text and file messages work; local voice transcription is unavailable. |
-| edge-tts + ffmpeg | No | Text replies work; the Listen button cannot create spoken replies. |
+| ffmpeg (macOS `say` is built in) | No | Text replies work; the Listen button cannot create spoken replies. |
 | tmux | No | Normal topic conversations work; console takeover and detached workers are unavailable. |
 | Conversational Control agent | No, off by default | Groups bind by exact path with `/bind`; no Codex router is started. |
 

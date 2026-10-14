@@ -2070,7 +2070,7 @@ def voice_configuration_review(
         "Review spoken reply settings\n\n"
         f"Current: {current_voice} · {current_rate}\n"
         f"Selected: {staged_voice} · {staged_rate}\n\n"
-        "Preview generates a real Microsoft TTS voice note. Confirm is the "
+        "Preview generates a real Mac voice note. Confirm is the "
         "only action that changes the global setting.",
         {
             "inline_keyboard": [
@@ -2233,7 +2233,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 "answerCallbackQuery",
                 {
                     "callback_query_id": callback_query_id,
-                    "text": "Generating preview via Microsoft TTS…",
+                    "text": "Generating preview with the Mac voice…",
                 },
                 "callback-answer",
             )
@@ -3256,7 +3256,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 "answerCallbackQuery",
                 {
                     "callback_query_id": callback_query_id,
-                    "text": "Generating via Microsoft TTS…",
+                    "text": "Generating with the Mac voice…",
                 },
                 "callback-answer",
             )

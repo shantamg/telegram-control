@@ -149,7 +149,7 @@ In a managed conversational topic, send a Telegram photo or any document normall
 
 Send a Telegram voice note there normally; it is transcribed locally and routed like text. If Telegram briefly fails to provide the audio file, Control retries behind the same transcribing receipt and shows an error only after every durable attempt fails. Report-only worker topics do not accept messages or commands.
 
-Use /voice to choose the global Microsoft TTS voice and speaking speed used by Listen buttons, agent voice updates, and detached worker voice reports. Selecting an option only stages it. Preview generates a real sample voice note; Confirm applies it, and Back returns to the choices without changing anything.
+Use /voice to choose the global macOS voice and speaking speed used by Listen buttons, agent voice updates, and detached worker voice reports. Selecting an option only stages it. Preview generates a real sample voice note; Confirm applies it, and Back returns to the choices without changing anything.
 
 Reply to an exact agent-routed message to continue that agent. A Control-routed reply continues the optional conversational Control agent only when it is enabled. During an active turn, a reply to its progress card can steer the work, and its Stop button interrupts the provider. Stop remains valid while the turn is active. If an owning worker exits, Control terminates that attempt’s provider process, restarts only the failed worker, and immediately retries or completes a queued Stop without disturbing other topics. Agents can also send requested voice or text progress updates through scoped Telegram skills.""",
     ),

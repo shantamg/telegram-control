@@ -3469,18 +3469,18 @@ def doctor_command(args: argparse.Namespace) -> None:
         Path("/usr/local/bin/ffmpeg"),
         command_name="ffmpeg",
     )
-    edge_tts = helper_paths.resolve_binary(
-        "edge_tts_binary",
-        Path.home() / ".local" / "bin" / "edge-tts",
-        command_name="edge-tts",
+    say = helper_paths.resolve_binary(
+        "say_binary",
+        Path("/usr/bin/say"),
+        command_name="say",
     )
     handy_ready = handy.is_file() and os.access(handy, os.X_OK)
     ffmpeg_ready = ffmpeg.is_file() and os.access(ffmpeg, os.X_OK)
     model_ready = HANDY_MODEL_DIR.is_dir()
     voice_input_ready = handy_ready and ffmpeg_ready and model_ready
     spoken_reply_ready = (
-        edge_tts.is_file()
-        and os.access(edge_tts, os.X_OK)
+        say.is_file()
+        and os.access(say, os.X_OK)
         and ffmpeg_ready
     )
     tmux = shutil.which("tmux")
@@ -3511,7 +3511,7 @@ def doctor_command(args: argparse.Namespace) -> None:
     )
     if not spoken_reply_ready:
         notices.append(
-            "Spoken replies need edge-tts and ffmpeg."
+            "Spoken replies need macOS say and ffmpeg."
         )
     print(
         "Interactive console and detached workers: "

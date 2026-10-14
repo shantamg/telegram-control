@@ -1711,7 +1711,9 @@ class DurableStore:
             return voice_settings.DEFAULT_CONFIGURATION
         try:
             value = json.loads(str(row["value"]))
-            return voice_settings.validate_configuration(value)
+            return voice_settings.validate_configuration(
+                voice_settings.upgrade_legacy(value)
+            )
         except (json.JSONDecodeError, ValueError):
             raise StoreError(
                 "Stored voice configuration is invalid."
@@ -6566,7 +6568,7 @@ class DurableStore:
             "inline_keyboard": [
                 [
                     {
-                        "text": "🔊 Listen via Microsoft TTS",
+                        "text": "🔊 Listen",
                         "callback_data": f"a:{action.token}",
                     }
                 ]
@@ -13131,7 +13133,7 @@ class DurableStore:
                     "inline_keyboard": [
                         [
                             {
-                        "text": "🔊 Replay via Microsoft TTS",
+                        "text": "🔊 Replay",
                                 "callback_data": f"a:{replay.token}",
                             }
                         ]
@@ -13192,7 +13194,7 @@ class DurableStore:
                     "inline_keyboard": [
                         [
                             {
-                                "text": "Try Microsoft TTS again",
+                                "text": "Try voice again",
                                 "callback_data": f"a:{retry.token}",
                             }
                         ]

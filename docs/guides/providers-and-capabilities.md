@@ -79,15 +79,15 @@ and unavailable.
 
 ## Spoken replies
 
-The Listen action requires `edge-tts` and `ffmpeg`. It is optional and
-independent from voice input. Spoken-reply synthesis uses the external
-text-to-speech service used by `edge-tts`; ordinary text replies remain local
-to the controller/provider path.
+The Listen action requires `ffmpeg`; speech itself comes from the built-in
+macOS `say` command, so synthesis runs on-device. It is optional and
+independent from voice input. The default voice is the Mac's own system voice
+(System Settings > Accessibility > Spoken Content) at 185 words per minute.
 
 Send `/voice` in the paired private chat or an ordinary authorized project
 topic to inspect the global spoken-reply configuration. Report-only detached
 worker topics do not accept commands. Voice and speed choices are staged first;
-**Preview** generates a real Microsoft TTS sample without changing the
+**Preview** generates a real sample voice note without changing the
 setting, **Confirm** applies it, and **Back** returns to the choices. The
 selected configuration is shared by Listen actions, agent-authored voice
 updates, and detached-worker voice reports.
@@ -109,7 +109,7 @@ The private install config may provide absolute paths:
 {
   "handy_binary": "/Applications/Handy.app/Contents/MacOS/handy",
   "ffmpeg_binary": "/opt/homebrew/bin/ffmpeg",
-  "edge_tts_binary": "/Users/you/.local/bin/edge-tts"
+  "say_binary": "/usr/bin/say"
 }
 ```
 

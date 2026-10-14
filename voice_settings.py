@@ -25,32 +25,32 @@ class VoiceConfiguration:
     rate: str
 
 
+# Spoken replies use the macOS built-in synthesizer (`say`). "system" means no
+# `-v` flag, so the Mac's own default voice (System Settings > Accessibility >
+# Spoken Content) is used; the others are standard bundled macOS voices.
+SYSTEM_VOICE_NAME = "system"
+
 VOICE_OPTIONS = (
-    VoiceOption("en-GB-SoniaNeural", "🇬🇧 Sonia", "British English · female"),
-    VoiceOption("en-GB-RyanNeural", "🇬🇧 Ryan", "British English · male"),
-    VoiceOption("en-US-AvaNeural", "🇺🇸 Ava", "American English · female"),
-    VoiceOption("en-US-AndrewNeural", "🇺🇸 Andrew", "American English · male"),
-    VoiceOption("en-US-JennyNeural", "🇺🇸 Jenny", "American English · female"),
-    VoiceOption("en-US-GuyNeural", "🇺🇸 Guy", "American English · male"),
-    VoiceOption("en-AU-NatashaNeural", "🇦🇺 Natasha", "Australian English · female"),
-    VoiceOption(
-        "en-AU-WilliamMultilingualNeural",
-        "🇦🇺 William",
-        "Australian English · male",
-    ),
-    VoiceOption("en-IN-NeerjaNeural", "🇮🇳 Neerja", "Indian English · female"),
-    VoiceOption("en-IN-PrabhatNeural", "🇮🇳 Prabhat", "Indian English · male"),
+    VoiceOption(SYSTEM_VOICE_NAME, "💻 Mac default", "This Mac's system voice"),
+    VoiceOption("Samantha", "🇺🇸 Samantha", "American English · female"),
+    VoiceOption("Reed (English (US))", "🇺🇸 Reed", "American English · male"),
+    VoiceOption("Daniel", "🇬🇧 Daniel", "British English · male"),
+    VoiceOption("Flo (English (UK))", "🇬🇧 Flo", "British English · female"),
+    VoiceOption("Karen", "🇦🇺 Karen", "Australian English · female"),
+    VoiceOption("Moira", "🇮🇪 Moira", "Irish English · female"),
+    VoiceOption("Rishi", "🇮🇳 Rishi", "Indian English · male"),
 )
 
+# Rates are `say -r` words per minute.
 RATE_OPTIONS = (
-    RateOption("-10%", "Slower · −10%"),
-    RateOption("+0%", "Natural · normal"),
-    RateOption("+10%", "Quick · +10%"),
-    RateOption("+20%", "Faster · +20%"),
+    RateOption("165", "Slower · 165 wpm"),
+    RateOption("185", "Natural · 185 wpm"),
+    RateOption("205", "Quick · 205 wpm"),
+    RateOption("225", "Faster · 225 wpm"),
 )
 
-DEFAULT_VOICE_NAME = "en-GB-SoniaNeural"
-DEFAULT_RATE = "+10%"
+DEFAULT_VOICE_NAME = SYSTEM_VOICE_NAME
+DEFAULT_RATE = "185"
 DEFAULT_CONFIGURATION = VoiceConfiguration(
     voice_name=DEFAULT_VOICE_NAME,
     rate=DEFAULT_RATE,
@@ -77,6 +77,25 @@ def validate_configuration(value: Any) -> VoiceConfiguration:
     if not isinstance(rate, str) or rate not in RATE_BY_VALUE:
         raise ValueError("Voice configuration rate is unsupported.")
     return VoiceConfiguration(voice_name=voice_name, rate=rate)
+
+
+def upgrade_legacy(value: Any) -> Any:
+    """Map a stored configuration from the retired edge-tts voices to defaults.
+
+    Older installs stored Microsoft neural voice names and percentage rates.
+    Those are no longer valid choices, so any unknown voice or rate falls back
+    to the default rather than making every spoken reply fail.
+    """
+    if not isinstance(value, dict) or set(value) != {"voice_name", "rate"}:
+        return value
+    voice_name = value.get("voice_name")
+    rate = value.get("rate")
+    return {
+        "voice_name": (
+            voice_name if voice_name in VOICE_BY_NAME else DEFAULT_VOICE_NAME
+        ),
+        "rate": rate if rate in RATE_BY_VALUE else DEFAULT_RATE,
+    }
 
 
 def as_dict(configuration: VoiceConfiguration) -> dict[str, str]:

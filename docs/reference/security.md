@@ -42,8 +42,8 @@ for approvals.
 
 ## Optional external paths
 
-Voice transcription via Handy and Parakeet runs on-device. Spoken replies via
-`edge-tts` use that tool's external text-to-speech service. Claude Code and
+Voice transcription via Handy and Parakeet runs on-device. Spoken replies use the
+on-device macOS `say` synthesizer. Claude Code and
 Codex communicate according to their own provider products and authentication.
 
 ## Public repository hygiene

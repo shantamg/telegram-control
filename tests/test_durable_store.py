@@ -1919,7 +1919,7 @@ class DurableStoreTests(unittest.TestCase):
             self._completed_agent_response_with_voice_button()
         )
         button = response.params["reply_markup"]["inline_keyboard"][0][0]
-        self.assertEqual(button["text"], "🔊 Listen via Microsoft TTS")
+        self.assertEqual(button["text"], "🔊 Listen")
         action = self.store.connection.execute(
             """
             SELECT * FROM callback_actions
@@ -1980,8 +1980,8 @@ class DurableStoreTests(unittest.TestCase):
             "The durable voice response is ready.",
             f"agent-{mailbox_id}-request-{int(callback_job['job_id'])}",
             protected_paths=set(),
-            voice_name="en-GB-SoniaNeural",
-            rate="+10%",
+            voice_name="system",
+            rate="185",
         )
         voice = self.store.connection.execute(
             """
@@ -1997,7 +1997,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(params["message_thread_id"], 62)
         self.assertEqual(
             params["reply_markup"]["inline_keyboard"][0][0]["text"],
-            "🔊 Replay via Microsoft TTS",
+            "🔊 Replay",
         )
         self.assertEqual(
             json.loads(voice["route_json"]),
@@ -2060,7 +2060,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertIn("complete text response", params["text"])
         self.assertEqual(
             params["reply_markup"]["inline_keyboard"][0][0]["text"],
-            "Try Microsoft TTS again",
+            "Try voice again",
         )
 
     def test_sent_voice_note_installs_reply_route(self):
@@ -2402,8 +2402,8 @@ class DurableStoreTests(unittest.TestCase):
         }
         self.store.set_voice_configuration(
             voice_settings.VoiceConfiguration(
-                voice_name="en-US-AndrewNeural",
-                rate="-10%",
+                voice_name="Daniel",
+                rate="165",
             )
         )
         voice_path = Path(self.temporary_directory.name) / "update.ogg"
@@ -2432,9 +2432,9 @@ class DurableStoreTests(unittest.TestCase):
                             self.assertEqual(agent_telegram.main(), 0)
         self.assertEqual(
             synthesize.call_args.kwargs["voice_name"],
-            "en-US-AndrewNeural",
+            "Daniel",
         )
-        self.assertEqual(synthesize.call_args.kwargs["rate"], "-10%")
+        self.assertEqual(synthesize.call_args.kwargs["rate"], "165")
         voice_row = self.store.connection.execute(
             """
             SELECT method, params_json

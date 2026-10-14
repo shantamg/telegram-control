@@ -50,7 +50,7 @@ are not valid in workspace settings:
 | `discovery_roots` | Array of absolute directory paths | Bounds exact-path validation and the optional Control agent's read-only workspace discovery. Defaults to the current user's home directory. |
 | `handy_binary` | Absolute executable path | Overrides Handy discovery for local voice transcription. |
 | `ffmpeg_binary` | Absolute executable path | Overrides `ffmpeg` discovery for voice input and spoken replies. |
-| `edge_tts_binary` | Absolute executable path | Overrides `edge-tts` discovery for spoken replies. |
+| `say_binary` | Absolute executable path | Overrides macOS `say` discovery for spoken replies. |
 
 Binary resolution checks an explicit override first, then the documented common
 locations, then `PATH`.

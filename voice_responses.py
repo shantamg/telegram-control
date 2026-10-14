@@ -21,10 +21,10 @@ SPEECH_DIR = (
     / "telegram-bridge"
     / "speech-outbox"
 )
-EDGE_TTS_BINARY = helper_paths.resolve_binary(
-    "edge_tts_binary",
-    Path.home() / ".local" / "bin" / "edge-tts",
-    command_name="edge-tts",
+SAY_BINARY = helper_paths.resolve_binary(
+    "say_binary",
+    Path("/usr/bin/say"),
+    command_name="say",
 )
 FFMPEG_BINARY = helper_paths.resolve_binary(
     "ffmpeg_binary",
@@ -131,7 +131,7 @@ def synthesize_voice(
     except ValueError as exc:
         raise VoiceResponseError(str(exc)) from None
     cleanup_stale_files(protected_paths=protected_paths)
-    if not EDGE_TTS_BINARY.is_file() or not os.access(EDGE_TTS_BINARY, os.X_OK):
+    if not SAY_BINARY.is_file() or not os.access(SAY_BINARY, os.X_OK):
         raise VoiceResponseError("The speech synthesizer is unavailable.")
     if not FFMPEG_BINARY.is_file() or not os.access(FFMPEG_BINARY, os.X_OK):
         raise VoiceResponseError("The audio encoder is unavailable.")
@@ -145,21 +145,25 @@ def synthesize_voice(
         final_path.unlink(missing_ok=True)
     nonce = secrets.token_hex(6)
     text_path = SPEECH_DIR / f".{key}-{nonce}.txt"
-    media_path = SPEECH_DIR / f".{key}-{nonce}.mp3"
+    media_path = SPEECH_DIR / f".{key}-{nonce}.aiff"
     encoded_path = SPEECH_DIR / f".{key}-{nonce}.ogg"
     try:
         text_path.write_text(speech_text(value), encoding="utf-8")
         text_path.chmod(0o600)
-        edge = subprocess.run(
+        voice_arguments = (
+            []
+            if configuration.voice_name == voice_settings.SYSTEM_VOICE_NAME
+            else ["-v", configuration.voice_name]
+        )
+        say = subprocess.run(
             [
-                str(EDGE_TTS_BINARY),
-                "--voice",
-                configuration.voice_name,
-                "--rate",
+                str(SAY_BINARY),
+                *voice_arguments,
+                "-r",
                 configuration.rate,
-                "--file",
+                "-f",
                 str(text_path),
-                "--write-media",
+                "-o",
                 str(media_path),
             ],
             stdin=subprocess.DEVNULL,
@@ -169,7 +173,7 @@ def synthesize_voice(
             timeout=SYNTHESIS_TIMEOUT_SECONDS,
             check=False,
         )
-        if edge.returncode != 0 or not media_path.is_file():
+        if say.returncode != 0 or not media_path.is_file():
             raise VoiceResponseError("Speech synthesis failed.")
         media_path.chmod(0o600)
         ffmpeg = subprocess.run(
