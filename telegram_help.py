@@ -118,7 +118,7 @@ Ask the main topic agent to start long-running work in a detached session. The w
 
 If tmux disappears, Telegram Control resumes the exact provider conversation. The resumed session retains its native scheduled work, so Control asks it to verify wakeups, loops, monitors, and background work, recreate anything missing, and explicitly report recovery success or failure. The worker is not asked to maintain a separate recovery inventory.
 
-Messages in a report-only topic do not steer the worker. Return to the main agent topic to guide or stop it. Stopping removes the worker's managed recovery file; deleting its report topic remains a separate explicit choice.""",
+When you message the report topic, Control replies with a tmux command you can run in a terminal on the machine running Telegram Control to interact with the worker directly. You can also return to the main agent topic to guide or stop it. Stopping removes the worker's managed recovery file. Deleting its report topic remains a separate explicit choice.""",
     ),
     HelpTopic(
         "teardown",

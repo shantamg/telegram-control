@@ -228,7 +228,7 @@ def handle_report_only_topic() -> bool:
             origin.display_name if origin is not None else None,
             detached_worker.telegram_topic_url(origin),
         )
-    send_message(notice)
+    send_message(notice, parse_mode="HTML")
     return True
 
 

@@ -373,29 +373,31 @@ class DetachedWorkerLaunchTests(unittest.TestCase):
 
 
 class ReportOnlyNoticeTests(unittest.TestCase):
+    def setUp(self):
+        self.worker = SimpleNamespace(
+            name="rails-fix", tmux_session_name="detached--rails-fix"
+        )
+
     def test_notice_names_the_worker_and_points_at_the_main_agent(self):
-        worker = mock.Mock(name="worker")
-        worker.name = "rails-fix"
-        notice = detached_worker.report_only_notice(worker, "reservations")
+        notice = detached_worker.report_only_notice(self.worker, "R&D <ops>")
         self.assertIn("report-only", notice)
         self.assertIn("rails-fix", notice)
-        self.assertIn("reservations", notice)
+        self.assertIn("R&amp;D &lt;ops&gt;", notice)
 
     def test_notice_includes_a_direct_main_topic_link(self):
-        worker = mock.Mock(name="worker")
-        worker.name = "rails-fix"
         notice = detached_worker.report_only_notice(
-            worker,
+            self.worker,
             "reservations",
             "https://t.me/c/4363256963/20",
         )
         self.assertIn("https://t.me/c/4363256963/20", notice)
 
     def test_notice_still_works_without_a_known_main_topic(self):
-        worker = mock.Mock()
-        worker.name = "rails-fix"
-        notice = detached_worker.report_only_notice(worker, None)
+        notice = detached_worker.report_only_notice(self.worker, None)
         self.assertIn("report-only", notice)
+        self.assertIn(
+            "<code>tmux attach-session -t '=detached--rails-fix'</code>", notice
+        )
         self.assertNotIn("None", notice)
 
 
@@ -809,7 +811,7 @@ class DetachedWorkerTopicTests(unittest.TestCase):
             origin_agent_id="agent_origin",
             project_path="/tmp/project",
             provider="claude",
-            tmux_session_name="detached--haiku-poems",
+            tmux_session_name="detached--stored-session",
         )
         update = {
             "update_id": 10,
@@ -841,6 +843,11 @@ class DetachedWorkerTopicTests(unittest.TestCase):
         )
         response = self.store.claim_outbox("sender", now=10**12)
         self.assertEqual(response.params["message_thread_id"], 220)
+        self.assertEqual(response.params["parse_mode"], "HTML")
+        self.assertIn(
+            "<code>tmux attach-session -t '=detached--stored-session'</code>",
+            response.params["text"],
+        )
         self.assertIn("report-only", response.params["text"])
         self.assertIn("haiku-poems", response.params["text"])
         self.assertIn("Test detach", response.params["text"])

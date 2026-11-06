@@ -26,6 +26,7 @@ Claude or Codex.
 from __future__ import annotations
 
 import re
+import shlex
 import subprocess
 import time
 import uuid
@@ -39,6 +40,7 @@ import telegram_bridge
 import tmux_console
 import voice_responses
 from durable_store import DetachedWorker, DurableStore, StoreError, SurfaceBinding
+from telegram_formatting import escape_html
 
 NAME_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 MAX_REPORT_CHARACTERS = 3_500
@@ -112,6 +114,14 @@ def _validate_name(name: str) -> str:
 
 def tmux_session_name(name: str) -> str:
     return f"detached--{name}"
+
+
+def attach_command(worker: DetachedWorker) -> str:
+    target = shlex.quote(f"={worker.tmux_session_name}")
+    if target.startswith("="):
+        # zsh treats an unquoted leading = as executable-path expansion.
+        target = f"'{target}'"
+    return f"tmux attach-session -t {target}"
 
 
 def topic_name(name: str) -> str:
@@ -1024,20 +1034,17 @@ def report_only_notice(
     main_topic_name: Optional[str],
     main_topic_url: Optional[str] = None,
 ) -> str:
-    """The reply an inbound message to a worker topic gets.
-
-    Worker topics are one-way by design. Steering a tmux session through chat
-    would mean reasoning about what it is doing and whether it is even at a
-    prompt; relaying through the main agent is both simpler and the thing an
-    operator actually wants.
-    """
-    destination = f" in {main_topic_name}" if main_topic_name else ""
+    """Render the Telegram HTML reply for inbound worker-topic messages."""
+    destination = f" in {escape_html(main_topic_name)}" if main_topic_name else ""
+    command = escape_html(attach_command(worker))
     notice = (
         f"This topic is report-only — it carries updates from the detached "
-        f"worker '{worker.name}' and nothing here is read by it.\n\n"
-        f"To steer or stop this worker, message the project's main agent"
+        f"worker '{escape_html(worker.name)}' and nothing here is read by it.\n\n"
+        "To interact directly, run this in a terminal on the machine running "
+        f"Telegram Control.\n<code>{command}</code>\n\n"
+        "To steer or stop this worker, message the project's main agent"
         f"{destination}."
     )
     if main_topic_url:
-        notice += f"\n\nOpen the main agent topic: {main_topic_url}"
+        notice += f"\n\nOpen the main agent topic: {escape_html(main_topic_url)}"
     return notice

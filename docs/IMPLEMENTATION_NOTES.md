@@ -1020,6 +1020,18 @@ starts with the controller note while `extract_user_request` returns only the
 owner's sentence, the full 331-test suite, and the offline router eval gate at
 14/14.
 
+## Direct tmux access from a detached worker topic
+
+When a user messages a report-only topic, the fresh handler reads the worker's
+stored tmux session name and adds the exact `tmux attach-session` command to its
+reply as Telegram code. The same shell-quoted command is printed by
+`worker-start`. The reply also points to the main agent topic when available.
+
+The inbound integration test verifies the rendered command in the outbox, the
+main topic link, and the absence of a router turn. An isolated tmux server with
+two similarly named sessions verified that the command attaches to the exact
+target. The reply uses the existing outbox send path and needs no restart.
+
 ## Reboot recovery for detached workers
 
 Schemas v22–23 turn a detached worker into a durable logical session rather than

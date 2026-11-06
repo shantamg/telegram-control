@@ -2537,7 +2537,7 @@ def worker_start_command(args: argparse.Namespace) -> None:
                     worker.provider_session_id is not None
                 ),
                 "recovery_file": worker.recovery_file_path,
-                "attach": f"tmux attach-session -t '={worker.tmux_session_name}'",
+                "attach": detached_worker.attach_command(worker),
             },
             indent=2,
             sort_keys=True,
