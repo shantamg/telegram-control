@@ -2191,3 +2191,31 @@ Detached workers import the synthesizer at start, so they use `say` once the
 controller reloads. Verified with the full suite under `/usr/bin/python3`
 (435 tests) and a real `say` synthesis for both the `system` and `Daniel`
 voices.
+
+## Project account bindings
+
+The standalone `ai_accounts.py` wrapper resolves the nearest private
+`.ai-account.local` file from the working directory. A Git root ends the
+ancestor search. Linked worktrees can inherit the primary checkout's root
+binding. Only a company label is stored in the binding. Separate owner-only
+profile mappings under `~/.config/ai-accounts/profiles/` select the native
+Claude and Codex directories. The wrapper writes bindings atomically, adds a
+local Git exclusion, and requires a choice from the launched provider's
+signed-in profiles on the first interactive launch. Existing CLI defaults
+can be selected explicitly per provider.
+
+Managed turns, the session picker, console takeover, and detached worker
+launch and recovery resolve the same binding. A present but invalid binding
+raises an error. Unbound workspaces retain their existing launch behavior.
+Bound Codex turns keep their native profile home for credentials and
+transcripts and set `sqlite_home` to controller-owned state. Non-default homes
+get separate SQLite directories and startup locks. The optional router
+continues to use the controller's default runtime. No schema or queue payload
+changes are required. Long-running workers pick up the resolver after an
+idle-safe reload.
+
+Verification covered Git exclusion and worktree inheritance, private binding
+validation, tmux environment changes, and separate Codex profile
+authentication and SQLite launch arguments. All 440 tests passed. A real
+terminal smoke test selected the existing Personal login through Codex and
+reused it from Claude in the same temporary directory.

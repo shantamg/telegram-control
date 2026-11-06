@@ -4814,6 +4814,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 discovered = session_source.discover_sessions(
                     working_directory,
                     excluded_session_ids=used_session_ids,
+                    **provider_adapters.project_session_options(
+                        provider, working_directory
+                    ),
                 )
                 snapshot = store.create_callback_action(
                     operation_id=snapshot_operation_id,
@@ -4962,6 +4965,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                         session_source.resolve_session(
                             provider_session_id,
                             working_directory,
+                            **provider_adapters.project_session_options(
+                                provider, working_directory
+                            ),
                         )
                         if working_directory
                         else None
@@ -5071,6 +5077,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     session_source.resolve_session(
                         provider_session_id,
                         working_directory,
+                        **provider_adapters.project_session_options(
+                            provider, working_directory
+                        ),
                     )
                     if working_directory
                     else None

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -23,12 +24,25 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Literal, Optional, Protocol
 
+import ai_accounts
 from durable_store import ManagedAgent, StoreError
 from turn_guidance import TURN_GUIDANCE, effective_turn_guidance
 
 
 class ProviderAdapterError(StoreError):
     """Raised when a provider cannot complete a normalized turn."""
+
+
+def project_account(directory: str) -> Optional[ai_accounts.Profile]:
+    try:
+        return ai_accounts.project_profile(directory)
+    except (ai_accounts.AccountError, OSError) as exc:
+        raise ProviderAdapterError(str(exc)) from exc
+
+
+def project_session_options(provider: str, directory: str) -> dict[str, Path]:
+    account = project_account(directory)
+    return account.session_options(provider) if account else {}
 
 
 PROVIDER_BINARY_CANDIDATES = {
@@ -63,14 +77,7 @@ CODEX_SHARED_HOME_ENTRIES = (
 )
 
 
-def _prepare_codex_runtime_home(
-    environment: dict[str, str],
-) -> Optional[Path]:
-    """Create a controller-owned Codex state home with shared read-mostly inputs."""
-    configured = str(environment.get("TELEGRAM_CONTROL_CODEX_HOME", "")).strip()
-    if not configured:
-        return None
-    runtime_home = Path(configured).expanduser()
+def _private_codex_runtime_directory(runtime_home: Path) -> Path:
     if not runtime_home.is_absolute():
         raise ProviderAdapterError(
             "TELEGRAM_CONTROL_CODEX_HOME must be an absolute path."
@@ -95,7 +102,18 @@ def _prepare_codex_runtime_home(
             "Telegram Control's Codex home is not owned by the current user."
         )
     runtime_home.chmod(0o700)
+    return runtime_home
 
+
+def _prepare_codex_runtime_home(
+    environment: dict[str, str],
+) -> Optional[Path]:
+    """Create the legacy controller state home with shared read-mostly inputs."""
+    configured = environment.get("TELEGRAM_CONTROL_CODEX_HOME", "").strip()
+    if not configured:
+        return None
+    runtime_home = _private_codex_runtime_directory(Path(configured).expanduser())
+    canonical_home = Path.home() / ".codex"
     for name in CODEX_SHARED_HOME_ENTRIES:
         source = canonical_home / name
         if not source.exists():
@@ -1019,9 +1037,26 @@ class CodexExecAdapter:
         deadline = time.monotonic() + self.timeout_seconds
         command = [self.binary, "app-server", "--stdio"]
         process_environment = {**os.environ, **agent.runtime_environment}
-        runtime_home = _prepare_codex_runtime_home(process_environment)
-        if runtime_home is not None:
-            process_environment["CODEX_HOME"] = str(runtime_home)
+        account = project_account(launch_directory) if agent.role != "main" else None
+        if account is None:
+            runtime_home = _prepare_codex_runtime_home(process_environment)
+            if runtime_home is not None:
+                process_environment["CODEX_HOME"] = str(runtime_home)
+        else:
+            process_environment = account.environment("codex", process_environment)
+            command.extend(account.codex_options())
+            configured = process_environment.get("TELEGRAM_CONTROL_CODEX_HOME", "").strip()
+            runtime_home = None
+            if configured:
+                runtime_home = _private_codex_runtime_directory(
+                    Path(configured).expanduser()
+                )
+                if account.codex is not None:
+                    identity = hashlib.sha256(os.fsencode(account.codex)).hexdigest()
+                    runtime_home = _private_codex_runtime_directory(
+                        runtime_home / f"account-{identity}"
+                    )
+                command.extend(["-c", f"sqlite_home={json.dumps(str(runtime_home))}"])
         _emit_progress(on_progress, "starting", "Starting Codex.")
         with tempfile.TemporaryFile(mode="w+t") as stderr_file:
             process = None
@@ -1767,6 +1802,10 @@ class ClaudePrintAdapter:
         if not agent.project_path:
             raise ProviderAdapterError("Claude agent has no project path.")
         launch_directory = agent.working_directory or agent.project_path
+        account = project_account(launch_directory)
+        process_environment = {**os.environ, **agent.runtime_environment}
+        if account is not None:
+            process_environment = account.environment("claude", process_environment)
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
         native_compact = prompt.strip().lower() == "/compact"
@@ -1789,7 +1828,7 @@ class ClaudePrintAdapter:
             process = self._popen_factory(
                 command,
                 cwd=launch_directory,
-                env={**os.environ, **agent.runtime_environment},
+                env=process_environment,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,

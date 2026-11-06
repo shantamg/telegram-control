@@ -222,8 +222,10 @@ def create_worker(
         raise StoreError(f"A tmux session already uses the name {session_name}.")
 
     config = dict(provider_config or {})
+    account = provider_adapters.project_account(directory)
+    session_options = account.session_options(provider) if account else {}
     recovery_file = ensure_recovery_file(store, name)
-    baseline_sessions = _session_ids_for(provider, directory)
+    baseline_sessions = _session_ids_for(provider, directory, **session_options)
     provider_session_id = (
         str(uuid.uuid4()) if provider == "claude" else None
     )
@@ -234,6 +236,8 @@ def create_worker(
         provider_session_id=provider_session_id,
     )
     command.append(launch_preamble(name))
+    if account is not None:
+        command = account.tmux_command(provider, command)
 
     worker = store.create_detached_worker(
         name=name,
@@ -263,6 +267,7 @@ def create_worker(
                 provider,
                 directory,
                 baseline_sessions,
+                **session_options,
             )
             worker = store.configure_detached_worker_recovery(
                 name,
@@ -365,16 +370,20 @@ def _kill_session(session_name: str) -> None:
     )
 
 
-def _session_ids_for(provider: str, working_directory: str) -> set[str]:
+def _session_ids_for(
+    provider: str, working_directory: str, **session_options: Path
+) -> set[str]:
     if provider == "claude":
         sessions = claude_sessions.discover_sessions(
             working_directory,
             limit=100,
+            **session_options,
         )
     elif provider == "codex":
         sessions = codex_sessions.discover_sessions(
             working_directory,
             limit=100,
+            **session_options,
         )
     else:
         return set()
@@ -385,10 +394,14 @@ def _wait_for_new_session(
     provider: str,
     working_directory: str,
     baseline_session_ids: set[str],
+    **session_options: Path,
 ) -> str:
     deadline = time.monotonic() + SESSION_DISCOVERY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        candidates = _session_ids_for(provider, working_directory) - baseline_session_ids
+        candidates = (
+            _session_ids_for(provider, working_directory, **session_options)
+            - baseline_session_ids
+        )
         if len(candidates) == 1:
             return next(iter(candidates))
         if len(candidates) > 1:
@@ -405,11 +418,15 @@ def _wait_for_new_session(
 def validate_provider_session(worker: DetachedWorker) -> bool:
     if not worker.provider_session_id:
         return False
+    session_options = provider_adapters.project_session_options(
+        worker.provider, worker.working_directory
+    )
     if worker.provider == "claude":
         return (
             claude_sessions.resolve_session(
                 worker.provider_session_id,
                 worker.working_directory,
+                **session_options,
             )
             is not None
         )
@@ -418,6 +435,7 @@ def validate_provider_session(worker: DetachedWorker) -> bool:
             codex_sessions.resolve_session(
                 worker.provider_session_id,
                 worker.working_directory,
+                **session_options,
             )
             is not None
         )
@@ -442,7 +460,8 @@ def resume_command_for(
         raise StoreError(str(error)) from error
     if prompt:
         command.append(prompt)
-    return command
+    account = provider_adapters.project_account(worker.working_directory)
+    return account.tmux_command(worker.provider, command) if account else command
 
 
 def pane_text(session: str) -> str:

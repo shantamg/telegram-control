@@ -180,7 +180,15 @@ detailed topic status text. The core safety and routing contract cannot be
 replaced through these settings.
 
 Start with [Customization and configuration](docs/guides/customization.md) and
-inspect the resolved result with:
+inspect the resolved result with `./telegram_control.py config show`.
+
+### Project accounts
+
+Use [project accounts](docs/guides/project-accounts.md) to pair a Claude Code
+login and a Codex CLI login under a company name. The optional shell wrapper
+asks on first launch and saves the choice in a private `.ai-account.local`
+file. Telegram topics, the session picker, and tmux launches use that same
+workspace binding.
 
 ### Allowlisted local-action buttons
 
@@ -198,10 +206,6 @@ The configuration file must be owned by the current macOS user and must not be
 group- or world-writable. A local action is not exposed automatically: a
 trusted local integration must also create a reusable `local_action_run`
 callback action for the exact chat, topic, and authorized Telegram owner.
-
-```sh
-./telegram_control.py config show
-```
 
 ## Documentation
 
@@ -229,6 +233,7 @@ policy. In particular:
 | Per-update commands and confirmations | `on_message.py` |
 | SQLite schema, queues, routes, and lifecycle | `durable_store.py` |
 | Claude and Codex execution/session state | `provider_adapters.py`, `claude_sessions.py`, `codex_sessions.py`, `provider_defaults.py` |
+| Shared terminal and Telegram account selection | `ai_accounts.py` |
 | Help, formatting, inventory, and voice UI | `telegram_help.py`, `telegram_formatting.py`, `workspace_catalog.py`, `voice_settings.py`, `voice_responses.py` |
 | Optional Control router | `router_contract.py`, `router_eval.py`, `discovery.py` |
 | Agent-scoped Telegram capabilities | `agent_telegram.py`, `skills/` |

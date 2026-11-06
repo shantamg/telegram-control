@@ -816,6 +816,42 @@ class LiveControlContractTests(unittest.TestCase):
             )
             self.assertTrue((runtime_home / "auth.json").is_symlink())
 
+    def test_bound_codex_app_server_uses_profile_auth_and_separate_sqlite(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "turn/start":
+                self.emit_codex_completion(process)
+
+        process.on_payload = handle
+        factory = FakePopenFactory(process)
+        adapter = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex", poll_interval_seconds=0.01, _popen_factory=factory,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            profile_home = root / "profile"
+            profile_home.mkdir()
+            profile = provider_adapters.ai_accounts.Profile("Lovely", None, profile_home)
+            runtime_home = root / "codex-home"
+            with mock.patch.object(provider_adapters, "project_account", return_value=profile):
+                adapter.run_turn(
+                    codex_agent(runtime_environment={
+                        "TELEGRAM_CONTROL_CODEX_HOME": str(runtime_home),
+                        "OPENAI_API_KEY": "inherited",
+                    }),
+                    "Inspect the worker.", None, lambda _session: None, lambda: None,
+                )
+            self.assertEqual(factory.kwargs["env"]["CODEX_HOME"], str(profile_home))
+            self.assertNotIn("OPENAI_API_KEY", factory.kwargs["env"])
+            self.assertIn('cli_auth_credentials_store="file"', factory.command)
+            sqlite_override = next(arg for arg in factory.command if arg.startswith("sqlite_home="))
+            sqlite_home = Path(json.loads(sqlite_override.split("=", 1)[1]))
+            self.assertEqual(sqlite_home.parent, runtime_home)
+            self.assertTrue((sqlite_home / ".telegram-control-app-server-start.lock").is_file())
+            self.assertFalse((sqlite_home / "auth.json").exists())
+
     def test_provider_control_validation_and_capabilities(self):
         control = provider_adapters.ProviderControl(
             control_id=4,
