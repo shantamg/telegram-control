@@ -25,6 +25,8 @@ Claude or Codex.
 
 from __future__ import annotations
 
+import fcntl
+import os
 import re
 import shlex
 import subprocess
@@ -59,10 +61,14 @@ RESTART_BACKOFF_SECONDS = 30
 RECOVERY_CONFIRM_TIMEOUT_SECONDS = 30 * 60
 SESSION_DISCOVERY_TIMEOUT_SECONDS = 15
 SESSION_DISCOVERY_POLL_SECONDS = 0.25
-BRIEF_SUBMIT_DELAY_SECONDS = 0.2
 BRIEF_SUBMIT_ATTEMPTS = 4
-BRIEF_SUBMIT_POLL_SECONDS = 0.75
-_COMPOSER_MATCH_CHARS = 8
+BRIEF_POLL_SECONDS = 0.2
+BRIEF_READY_POLLS = 25
+BRIEF_RECEIPT_POLLS = 40
+BRIEF_ENTER_RETRY_POLLS = 5
+_BRIEF_FILENAME = re.compile(r"brief-[0-9a-f]{32}\.md")
+_COMPOSER_PROMPT = re.compile(r"^( *)[›❯](?:\s|$)")
+_SUBMITTED_PROMPT = re.compile(r"^ *[›❯>](?:\s|$)")
 
 DEFAULT_RECOVERY_PROMPT = """You have been automatically resumed after the host or detached session stopped unexpectedly.
 
@@ -142,7 +148,7 @@ def ensure_recovery_file(store: DurableStore, name: str) -> Path:
 
 
 def remove_recovery_file(store: DurableStore, worker: DetachedWorker) -> bool:
-    """Remove only the exact harness-owned recovery file at worker teardown."""
+    """Remove controller-owned recovery state and temporary handoffs."""
     expected = recovery_file_path(store, worker.name)
     if worker.recovery_file_path and Path(worker.recovery_file_path) != expected:
         raise StoreError(
@@ -154,6 +160,21 @@ def remove_recovery_file(store: DurableStore, worker: DetachedWorker) -> bool:
         removed = True
     except FileNotFoundError:
         pass
+    handoffs = expected.parent / "handoffs"
+    if handoffs.is_dir() and not handoffs.is_symlink():
+        directory_fd = os.open(handoffs, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX)
+            for path in handoffs.iterdir():
+                if _BRIEF_FILENAME.fullmatch(path.name) and path.is_file():
+                    path.unlink(missing_ok=True)
+            try:
+                handoffs.rmdir()
+            except OSError:
+                # Preserve any companion files the controller did not create.
+                pass
+        finally:
+            os.close(directory_fd)
     try:
         expected.parent.rmdir()
     except OSError:
@@ -523,80 +544,132 @@ def answer_startup_dialog(session_name: str) -> Optional[str]:
     return None
 
 
-def _still_in_composer(pane: str, text: str) -> bool:
-    """Is `text` sitting at a prompt, typed but never submitted?
-
-    Providers draw the composer as a prompt marker followed by whatever has
-    been typed. Once submitted the text moves into the transcript above and no
-    prompt line carries it any more, so a prompt line that still starts with
-    the opening words is the signature of an Enter that did not land.
-    """
-    probe = " ".join(text.split())
-    if len(probe) < _COMPOSER_MATCH_CHARS:
-        return False
-    # Only the *last* prompt line is the composer. Providers echo submitted
-    # messages back into the transcript behind a marker of their own — Claude
-    # uses "> " — so scanning every line finds the successful delivery and
-    # reads it as a failure.
-    typed = None
-    for line in reversed(pane.splitlines()):
-        stripped = line.strip()
-        if stripped[:1] in {"❯", ">"}:
-            typed = " ".join(stripped[1:].split())
-            break
-    if not typed:
-        return False
-    # A long brief wraps, so the composer line holds only its opening. Compare
-    # on whatever both actually have, floored so a stray short line cannot
-    # match by accident.
-    shared = min(len(typed), len(probe), 40)
-    if shared < _COMPOSER_MATCH_CHARS:
-        return False
-    return typed[:shared] == probe[:shared]
-
-
-def send_brief(name: str, brief: str) -> None:
-    """Type a brief into the worker's session and submit it.
-
-    Sent as a separate step from the launch so the provider has finished
-    starting before it receives instructions, and so a caller can send further
-    guidance later through the same path.
-
-    The submit is verified rather than assumed. Sending the text and Enter
-    together loses the Enter outright, and even sent separately it can arrive
-    while the paste is still being processed, leaving the whole brief parked in
-    the composer while the caller is told it was delivered. So this checks the
-    pane, re-sends a bare Enter while the text is still sitting there, and
-    raises rather than reporting a delivery that did not happen.
-    """
-    session = tmux_session_name(_validate_name(name))
-    if not tmux_console.has_tmux_session(session):
-        raise StoreError("Detached worker session is not running.")
-    tmux = tmux_console.tmux_binary()
-    subprocess.run(
-        [tmux, "send-keys", "-t", session, brief],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    # Interactive providers process bracketed paste asynchronously. Without a
-    # small gap, Enter can arrive before the pasted brief becomes submit-ready
-    # and leave the entire task sitting unsent in the prompt.
-    time.sleep(BRIEF_SUBMIT_DELAY_SECONDS)
-    for _ in range(BRIEF_SUBMIT_ATTEMPTS):
-        subprocess.run(
-            [tmux, "send-keys", "-t", session, "Enter"],
-            capture_output=True,
-            text=True,
-            check=False,
+def _brief_tmux(binary: str, *args: str) -> str:
+    try:
+        result = subprocess.run(
+            [binary, *args], capture_output=True, text=True, check=True, timeout=5
         )
-        time.sleep(BRIEF_SUBMIT_POLL_SECONDS)
-        if not _still_in_composer(pane_text(session), brief):
-            return
-    raise StoreError(
-        "The brief stayed in the worker's composer after "
-        f"{BRIEF_SUBMIT_ATTEMPTS} attempts to submit it. Nothing was delivered."
+    except (OSError, subprocess.SubprocessError) as error:
+        raise StoreError(f"tmux {args[0]} failed during worker handoff.") from error
+    return result.stdout
+
+
+def _brief_pane_state(snapshot: str, reference: str) -> str:
+    """Distinguish a live composer from the provider's echo of a sent message."""
+    header, _, body = snapshot.partition("\n")
+    x, y, height, in_mode, dead = map(int, header.split())
+    lines = body.split("\n")[:-1]
+    cursor = len(lines) - height + y
+    if in_mode or dead or not 0 <= cursor < len(lines):
+        return "unavailable"
+
+    expected = "".join(reference.split())
+    prompt = _COMPOSER_PROMPT.match(lines[cursor])
+    if prompt and x == len(prompt[1]) + 2:
+        placeholder = lines[cursor][prompt.end():].strip()
+        if (
+            not placeholder
+            or placeholder == "Ask Codex to do anything"
+            or placeholder.startswith('Try "')
+        ):
+            if expected:
+                # A unique reference in the transcript above an empty composer
+                # is positive evidence. Its disappearance alone proves nothing.
+                for row in range(cursor - 1, -1, -1):
+                    echo = _SUBMITTED_PROMPT.match(lines[row])
+                    if not echo:
+                        continue
+                    following = [lines[row][echo.end():], *lines[row + 1:cursor]]
+                    if "".join("".join(following).split()).startswith(expected):
+                        return "accepted"
+            return "empty"
+
+    if expected:
+        # The cursor can be several screen rows below the prompt after wrapping.
+        for row in range(cursor, max(-1, cursor - height), -1):
+            prompt = _COMPOSER_PROMPT.match(lines[row])
+            if prompt:
+                draft = [lines[row][prompt.end():], *lines[row + 1:cursor + 1]]
+                if (row < cursor or x > len(prompt[1]) + 2) and (
+                    "".join("".join(draft).split()) == expected
+                ):
+                    return "draft"
+                break
+    return "unavailable"
+
+
+def send_brief(name: str, worker_dir: Path, brief: bytes) -> Path:
+    """Keep the full brief on disk and submit only its short file reference."""
+    session = tmux_session_name(_validate_name(name))
+    binary = tmux_console.tmux_binary()
+    # The launch pane is first. A watcher or attached client can change which
+    # window is active, so resolve once and use the exact pane ID thereafter.
+    panes = _brief_tmux(
+        binary, "list-panes", "-s", "-t", f"={session}", "-F", "#{pane_id}"
     )
+    pane = panes.partition("\n")[0]
+    if not re.fullmatch(r"%[0-9]+", pane):
+        raise StoreError("The detached worker has no tmux pane.")
+
+    def state(reference: str = "") -> str:
+        snapshot = _brief_tmux(
+            binary, "display-message", "-t", pane, "-p",
+            "#{cursor_x} #{cursor_y} #{pane_height} #{pane_in_mode} #{pane_dead}",
+            ";", "capture-pane", "-p", "-t", pane, "-S", "-200",
+        )
+        return _brief_pane_state(snapshot, reference)
+
+    handoffs = worker_dir / "handoffs"
+    handoffs.mkdir(mode=0o700, exist_ok=True)
+    directory_fd = os.open(handoffs, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(directory_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise StoreError("Another handoff is in progress for this worker.") from error
+
+        for _ in range(BRIEF_READY_POLLS):
+            if state() == "empty":
+                break
+            time.sleep(BRIEF_POLL_SECONDS)
+        else:
+            raise StoreError("The worker did not show an empty composer. No keys were sent.")
+
+        path = handoffs / f"brief-{uuid.uuid4().hex}.md"
+        reference = f"Read and follow {shlex.quote(str(path))}"
+        if not reference.isprintable():
+            raise StoreError("The handoff path contains terminal control characters.")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(brief)
+
+        try:
+            _brief_tmux(binary, "send-keys", "-t", pane, "-l", "--", reference)
+            attempts = 0
+            next_enter = 0
+            for poll in range(BRIEF_RECEIPT_POLLS):
+                status = state(reference)
+                if status == "accepted" and attempts:
+                    return path
+                if (
+                    status == "draft"
+                    and attempts < BRIEF_SUBMIT_ATTEMPTS
+                    and poll >= next_enter
+                ):
+                    _brief_tmux(binary, "send-keys", "-t", pane, "Enter")
+                    attempts += 1
+                    next_enter = poll + BRIEF_ENTER_RETRY_POLLS
+                time.sleep(BRIEF_POLL_SECONDS)
+        except StoreError as error:
+            raise StoreError(
+                f"{error} Delivery is unconfirmed. Handoff saved at {path}."
+            ) from error
+        raise StoreError(
+            f"Telegram Control could not verify submission. Handoff saved at {path}. "
+            "Inspect the pane before retrying."
+        )
+    finally:
+        os.close(directory_fd)
 
 
 def reconcile_worker(store: DurableStore, name: str) -> Optional[DetachedWorker]:

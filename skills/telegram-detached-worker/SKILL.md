@@ -36,8 +36,9 @@ names both the tmux session and the topic.
   using its own native scheduling, wakeup, loop, and background features. It is
   not asked to keep any recovery inventory.
 
-Then give the worker its task. **Write the brief to a file first** and point the
-worker at it — briefs are long, and typing one through `send-keys` is fragile:
+Then give the worker its task. Write the brief as readable Markdown, with full
+sentences and a clear separation between current instructions and earlier
+context:
 
 ```bash
 /usr/bin/python3 {{TELEGRAM_CONTROL_ROOT}}/telegram_control.py \
@@ -49,7 +50,9 @@ explicitly tells the worker to report at milestones (see below). Include
 anything the worker cannot discover for itself — it does not inherit your
 conversation.
 
-The brief is delivered verbatim, with nothing prepended.
+Telegram Control copies the brief verbatim into a private temporary handoff file
+and submits a short instruction to read it. The worker can read the copy after
+the parent turn ends. Telegram Control removes managed copies at worker teardown.
 
 After the brief command succeeds, the detached worker owns the long-running
 task. You may capture its pane once for an immediate sanity check, but **do not
@@ -104,8 +107,10 @@ is in the buffer and will match. Check for a real artifact instead.
 
 ## Typing into a pane yourself
 
-`worker-brief` already does this correctly — it types the text, submits it, and
-verifies the composer emptied — so prefer it. **Never send Enter, or any other
+`worker-brief` is the standard path for task instructions and automated wake-ups.
+It verifies the unique file reference appears in the provider's submitted
+messages. If delivery is unconfirmed, inspect the pane before retrying and use
+the saved handoff path from the error. **Never send Enter, or any other
 key, after `worker-brief` reports the brief delivered.** The message is already
 submitted at that point; a follow-up Enter arrives in a live session and
 presses whatever happens to be focused — accepting a permission or trust

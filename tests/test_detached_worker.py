@@ -274,102 +274,94 @@ class DetachedWorkerLaunchTests(unittest.TestCase):
             detached_worker.launch_command_for("someone-else", "/tmp/project", {})
         self.assertIn("someone-else", str(caught.exception))
 
-    def test_brief_waits_for_bracketed_paste_before_submitting(self):
-        with (
-            mock.patch.object(
-                detached_worker.tmux_console,
-                "has_tmux_session",
-                return_value=True,
-            ),
-            mock.patch.object(
-                detached_worker.tmux_console,
-                "tmux_binary",
-                return_value="/bin/tmux",
-            ),
-            mock.patch.object(detached_worker.subprocess, "run") as run,
-            mock.patch.object(detached_worker.time, "sleep") as sleep,
-        ):
-            with mock.patch.object(
-                detached_worker,
-                "pane_text",
-                return_value="⏺ Working on it.\n❯ ",
-            ):
-                detached_worker.send_brief("rails-fix", "Do the work now.")
-        self.assertEqual(run.call_count, 2)
-        self.assertEqual(
-            sleep.call_args_list[0].args,
-            (detached_worker.BRIEF_SUBMIT_DELAY_SECONDS,),
-        )
-        self.assertEqual(run.call_args_list[0].args[0][-1], "Do the work now.")
-        self.assertEqual(run.call_args_list[1].args[0][-1], "Enter")
+class WorkerBriefTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.worker_dir = Path(directory.name)
 
-    def test_brief_left_in_the_composer_gets_another_bare_enter(self):
-        # First check still shows the brief typed but unsent; the second is
-        # clear, so exactly one extra Enter should have been needed.
-        panes = ["❯ Do the work now.", "⏺ Working on it.\n❯ "]
+    def _deliver(self, render):
+        sent = []
+
+        def tmux(_binary, *args):
+            if args[0] == "list-panes":
+                self.assertIn("=detached--rails-fix", args)
+                return "%42\n%67\n"
+            self.assertEqual(args[2], "%42")
+            if args[0] == "send-keys":
+                sent.append(args[-1])
+                return ""
+            return render(sent)
+
         with (
-            mock.patch.object(
-                detached_worker.tmux_console,
-                "has_tmux_session",
-                return_value=True,
-            ),
-            mock.patch.object(
-                detached_worker.tmux_console,
-                "tmux_binary",
-                return_value="/bin/tmux",
-            ),
-            mock.patch.object(detached_worker.subprocess, "run") as run,
+            mock.patch.object(detached_worker, "_brief_tmux", side_effect=tmux),
+            mock.patch.object(detached_worker.tmux_console, "tmux_binary"),
             mock.patch.object(detached_worker.time, "sleep"),
-            mock.patch.object(
-                detached_worker,
-                "pane_text",
-                side_effect=panes,
-            ),
         ):
-            detached_worker.send_brief("rails-fix", "Do the work now.")
-        enters = [
-            call for call in run.call_args_list if call.args[0][-1] == "Enter"
-        ]
-        self.assertEqual(len(enters), 2)
+            path = detached_worker.send_brief(
+                "rails-fix", self.worker_dir, b"Full brief\r\nSecond line\n"
+            )
+        return path, sent
 
-    def test_delivered_brief_echoed_in_the_transcript_is_not_read_as_stuck(self):
-        # Claude echoes a submitted message back behind "> ", so scanning every
-        # prompt-marked line mistook a successful delivery for a failed one.
-        # Only the last such line is the composer.
-        brief = "Write the single word delivered into the proof file."
-        pane = (
-            "> Write the single word delivered into the proof file.\n"
-            "⏺ Done.\n"
-            "❯ "
-        )
-        self.assertFalse(detached_worker._still_in_composer(pane, brief))
-        self.assertTrue(
-            detached_worker._still_in_composer(f"⏺ idle\n❯ {brief}", brief)
-        )
+    def test_file_reference_is_the_only_text_sent_to_tmux(self):
+        def render(sent):
+            if not sent:
+                return "2 0 1 0 0\n› Ask Codex to do anything\n"
+            if sent[-1] != "Enter":
+                return f"20 1 2 0 0\n› {sent[0][:35]}\n  {sent[0][35:]}\n"
+            return f"2 2 3 0 0\n› {sent[0]}\n\n› Ask Codex to do anything\n"
 
-    def test_brief_that_never_submits_is_reported_not_claimed(self):
-        with (
-            mock.patch.object(
-                detached_worker.tmux_console,
-                "has_tmux_session",
-                return_value=True,
-            ),
-            mock.patch.object(
-                detached_worker.tmux_console,
-                "tmux_binary",
-                return_value="/bin/tmux",
-            ),
-            mock.patch.object(detached_worker.subprocess, "run"),
-            mock.patch.object(detached_worker.time, "sleep"),
-            mock.patch.object(
-                detached_worker,
-                "pane_text",
-                return_value="❯ Do the work now.",
-            ),
-            self.assertRaises(Exception) as caught,
-        ):
-            detached_worker.send_brief("rails-fix", "Do the work now.")
-        self.assertIn("Nothing was delivered", str(caught.exception))
+        path, sent = self._deliver(render)
+        self.assertEqual(path.read_bytes(), b"Full brief\r\nSecond line\n")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(sent, [f"Read and follow {path}", "Enter"])
+
+    def test_retries_enter_only_while_the_exact_reference_is_in_the_composer(self):
+        def render(sent):
+            if not sent:
+                return '2 0 1 0 0\n❯ Try "make a change"\n'
+            if sent.count("Enter") < 2:
+                return f"30 0 1 0 0\n❯ {sent[0]}\n"
+            return f"2 1 2 0 0\n❯ {sent[0]}\n❯ \n"
+
+        _, sent = self._deliver(render)
+        self.assertEqual(sent[1:], ["Enter", "Enter"])
+
+    def test_disappearing_draft_is_not_a_receipt_or_a_reason_to_retry_enter(self):
+        def render(sent):
+            if not sent or sent[-1] == "Enter":
+                self.assertLessEqual(sent.count("Enter"), 1)
+                return "2 0 1 0 0\n› Ask Codex to do anything\n"
+            return f"30 0 1 0 0\n› {sent[0]}\n"
+
+        with self.assertRaisesRegex(StoreError, "could not verify") as caught:
+            self._deliver(render)
+        handoffs = list((self.worker_dir / "handoffs").glob("*.md"))
+        self.assertEqual(len(handoffs), 1)
+        self.assertIn(str(handoffs[0]), str(caught.exception))
+
+    def test_existing_draft_is_left_alone(self):
+        def render(sent):
+            self.assertEqual(sent, [])
+            return "16 0 1 0 0\n› Earlier draft\n"
+
+        with self.assertRaisesRegex(StoreError, "empty composer"):
+            self._deliver(render)
+        self.assertEqual(list((self.worker_dir / "handoffs").glob("*.md")), [])
+
+    def test_a_stuck_reference_has_bounded_enter_retries(self):
+        sent_keys = []
+
+        def render(sent):
+            sent_keys[:] = sent
+            if not sent:
+                return "2 0 1 0 0\n› \n"
+            return f"30 0 1 0 0\n› {sent[0]}\n"
+
+        with self.assertRaisesRegex(StoreError, "could not verify"):
+            self._deliver(render)
+        self.assertEqual(sent_keys[1:], ["Enter"] * detached_worker.BRIEF_SUBMIT_ATTEMPTS)
 
 
 class ReportOnlyNoticeTests(unittest.TestCase):
@@ -458,13 +450,21 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
         self.assertNotIn("RECOVERY.md", preamble)
         self.assertNotIn(str(self.recovery_file), preamble)
 
-    def test_worker_teardown_removes_only_its_managed_recovery_file(self):
+    def test_worker_teardown_removes_managed_recovery_file_and_handoffs(self):
         companion = self.recovery_file.parent / "operator-note.txt"
         companion.write_text("preserve me", encoding="utf-8")
+        handoffs = self.recovery_file.parent / "handoffs"
+        handoffs.mkdir()
+        handoff = handoffs / ("brief-" + "0" * 32 + ".md")
+        handoff.write_text("handoff", encoding="utf-8")
+        handoff_companion = handoffs / "operator-note.md"
+        handoff_companion.write_text("preserve me", encoding="utf-8")
         removed = detached_worker.remove_recovery_file(self.store, self.worker)
         self.assertTrue(removed)
         self.assertFalse(self.recovery_file.exists())
+        self.assertFalse(handoff.exists())
         self.assertTrue(companion.exists())
+        self.assertTrue(handoff_companion.exists())
 
     def test_stopped_worker_resumes_exact_session_without_a_prompt(self):
         with (
