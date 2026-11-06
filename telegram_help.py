@@ -144,6 +144,8 @@ You can ask an active managed agent to:
 
 Ask for a new topic by name and include the task you want it to start. The new topic inherits the group's provider, model, and effort unless you choose explicit overrides, receives the task as its first turn, and remains a normal conversation you can steer directly.
 
+For detached workers, the managed agent relays instructions through a private handoff file. The worker receives a short reference, and Telegram Control checks that the provider accepted it.
+
 These skills are scoped to the active Telegram turn. They do not accept arbitrary chat or topic IDs.""",
     ),
     HelpTopic(

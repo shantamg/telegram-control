@@ -2586,8 +2586,12 @@ def worker_start_command(args: argparse.Namespace) -> None:
 
 
 def worker_brief_command(args: argparse.Namespace) -> None:
-    brief = Path(args.file).expanduser().read_text(encoding="utf-8").strip()
-    if not brief:
+    brief = Path(args.file).expanduser().read_bytes()
+    try:
+        has_text = bool(brief.decode("utf-8").strip())
+    except UnicodeDecodeError as error:
+        raise StoreError("Brief file must be UTF-8 text.") from error
+    if not has_text:
         raise StoreError("Brief file is empty.")
     with open_store(args.db) as store:
         worker = store.resolve_detached_worker(args.name)
@@ -2601,11 +2605,11 @@ def worker_brief_command(args: argparse.Namespace) -> None:
                 recovery_file_path=str(recovery_file),
                 recovery_prompt=detached_worker.DEFAULT_RECOVERY_PROMPT,
             )
-    # Delivered verbatim. The worker was told who it is at launch, and a brief
-    # is usually a relay of something the owner just said, so anything prepended
-    # here is a standing instruction repeated for no one's benefit.
-    detached_worker.send_brief(args.name, brief)
-    print(f"Brief delivered to {detached_worker.tmux_session_name(args.name)}")
+    handoff = detached_worker.send_brief(worker.name, recovery_file.parent, brief)
+    print(
+        f"Brief delivered to {worker.tmux_session_name} and verified submitted. "
+        f"Handoff file: {handoff}"
+    )
 
 
 def worker_report_command(args: argparse.Namespace) -> None:
@@ -3730,7 +3734,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     worker_brief_parser = subparsers.add_parser(
         "worker-brief",
-        help="Send a task brief from a file into a detached worker.",
+        help="Submit a private file handoff to a detached worker.",
     )
     worker_brief_parser.add_argument("name")
     worker_brief_parser.add_argument("--file", required=True)

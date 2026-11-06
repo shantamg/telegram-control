@@ -1063,6 +1063,26 @@ generations, and the confirm/fail handshake all stay. Removing them means a
 schema migration on a live system for no behavioral gain, so the columns simply
 go quiet and `RECOVERY.md` is created but never mentioned to the worker.
 
+## File handoffs for detached worker briefs
+
+`worker-brief <name> --file <path>` copies the UTF-8 brief byte for byte to a
+private, uniquely named Markdown file in the worker's managed state directory.
+The provider composer receives only a short instruction with the absolute
+path. The copy survives the parent turn, a failed send, and a worker restart.
+Worker teardown removes managed copies and preserves other files.
+
+The sender serializes deliveries per worker and pins the launch pane before
+sending any keys. It waits for an empty Codex or Claude composer, types the
+reference literally, and submits only after seeing the exact reference in the
+composer. It retries Enter a bounded number of times while that same draft is
+still visible. Success requires the unique reference in the provider's
+submitted messages above the composer. An unconfirmed send exits with an error
+and the handoff path so the caller can inspect the pane before retrying.
+
+Verified with regression tests for wrapped Codex drafts, Claude submit retries,
+an occupied composer, a vanished draft, and teardown. Isolated tmux sessions
+running Codex and Claude each received and acted on a multi-line file handoff.
+
 ## Agent-authored questions with buttons
 
 Agents could send text, voice, group icons, detached workers, and teardown
