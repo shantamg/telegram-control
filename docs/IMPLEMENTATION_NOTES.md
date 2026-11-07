@@ -1083,6 +1083,9 @@ Verified with regression tests for wrapped Codex drafts, Claude submit retries,
 an occupied composer, a vanished draft, and teardown. Isolated tmux sessions
 running Codex and Claude each received and acted on a multi-line file handoff.
 
+The required macOS CI jobs use `macos-15-intel`. GitHub rejected the previous
+`macos-14` runner configuration before either Python matrix job could start.
+
 ## Agent-authored questions with buttons
 
 Agents could send text, voice, group icons, detached workers, and teardown
