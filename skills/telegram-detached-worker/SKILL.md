@@ -36,8 +36,9 @@ names both the tmux session and the topic.
   using its own native scheduling, wakeup, loop, and background features. It is
   not asked to keep any recovery inventory.
 
-Then give the worker its task. **Write the brief to a file first** and point the
-worker at it — briefs are long, and typing one through `send-keys` is fragile:
+Then give the worker its task. Write the brief as readable Markdown, with full
+sentences and a clear separation between current instructions and earlier
+context:
 
 ```bash
 /usr/bin/python3 {{TELEGRAM_CONTROL_ROOT}}/telegram_control.py \
@@ -49,7 +50,9 @@ explicitly tells the worker to report at milestones (see below). Include
 anything the worker cannot discover for itself — it does not inherit your
 conversation.
 
-The brief is delivered verbatim, with nothing prepended.
+Telegram Control copies the brief verbatim into a private temporary handoff file
+and submits a short instruction to read it. The worker can read the copy after
+the parent turn ends. Telegram Control removes managed copies at worker teardown.
 
 Recovery is deliberately thin. Resuming the exact provider session ID restores
 the conversation and its scheduled work, so the recovery turn only asks the
@@ -91,6 +94,14 @@ tmux capture-pane -p -t detached--<name> | tail -40
 
 When polling a pane, do not grep for text you typed into it — your own prompt
 is in the buffer and will match. Check for a real artifact instead.
+
+## Delivering instructions reliably
+
+`worker-brief` is the standard path for task instructions and automated wake-ups.
+It verifies the unique file reference appears in the provider's submitted
+messages. If delivery is unconfirmed, inspect the pane before retrying and use
+the saved handoff path from the error. Once delivery succeeds, allow the worker
+to process the message without sending additional keys.
 
 ## Tearing a worker down
 

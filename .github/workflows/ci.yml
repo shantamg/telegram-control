@@ -16,7 +16,7 @@ concurrency:
 jobs:
   tests:
     name: Python ${{ matrix.python-version }} on macOS
-    runs-on: macos-14
+    runs-on: macos-15-intel
     timeout-minutes: 15
     strategy:
       fail-fast: false
