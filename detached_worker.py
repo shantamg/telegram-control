@@ -56,7 +56,7 @@ MAX_RESTARTS = 3
 # every reboot. Unbounded accumulation of finished-but-never-stopped workers
 # once swapped a 16 GB machine to a standstill, so creation refuses past this
 # point and names the workers to stop instead.
-MAX_RUNNING_WORKERS = 12
+MAX_RUNNING_WORKERS = 16
 RESTART_BACKOFF_SECONDS = 30
 RECOVERY_CONFIRM_TIMEOUT_SECONDS = 30 * 60
 SESSION_DISCOVERY_TIMEOUT_SECONDS = 15

@@ -1256,7 +1256,7 @@ Second, nothing ever reaped a worker whose task had finished: workers whose
 final report had been delivered stayed `intended_state = running`
 indefinitely, and reboot recovery faithfully resurrected all of them.
 `create_worker` now refuses to create a new worker while `MAX_RUNNING_WORKERS`
-(12) are already intended running, and the error names the running workers and
+(16) are already intended running, and the error names the running workers and
 `worker-stop` so the caller can clean up. `worker-status` also reports
 `created_at` and `age_days` per worker so staleness is visible at a glance.
 
@@ -2239,3 +2239,11 @@ validation, tmux environment changes, and separate Codex profile
 authentication and SQLite launch arguments. All 440 tests passed. A real
 terminal smoke test selected the existing Personal login through Codex and
 reused it from Claude in the same temporary directory.
+
+## Preserve the approved detached-worker capacity
+
+The running checkout's September 3 capacity increase from 12 to 16 intended
+running detached workers is now recorded in Git. The guard still rejects new
+workers at the limit and names the existing workers to stop. No schema or queue
+payload changes. Verified with the full 441-test suite, including the capacity
+guard test, before committing this existing runtime change.
