@@ -3413,6 +3413,7 @@ class DurableStoreTests(unittest.TestCase):
             self.assertTrue(1 <= len(command["description"]) <= 256)
             self.assertIn(f"/{command['command']}", telegram_help.HOME_TEXT)
         for handled in (
+            "compact",
             "help",
             "agent",
             "status",
@@ -10203,6 +10204,69 @@ class DurableIntegrationTests(unittest.TestCase):
                     ).fetchone()[0],
                     0,
                 )
+
+    def test_compact_commands_queue_native_input_without_steering(self):
+        for provider in ("codex", "claude"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                database_path = Path(directory) / "controller.sqlite3"
+                config = {
+                    "chat_id": 123, "owner_user_id": 123,
+                    "bot_username": "example_bot",
+                    "handler_path": str(Path(on_message.__file__).resolve()),
+                }
+                with DurableStore(database_path) as store:
+                    store.ensure_surface_binding(
+                        chat_id=123, message_thread_id=62, surface_type="project",
+                        display_name="Project", target_type="controller", target_id="control",
+                    )
+                    agent, _ = store.register_project_agent(
+                        chat_id=123, surface_name="Project", slug="project",
+                        provider=provider, project_path=directory,
+                    )
+                    # Both forms must become exact native commands. A reply
+                    # to another message must not route /compact as steering.
+                    for index, command in enumerate(("/compact", "/compact@example_bot")):
+                        update = topic_message_update(10 + index, command)
+                        update["message"]["reply_to_message"] = {
+                            "message_id": 500, "message_thread_id": 62,
+                            "chat": dict(update["message"]["chat"]),
+                        }
+                        store.ingest_update(update, now=100 + index)
+                        job = store.claim_job("worker", now=100 + index)
+                        telegram_control.process_inbox_job(store, config, job, "worker")
+                        if index == 0:
+                            active = store.claim_agent_mailbox("active-worker")
+                            self.assertIsNotNone(active)
+                    self.assertIsNone(store.claim_agent_mailbox("other-worker"))
+                    rows = store.connection.execute(
+                        "SELECT agent_id, input_text, state FROM agent_mailbox ORDER BY mailbox_id"
+                    ).fetchall()
+                    self.assertEqual([tuple(row) for row in rows], [
+                        (agent.agent_id, "/compact", "leased"),
+                        (agent.agent_id, "/compact", "queued"),
+                    ])
+                    self.assertEqual(store.connection.execute(
+                        "SELECT COUNT(*) FROM agent_turn_controls"
+                    ).fetchone()[0], 0)
+                    self.assertEqual(store.connection.execute(
+                        "SELECT COUNT(*) FROM router_mailbox"
+                    ).fetchone()[0], 0)
+
+    def test_compact_outside_agent_topic_explains_scope_without_starting_agent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with DurableStore(Path(directory) / "controller.sqlite3") as store:
+                config = {
+                    "chat_id": 123, "owner_user_id": 123,
+                    "handler_path": str(Path(on_message.__file__).resolve()),
+                }
+                store.ingest_update(message_update(10, "/compact"), now=100)
+                job = store.claim_job("worker", now=100)
+                telegram_control.process_inbox_job(store, config, job, "worker")
+                outbox = store.claim_outbox("sender", now=10**12)
+                self.assertIn("only works inside a managed agent topic", outbox.params["text"])
+                self.assertEqual(store.connection.execute(
+                    "SELECT COUNT(*) FROM agent_mailbox"
+                ).fetchone()[0], 0)
 
     def test_teardown_command_opens_confirmation_without_an_agent_turn(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

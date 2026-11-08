@@ -2247,3 +2247,31 @@ running detached workers is now recorded in Git. The guard still rejects new
 workers at the limit and names the existing workers to stop. No schema or queue
 payload changes. Verified with the full 441-test suite, including the capacity
 guard test, before committing this existing runtime change.
+
+## Native context compaction for Codex topics
+
+A standalone `/compact` is now a registered Telegram command for managed Claude
+and Codex topics. `addressed_command` normalizes the menu's `/compact@botname`
+form before queuing the exact native command. It queues on the topic agent
+behind active work, including when sent as a reply to a progress card, rather
+than becoming steering input. Other surfaces receive an explanation.
+
+The Codex adapter resumes the existing thread and calls `thread/compact/start`
+instead of sending `/compact` as model input through `turn/start`. Its empty
+RPC acknowledgment is not completion: the adapter consumes `turn/started`,
+compaction item progress, and `turn/completed`, preserving events even when
+they arrive before the RPC acknowledgment. Only a successful completed turn
+produces the same-session confirmation. RPC failures, failed or interrupted
+turns, EOF, and timeouts remain failures or cancellations. Stop uses the native
+compaction turn ID; steering during compaction is rejected with guidance to
+queue a new topic message. Recovery also retains the native operation.
+
+No schema or durable payload variants change. Existing long-running Codex
+workers need an idle-safe reload to pick up this adapter change. The completed
+live feature branch was reconciled into main first, retaining main's supported
+CI runner and the existing native Claude compaction behavior.
+
+Verification: all 447 tests passed, including both RPC/event orderings, session
+preservation, recovery, errors, Stop, command normalization, queueing, and scope.
+A real installed Codex app-server smoke test created a disposable thread,
+compacted it, and resumed that same thread with its earlier instruction intact.

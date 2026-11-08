@@ -710,6 +710,155 @@ class LiveControlContractTests(unittest.TestCase):
                 }
             )
 
+    def test_codex_compact_resumes_session_and_waits_for_native_completion(self):
+        for recovery in (None, "thread-1"):
+            for ack_first in (True, False):
+                with self.subTest(recovery=recovery, ack_first=ack_first):
+                    process = FakeProcess(lambda payload: None)
+                    sessions, progress = [], []
+
+                    def handle(payload):
+                        self.codex_handshake(process, payload)
+                        if payload.get("method") != "thread/compact/start":
+                            return
+                        ack = {"id": payload["id"], "result": {}}
+                        if ack_first:
+                            process.stdout.emit(ack)
+                        # Ignore events from a different thread.
+                        process.stdout.emit({"method": "turn/started", "params": {
+                            "threadId": "other", "turn": {"id": "other-turn"},
+                        }})
+                        process.stdout.emit({"method": "turn/started", "params": {
+                            "threadId": "thread-1", "turn": {"id": "compact-1"},
+                        }})
+                        for method in ("item/started", "item/completed"):
+                            process.stdout.emit({"method": method, "params": {
+                                "threadId": "thread-1", "turnId": "compact-1",
+                                "item": {"id": "compact-item", "type": "contextCompaction"},
+                            }})
+                        process.stdout.emit({"method": "turn/completed", "params": {
+                            "threadId": "thread-1",
+                            "turn": {"id": "compact-1", "status": "completed"},
+                        }})
+                        if not ack_first:
+                            process.stdout.emit(ack)
+
+                    process.on_payload = handle
+                    result = provider_adapters.CodexExecAdapter(
+                        binary="/bin/codex", poll_interval_seconds=0.01,
+                        _popen_factory=FakePopenFactory(process),
+                    ).run_turn(
+                        codex_agent(provider_session_id="thread-1"),
+                        " /compact ", recovery, sessions.append, lambda: None,
+                        lambda stage, detail: progress.append((stage, detail)),
+                    )
+                    methods = [payload.get("method") for payload in process.payloads]
+                    self.assertIn("thread/resume", methods)
+                    self.assertNotIn("turn/start", methods)
+                    self.assertEqual(process.payloads[-1]["params"], {"threadId": "thread-1"})
+                    self.assertEqual(sessions, ["thread-1"])
+                    self.assertEqual(result.provider_session_id, "thread-1")
+                    self.assertEqual(result.final_text, "Context compacted successfully. "
+                                     "This topic will continue in the same Codex session.")
+                    self.assertIn(("turn_started", "compact-1"), progress)
+
+    def test_codex_compact_does_not_report_success_for_errors_or_missing_completion(self):
+        for failure in ("rpc", "turn", "interrupted", "eof", "timeout"):
+            with self.subTest(failure=failure):
+                process = FakeProcess(lambda payload: None)
+
+                def handle(payload):
+                    self.codex_handshake(process, payload)
+                    if payload.get("method") != "thread/compact/start":
+                        return
+                    if failure == "rpc":
+                        process.stdout.emit({"id": payload["id"], "error": {
+                            "message": "Compaction unavailable",
+                        }})
+                        return
+                    process.stdout.emit({"id": payload["id"], "result": {}})
+                    if failure == "timeout":
+                        return
+                    if failure == "eof":
+                        process.stdout.close()
+                        return
+                    process.stdout.emit({"method": "turn/started", "params": {
+                        "threadId": "thread-1", "turn": {"id": "compact-1"},
+                    }})
+                    process.stdout.emit({"method": "turn/completed", "params": {
+                        "threadId": "thread-1", "turn": {
+                            "id": "compact-1",
+                            "status": "interrupted" if failure == "interrupted" else "failed",
+                            "error": {"message": "Compaction failed"},
+                        },
+                    }})
+
+                process.on_payload = handle
+                adapter = provider_adapters.CodexExecAdapter(
+                    binary="/bin/codex", poll_interval_seconds=0.01,
+                    _popen_factory=FakePopenFactory(process),
+                )
+                adapter.timeout_seconds = 0.1
+                progress = []
+                with self.assertRaises(provider_adapters.ProviderAdapterError):
+                    adapter.run_turn(
+                        codex_agent(provider_session_id="thread-1"), "/compact", None,
+                        lambda _: None, lambda: None,
+                        lambda stage, detail: progress.append((stage, detail)),
+                    )
+                self.assertFalse(any(stage == "completed" for stage, _ in progress))
+
+    def test_codex_compact_supports_stop_and_rejects_steering(self):
+        process = FakeProcess(lambda payload: None)
+        controls = [
+            provider_adapters.ProviderControl(1, "steer", "new guidance", "compact-1"),
+            provider_adapters.ProviderControl(2, "cancel", "", "compact-1"),
+        ]
+        outcomes = []
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "thread/compact/start":
+                process.stdout.emit({"id": payload["id"], "result": {}})
+                process.stdout.emit({"method": "turn/started", "params": {
+                    "threadId": "thread-1", "turn": {"id": "compact-1"},
+                }})
+            elif payload.get("method") == "turn/interrupt":
+                process.stdout.emit({"id": payload["id"], "result": {}})
+
+        process.on_payload = handle
+        adapter = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex", poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        )
+        with self.assertRaises(provider_adapters.ProviderTurnCancelled):
+            adapter.run_turn(
+                codex_agent(provider_session_id="thread-1"), "/compact", None,
+                lambda _: None, lambda: None,
+                poll_control=lambda: controls.pop(0) if controls else None,
+                on_control=lambda control, outcome, _: outcomes.append((control.control_id, outcome)),
+            )
+        self.assertEqual(outcomes, [(1, "rejected"), (2, "applied")])
+        self.assertEqual(process.payloads[-1]["params"], {
+            "threadId": "thread-1", "turnId": "compact-1",
+        })
+
+    def test_codex_compact_mentioned_in_prose_is_an_ordinary_turn(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "turn/start":
+                self.emit_codex_completion(process)
+
+        process.on_payload = handle
+        result = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex", poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        ).run_turn(codex_agent(), "Explain /compact", None, lambda _: None, lambda: None)
+        self.assertEqual(result.final_text, "Codex final")
+        self.assertNotIn("thread/compact/start", [p.get("method") for p in process.payloads])
+
     def test_controller_codex_home_isolates_state_and_links_shared_inputs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

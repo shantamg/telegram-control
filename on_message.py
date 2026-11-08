@@ -5908,6 +5908,14 @@ def main() -> int:
                     send_agent_status()
                 else:
                     send_status_card(update)
+            elif command.lower() == "/compact":
+                binding = current_surface_binding()
+                if binding is None or binding.target_type != "agent":
+                    send_message("/compact only works inside a managed agent topic.")
+                else:
+                    # Always queue a native operation, even when this command
+                    # replies to the active progress card. Never steer it as text.
+                    enqueue_agent_input(binding.target_id, "/compact")
             elif command.lower() == "/voice":
                 send_voice_configuration()
             elif command.lower() == "/help":

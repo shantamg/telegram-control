@@ -28,6 +28,7 @@ class BotCommand(NamedTuple):
 COMMANDS = (
     BotCommand("help", "Browse the Telegram Control guide"),
     BotCommand("agent", "Inspect or manage this topic's agent"),
+    BotCommand("compact", "Compact this topic's context and keep its session"),
     BotCommand("status", "Inspect this Telegram surface"),
     BotCommand("voice", "Choose and preview the spoken-reply voice"),
     BotCommand("projects", "List connected workspaces and topic sessions"),
@@ -53,6 +54,7 @@ PRIVATE_COMMAND_NAMES = (
 GROUP_COMMAND_NAMES = (
     "help",
     "agent",
+    "compact",
     "status",
     "voice",
     "projects",
@@ -107,7 +109,7 @@ Use /agent inside a managed topic to inspect a grouped Runtime, Workspace, and U
 
 If you set a project account with ai-accounts in Terminal, Telegram uses the same Claude or Codex login for turns, session selection, and tmux. Run ai-accounts show in the working directory to see the company. If you switch the project to another account, use /agent to start a fresh session.
 
-The /agent controls can change the current model and effort while preserving the existing conversation, pause or resume the agent, start a fresh session, resume a previous session, or switch providers. Claude topics offer both the moving Opus alias and a pinned Opus 4.8 choice. Codex topics can also switch between OpenAI cloud and dynamically discovered local Ollama models; changing backend starts a fresh conversation, local output streams through the same progress card, and local models default to a read-only sandbox. Codex and Claude each expose their own supported choices, and switching requires the destination CLI to be installed and authenticated. Small local models are experimental and may follow tool instructions less reliably. Conflicting changes are rejected while a turn or console is active; wait for it to finish, close the console, and try again. Session and provider changes also require the topic’s queue to be empty. Ordinary messages in the topic go to its bound agent. In a Claude topic, send /compact by itself to run Claude's native context compaction while keeping the same session. A reply sent while Claude is inside a long tool call remains queued until Claude acknowledges it; Stop remains independently available.
+The /agent controls can change the current model and effort while preserving the existing conversation, pause or resume the agent, start a fresh session, resume a previous session, or switch providers. Claude topics offer both the moving Opus alias and a pinned Opus 4.8 choice. Codex topics can also switch between OpenAI cloud and dynamically discovered local Ollama models; changing backend starts a fresh conversation, local output streams through the same progress card, and local models default to a read-only sandbox. Codex and Claude each expose their own supported choices, and switching requires the destination CLI to be installed and authenticated. Small local models are experimental and may follow tool instructions less reliably. Conflicting changes are rejected while a turn or console is active; wait for it to finish, close the console, and try again. Session and provider changes also require the topic’s queue to be empty. Ordinary messages in the topic go to its bound agent. In a Claude or Codex topic, send /compact by itself to run native context compaction while keeping the same session. It queues behind active work and reports success when compaction finishes. A reply sent while Claude is inside a long tool call remains queued until Claude acknowledges it; Stop remains independently available.
 
 Claude and Codex answers use safe native Telegram formatting for common Markdown such as headings, emphasis, links, lists, quotes, and code. If formatting cannot be validated or Telegram rejects it, Control falls back to plain text rather than losing the answer.""",
     ),

@@ -124,8 +124,9 @@ the bot or delete the group in Telegram after cleanup finishes.
   model, or effort, and start or resume a provider session. Codex topics can
   choose dynamically discovered local Ollama models; Claude topics include a
   pinned Opus 4.8 choice alongside the moving Opus alias.
-- Sending `/compact` by itself in a Claude topic runs Claude's native context
-  compaction and keeps the topic bound to the same provider session.
+- Sending `/compact` by itself in a Claude or Codex topic runs native context
+  compaction and keeps the topic bound to the same provider session. It queues
+  behind active work and confirms success when compaction finishes.
 - `/voice` previews and changes the global spoken-reply voice and speed.
 - Replying to the progress card steers the active turn; guidance sent while
   Claude is inside a tool call stays pending until Claude acknowledges it.
@@ -153,6 +154,7 @@ accept commands.
 | --- | --- | --- |
 | `/help` | Paired chat or ordinary project topic | Opens the button-driven guide. |
 | `/agent` | Managed agent topic | Inspects and manages runtime, provider, model, effort, lifecycle, and sessions. |
+| `/compact` | Managed agent topic | Compacts context while keeping the same provider session. |
 | `/status` | Paired chat or ordinary project topic | Inspects the current surface; in an agent topic it opens the agent card. |
 | `/voice` | Paired chat or ordinary project topic | Stages, previews, and confirms the global spoken-reply voice and speed. |
 | `/projects` | Paired chat or ordinary project topic | Lists connected workspaces without exposing local paths. |

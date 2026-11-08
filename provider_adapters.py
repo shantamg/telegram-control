@@ -1024,8 +1024,9 @@ class CodexExecAdapter:
         sandbox = self._sandbox_mode(agent)
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
+        native_compact = prompt.strip().lower() == "/compact"
         effective_prompt = prompt
-        if recovery:
+        if recovery and not native_compact:
             effective_prompt = (
                 "The controller lost the completion status for the previous "
                 "delivery of this request. Inspect the existing conversation "
@@ -1154,38 +1155,57 @@ class CodexExecAdapter:
                 _emit_progress(on_progress, "session_ready", thread_id)
 
                 request_id += 1
-                _write_json_line(
-                    process,
-                    {
-                        "id": request_id,
-                        "method": "turn/start",
-                        "params": self._turn_request(
-                            thread_id,
-                            effective_prompt,
-                            launch_directory,
-                            model,
-                            effort,
-                        ),
-                    },
-                )
-                turn_result = self._wait_for_rpc(
-                    process,
-                    lines,
-                    request_id,
-                    deadline,
-                    heartbeat,
-                )
-                turn = turn_result.get("turn")
-                turn_id = (
-                    str(turn.get("id", ""))
-                    if isinstance(turn, dict)
-                    else ""
-                )
-                if not turn_id:
-                    raise ProviderAdapterError(
-                        "Codex app-server returned an empty turn ID."
+                compact_request_id: Optional[int] = None
+                if native_compact:
+                    # Compaction acknowledges with {}, then starts a turn via
+                    # notifications. Read both in the event loop so early
+                    # lifecycle events cannot be discarded by _wait_for_rpc.
+                    compact_request_id = request_id
+                    turn_id = ""
+                    _emit_progress(
+                        on_progress, "working", "Compacting Codex context."
                     )
-                _emit_progress(on_progress, "turn_started", turn_id)
+                    _write_json_line(
+                        process,
+                        {
+                            "id": request_id,
+                            "method": "thread/compact/start",
+                            "params": {"threadId": thread_id},
+                        },
+                    )
+                else:
+                    _write_json_line(
+                        process,
+                        {
+                            "id": request_id,
+                            "method": "turn/start",
+                            "params": self._turn_request(
+                                thread_id,
+                                effective_prompt,
+                                launch_directory,
+                                model,
+                                effort,
+                            ),
+                        },
+                    )
+                    turn_result = self._wait_for_rpc(
+                        process,
+                        lines,
+                        request_id,
+                        deadline,
+                        heartbeat,
+                    )
+                    turn = turn_result.get("turn")
+                    turn_id = (
+                        str(turn.get("id", ""))
+                        if isinstance(turn, dict)
+                        else ""
+                    )
+                    if not turn_id:
+                        raise ProviderAdapterError(
+                            "Codex app-server returned an empty turn ID."
+                        )
+                    _emit_progress(on_progress, "turn_started", turn_id)
 
                 final_text = ""
                 usage: dict[str, Any] = {}
@@ -1197,17 +1217,30 @@ class CodexExecAdapter:
                 pending: Optional[
                     tuple[int, ProviderControl, float]
                 ] = None
-                while not completed:
+                while not completed or compact_request_id is not None:
                     now = time.monotonic()
                     if now >= deadline:
                         raise ProviderAdapterError("Codex turn timed out.")
                     heartbeat()
 
-                    if pending is None and poll_control is not None:
+                    if (
+                        turn_id
+                        and not completed
+                        and pending is None
+                        and poll_control is not None
+                    ):
                         candidate = poll_control()
                         if candidate is not None:
                             control = _validate_control(candidate)
-                            if (
+                            if native_compact and control.kind == "steer":
+                                _emit_control(
+                                    on_control,
+                                    control,
+                                    "rejected",
+                                    "Context compaction cannot accept steering. "
+                                    "Send a new message in the topic to queue it.",
+                                )
+                            elif (
                                 control.expected_turn_id is not None
                                 and control.expected_turn_id != turn_id
                             ):
@@ -1313,6 +1346,22 @@ class CodexExecAdapter:
                             "Codex requested unsupported interactive input."
                         )
                     if "id" in message:
+                        if (
+                            compact_request_id is not None
+                            and message.get("id") == compact_request_id
+                        ):
+                            if "error" in message:
+                                raise ProviderAdapterError(
+                                    _safe_rpc_error_detail(
+                                        "Codex", "context compaction", message.get("error")
+                                    )
+                                )
+                            if not isinstance(message.get("result"), dict):
+                                raise ProviderAdapterError(
+                                    "Codex returned an invalid compaction response."
+                                )
+                            compact_request_id = None
+                            continue
                         if pending is None or message.get("id") != pending[0]:
                             continue
                         control = pending[1]
@@ -1379,7 +1428,24 @@ class CodexExecAdapter:
                     params = message.get("params")
                     if not isinstance(params, dict):
                         continue
-                    if method == "item/agentMessage/delta":
+                    if (
+                        native_compact
+                        and method == "turn/started"
+                        and params.get("threadId") == thread_id
+                        and not turn_id
+                    ):
+                        started_turn = params.get("turn")
+                        turn_id = (
+                            str(started_turn.get("id") or "")
+                            if isinstance(started_turn, dict)
+                            else ""
+                        )
+                        if not turn_id:
+                            raise ProviderAdapterError(
+                                "Codex compaction started without a turn ID."
+                            )
+                        _emit_progress(on_progress, "turn_started", turn_id)
+                    elif method == "item/agentMessage/delta":
                         if (
                             params.get("threadId") == thread_id
                             and params.get("turnId") == turn_id
@@ -1441,6 +1507,7 @@ class CodexExecAdapter:
                                 "commandExecution": "Running a project operation.",
                                 "fileChange": "Preparing a project change.",
                                 "reasoning": "Reasoning about the request.",
+                                "contextCompaction": "Compacting Codex context.",
                                 "webSearch": "Looking up requested information.",
                                 "mcpToolCall": "Using an approved tool.",
                                 "collabAgentToolCall": "Coordinating agent work.",
@@ -1558,6 +1625,11 @@ class CodexExecAdapter:
                             )
                         completed = True
 
+                if native_compact:
+                    final_text = (
+                        "Context compacted successfully. This topic will "
+                        "continue in the same Codex session."
+                    )
                 if not final_text:
                     raise ProviderAdapterError(
                         "Codex completed without a final agent message."
