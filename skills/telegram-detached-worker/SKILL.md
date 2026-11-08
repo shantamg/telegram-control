@@ -54,11 +54,21 @@ Telegram Control copies the brief verbatim into a private temporary handoff file
 and submits a short instruction to read it. The worker can read the copy after
 the parent turn ends. Telegram Control removes managed copies at worker teardown.
 
-Recovery is deliberately thin. Resuming the exact provider session ID restores
-the conversation and its scheduled work, so the recovery turn only asks the
-worker to check that its scheduled tasks, wakeups, loops, and monitors are still
-active, recreate anything missing, and confirm success or failure; the
-controller sends the result through its durable Telegram outbox.
+After the brief command succeeds, the detached worker owns the long-running
+task. You may capture its pane once for an immediate sanity check, but **do not
+wait or poll for a milestone from the managed parent turn**. In particular,
+never run an `until tmux capture-pane ...` loop waiting for report text. The
+worker's durable `worker-report` message is the confirmation; finish the parent
+turn so it remains conversational and steerable.
+
+For a later correction or follow-up, write the new instruction to another file
+and deliver it with `worker-brief` again. Do not keep the parent turn open while
+the detached worker processes it.
+
+Recovery involves no agent at all. Resuming the exact provider session ID is
+itself what restores the conversation and its scheduled work, so the controller
+reopens the session with no prompt, checks the process came up, and posts that
+the worker recovered. Nothing is asked of the worker and nothing is waited for.
 
 ## Making the worker report
 
@@ -95,13 +105,48 @@ tmux capture-pane -p -t detached--<name> | tail -40
 When polling a pane, do not grep for text you typed into it — your own prompt
 is in the buffer and will match. Check for a real artifact instead.
 
-## Delivering instructions reliably
+## Typing into a pane yourself
 
 `worker-brief` is the standard path for task instructions and automated wake-ups.
 It verifies the unique file reference appears in the provider's submitted
 messages. If delivery is unconfirmed, inspect the pane before retrying and use
-the saved handoff path from the error. Once delivery succeeds, allow the worker
-to process the message without sending additional keys.
+the saved handoff path from the error. **Never send Enter, or any other
+key, after `worker-brief` reports the brief delivered.** The message is already
+submitted at that point; a follow-up Enter arrives in a live session and
+presses whatever happens to be focused — accepting a permission or trust
+prompt, choosing a dialog's highlighted default, or submitting a stray empty
+message. Stray "just in case" Enters are the most common way agents break a
+worker that was doing fine.
+
+When you must drive a pane directly — a confirmation dialog, a slash command,
+another tmux session entirely — the loop is send, verify, and press Enter
+again *only* while the text is visibly stuck:
+
+```bash
+tmux send-keys -t <session> 'your text'      # 1. the text, alone
+sleep 1
+tmux send-keys -t <session> Enter            # 2. Enter, as its own call
+sleep 1
+tmux capture-pane -p -t <session> | tail -5  # 3. verify before any more keys
+```
+
+Three rules, each of which has already bitten:
+
+- **Never put the text and `Enter` in one `send-keys`.** The Enter is swallowed
+  and the text sits in the composer unsent.
+- **A second Enter is a recovery step, never a routine one.** Interactive
+  providers process bracketed paste asynchronously, so an Enter arriving too
+  early can land before the paste is submit-ready. If — and only if — the
+  capture still shows your text on the prompt line, send one more bare `Enter`
+  and check again.
+- **Verify, then stop.** Text still sitting on the `❯` prompt line means the
+  submit never landed: send another Enter and re-check. Text gone from the
+  prompt — moved into the transcript, the provider showing `esc to interrupt`
+  or similar — means it submitted: you are done, and any further key you send
+  goes to a working agent's UI, not to your message.
+
+Clear a stale composer with `tmux send-keys -t <session> C-u` before typing, or
+your text is appended to whatever was already there.
 
 ## Tearing a worker down
 
@@ -127,4 +172,7 @@ unexpected companion file is preserved rather than recursively deleted.
   something destructive to run unattended.
 - Do not tell the user to reply in the worker's topic — nothing there reaches
   the worker. Relay their instructions yourself.
+- A parent turn must never block on a detached worker's tmux pane. Report the
+  worker as started after the start and brief commands succeed, then finish the
+  parent turn.
 - Report a worker as started only after the command succeeds.

@@ -20,6 +20,7 @@ venv/
 *.secret
 config.json
 .telegram-control.local.json
+.ai-account.local
 offset
 state/
 data/

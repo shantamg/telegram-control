@@ -5,7 +5,8 @@ Run Claude Code or Codex on your Mac from Telegram.
 Telegram Control gives each project its own private Telegram group and each
 conversation its own topic. Send text, files, photos, or optional voice notes;
 the controller durably queues the work, runs the selected coding agent in the
-bound local folder, and streams the answer back to Telegram.
+bound local folder, streams progress, and sends the final answer back to
+Telegram.
 
 The default experience is deliberately direct:
 
@@ -27,16 +28,19 @@ discovery and delegation.
 
 | Capability | Required? | What happens without it |
 | --- | --- | --- |
-| macOS and Python 3.9+ | Yes | Installation stops with a specific readiness error. |
+| macOS and Python 3.9+ at `/usr/bin/python3` | Yes | Installation stops with a specific readiness error. |
 | A private Telegram bot | Yes | `SETUP.command` walks you through BotFather and pairing. |
-| Claude Code **or** Codex CLI | Yes, one or both | Topics use whichever authenticated provider is available. A Claude-only installation does not need Codex. |
+| Claude Code **or** Codex CLI | Yes, one or both | Install and authenticate at least one CLI, then verify it manually in Terminal. `doctor` checks the executable and version, not login state. A Claude-only installation does not need Codex. |
+| Ollama | No | Codex topics can use locally installed Ollama models; cloud providers remain available without it. |
 | Handy + Parakeet V3 + ffmpeg | No | Text and file messages work; local voice transcription is unavailable. |
-| edge-tts + ffmpeg | No | Text replies work; the Listen button cannot create spoken replies. |
+| ffmpeg (macOS `say` is built in) | No | Text replies work; the Listen button cannot create spoken replies. |
 | tmux | No | Normal topic conversations work; console takeover and detached workers are unavailable. |
 | Conversational Control agent | No, off by default | Groups bind by exact path with `/bind`; no Codex router is started. |
 
-No Python packages need to be installed. Provider authentication is owned by
-the Claude Code and Codex CLIs, just as it is in your terminal.
+The core controller and test suite have no third-party Python-package
+dependencies. Optional voice tools are separate local executables. Provider
+authentication is owned by the Claude Code and Codex CLIs, just as it is in
+your terminal.
 
 ## Install on a local Mac
 
@@ -55,8 +59,13 @@ After the foreground echo test succeeds, press Control-C and run:
 ```
 
 `bootstrap` runs the readiness checks, initializes the durable database,
-installs the shared agent skills, publishes the Telegram command menu, and
-installs the login LaunchAgent. Confirm the result with:
+seeds this checkout as the default **Telegram Control** group workspace,
+installs the shared agent skills, attempts to publish the Telegram command
+menu, and installs the login LaunchAgent. The seed uses the checkout's resolved
+path, so cloning somewhere else requires no path edit. A transient
+menu-publication failure is reported as a warning without aborting
+installation; retry it with `./telegram_control.py sync-commands`. Confirm the
+result with:
 
 ```sh
 ./telegram_control.py status
@@ -73,39 +82,85 @@ For the human checkpoints, troubleshooting, and uninstall details, follow the
    This is a separate per-account display choice and makes each agent
    conversation feel like its own chat.
 4. Tap the link from `/newgroup` to add the bot with the requested admin rights.
-5. In the group, send `/bind` followed by an exact existing folder:
+5. The bot automatically posts a welcome card in General explaining the next
+   steps. For an ordinary project group, send `/bind` followed by an exact
+   existing folder:
 
    ```text
    /bind ~/Software/my-project
    ```
 
-6. Confirm the folder and provider. Then create a topic and send a message.
-   The topic agent is created automatically and the message becomes its first
-   turn.
+6. Confirm the folder and provider. Telegram Control reuses the ordinary topic
+   where binding happened, or creates **Start Here** when setup happened in
+   General. Send a message there to begin.
+
+The first private group named **Telegram Control** is a shortcut: installation
+has already seeded this repository's checkout, so adding the bot offers that
+exact folder for confirmation without requiring `/bind`. Confirming that seeded
+setup also applies the bundled 🎛 group avatar.
 
 See [Set up a Telegram project group](docs/getting-started/telegram-group.md)
 for the exact Telegram settings and why each permission is needed.
 
 To disconnect a project group, first finish active turns and consoles and stop
-its detached workers. Then send `/removegroup` in any ordinary topic and confirm
-the removal card. Telegram Control deletes every managed topic, archives its
-agents and sessions, and revokes the workspace binding. It cannot delete the
-Telegram group itself, so remove the bot or delete the group in Telegram after
-cleanup finishes.
+its detached workers. Then send `/removegroup` in General or any ordinary topic
+and confirm the removal card. Telegram Control deletes every managed topic,
+archives its topic agents, clears their provider-session pointers, and revokes
+the workspace binding. It cannot delete the Telegram group itself, so remove
+the bot or delete the group in Telegram after cleanup finishes.
 
 ## Everyday behavior
 
 - One project group can contain many independent topic conversations.
+- General is the group's setup and administration surface. Telegram sometimes
+  omits its thread ID, so Telegram Control normalizes it to Telegram's reserved
+  topic ID 1; General is never turned into a disposable agent topic.
 - Topic sessions and queues survive controller restarts.
 - `/projects` lists every connected workspace with its active topic and session
   counts, whether it came from the older project catalog or a bound group.
-- `/agent` changes provider, model, effort, or session for the current topic.
+- `/status` inspects the current Control surface; in an agent topic it opens
+  the same runtime card as `/agent`.
+- `/agent` can pause or resume the topic agent, change provider, backend,
+  model, or effort, and start or resume a provider session. Codex topics can
+  choose dynamically discovered local Ollama models; Claude topics include a
+  pinned Opus 4.8 choice alongside the moving Opus alias.
+- Sending `/compact` by itself in a Claude topic runs Claude's native context
+  compaction and keeps the topic bound to the same provider session.
 - `/voice` previews and changes the global spoken-reply voice and speed.
-- Replying to the progress card steers the active turn; **Stop** interrupts it.
-- Attachments are saved to private local paths the agent can inspect.
+- Replying to the progress card steers the active turn; guidance sent while
+  Claude is inside a tool call stays pending until Claude acknowledges it.
+  **Stop** remains independently available while work is active and interrupts
+  it. A failed agent worker is recovered without restarting unrelated active
+  topics.
+- Photos and documents up to 20 MB are saved to private local paths the agent
+  can inspect.
 - `/help` is the in-Telegram source of truth for commands and workflows.
 - Agents can create more conversational topics when asked.
-- Optional detached workers use tmux for work that must outlive one turn.
+- Optional detached workers use tmux for work that must outlive one turn. The
+  parent starts and briefs a worker, then finishes instead of polling its tmux
+  pane. After a reboot, Telegram Control resumes the exact provider session and
+  has it verify its native scheduled and background work.
+
+## Telegram commands
+
+Telegram publishes these from `telegram_help.COMMANDS`, so typing `/` shows the
+relevant subset in private bot chats and project groups. Telegram has no
+topic-level command scope, so General and ordinary topics in one group share
+the group menu. Report-only detached-worker topics display that menu but do not
+accept commands.
+
+| Command | Where to use it | What it does |
+| --- | --- | --- |
+| `/help` | Paired chat or ordinary project topic | Opens the button-driven guide. |
+| `/agent` | Managed agent topic | Inspects and manages runtime, provider, model, effort, lifecycle, and sessions. |
+| `/status` | Paired chat or ordinary project topic | Inspects the current surface; in an agent topic it opens the agent card. |
+| `/voice` | Paired chat or ordinary project topic | Stages, previews, and confirms the global spoken-reply voice and speed. |
+| `/projects` | Paired chat or ordinary project topic | Lists connected workspaces without exposing local paths. |
+| `/newgroup` | Paired private chat | Creates the link for adding the bot to a private project group. |
+| `/showcase` | Paired chat or ordinary project topic | Previews rich messages, styled buttons, reactions, guided replies, and other native Telegram UI. |
+| `/bind <path>` | Authorized, unbound private project group | Confirms an exact existing workspace and available provider. |
+| `/removegroup` | Ordinary topic in a bound project group | Confirms safe removal of the binding and every managed topic. |
+| `/teardown` | Managed agent topic | Confirms removal of that topic and its agent binding. |
 
 ## Customize without changing the project
 
@@ -125,11 +180,32 @@ detailed topic status text. The core safety and routing contract cannot be
 replaced through these settings.
 
 Start with [Customization and configuration](docs/guides/customization.md) and
-inspect the resolved result with:
+inspect the resolved result with `./telegram_control.py config show`.
 
-```sh
-./telegram_control.py config show
-```
+### Project accounts
+
+Use [project accounts](docs/guides/project-accounts.md) to pair a Claude Code
+login and a Codex CLI login under a company name. The optional shell wrapper
+asks on first launch and saves the choice in a private `.ai-account.local`
+file. Telegram topics, the session picker, and tmux launches use that same
+workspace binding.
+
+### Allowlisted local-action buttons
+
+An owner-authorized durable callback can run a local command that has been
+explicitly allowlisted in
+`~/.config/telegram-control/local-actions.json`. Telegram carries only an
+opaque callback token and an action key; it never receives the command or local
+paths. Commands run directly without a shell, have a maximum two-minute
+timeout, and normally return bounded stdout to the originating topic. A trusted
+integration can set `suppress_output: true` on the durable callback payload
+when the command updates an existing Telegram card itself; failures are still
+posted to the topic.
+
+The configuration file must be owned by the current macOS user and must not be
+group- or world-writable. A local action is not exposed automatically: a
+trusted local integration must also create a reusable `local_action_run`
+callback action for the exact chat, topic, and authorized Telegram owner.
 
 ## Documentation
 
@@ -147,6 +223,22 @@ policy. In particular:
 - [Repository architecture](docs/contributing/architecture.md)
 - [Exact implementation notes](docs/IMPLEMENTATION_NOTES.md)
 - [Original build plan](docs/BUILD_PLAN.md)
+
+## Repository map
+
+| Area | Main files |
+| --- | --- |
+| Pairing and Telegram transport | `SETUP.command`, `telegram_bridge.py` |
+| CLI, supervisor, and durable workers | `telegram_control.py` |
+| Per-update commands and confirmations | `on_message.py` |
+| SQLite schema, queues, routes, and lifecycle | `durable_store.py` |
+| Claude and Codex execution/session state | `provider_adapters.py`, `claude_sessions.py`, `codex_sessions.py`, `provider_defaults.py` |
+| Shared terminal and Telegram account selection | `ai_accounts.py` |
+| Help, formatting, inventory, and voice UI | `telegram_help.py`, `telegram_formatting.py`, `workspace_catalog.py`, `voice_settings.py`, `voice_responses.py` |
+| Optional Control router | `router_contract.py`, `router_eval.py`, `discovery.py` |
+| Agent-scoped Telegram capabilities | `agent_telegram.py`, `skills/` |
+| Default Telegram group artwork | `assets/telegram-control-group-icon.png` |
+| Tests and exact mechanism history | `tests/`, `docs/IMPLEMENTATION_NOTES.md` |
 
 ## Contributing
 

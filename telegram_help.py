@@ -32,9 +32,34 @@ COMMANDS = (
     BotCommand("voice", "Choose and preview the spoken-reply voice"),
     BotCommand("projects", "List connected workspaces and topic sessions"),
     BotCommand("newgroup", "Get the link that adds me to a new project group"),
+    BotCommand("showcase", "Preview Telegram's native bot interface controls"),
     BotCommand("bind", "Bind this group to an exact local folder"),
     BotCommand("removegroup", "Safely remove this project group and all topics"),
     BotCommand("teardown", "Safely remove this managed topic and session"),
+)
+
+# Telegram can scope the composer command menu by chat type, though not by
+# individual forum topic. Keep setup-only commands out of project groups and
+# group-only lifecycle commands out of the bot's private administration chat.
+PRIVATE_COMMAND_NAMES = (
+    "help",
+    "status",
+    "voice",
+    "projects",
+    "newgroup",
+    "showcase",
+)
+
+GROUP_COMMAND_NAMES = (
+    "help",
+    "agent",
+    "status",
+    "voice",
+    "projects",
+    "showcase",
+    "bind",
+    "removegroup",
+    "teardown",
 )
 
 
@@ -78,9 +103,11 @@ TOPICS = (
         "Agents & sessions",
         """Agents and sessions
 
-Use /agent inside a managed topic to inspect a grouped Runtime, Workspace, and Usage card covering its provider, model, effort, state, session, console, and context usage.
+Use /agent inside a managed topic to inspect a grouped Runtime, Workspace, and Usage card covering its provider, model, effort, state, session, console, and context usage. In a managed topic, /status opens this same agent card; on a Control or setup surface, /status shows durable transport status with a Refresh button.
 
-The /agent controls can change the current model and effort while preserving the existing conversation, pause or resume the agent, start a fresh session, resume a previous session, or switch providers. Codex and Claude each expose their own supported choices. Reconfiguration waits for an active turn or console to become idle. Ordinary messages in the topic go to its bound agent.
+If you set a project account with ai-accounts in Terminal, Telegram uses the same Claude or Codex login for turns, session selection, and tmux. Run ai-accounts show in the working directory to see the company. If you switch the project to another account, use /agent to start a fresh session.
+
+The /agent controls can change the current model and effort while preserving the existing conversation, pause or resume the agent, start a fresh session, resume a previous session, or switch providers. Claude topics offer both the moving Opus alias and a pinned Opus 4.8 choice. Codex topics can also switch between OpenAI cloud and dynamically discovered local Ollama models; changing backend starts a fresh conversation, local output streams through the same progress card, and local models default to a read-only sandbox. Codex and Claude each expose their own supported choices, and switching requires the destination CLI to be installed and authenticated. Small local models are experimental and may follow tool instructions less reliably. Conflicting changes are rejected while a turn or console is active; wait for it to finish, close the console, and try again. Session and provider changes also require the topic’s queue to be empty. Ordinary messages in the topic go to its bound agent. In a Claude topic, send /compact by itself to run Claude's native context compaction while keeping the same session. A reply sent while Claude is inside a long tool call remains queued until Claude acknowledges it; Stop remains independently available.
 
 Claude and Codex answers use safe native Telegram formatting for common Markdown such as headings, emphasis, links, lists, quotes, and code. If formatting cannot be validated or Telegram rejects it, Control falls back to plain text rather than losing the answer.""",
     ),
@@ -89,11 +116,11 @@ Claude and Codex answers use safe native Telegram formatting for common Markdown
         "Detached workers",
         """Detached workers
 
-Ask the main topic agent to start long-running work in a detached session. The worker receives its own report-only topic in the same group and can post text or voice milestones there.
+Ask the main topic agent to start long-running work in a detached session. The worker receives its own report-only topic in the same group and can post text or voice milestones there. Once the worker is started and briefed, the main turn finishes instead of polling the worker, so the conversational topic remains responsive.
 
-Telegram Control gives the worker a durable recovery file and requires it to keep that file current whenever it creates goals, native wakeups, scheduled tasks, background agents, monitors, or processes that would need to be restored. After a reboot and graphical login, Control recreates tmux, resumes the exact provider conversation, asks it to read that file and reactivate its own native work, then reports whether the agent verified recovery.
+If tmux disappears, Telegram Control resumes the exact provider conversation. The resumed session retains its native scheduled work, so Control asks it to verify wakeups, loops, monitors, and background work, recreate anything missing, and explicitly report recovery success or failure. The worker is not asked to maintain a separate recovery inventory.
 
-Messages in a report-only topic do not steer the worker. Return to the main agent topic to guide or stop it. Stopping removes the worker's managed recovery file; deleting its report topic remains a separate explicit choice.""",
+When you message the report topic, Control replies with a tmux command you can run in a terminal on the machine running Telegram Control to interact with the worker directly. You can also return to the main agent topic to guide or stop it. Stopping removes the worker's managed recovery file. Deleting its report topic remains a separate explicit choice.""",
     ),
     HelpTopic(
         "teardown",
@@ -102,16 +129,16 @@ Messages in a report-only topic do not steer the worker. Return to the main agen
 
 Type /teardown inside an active managed agent topic. Control opens the confirmation card directly without invoking Codex or Claude.
 
-After confirmation, Telegram Control clears the provider-session pointer, archives the agent binding, revokes routes and buttons, and removes the Telegram topic. Running detached workers that originated here must be stopped first.""",
+After confirmation, Telegram Control clears the provider-session pointer, archives the agent binding, revokes routes and buttons, and removes the Telegram topic. A queued or active turn must finish first. Control closes an active interactive console, but any detached worker created from this topic must be stopped. If confirmation is blocked, fix the named blocker and tap the same button again before the 30-minute card expires.""",
     ),
     HelpTopic(
         "removegroup",
         "Group removal",
         """Safe group removal
 
-Type /removegroup in any ordinary topic inside the bound project group. Control shows how many managed topics and detached workers belong to the group, then asks for confirmation without invoking Codex or Claude.
+Type /removegroup in General or any ordinary topic inside the bound project group. Control shows how many managed topics and detached workers belong to the group, then asks for confirmation without invoking Codex or Claude.
 
-Active turns and consoles must finish, and detached workers must be stopped, before removal can proceed. After confirmation, Telegram Control deletes every managed and worker topic, archives the topic agents, clears provider sessions, removes stopped worker records and recovery files, and revokes the group’s workspace binding, routes, buttons, and cards.
+Queued or active topic turns, active consoles, an active optional Control turn, and running detached workers block removal. Fix the named blocker and tap the same confirmation again before the 30-minute card expires. After confirmation, Telegram Control deletes every managed and worker topic, archives the topic agents, clears provider sessions, removes stopped worker records and recovery files, and revokes the group’s workspace binding, routes, buttons, and cards.
 
 Telegram Control cannot delete the Telegram group itself. Once cleanup finishes, remove the bot from the group or delete the group in Telegram.""",
     ),
@@ -120,13 +147,13 @@ Telegram Control cannot delete the Telegram group itself. Once cleanup finishes,
         "Voice & replies",
         """Voice messages and replies
 
-Send a Telegram photo or any document normally, with an optional caption. Attachments up to 20 MB are saved privately and routed to Codex or Claude by local path.
+In a managed conversational topic, send a Telegram photo or any document normally, with an optional caption. Attachments up to 20 MB are saved privately and routed to Codex or Claude by local path.
 
-Send a Telegram voice note normally; it is transcribed locally and routed like text. If Telegram briefly fails to provide the audio file, Control retries behind the same transcribing receipt and shows an error only after every durable attempt fails.
+Send a Telegram voice note there normally; it is transcribed locally and routed like text. If Telegram briefly fails to provide the audio file, Control retries behind the same transcribing receipt and shows an error only after every durable attempt fails. Report-only worker topics do not accept messages or commands.
 
-Use /voice to choose the global Microsoft TTS voice and speaking speed used by Listen buttons, agent voice updates, and detached worker voice reports. Selecting an option only stages it. Preview generates a real sample voice note; Confirm applies it, and Back returns to the choices without changing anything.
+Use /voice to choose the global macOS voice and speaking speed used by Listen buttons, agent voice updates, and detached worker voice reports. Selecting an option only stages it. Preview generates a real sample voice note; Confirm applies it, and Back returns to the choices without changing anything.
 
-Reply to an exact Control or agent message to continue that routed conversation. During an active turn, a reply to its progress card can steer the work, and its Stop button interrupts the provider. If the owning worker has already exited, Stop clears the orphaned turn immediately so the next queued message can start. Agents can also send requested voice or text progress updates through scoped Telegram skills.""",
+Reply to an exact agent-routed message to continue that agent. A Control-routed reply continues the optional conversational Control agent only when it is enabled. During an active turn, a reply to its progress card can steer the work, and its Stop button interrupts the provider. Stop remains valid while the turn is active. If an owning worker exits, Control terminates that attempt’s provider process, restarts only the failed worker, and immediately retries or completes a queued Stop without disturbing other topics. Agents can also send requested voice or text progress updates through scoped Telegram skills.""",
     ),
     HelpTopic(
         "skills",
@@ -155,15 +182,21 @@ These skills are scoped to the active Telegram turn. They do not accept arbitrar
 
 Use /projects to list every connected workspace, including group-only workspaces, with its active topic and session counts. A workspace that is both enrolled in the older project catalog and bound to a group appears only once.
 
-Setting up a new group: send /newgroup in the bot’s private chat, create a private group, enable Topics, choose Telegram’s separate “View as Topics” display mode, then tap the link. Telegram adds the bot with the rights it needs in one step. Authorize the forum, then send /bind followed by an exact existing folder path and confirm the workspace and provider.
+For an older enrolled catalog project, use /agent create project-slug in a Control-bound topic; /projects shows the available slug. Directly bound groups do not need this legacy attach step.
 
-Each new topic in a bound group starts immediately with the group’s provider, model, and effort. Whatever you already sent runs as the topic’s first turn, so you never resend it. Use /agent to inspect or change that topic’s conversation.
+Setting up a new group: send /newgroup in the bot’s private chat, create a private group, enable Topics, choose Telegram’s separate “View as Topics” display mode, then tap the link. Telegram adds the bot with the rights it needs in one step and automatically posts a welcome card in General with the remaining steps. A group named Telegram Control is offered the repository checkout seeded during installation; confirm it without typing a path. That seeded confirmation also applies the bundled 🎛 group avatar. Other groups authorize first, then use /bind with an exact existing folder path and confirm the workspace and provider.
+
+General is the group’s setup and administration topic. It accepts authorization, /bind, /help, /status, /projects, and /removegroup, but it does not become a disposable agent conversation because Telegram gives General special lifecycle rules. When binding finishes in General, Telegram Control creates Start Here automatically. Binding from an ordinary topic reuses that topic instead.
+
+Use /showcase to preview Telegram-native rich content, colored and copy buttons, reactions, private group hints, and a guided reply composer. In the paired private chat it can also show Telegram’s native existing-group picker. The preview is side-effect-free apart from copying button labels and sending its own messages.
+
+By default, each new topic in a bound group starts immediately with the group’s provider, model, and effort. If per-topic confirmation is enabled, your first request is held while you accept those defaults or choose a different agent, then runs as the first turn—you do not resend it. Use /agent to inspect or change that topic’s conversation.
 
 An active topic agent can create another regular conversational topic in the same group and queue a self-contained first prompt there. Ask it to create a topic by name and describe the separate task; the new independent session begins immediately and is conversational, unlike a detached worker's report-only topic.
 
 The central conversational Control agent is optional and disabled by default. Direct mode does not need it: work happens in group topics, and a Claude-only installation does not need Codex.
 
-Every topic opens with one status message, edited in place as its state changes. Type / in any chat or topic for the command menu. Topic names and Telegram coordinates remain durable routing identities until formal teardown.""",
+Each automatically provisioned conversational topic opens with one status message, edited in place as its state changes. Type / in the paired private chat or a regular project topic for the command menu; report-only worker topics do not accept input. Topic names and Telegram coordinates remain durable routing identities until formal teardown.""",
     ),
 )
 

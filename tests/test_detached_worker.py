@@ -60,6 +60,27 @@ class DetachedWorkerStoreTests(unittest.TestCase):
         self.assertEqual(worker.observed_state, "starting")
         self.assertEqual(worker.restart_count, 0)
 
+    def test_worker_creation_refuses_past_the_running_cap(self):
+        # Finished-but-never-stopped workers accumulate silently and are all
+        # resurrected on reboot; the cap turns that into an actionable error
+        # naming what to stop.
+        for index in range(detached_worker.MAX_RUNNING_WORKERS):
+            binding = self._active_binding(
+                chat_id=-100900 - index,
+                thread_id=index + 1,
+            )
+            self._create(name=f"worker-{index}", binding_id=binding)
+        with self.assertRaises(StoreError) as caught:
+            detached_worker.create_worker(
+                self.store,
+                name="one-too-many",
+                binding_id=self.binding_id,
+                project_path="/tmp/project",
+                provider="claude",
+            )
+        self.assertIn("worker-stop", str(caught.exception))
+        self.assertIn("worker-0", str(caught.exception))
+
     def test_names_and_sessions_are_unique(self):
         self._create()
         with self.assertRaisesRegex(StoreError, "already uses that name"):
@@ -95,8 +116,8 @@ class DetachedWorkerStoreTests(unittest.TestCase):
         self._create()
         self.store.set_voice_configuration(
             voice_settings.VoiceConfiguration(
-                voice_name="en-US-AndrewNeural",
-                rate="-10%",
+                voice_name="Daniel",
+                rate="165",
             )
         )
         voice_path = Path(self.directory.name) / "report.ogg"
@@ -122,8 +143,8 @@ class DetachedWorkerStoreTests(unittest.TestCase):
         synthesize.assert_called_once_with(
             "The migration is complete.",
             "detached-rails-fix-milestone",
-            voice_name="en-US-AndrewNeural",
-            rate="-10%",
+            voice_name="Daniel",
+            rate="165",
         )
         self.assertEqual(api_call.call_args.args[:2], ("token", "sendVoice"))
 
@@ -343,31 +364,32 @@ class WorkerBriefTests(unittest.TestCase):
         self.assertEqual(sent_keys[1:], ["Enter"] * detached_worker.BRIEF_SUBMIT_ATTEMPTS)
 
 
-
 class ReportOnlyNoticeTests(unittest.TestCase):
+    def setUp(self):
+        self.worker = SimpleNamespace(
+            name="rails-fix", tmux_session_name="detached--rails-fix"
+        )
+
     def test_notice_names_the_worker_and_points_at_the_main_agent(self):
-        worker = mock.Mock(name="worker")
-        worker.name = "rails-fix"
-        notice = detached_worker.report_only_notice(worker, "reservations")
+        notice = detached_worker.report_only_notice(self.worker, "R&D <ops>")
         self.assertIn("report-only", notice)
         self.assertIn("rails-fix", notice)
-        self.assertIn("reservations", notice)
+        self.assertIn("R&amp;D &lt;ops&gt;", notice)
 
     def test_notice_includes_a_direct_main_topic_link(self):
-        worker = mock.Mock(name="worker")
-        worker.name = "rails-fix"
         notice = detached_worker.report_only_notice(
-            worker,
+            self.worker,
             "reservations",
             "https://t.me/c/4363256963/20",
         )
         self.assertIn("https://t.me/c/4363256963/20", notice)
 
     def test_notice_still_works_without_a_known_main_topic(self):
-        worker = mock.Mock()
-        worker.name = "rails-fix"
-        notice = detached_worker.report_only_notice(worker, None)
+        notice = detached_worker.report_only_notice(self.worker, None)
         self.assertIn("report-only", notice)
+        self.assertIn(
+            "<code>tmux attach-session -t '=detached--rails-fix'</code>", notice
+        )
         self.assertNotIn("None", notice)
 
 
@@ -444,13 +466,13 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
         self.assertTrue(companion.exists())
         self.assertTrue(handoff_companion.exists())
 
-
-    def test_stopped_worker_resumes_exact_session_and_waits_for_confirmation(self):
+    def test_stopped_worker_resumes_exact_session_without_a_prompt(self):
         with (
             mock.patch.object(
                 detached_worker.tmux_console,
                 "has_tmux_session",
-                return_value=False,
+                # Stopped when reconciled, up again once the resume has run.
+                side_effect=[False, True],
             ),
             mock.patch.object(
                 detached_worker,
@@ -470,14 +492,19 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
                 now=1_700_000_100,
             )
 
-        self.assertEqual(result, "started")
-        self.assertEqual(worker.recovery_state, "recovering")
+        # Recovery completes in one pass: resuming the session ID is what
+        # restores the worker, so there is nothing to wait for an agent to say.
+        self.assertEqual(result, "recovered")
+        self.assertEqual(worker.recovery_state, "succeeded")
         self.assertEqual(worker.recovery_generation, 1)
-        self.assertEqual(worker.restart_count, 1)
-        recovery_prompt = resume_command.call_args.args[1]
-        self.assertNotIn(str(self.recovery_file), recovery_prompt)
-        self.assertIn("recreate anything that is missing", recovery_prompt)
-        self.assertIn("worker-recovery-confirm recover-me", recovery_prompt)
+        # Succeeding clears the attempt counter, so the backoff ladder starts
+        # fresh for the next unrelated crash rather than inheriting this one.
+        self.assertEqual(worker.restart_count, 0)
+        self.assertEqual(worker.observed_state, "running")
+        # One argument: the worker, and no prompt after it.
+        self.assertEqual(len(resume_command.call_args.args), 1)
+        self.assertEqual(resume_command.call_args.args[0].name, worker.name)
+        self.assertEqual(resume_command.call_args.kwargs, {})
         start_session.assert_called_once_with(
             "detached--recover-me",
             self.directory.name,
@@ -488,11 +515,52 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
             SELECT method, params_json
             FROM outbox_messages
             WHERE operation_id =
-                'detached-worker:1:recovery:1:started'
+                'detached-worker:1:recovery:1:succeeded'
             """
         ).fetchone()
         self.assertEqual(report["method"], "sendMessage")
-        self.assertIn("waiting for the agent to verify success", report["params_json"])
+        self.assertIn("running again", report["params_json"])
+
+    def test_live_worker_stalled_at_a_dialog_is_unwedged_and_reported(self):
+        # A session can survive recovery yet sit at a provider startup dialog
+        # doing nothing. Every maintenance pass over a live worker checks for
+        # the known dialogs and answers them.
+        self.store.set_detached_worker_states(
+            self.worker.name,
+            observed_state="running",
+        )
+        with (
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "has_tmux_session",
+                return_value=True,
+            ),
+            mock.patch.object(
+                detached_worker,
+                "pane_text",
+                return_value=StartupDialogTests.CLAUDE_DIALOG,
+            ),
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "tmux_binary",
+                return_value="/bin/tmux",
+            ),
+            mock.patch.object(detached_worker.subprocess, "run") as run,
+        ):
+            result, _ = detached_worker.recover_worker(
+                self.store,
+                self.worker.name,
+                now=1_700_000_100,
+            )
+        self.assertEqual(result, "running")
+        self.assertEqual(run.call_args.args[0][-1], "Enter")
+        report = self.store.connection.execute(
+            """
+            SELECT params_json FROM outbox_messages
+            WHERE operation_id LIKE '%dialog-claude-resume-summary'
+            """
+        ).fetchone()
+        self.assertIn("stalled", report["params_json"])
 
     def test_agent_confirmation_marks_success_and_queues_verified_report(self):
         self.store.begin_detached_worker_recovery(
@@ -543,6 +611,58 @@ class DetachedWorkerRecoveryTests(unittest.TestCase):
         self.assertEqual(result, "unavailable")
         self.assertEqual(worker.restart_count, 0)
         self.assertIn("No provider session ID", worker.last_recovery_error)
+
+
+class StartupDialogTests(unittest.TestCase):
+    CLAUDE_DIALOG = (
+        "  Resuming the full session will consume a substantial portion of your"
+        " usage limits. We recommend resuming from a summary.\n"
+        "  ❯ 1. Resume from summary (recommended)\n"
+        "    2. Resume full session as-is\n"
+        "    3. Don't ask me again\n"
+        "  Enter to confirm · Esc to cancel\n"
+    )
+    CODEX_DIALOG = (
+        "  ✨ Update available! 0.144.5 -> 0.147.0\n"
+        "› 1. Update now (runs `npm install -g @openai/codex`)\n"
+        "  2. Skip\n"
+        "  3. Skip until next version\n"
+        "  Press enter to continue\n"
+    )
+
+    def _answer(self, pane):
+        with (
+            mock.patch.object(
+                detached_worker, "pane_text", return_value=pane
+            ),
+            mock.patch.object(
+                detached_worker.tmux_console,
+                "tmux_binary",
+                return_value="/bin/tmux",
+            ),
+            mock.patch.object(detached_worker.subprocess, "run") as run,
+        ):
+            answered = detached_worker.answer_startup_dialog("detached--x")
+        return answered, run
+
+    def test_claude_resume_dialog_is_confirmed_with_enter(self):
+        # The recommended option is already highlighted; Enter takes it. A
+        # worker wedged here does nothing while looking recovered.
+        answered, run = self._answer(self.CLAUDE_DIALOG)
+        self.assertEqual(answered, "claude-resume-summary")
+        self.assertEqual(run.call_args.args[0][-1:], ["Enter"])
+
+    def test_codex_update_offer_is_skipped_not_taken(self):
+        # The highlighted default would run npm install inside the worker;
+        # moving down one lands on "Skip".
+        answered, run = self._answer(self.CODEX_DIALOG)
+        self.assertEqual(answered, "codex-update-offer")
+        self.assertEqual(run.call_args.args[0][-2:], ["Down", "Enter"])
+
+    def test_a_working_composer_is_left_alone(self):
+        answered, run = self._answer("⏺ Working on it.\n❯ ")
+        self.assertIsNone(answered)
+        run.assert_not_called()
 
 
 class DetachedWorkerTopicTests(unittest.TestCase):
@@ -691,7 +811,7 @@ class DetachedWorkerTopicTests(unittest.TestCase):
             origin_agent_id="agent_origin",
             project_path="/tmp/project",
             provider="claude",
-            tmux_session_name="detached--haiku-poems",
+            tmux_session_name="detached--stored-session",
         )
         update = {
             "update_id": 10,
@@ -723,6 +843,11 @@ class DetachedWorkerTopicTests(unittest.TestCase):
         )
         response = self.store.claim_outbox("sender", now=10**12)
         self.assertEqual(response.params["message_thread_id"], 220)
+        self.assertEqual(response.params["parse_mode"], "HTML")
+        self.assertIn(
+            "<code>tmux attach-session -t '=detached--stored-session'</code>",
+            response.params["text"],
+        )
         self.assertIn("report-only", response.params["text"])
         self.assertIn("haiku-poems", response.params["text"])
         self.assertIn("Test detach", response.params["text"])

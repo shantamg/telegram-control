@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,15 +18,31 @@ import tempfile
 import threading
 import time
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Literal, Optional, Protocol
 
+import ai_accounts
 from durable_store import ManagedAgent, StoreError
 from turn_guidance import TURN_GUIDANCE, effective_turn_guidance
 
 
 class ProviderAdapterError(StoreError):
     """Raised when a provider cannot complete a normalized turn."""
+
+
+def project_account(directory: str) -> Optional[ai_accounts.Profile]:
+    try:
+        return ai_accounts.project_profile(directory)
+    except (ai_accounts.AccountError, OSError) as exc:
+        raise ProviderAdapterError(str(exc)) from exc
+
+
+def project_session_options(provider: str, directory: str) -> dict[str, Path]:
+    account = project_account(directory)
+    return account.session_options(provider) if account else {}
 
 
 PROVIDER_BINARY_CANDIDATES = {
@@ -40,6 +57,14 @@ PROVIDER_BINARY_CANDIDATES = {
     ),
 }
 
+CODEX_MODEL_PROVIDER_OPTIONS = (
+    ("OpenAI cloud", None),
+    ("Ollama local", "ollama"),
+)
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+MAX_OLLAMA_RESPONSE_BYTES = 256 * 1024
+MAX_OLLAMA_MODELS = 30
+MAX_TELEGRAM_BUTTON_CHARACTERS = 64
 CODEX_SHARED_HOME_ENTRIES = (
     "AGENTS.md",
     "auth.json",
@@ -52,14 +77,7 @@ CODEX_SHARED_HOME_ENTRIES = (
 )
 
 
-def _prepare_codex_runtime_home(
-    environment: dict[str, str],
-) -> Optional[Path]:
-    """Create a controller-owned Codex state home with shared read-mostly inputs."""
-    configured = str(environment.get("TELEGRAM_CONTROL_CODEX_HOME", "")).strip()
-    if not configured:
-        return None
-    runtime_home = Path(configured).expanduser()
+def _private_codex_runtime_directory(runtime_home: Path) -> Path:
     if not runtime_home.is_absolute():
         raise ProviderAdapterError(
             "TELEGRAM_CONTROL_CODEX_HOME must be an absolute path."
@@ -84,7 +102,18 @@ def _prepare_codex_runtime_home(
             "Telegram Control's Codex home is not owned by the current user."
         )
     runtime_home.chmod(0o700)
+    return runtime_home
 
+
+def _prepare_codex_runtime_home(
+    environment: dict[str, str],
+) -> Optional[Path]:
+    """Create the legacy controller state home with shared read-mostly inputs."""
+    configured = environment.get("TELEGRAM_CONTROL_CODEX_HOME", "").strip()
+    if not configured:
+        return None
+    runtime_home = _private_codex_runtime_directory(Path(configured).expanduser())
+    canonical_home = Path.home() / ".codex"
     for name in CODEX_SHARED_HOME_ENTRIES:
         source = canonical_home / name
         if not source.exists():
@@ -103,6 +132,8 @@ def _prepare_codex_runtime_home(
         try:
             destination.symlink_to(source)
         except FileExistsError:
+            # Another mailbox process may prepare the shared runtime home at
+            # the same moment. Accept only the exact link it was about to make.
             if (
                 not destination.is_symlink()
                 or destination.resolve() != source.resolve()
@@ -184,6 +215,94 @@ def provider_availability() -> dict[str, Optional[str]]:
         provider: provider_binary(provider)
         for provider in ("claude", "codex")
     }
+
+
+def model_provider_options(
+    provider: str,
+) -> tuple[tuple[str, Optional[str]], ...]:
+    """Return runtime backends selectable for one provider."""
+    if provider == "codex":
+        return CODEX_MODEL_PROVIDER_OPTIONS
+    if provider == "claude":
+        return (("Anthropic cloud", None),)
+    raise ProviderAdapterError(f"Unknown provider: {provider}")
+
+
+def ollama_base_url(environment: Optional[dict[str, str]] = None) -> str:
+    """Resolve Ollama's local endpoint without baking a model into code."""
+    values = os.environ if environment is None else environment
+    configured = str(values.get("OLLAMA_HOST", "")).strip()
+    if not configured:
+        return DEFAULT_OLLAMA_URL
+    if "://" not in configured:
+        configured = f"http://{configured}"
+    parsed = urllib.parse.urlsplit(configured)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ProviderAdapterError("OLLAMA_HOST is not a valid HTTP endpoint.")
+    return configured.rstrip("/")
+
+
+def ollama_models(
+    *,
+    base_url: Optional[str] = None,
+    timeout_seconds: float = 3.0,
+    urlopen: Callable[..., Any] = urllib.request.urlopen,
+) -> tuple[tuple[str, str], ...]:
+    """Discover installed Ollama models through its local API."""
+    endpoint = f"{(base_url or ollama_base_url()).rstrip('/')}/api/tags"
+    request = urllib.request.Request(
+        endpoint,
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=max(0.1, float(timeout_seconds))) as response:
+            raw_payload = response.read(MAX_OLLAMA_RESPONSE_BYTES + 1)
+            if len(raw_payload) > MAX_OLLAMA_RESPONSE_BYTES:
+                raise ProviderAdapterError(
+                    "Ollama returned an oversized model list."
+                )
+            payload = json.loads(raw_payload.decode("utf-8"))
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        urllib.error.URLError,
+    ) as exc:
+        raise ProviderAdapterError(
+            "Ollama is unavailable. Start Ollama and try again."
+        ) from exc
+    rows = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise ProviderAdapterError("Ollama returned an invalid model list.")
+    discovered: list[tuple[str, str, int]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("name") or row.get("model")
+        if (
+            not isinstance(name, str)
+            or not name
+            or len(name) > 100
+            or not all(character.isalnum() or character in "._:/-" for character in name)
+        ):
+            continue
+        size = row.get("size")
+        byte_size = int(size) if type(size) is int and size >= 0 else 0
+        gibibytes = byte_size / (1024**3)
+        label = f"{name} · {gibibytes:.1f} GB" if byte_size else name
+        if len(label) > MAX_TELEGRAM_BUTTON_CHARACTERS:
+            label = label[: MAX_TELEGRAM_BUTTON_CHARACTERS - 1].rstrip() + "…"
+        discovered.append((label, name, byte_size))
+    if not discovered:
+        raise ProviderAdapterError(
+            "Ollama has no installed models. Pull one and try again."
+        )
+    discovered.sort(key=lambda item: (item[2], item[1].casefold()))
+    return tuple(
+        (label, name)
+        for label, name, _size in discovered[:MAX_OLLAMA_MODELS]
+    )
 
 
 class ProviderTurnCancelled(ProviderAdapterError):
@@ -530,6 +649,7 @@ def consume_claude_events(
     events: Iterable[dict[str, Any]],
     existing_session_id: Optional[str] = None,
     on_session: Optional[Callable[[str], None]] = None,
+    empty_success_text: Optional[str] = None,
 ) -> ProviderTurnResult:
     session_id = existing_session_id
     final_text = ""
@@ -538,6 +658,7 @@ def consume_claude_events(
     notified_session = False
     latest_context_usage: dict[str, Any] = {}
     latest_context_model = ""
+    completed_successfully = False
     for event in events:
         candidate_value = event.get("session_id")
         if candidate_value is not None:
@@ -581,6 +702,8 @@ def consume_claude_events(
                     or event.get("error")
                     or "Claude reported a failed turn."
                 )
+            else:
+                completed_successfully = True
             result_text = event.get("result")
             if isinstance(result_text, str) and result_text.strip():
                 final_text = result_text.strip()
@@ -628,6 +751,8 @@ def consume_claude_events(
         raise ProviderAdapterError(failure)
     if not session_id:
         raise ProviderAdapterError("Claude did not provide a persistent session ID.")
+    if not final_text and completed_successfully and empty_success_text:
+        final_text = str(empty_success_text)
     if not final_text:
         raise ProviderAdapterError("Claude completed without a final agent message.")
     return ProviderTurnResult(
@@ -705,6 +830,8 @@ class CodexExecAdapter:
             "--cd",
             launch_directory,
         ]
+        if agent.provider_config.get("model_provider") == "ollama":
+            command.extend(["--oss", "--local-provider", "ollama"])
         model = agent.provider_config.get("model")
         if model:
             command.extend(["--model", str(model)])
@@ -727,8 +854,19 @@ class CodexExecAdapter:
             "--cd",
             str(working_directory),
             "--sandbox",
-            str(provider_config.get("sandbox", "danger-full-access")),
+            str(
+                provider_config.get(
+                    "sandbox",
+                    (
+                        "read-only"
+                        if provider_config.get("model_provider") == "ollama"
+                        else "danger-full-access"
+                    ),
+                )
+            ),
         ]
+        if provider_config.get("model_provider") == "ollama":
+            command.extend(["--oss", "--local-provider", "ollama"])
         model = provider_config.get("model")
         if model:
             command.extend(["--model", str(model)])
@@ -744,7 +882,14 @@ class CodexExecAdapter:
     @staticmethod
     def _sandbox_mode(agent: ManagedAgent) -> str:
         return str(
-            agent.provider_config.get("sandbox", "danger-full-access")
+            agent.provider_config.get(
+                "sandbox",
+                (
+                    "read-only"
+                    if agent.provider_config.get("model_provider") == "ollama"
+                    else "danger-full-access"
+                ),
+            )
         )
 
     @staticmethod
@@ -754,6 +899,7 @@ class CodexExecAdapter:
         model: Optional[Any],
         sandbox: str,
         guidance: str = TURN_GUIDANCE,
+        model_provider: Optional[Any] = None,
     ) -> tuple[str, dict[str, Any]]:
         params: dict[str, Any] = {
             "cwd": launch_directory,
@@ -763,6 +909,8 @@ class CodexExecAdapter:
         }
         if model:
             params["model"] = str(model)
+        if model_provider:
+            params["modelProvider"] = str(model_provider)
         if persisted_session:
             params["threadId"] = persisted_session
             return "thread/resume", params
@@ -872,6 +1020,7 @@ class CodexExecAdapter:
         launch_directory = agent.working_directory or agent.project_path
         model = agent.provider_config.get("model")
         effort = agent.provider_config.get("effort")
+        model_provider = agent.provider_config.get("model_provider")
         sandbox = self._sandbox_mode(agent)
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
@@ -888,9 +1037,26 @@ class CodexExecAdapter:
         deadline = time.monotonic() + self.timeout_seconds
         command = [self.binary, "app-server", "--stdio"]
         process_environment = {**os.environ, **agent.runtime_environment}
-        runtime_home = _prepare_codex_runtime_home(process_environment)
-        if runtime_home is not None:
-            process_environment["CODEX_HOME"] = str(runtime_home)
+        account = project_account(launch_directory) if agent.role != "main" else None
+        if account is None:
+            runtime_home = _prepare_codex_runtime_home(process_environment)
+            if runtime_home is not None:
+                process_environment["CODEX_HOME"] = str(runtime_home)
+        else:
+            process_environment = account.environment("codex", process_environment)
+            command.extend(account.codex_options())
+            configured = process_environment.get("TELEGRAM_CONTROL_CODEX_HOME", "").strip()
+            runtime_home = None
+            if configured:
+                runtime_home = _private_codex_runtime_directory(
+                    Path(configured).expanduser()
+                )
+                if account.codex is not None:
+                    identity = hashlib.sha256(os.fsencode(account.codex)).hexdigest()
+                    runtime_home = _private_codex_runtime_directory(
+                        runtime_home / f"account-{identity}"
+                    )
+                command.extend(["-c", f"sqlite_home={json.dumps(str(runtime_home))}"])
         _emit_progress(on_progress, "starting", "Starting Codex.")
         with tempfile.TemporaryFile(mode="w+t") as stderr_file:
             process = None
@@ -911,6 +1077,11 @@ class CodexExecAdapter:
                         text=True,
                         bufsize=1,
                         start_new_session=True,
+                    )
+                    _emit_progress(
+                        on_progress,
+                        "process_started",
+                        str(process.pid),
                     )
                     if process.stdout is None:
                         raise ProviderAdapterError(
@@ -948,6 +1119,7 @@ class CodexExecAdapter:
                     model,
                     sandbox,
                     effective_turn_guidance(agent.project_path),
+                    model_provider=model_provider,
                 )
                 _write_json_line(
                     process,
@@ -1409,6 +1581,7 @@ class ClaudePrintAdapter:
         models=(
             ("Default", None),
             ("Opus", "opus"),
+            ("Opus 4.8", "claude-opus-4-8"),
             ("Sonnet", "sonnet"),
             ("Fable", "fable"),
         ),
@@ -1629,12 +1802,17 @@ class ClaudePrintAdapter:
         if not agent.project_path:
             raise ProviderAdapterError("Claude agent has no project path.")
         launch_directory = agent.working_directory or agent.project_path
+        account = project_account(launch_directory)
+        process_environment = {**os.environ, **agent.runtime_environment}
+        if account is not None:
+            process_environment = account.environment("claude", process_environment)
         persisted_session = mailbox_session_id or agent.provider_session_id
         recovery = mailbox_session_id is not None
+        native_compact = prompt.strip().lower() == "/compact"
         session_id = persisted_session or str(uuid.uuid4())
         command = self.command(agent, persisted_session, session_id)
         effective_prompt = prompt
-        if recovery:
+        if recovery and not native_compact:
             effective_prompt = (
                 "The controller lost the completion status for the previous "
                 "delivery of this request. Inspect the existing conversation "
@@ -1650,7 +1828,7 @@ class ClaudePrintAdapter:
             process = self._popen_factory(
                 command,
                 cwd=launch_directory,
-                env={**os.environ, **agent.runtime_environment},
+                env=process_environment,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=stderr_file,
@@ -1659,6 +1837,7 @@ class ClaudePrintAdapter:
                 start_new_session=True,
             )
             try:
+                _emit_progress(on_progress, "process_started", str(process.pid))
                 if process.stdout is None:
                     raise ProviderAdapterError(
                         "Claude output stream is unavailable."
@@ -1699,16 +1878,17 @@ class ClaudePrintAdapter:
                 completed_text_parts: list[str] = []
                 active_text_blocks: dict[int, str] = {}
                 visible_progress = _UserFacingProgress(on_progress)
-                pending: Optional[
+                pending_interrupt: Optional[
                     tuple[ProviderControl, str, float]
                 ] = None
+                pending_steers: dict[str, ProviderControl] = {}
                 while True:
                     now = time.monotonic()
                     if now >= deadline:
                         raise ProviderAdapterError("Claude turn timed out.")
                     heartbeat()
 
-                    if pending is None and poll_control is not None:
+                    if pending_interrupt is None and poll_control is not None:
                         candidate_control = poll_control()
                         if candidate_control is not None:
                             control = _validate_control(candidate_control)
@@ -1737,11 +1917,7 @@ class ClaudePrintAdapter:
                                         steer_message_id,
                                     ),
                                 )
-                                pending = (
-                                    control,
-                                    steer_message_id,
-                                    now + self.control_timeout_seconds,
-                                )
+                                pending_steers[steer_message_id] = control
                             else:
                                 control_request_id = (
                                     f"tc-control-{control.control_id}"
@@ -1759,43 +1935,41 @@ class ClaudePrintAdapter:
                                         "request": {"subtype": "interrupt"},
                                     },
                                 )
-                                pending = (
+                                pending_interrupt = (
                                     control,
                                     control_request_id,
                                     now + self.control_timeout_seconds,
                                 )
 
-                    if pending is not None and now >= pending[2]:
-                        control = pending[0]
-                        if control.kind == "cancel":
-                            _terminate_process_group(process)
-                            _emit_control(
-                                on_control,
-                                control,
-                                "applied",
-                                "Claude did not acknowledge interrupt; "
-                                "its local process group was terminated.",
-                            )
-                            raise ProviderTurnCancelled(
-                                "Claude turn was cancelled by local fallback."
-                            )
+                    if (
+                        pending_interrupt is not None
+                        and now >= pending_interrupt[2]
+                    ):
+                        control = pending_interrupt[0]
+                        _terminate_process_group(process)
                         _emit_control(
                             on_control,
                             control,
-                            "rejected",
-                            "Claude did not acknowledge steering before timeout.",
+                            "applied",
+                            "Claude did not acknowledge interrupt; "
+                            "its local process group was terminated.",
                         )
-                        pending = None
+                        raise ProviderTurnCancelled(
+                            "Claude turn was cancelled by local fallback."
+                        )
 
                     wait_for = min(self.poll_interval_seconds, deadline - now)
-                    if pending is not None:
-                        wait_for = min(wait_for, max(0.0, pending[2] - now))
+                    if pending_interrupt is not None:
+                        wait_for = min(
+                            wait_for,
+                            max(0.0, pending_interrupt[2] - now),
+                        )
                     event = _read_json_line(lines, wait_for)
                     if event is _NO_LINE:
                         continue
                     if event is _END_OF_STREAM:
-                        if pending is not None and pending[0].kind == "cancel":
-                            control = pending[0]
+                        if pending_interrupt is not None:
+                            control = pending_interrupt[0]
                             _emit_control(
                                 on_control,
                                 control,
@@ -1831,13 +2005,13 @@ class ClaudePrintAdapter:
                     if event.get("type") == "control_response":
                         response = event.get("response")
                         if (
-                            pending is None
-                            or pending[0].kind != "cancel"
+                            pending_interrupt is None
                             or not isinstance(response, dict)
-                            or response.get("request_id") != pending[1]
+                            or response.get("request_id")
+                            != pending_interrupt[1]
                         ):
                             continue
-                        control = pending[0]
+                        control = pending_interrupt[0]
                         if response.get("subtype") == "success":
                             _emit_control(
                                 on_control,
@@ -1875,13 +2049,13 @@ class ClaudePrintAdapter:
                         )
                         notified_session = True
 
-                    if (
-                        pending is not None
-                        and pending[0].kind == "steer"
-                        and event.get("type") == "user"
-                        and event.get("uuid") == pending[1]
-                    ):
-                        control = pending[0]
+                    steer_message_id = (
+                        str(event.get("uuid", ""))
+                        if event.get("type") == "user"
+                        else ""
+                    )
+                    if steer_message_id in pending_steers:
+                        control = pending_steers.pop(steer_message_id)
                         _emit_control(
                             on_control,
                             control,
@@ -1897,8 +2071,6 @@ class ClaudePrintAdapter:
                             "working",
                             "Claude is continuing with the new guidance.",
                         )
-                        pending = None
-
                     events.append(event)
                     event_type = str(event.get("type", ""))
                     if event_type == "assistant":
@@ -2022,24 +2194,28 @@ class ClaudePrintAdapter:
                             "Claude is working.",
                         )
                     elif event_type == "result":
-                        if pending is not None:
-                            control = pending[0]
-                            if control.kind == "steer":
-                                _emit_control(
-                                    on_control,
-                                    control,
-                                    "rejected",
-                                    "The Claude turn completed before steering "
-                                    "acknowledgment.",
-                                )
-                                pending = None
-                            else:
-                                # The SDK control response can follow the turn's
-                                # result; keep stdin open until it is definitive.
-                                continue
+                        for control in pending_steers.values():
+                            _emit_control(
+                                on_control,
+                                control,
+                                "rejected",
+                                "The Claude turn completed before steering "
+                                "acknowledgment.",
+                            )
+                        pending_steers.clear()
+                        if pending_interrupt is not None:
+                            # The SDK control response can follow the turn's
+                            # result; keep stdin open until it is definitive.
+                            continue
                         result = consume_claude_events(
                             events,
                             existing_session_id=persisted_session,
+                            empty_success_text=(
+                                "Context compacted successfully. This topic will "
+                                "continue in the same Claude session."
+                                if native_compact
+                                else None
+                            ),
                         )
                         _emit_progress(
                             on_progress,
@@ -2062,9 +2238,21 @@ def adapter_for(agent: ManagedAgent) -> ProviderAdapter:
     )
 
 
-def configuration_options(provider: str) -> ProviderConfigurationOptions:
+def configuration_options(
+    provider: str,
+    model_provider: Optional[str] = None,
+) -> ProviderConfigurationOptions:
     """Return selectable settings without constructing a provider process."""
     if provider == "codex":
+        if model_provider == "ollama":
+            return ProviderConfigurationOptions(
+                models=ollama_models(),
+                efforts=(("Default", None),),
+            )
+        if model_provider is not None:
+            raise ProviderAdapterError(
+                f"Codex model provider is not implemented: {model_provider}"
+            )
         return CodexExecAdapter.configuration_options()
     if provider == "claude":
         return ClaudePrintAdapter.configuration_options()

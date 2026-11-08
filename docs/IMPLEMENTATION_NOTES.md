@@ -15,13 +15,35 @@ simply the author's bot — read it as "your bot" throughout. Nothing in the cod
 depends on that name.
 
 Telegram Control is a phone-to-Mac control plane for local Codex and Claude
-agents. The intended experience is:
+agents. Its current default experience is:
 
-1. Send text or a voice note in Telegram.
-2. Transcribe voice locally with Handy's Parakeet V3 model.
-3. Route the request to the main Codex controller or a project agent.
-4. Receive text, a Telegram voice note, and contextual buttons that route
-   follow-up actions back to the originating agent.
+1. Bind a private Telegram forum group to an exact local workspace.
+2. Send text, a photo, a document, or an optional voice note in one of its
+   topics.
+3. Route the request directly to that topic's persisted Claude or Codex agent.
+4. Receive a formatted text answer with contextual controls and optional
+   spoken replies.
+
+The central conversational Control router remains available as an opt-in
+feature for natural-language discovery and delegation; it is disabled by
+default. The sections below are chronological, so an earlier mechanism may be
+explicitly superseded by a later section.
+
+## Allowlisted local-action callbacks
+
+Reusable `local_action_run` callbacks can invoke owner-configured commands from
+`~/.config/telegram-control/local-actions.json`. The callback remains subject
+to the durable action table's chat, topic, owner, expiry, and replay checks.
+The handler resolves only a short allowlist key; executable arguments and the
+working directory stay in the owner-only local configuration.
+
+The runner does not invoke a shell, requires an absolute executable and
+working directory, limits execution to 120 seconds, bounds returned stdout,
+and reports failures without echoing command output. A callback payload may set
+`suppress_output: true` for commands that update an existing Telegram message;
+successful stdout is then discarded while failures still produce an error
+message. Focused tests cover successful execution, unknown keys, unsafe
+configuration permissions, and callback output suppression.
 
 ## Stage 0 baseline
 
@@ -563,13 +585,7 @@ to the durable outbox. It does not receive the Telegram bot token. Stable
 caller-provided keys and a content hash make retries idempotent. Canonical
 skill definitions live under `skills/` and are installed in both the Codex and
 Claude user skill directories. Voice messages send their bounded text to
-Microsoft Edge TTS. The voice helper performs synthesis synchronously before
-creating the durable outbox row. Its skill therefore requires agents to keep
-the helper in the foreground through its explicit queued result, resume any
-yielded command session instead of treating the session ID as success, and
-verify the outbox's Telegram `sent` result before claiming delivery. Ending a
-managed turn during synthesis tears down the helper before anything durable
-exists.
+Microsoft Edge TTS.
 
 The repo also owns the implicitly triggered `telegram-group-icon` skill.
 Inside an active managed turn it can create or select a square PNG/JPEG and
@@ -650,17 +666,45 @@ on July 27, 2026.
 
 ### Restarting the controller safely
 
-Use the controller's guarded restart command:
+This subsection originally documented the delayed `restart` helper. It is
+superseded by the database-backed idle-restart request described later in
+[Restarts are queued, not timed](#restarts-are-queued-not-timed). For a live
+controller, use:
 
 ```bash
-/usr/bin/python3 ./telegram_control.py restart
+./telegram_control.py request-restart --reason "Apply updated worker code"
 ```
 
-It schedules one delayed restart, removes its helper after the first
-`kickstart`, and the replacement supervisor removes any stale matching helper
-before starting workers. Do not use `launchctl submit` directly for controller
-reloads: macOS can infer submitted jobs as `KeepAlive`, turning a one-shot
-reload into a repeated restart loop.
+The supervisor claims the request only when inbox, router, agent, and outbox
+leases are all idle, then exits so launchd's existing `KeepAlive` policy loads
+the new code. The older `restart` command remains for compatibility, but it is
+not the documented live-update path. Do not use `launchctl submit` directly for
+controller reloads.
+
+## Native Claude compaction survives empty results and hostname changes
+
+Claude Code's native `/compact` command is a successful state-changing command,
+but its stream-JSON result intentionally contains no final assistant message.
+The generic Claude adapter previously interpreted that empty result as a failed
+turn. A retry was worse: recovery wrapping turned the slash command into prose,
+so Claude described prior work instead of compacting the session. The adapter
+now recognizes an exact, standalone `/compact`, sends it unchanged even during
+turn recovery, and converts only a successful empty provider result into a
+short Telegram confirmation. The provider session ID is preserved.
+
+Worker leases also no longer treat macOS's current hostname as durable machine
+identity. macOS can change its hostname after a network transition while old
+leases still contain the previous value. Because Telegram Control supports one
+local Mac, worker and provider recovery now use the PID encoded in the standard
+lease owner as the liveness identity and retain the hostname for diagnostics.
+This lets startup and supervisor recovery clear or retry the exact orphaned
+turn instead of leaving it leased until the two-hour timeout.
+
+Verified with Claude event-consumer coverage for a successful empty native
+command and durable-store coverage that recovers a worker lease created under
+a previous hostname. The live Lovely / Big Picture session was then compacted
+in place, its stale mailbox completed without changing the topic's provider
+session ID, and a resumed health-check turn confirmed the compacted session.
 
 ## Live Codex worker control
 
@@ -696,6 +740,50 @@ ID and adds a durable control queue for active worker turns:
   keys. Terminal completion supersedes queued status edits and removes the
   inline keyboard, preventing an old `Working` or `Stop` state from
   overwriting a final response.
+
+### Agent worker exits are isolated and reconciled
+
+The Reservations incident on July 27, 2026 exposed three interacting failure
+paths. A manual rescue correctly closed one stale lease, then used the global
+`retry agent` command. That requeued two unrelated dead turns from July 24 and
+reset their attempt counters. One replay therefore reused
+`agent-mailbox:42:retry-1` after status-card formatting had changed; the
+outbox's strict idempotency check correctly rejected the changed payload. The
+error escaped the agent worker, and the supervisor's original all-or-nothing
+policy terminated every sibling worker. Two newly leased Reservations turns
+were left owned by dead worker PIDs. Claude's provider CLI runs in its own
+process group, so one provider survived as useful but untrackable orphaned
+work, while the other turn had only a stale database lease.
+
+The repair has four layers:
+
+- Provider adapters report their process-group leader immediately after
+  launch. The durable event log ties that PID to the exact mailbox lease and
+  worker owner without a schema change.
+- Each supervised child is now its own process-group leader. An unexpected
+  child exit terminates the provider process groups recorded for that worker,
+  releases only that worker's leases, and restarts only that child. Other
+  active topics continue uninterrupted. Supervisor startup performs the same
+  reconciliation for same-host lease owners proven to be gone.
+- Manual agent retries preserve the monotonic attempt counter, so retry status
+  and failure operations receive a fresh attempt namespace. The CLI requires
+  either `retry agent --id MAILBOX_ID` or an explicit `retry agent --all`, and
+  stopped agents are not resurrected by a bulk retry.
+- Agent heartbeats extend the Stop callback beyond the renewed worker lease.
+  If an old Stop callback is tapped while its mailbox is still queued or
+  leased, callback consumption renews it instead of reporting a false expiry.
+  Terminal recovery edits remove the keyboard normally.
+
+The live repair left the working Postmortem provider untouched, cleared the
+dead Watch Monday lease and the two unrelated replays, expired their callback
+actions, and queued terminal Telegram edits. Three visible stale keyboards
+were removed; the fourth target message was already absent in Telegram.
+
+Verified on July 27, 2026 with 403 passing tests, including new coverage for
+monotonic manual retry operation IDs, long-turn Stop renewal, consumption of an
+expired-but-still-live Stop callback, exact worker/provider PID recording,
+single-worker lease recovery, explicit agent retry scope, and supervised
+process-group creation.
 
 ## One bot across private forum groups
 
@@ -766,29 +854,19 @@ Live setup:
    session; later requests continue it. Send `/status` in that topic to inspect
    or control its managed agent.
 
-For immediate clean removal, send `/teardown` in the managed topic and confirm
-its Telegram card. If a topic is instead deleted directly in Telegram, the
-durable supervisor's `maintain-topics` loop repairs the stale state on its next
-check, at most once per day. The Bot API has no read-only topic lookup, but a
-non-General topic's ID is also the ID of its non-editable topic-creation
-service message. The check attempts to edit that root message without sending
-anything: an open or closed topic returns `message can't be edited`, while a
-deleted topic returns `message to edit not found`. General is non-deletable and
-requires no API probe. A definitive missing-root response atomically revokes
-the topic route, callbacks, reply routes, and status card, archives the forum
-subject and managed agent, frees the original slug, and forgets the
-controller's resumable provider-session pointer. Historical inbox/outbox and
-event rows remain as a compact audit trail. Network failures, permission
-errors, unexpected edit success, and all ambiguous responses leave the binding
-active and retry on a later cycle; active agent work or a running console also
-defers cleanup. The probe creates no Telegram message, notification, or unread
-state. The maintenance process starts and restarts with the same
-LaunchAgent-backed supervisor as the rest of Telegram Control. For a one-time
-diagnostic run:
-
-```sh
-/usr/bin/python3 telegram_control.py maintain-topics --once
-```
+For clean removal, send `/teardown` in the managed topic and confirm its
+Telegram card, or use `/removegroup` for the whole project group. Telegram's
+Bot API emits no ordinary topic-deletion update and exposes no read-only topic
+lookup. An earlier daily reconciler tried both a send-and-delete probe and a
+rejected edit of each topic's root service message; in practice these calls
+could still create notification or unread activity in Telegram clients. The
+supervisor and CLI therefore perform no proactive topic-existence probes.
+Deleting a topic directly in Telegram may leave harmless stale local routing
+metadata and its provider-session pointer until a later explicit group
+removal. This is an intentional tradeoff to keep inactive topics completely
+quiet. The additive `last_probe_*` schema columns remain for compatibility and
+for recording explicit missing-topic retirement details; no schema downgrade
+is required.
 
 Replies that legitimately remain with the main router (receipts, direct
 responses, relayed continuation chunks, fallback deliveries) now carry bounded
@@ -942,6 +1020,18 @@ starts with the controller note while `extract_user_request` returns only the
 owner's sentence, the full 331-test suite, and the offline router eval gate at
 14/14.
 
+## Direct tmux access from a detached worker topic
+
+When a user messages a report-only topic, the fresh handler reads the worker's
+stored tmux session name and adds the exact `tmux attach-session` command to its
+reply as Telegram code. The same shell-quoted command is printed by
+`worker-start`. The reply also points to the main agent topic when available.
+
+The inbound integration test verifies the rendered command in the outbox, the
+main topic link, and the absence of a router turn. An isolated tmux server with
+two similarly named sessions verified that the command attaches to the exact
+target. The reply uses the existing outbox send path and needs no restart.
+
 ## Reboot recovery for detached workers
 
 Schemas v22–23 turn a detached worker into a durable logical session rather than
@@ -1063,6 +1153,61 @@ generations, and the confirm/fail handshake all stay. Removing them means a
 schema migration on a live system for no behavioral gain, so the columns simply
 go quiet and `RECOVERY.md` is created but never mentioned to the worker.
 
+### Delivering a brief is verified, not assumed
+
+`send_brief` sends the text and the Enter as separate `send-keys` calls, because
+combining them swallows the Enter and parks the whole brief in the composer. It
+turns out separating them is necessary but not sufficient: interactive providers
+process bracketed paste asynchronously, so an Enter can arrive before the paste
+is submit-ready and be lost the same way. The old code slept 0.2 s and returned,
+printing "Brief delivered" whether or not anything had been.
+
+It now checks. `pane_text` captures the pane and `_still_in_composer` looks for a
+prompt line (`❯` or `>`) whose typed text matches the opening of the brief —
+comparing on whatever both actually have, since a long brief wraps and the
+prompt line holds only its start, with an eight-character floor so a short
+unrelated line cannot match by accident. While the brief is still sitting there,
+another bare Enter goes out, up to four times; if it never clears, `send_brief`
+raises instead of claiming a delivery that did not happen.
+
+The same trap catches agents steering a pane by hand, so the skill now
+documents the send / Enter / verify sequence and `C-u` for clearing a stale
+composer.
+
+### Recovery needs no agent
+
+A longer experiment removed the remaining reason to prompt on recovery. A worker
+was launched, given a cron job writing a timestamp every two minutes and a
+`/loop` writing another every three, and left alone for six minutes: four cron
+lines, three loop lines, all on schedule. Killing its tmux session froze both
+files for four minutes — the control that distinguishes recovery working from
+something else doing the writing. Resuming the session ID **with no prompt at
+all** restarted both within seconds, and they kept firing correctly for another
+seven minutes. `ps` confirmed the original process was gone and the resumed one
+was doing the work. The loop is the sharper case: Claude Code prints "Runs until
+you close this session" when one starts, and it came back anyway.
+
+So `recover_worker` now calls `resume_command_for(worker)` with no prompt,
+checks the tmux session came up, calls `complete_detached_worker_recovery`, and
+posts one message. It returns `"recovered"` instead of `"started"`; there is no
+`awaiting_confirmation` phase in the normal path and nothing waits on
+`RECOVERY_CONFIRM_TIMEOUT_SECONDS`. Dropping the prompt is also marginally
+*better* than keeping it: scheduled jobs fire only while the session is idle, so
+asking the worker to narrate its own recovery briefly delays what recovery is
+for.
+
+`_recovery_prompt` is deleted. `DEFAULT_RECOVERY_PROMPT`, the `recovery_prompt`
+column, and the `worker-recovery-confirm` / `worker-recovery-fail` commands stay
+in place but dormant, as does the `recovery_state == "recovering"` branch, which
+is now reachable only if a process dies between starting and being checked.
+
+Two limits worth stating. This was verified for scheduled jobs and `/loop`, not
+for background subagents or monitors — those are child processes rather than
+schedule entries, and a replayed transcript can describe them but cannot re-run
+them. And a process check is a weaker signal than an agent's confirmation about
+*what* was restored, though a confused agent could always confirm success just
+as easily as a healthy one, so little was actually given up.
+
 ## File handoffs for detached worker briefs
 
 `worker-brief <name> --file <path>` copies the UTF-8 brief byte for byte to a
@@ -1083,10 +1228,43 @@ Verified with regression tests for wrapped Codex drafts, Claude submit retries,
 an occupied composer, a vanished draft, and teardown. Isolated tmux sessions
 running Codex and Claude each received and acted on a multi-line file handoff.
 
-The required macOS CI jobs use `macos-15-intel`. GitHub rejected the previous
-`macos-14` runner configuration before either Python matrix job could start.
+## Startup-dialog unwedging and the running-worker cap
 
-## Agent-authored questions with buttons
+Two failure modes surfaced together on August 28, 2026, after the machine had
+been up for two weeks following its August 14 reboot.
+
+First, a resumed provider CLI can stall on an interactive startup dialog
+instead of reaching its composer: Claude offers "Resume from summary
+(recommended)" before opening a large session, and Codex offers to update
+itself. Recovery declares success the moment the tmux session is up, so the
+worker *looked* recovered while doing nothing. Nine workers sat at these
+dialogs from the reboot until they were found — each one pinning a full
+provider process, which is what drove the machine to 28 GB of swap, starved
+disk I/O, and produced the "database is locked" convoy that stalled inbox
+turns.
+
+`answer_startup_dialog` in `detached_worker.py` now recognises the known
+dialogs by pane text and answers them: Enter for Claude's resume dialog (the
+recommended option is already highlighted), Down + Enter for Codex's update
+offer (landing on "Skip" rather than running an npm install inside a worker).
+`recover_worker` calls it on every maintenance pass over a live session, so a
+dialog that renders after recovery completes is still caught on the next
+cycle, and a one-line report is posted to the worker's topic when one is
+dismissed. The dialog table is additive — an unrecognised pane is left alone.
+
+Second, nothing ever reaped a worker whose task had finished: workers whose
+final report had been delivered stayed `intended_state = running`
+indefinitely, and reboot recovery faithfully resurrected all of them.
+`create_worker` now refuses to create a new worker while `MAX_RUNNING_WORKERS`
+(12) are already intended running, and the error names the running workers and
+`worker-stop` so the caller can clean up. `worker-status` also reports
+`created_at` and `age_days` per worker so staleness is visible at a glance.
+
+Verified with the detached-worker suite (39 tests, including the new dialog,
+recover-path, and cap tests) and the full 435-test run. The cap and
+`worker-status` fields are handler-side and live immediately; the dialog
+answering runs inside `maintain-workers`, so it takes effect at the next
+supervisor restart.
 
 Agents could send text, voice, group icons, detached workers, and teardown
 cards, but they could not ask a question with choices — only Control could,
@@ -1377,6 +1555,11 @@ The original non-durable bridge remains in `telegram_bridge.py` and is still
 useful for isolating the transport from the controller. Do not run it at the
 same time as the durable collector: Telegram permits only one long poller per
 bot.
+
+The commands in this section are historical diagnostics and rollback tools,
+not the supported live-update procedure. Current installations should use
+`telegram_control.py bootstrap` for first installation and the queued
+`request-restart` workflow for worker reloads.
 
 Computer to phone:
 
@@ -1699,6 +1882,276 @@ voice/rate command arguments, command registration, and the complete
 picker → staged review → preview → back → confirm flow. Preview coverage also
 asserts that the stored setting remains unchanged until confirmation.
 
+## Documentation audit against current direct-mode behavior
+
+After merged pull requests #1–#4, the public documentation and `/help` copy
+were checked against the current command dispatcher, configuration validator,
+provider/session controls, detached-worker recovery path, teardown planners,
+CLI rollout commands, and schema v23 store.
+
+The audit corrected several historical statements that had outlived their
+implementation: provider choice happens at `/bind`, `doctor` checks CLI
+executability rather than authentication, command-menu publication is
+best-effort and retriable, detached workers no longer maintain a recovery
+inventory, busy agent reconfiguration is rejected rather than deferred, and
+the repository is already public under Apache 2.0. It also documents all nine
+registered commands, the current module map, machine-local configuration keys,
+the older `/agent create <slug>` catalog path, uninstall retention semantics,
+and the requirement to wait for durable topic deletions before removing the bot
+from a group.
+
+The `/newgroup` card now includes Telegram's separate **View as Topics** choice
+and gives the current direct-mode next step: authorize the forum, then send
+`/bind` with an exact existing folder. The private `/start` response likewise
+points to `/newgroup` and `/projects` instead of implying that ordinary private
+text will reach a disabled Control router. These are fresh-handler copy changes;
+they need no schema migration, command-menu republish, skill installation, or
+worker restart.
+
+Verified on July 27, 2026 with all 398 unit and integration tests,
+`python -m compileall`, a local Markdown-link resolution check, and
+`git diff --check`.
+
+## Claude steering survives long foreground tool calls
+
+The July 27 Reservations release-watch setup exposed a second live-control
+failure after worker-exit recovery was deployed. The managed parent Claude turn
+started a foreground `until tmux capture-pane ...` loop waiting for text that
+the detached worker never printed. Claude and its controller worker remained
+healthy, and the detached worker reported successfully, but the Claude SDK did
+not echo a later steering message while the Bash tool call was still active.
+The adapter treated the missing echo after 30 seconds as a rejection even
+though the message had already been written to Claude's input stream and could
+still be processed after the tool returned.
+
+Claude steering is now tracked by message UUID for the lifetime of the provider
+turn. It no longer expires on the interrupt timeout: each steer remains
+`delivery_in_flight` until Claude echoes that exact UUID or the turn finishes.
+Multiple pending steers do not prevent Control from claiming a later Stop;
+interrupts retain their 30-second process-group fallback. This keeps the
+Telegram receipt truthful during a long tool call and preserves independent
+Stop delivery.
+
+The detached-worker skill also forbids parent-turn polling. After
+`worker-start` and `worker-brief` succeed, the parent may take one immediate
+pane snapshot but must finish instead of waiting for a milestone. Durable
+`worker-report` messages provide progress, and later corrections are relayed
+with another file-backed `worker-brief`.
+
+For the live incident, the release-watch correction was delivered directly to
+the healthy detached worker. Only the parent turn's polling shell process group
+was terminated; the Claude provider, detached worker, and its scheduled work
+were left running.
+
+Verified with two new Claude adapter regressions covering delayed steering
+acknowledgment and Stop delivery behind an unacknowledged steer, the complete
+405-test suite, Python compilation, and `git diff --check`.
+
+## Install-time workspace seed and General-topic onboarding
+
+Installation now stores one `install_workspace` record in the existing
+`controller_state` table. It contains the symlink-resolved checkout,
+working-directory and optional Git-root paths for the repository that ran
+`bootstrap`, the portable display name **Telegram Control**, and the absolute
+path to the bundled 🎛 group avatar inside that checkout. No chat ID is
+hardcoded: if an active forum already uses that exact workspace the seed adopts
+its chat ID, otherwise the first matching private forum can claim it only after
+the paired owner confirms the setup card. A newly added private forum named
+**Telegram Control** therefore offers the cloned checkout and provider choices
+immediately instead of requiring the owner to type `/bind`.
+
+Telegram's General topic is normalized to reserved topic ID 1 when a private
+forum update omits `message_thread_id`. General remains the root setup and
+administration surface rather than a `forum_subject`: Telegram exposes special
+General lifecycle methods and does not allow deleting it through the ordinary
+`deleteForumTopic` contract used by agent teardown. `/bind`, authorization,
+`/help`, `/status`, `/projects`, and `/removegroup` consequently work from
+General without placing it in the managed-topic deletion set.
+
+After a workspace binding succeeds, the handler reuses the ordinary topic
+where binding happened. If binding happened in General and the database has no
+ordinary topic surface yet, it calls `createForumTopic` once for **Start Here**,
+creates the normal durable subject/agent route, and queues its standing intro.
+Installations that require per-topic confirmation receive the normal
+first-request prompt instead. A Telegram creation failure does not roll back
+the already-confirmed workspace binding; the General response explains that a
+normal topic must be created manually.
+
+The add-to-group `/start` arrival now produces an explicit welcome card in
+General without waiting for another owner message. It explains General's
+administrative role, the authorization → `/bind` → provider-confirmation
+sequence, and the automatic **Start Here** result. For the install-seeded
+Telegram Control group, the same card includes the resolved checkout and
+provider choices, so confirmation replaces the manual `/bind` step. That
+confirmation also queues `setChatPhoto` with
+`assets/telegram-control-group-icon.png`; ordinary project groups do not inherit
+the product avatar. The private `/newgroup` card tells the owner to expect this
+automatic General message.
+
+This uses existing tables and outbox card variants, so there is no schema
+migration. General normalization runs in the long-lived inbox worker and
+therefore needs one idle-safe controller reload; checkout seeding and the
+remaining onboarding behavior need no new daemon protocol.
+
+Verified on July 27, 2026 with focused seed, General-normalization,
+starter-topic, and matching-group tests. The complete 409-test run passed every
+feature test and exposed one pre-existing concurrent-first-open locking flake;
+that isolated test passed immediately on rerun.
+
+The bundled avatar was applied successfully to the live Telegram Control group,
+and the current install seed was refreshed with its checkout-derived path.
+Focused seed-claim and confirmation tests verify that the path survives the
+durable callback and produces the existing multipart `setChatPhoto` outbox
+call. Compilation and `git diff --check` pass. The full 413-test run passes 403
+tests and still exposes ten pre-existing reaction-outbox ordering assertions
+from the native UI change; none exercise the icon-bearing seed or group-photo
+path.
+
+## Native Telegram UI showcase and scoped composer menus
+
+`/showcase` exercises Telegram-native UI without a Mini App. Its first message
+uses `sendRichMessage` with headings, a striped table, a divider, and a
+collapsible details block, plus side-effect-free copy buttons using Telegram's
+`primary`, `success`, and `danger` styles. A rejected rich-message call falls
+back to ordinary HTML. In a group, the command also tries an owner-only
+ephemeral hint, reacts to the command with 👀, and opens a selective ForceReply
+composer with a descriptive placeholder. In the paired private chat, where
+ephemeral group messages do not apply, it instead offers Telegram's native
+forum-group picker with the bot's required administrator rights.
+
+The same primitives improved normal setup and lifecycle flows. Unbound-group
+path prompts use ForceReply with a folder-path placeholder, add/bind actions use
+the primary button style, and destructive group/topic teardown confirmations
+use Telegram's red danger style. This release also initially queued a 👀
+reaction on ordinary text accepted by an agent or the optional Control router;
+that automatic reaction was later removed. Styling adds no callback authority:
+every mutating button still resolves its existing
+owner/chat/topic-bound durable action.
+
+The composer menu is now scoped with `all_private_chats` and
+`all_group_chats`. Private chat omits group-only lifecycle commands, while
+groups omit `/newgroup`; Telegram does not expose a forum-topic command scope,
+so General and ordinary topics still share the group list.
+
+No schema migration or new outbox card variant is involved. The showcase is
+also available as the scoped `agent_telegram.py ui-showcase` helper so a live
+managed turn can render the exact preview in its current topic.
+
+Verified live on July 27, 2026: Telegram accepted the rich message, all three
+button styles, copy actions, reaction, ephemeral group hint, and ForceReply in
+the current managed topic. `getMyCommands` returned the intended private and
+group scopes after publication. All 413 tests passed with the repository's
+`/usr/bin/python3` interpreter, followed by compilation and `git diff --check`.
+
+## Remove automatic eyes reactions
+
+Ordinary accepted messages no longer receive an automatic 👀 reaction. This
+applies to agent turns, active-turn steering, optional Control-router input, and
+messages accepted by report-only detached-worker topics. Their durable progress
+cards and queue receipts remain unchanged. `/showcase` still demonstrates an
+explicit reaction because reactions are part of that opt-in UI preview.
+
+This is a fresh-handler-only change: it adds no schema migration or daemon-side
+protocol variant, so it does not require a controller restart.
+
+Verified on July 28, 2026 with a regression assertion that accepted agent
+messages queue only their durable receipt, the complete 413-test suite, Python
+compilation, and `git diff --check`.
+
+## Configurable local Ollama backend
+
+Codex topic agents can now select **Ollama local** as a model backend from
+`/agent` without introducing a third database-level provider. The persisted
+agent remains `provider = "codex"` and stores
+`model_provider = "ollama"` plus the selected model in its existing
+`provider_config_json`. The model picker queries Ollama's bounded local
+`/api/tags` endpoint each time it opens, sorts the installed results by size,
+and renders one full-width button per model so names remain distinguishable on
+narrow Telegram clients. It stores the exact selected name; no local model
+identifier is hardcoded. Selecting an Ollama model applies it immediately
+instead of opening a redundant one-option effort screen.
+`OLLAMA_HOST` can override the default loopback endpoint.
+
+Codex app-server receives `modelProvider: "ollama"` on both `thread/start` and
+`thread/resume`, so local turns retain the provider-neutral thread checkpoint,
+incremental visible-text events, usage accounting, steering, interruption, and
+console contract. Interactive and detached Codex commands carry the equivalent
+`--oss --local-provider ollama` flags. An Ollama-backed topic defaults to the
+read-only sandbox unless its provider configuration explicitly selects another
+mode.
+
+Changing between OpenAI cloud and Ollama clears Telegram Control's session
+pointer and starts a fresh conversation; changing a model within the same
+backend preserves the current session. `/agent`, topic intros, and transient
+turn cards identify the runtime as **Codex (Ollama)**. The dormant-session
+picker is hidden for local topics because the current Codex session index does
+not expose enough model-provider metadata to safely distinguish cloud and
+Ollama candidates.
+
+This adds no schema migration, command, or outbox card variant. The fresh
+handler exposes the picker immediately, while the long-running agent workers
+need one idle-safe controller reload before they can pass the new backend field
+to Codex.
+
+Verified on July 28, 2026 against the live Ollama 0.32.4 service. The picker
+discovered eight installed models dynamically. A real `llama3.2:1b` turn ran
+through `CodexExecAdapter`, checkpointed a thread, reported usage, and emitted
+two incremental response callbacks before completion; a second turn resumed
+the same thread ID. The 1B model did not follow exact-output instructions
+reliably, confirming that small-model quality remains experimental even though
+transport and streaming work. All 422 unit and integration tests passed,
+followed by Python compilation and `git diff --check`.
+
+## Pinned Claude Opus 4.8 model choice
+
+Claude topic model pickers now offer **Opus 4.8** with the full Claude Code
+model identifier `claude-opus-4-8`. The existing **Opus** choice remains the
+moving `opus` alias, so users can deliberately choose either the pinned 4.8
+release or Claude Code's current Opus default. The selected identifier flows
+through the adapter's existing `--model` argument for streamed turns,
+interactive consoles, and detached launches.
+
+This is a fresh-handler catalog change with no schema migration, Telegram
+command change, new outbox variant, or worker protocol change, so no controller
+restart is required.
+
+Verified on August 18, 2026 with focused adapter and durable Telegram-menu
+tests, the complete 425-test suite, Python compilation, and
+`git diff --check`.
+
+## Current-schema opens do not take the migration lock
+
+On August 26–27, 2026 the live controller entered a SQLite lock convoy. Each
+collector, worker, sender, handler, and supervisor connection called the schema
+migrator, which unconditionally took `BEGIN IMMEDIATE` and ran
+`PRAGMA foreign_key_check` even when `user_version` was already current. Every
+ordinary open then ran `PRAGMA quick_check` as well. Under heavy disk I/O, one
+startup scan held SQLite's single writer slot long enough for the other
+controller children to exhaust their five-second busy timeout. The supervisor
+restarted those children together, creating another simultaneous-open wave.
+Telegram collection and delivery repeatedly disappeared even though an
+isolated CLI `status` could still report a healthy database.
+
+`DurableStore` now reads `user_version` before entering migration machinery and
+returns immediately for the current schema. Actual migration contenders still
+take the writer lock, re-read the version after acquiring it, apply any missing
+migrations, and audit foreign keys before committing. A contender that waited
+while another process completed the migration commits without repeating the
+full audit. Ordinary `open_store` calls no longer run a database-wide
+`quick_check`; explicit `status`, `doctor`, and initialization paths retain
+their health checks.
+
+This changes worker startup behavior without changing the schema or durable
+payload formats, so existing database contents remain compatible. It requires
+one idle-safe controller reload for the long-running supervisor and workers to
+pick up the fix.
+
+Verified on August 27, 2026 with regressions proving that a current-schema open
+succeeds while another connection owns the SQLite writer lock, ordinary opens
+do not invoke the full health scan, and concurrent first opens still migrate
+exactly once. All 427 tests passed, followed by Python compilation and
+`git diff --check`.
+
 ## Isolated Codex app-server state for managed turns
 
 On August 27, 2026 a managed Telegram topic turn failed three times while
@@ -1727,5 +2180,62 @@ and detached workers unchanged.
 This changes long-running agent and router worker behavior without changing the
 database schema or durable payload formats. It requires one idle-safe
 controller reload. Verified with isolated-home, session-input linking, launch
-environment, and mailbox-runtime regressions, followed by the full test suite,
-Python compilation, and `git diff --check`.
+environment, and mailbox-runtime regressions; the adapter and durable-store
+test suites pass with `/usr/bin/python3`. All 430 tests passed, followed by
+compilation and `git diff --check`.
+
+## Spoken replies use macOS `say` (October 14, 2026)
+
+On October 14, 2026 an agent voice update failed with "Speech synthesis
+failed." because `edge-tts` (the external Microsoft text-to-speech service)
+could not produce audio. A macOS `say` voice was used as a one-off fallback, and
+the owner preferred it, so `edge-tts` was removed entirely.
+
+`voice_responses.synthesize_voice` now runs `say [-v VOICE] -r RATE -f TEXT -o
+AIFF` and encodes the AIFF with the same `ffmpeg` OGG/Opus step as before, so
+the durable outbox, file validation, retry idempotency and deterministic paths
+did not change. Synthesis is on-device; nothing is sent to an external service.
+`say_binary` replaces the `edge_tts_binary` config override, and `doctor` now
+reports "Spoken replies need macOS say and ffmpeg."
+
+`voice_settings` now lists macOS voices. The special `system` voice passes no
+`-v` flag, so it uses the Mac's own system voice, and it is the default. Rates
+are `say` words per minute (165/185/205/225), with 185 as the default. Stored
+configurations from the edge-tts era (neural voice names, percentage rates)
+are mapped to the defaults by `voice_settings.upgrade_legacy` when read, so an
+existing install keeps speaking instead of failing closed. User-facing "via
+Microsoft TTS" labels became plain "Listen" / "Replay" / "Try voice again".
+
+No schema or durable payload change. Handlers pick this up on their next turn.
+Detached workers import the synthesizer at start, so they use `say` once the
+controller reloads. Verified with the full suite under `/usr/bin/python3`
+(435 tests) and a real `say` synthesis for both the `system` and `Daniel`
+voices.
+
+## Project account bindings
+
+The standalone `ai_accounts.py` wrapper resolves the nearest private
+`.ai-account.local` file from the working directory. A Git root ends the
+ancestor search. Linked worktrees can inherit the primary checkout's root
+binding. Only a company label is stored in the binding. Separate owner-only
+profile mappings under `~/.config/ai-accounts/profiles/` select the native
+Claude and Codex directories. The wrapper writes bindings atomically, adds a
+local Git exclusion, and requires a choice from the launched provider's
+signed-in profiles on the first interactive launch. Existing CLI defaults
+can be selected explicitly per provider.
+
+Managed turns, the session picker, console takeover, and detached worker
+launch and recovery resolve the same binding. A present but invalid binding
+raises an error. Unbound workspaces retain their existing launch behavior.
+Bound Codex turns keep their native profile home for credentials and
+transcripts and set `sqlite_home` to controller-owned state. Non-default homes
+get separate SQLite directories and startup locks. The optional router
+continues to use the controller's default runtime. No schema or queue payload
+changes are required. Long-running workers pick up the resolver after an
+idle-safe reload.
+
+Verification covered Git exclusion and worktree inheritance, private binding
+validation, tmux environment changes, and separate Codex profile
+authentication and SQLite launch arguments. All 440 tests passed. A real
+terminal smoke test selected the existing Personal login through Codex and
+reused it from Claude in the same temporary directory.

@@ -177,6 +177,72 @@ class DurableStoreTests(unittest.TestCase):
         self.store.close()
         self.temporary_directory.cleanup()
 
+    def test_install_workspace_seed_is_claimed_by_one_matching_forum(self):
+        workspace = Path(self.temporary_directory.name).resolve()
+        icon_path = workspace / "group-icon.png"
+        icon_path.write_bytes(b"\x89PNG\r\n\x1a\nicon")
+        seed = self.store.seed_install_workspace(
+            display_name="Telegram Control",
+            project_path=str(workspace),
+            working_directory=str(workspace),
+            git_repository_root=None,
+            group_icon_path=str(icon_path),
+            now=100,
+        )
+        self.assertIsNone(seed["chat_id"])
+        self.assertEqual(seed["group_icon_path"], str(icon_path))
+        self.assertIsNone(
+            self.store.install_workspace_for_forum(
+                chat_id=-1001,
+                display_name="Another Project",
+            )
+        )
+        candidate = self.store.install_workspace_for_forum(
+            chat_id=-1001,
+            display_name="telegram control",
+        )
+        self.assertEqual(candidate["project_path"], str(workspace))
+        self.assertTrue(
+            self.store.mark_install_workspace_bound(
+                chat_id=-1001,
+                project_path=str(workspace),
+                now=101,
+            )
+        )
+        self.assertIsNotNone(
+            self.store.install_workspace_for_forum(
+                chat_id=-1001,
+                display_name="Telegram Control",
+            )
+        )
+        self.assertIsNone(
+            self.store.install_workspace_for_forum(
+                chat_id=-1002,
+                display_name="Telegram Control",
+            )
+        )
+
+    def test_general_forum_message_without_thread_id_normalizes_to_one(self):
+        message = {
+            "chat": {
+                "id": -1001,
+                "type": "supergroup",
+                "title": "Telegram Control",
+                "is_forum": True,
+            },
+            "from": {"id": 123},
+            "message_id": 99,
+            "text": "/start true",
+        }
+        self.assertEqual(
+            telegram_control.bridge.forum_message_thread_id(message),
+            1,
+        )
+        message["chat"]["username"] = "public_forum"
+        self.assertIsNone(
+            telegram_control.bridge.forum_message_thread_id(message)
+        )
+
     def _completed_agent_response_with_voice_button(self):
         self.store.ensure_surface_binding(
             chat_id=123,
@@ -274,6 +340,32 @@ class DurableStoreTests(unittest.TestCase):
             self.store.connection.execute("PRAGMA journal_mode").fetchone()[0],
             "wal",
         )
+
+    def test_current_schema_open_does_not_wait_for_sqlite_writer(self):
+        self.store.connection.execute("BEGIN IMMEDIATE")
+        try:
+            with DurableStore(self.database_path) as concurrent_store:
+                self.assertEqual(
+                    concurrent_store.connection.execute(
+                        "PRAGMA user_version"
+                    ).fetchone()[0],
+                    SCHEMA_VERSION,
+                )
+        finally:
+            self.store.connection.execute("ROLLBACK")
+
+    def test_open_store_does_not_run_full_health_check(self):
+        with mock.patch.object(
+            telegram_control.bridge,
+            "read_offset",
+            return_value=None,
+        ), mock.patch.object(
+            DurableStore,
+            "quick_check",
+            side_effect=AssertionError("ordinary opens must stay lightweight"),
+        ):
+            with telegram_control.open_store(self.database_path):
+                pass
 
     def test_context_usage_summary_requires_provider_reported_window(self):
         self.assertEqual(
@@ -1402,6 +1494,46 @@ class DurableStoreTests(unittest.TestCase):
         self.assertNotIn("model", reset.provider_config)
         self.assertEqual(reset.provider_config["effort"], "max")
 
+        self.store.connection.execute(
+            """
+            UPDATE agents
+            SET provider_session_id = 'cloud-session'
+            WHERE agent_id = ?
+            """,
+            (agent.agent_id,),
+        )
+        local = self.store.configure_agent_provider(
+            agent.agent_id,
+            {
+                "model_provider": "ollama",
+                "model": "small:1b",
+                "effort": None,
+            },
+            now=105,
+        )
+        self.assertEqual(
+            local.provider_config,
+            {"model_provider": "ollama", "model": "small:1b"},
+        )
+        self.assertIsNone(local.provider_session_id)
+        self.store.connection.execute(
+            """
+            UPDATE agents
+            SET provider_session_id = 'local-session'
+            WHERE agent_id = ?
+            """,
+            (agent.agent_id,),
+        )
+        changed_model = self.store.configure_agent_provider(
+            agent.agent_id,
+            {"model": "other:3b"},
+            now=106,
+        )
+        self.assertEqual(
+            changed_model.provider_session_id,
+            "local-session",
+        )
+
         with self.assertRaises(StoreError):
             self.store.register_project_agent(
                 chat_id=123,
@@ -1787,7 +1919,7 @@ class DurableStoreTests(unittest.TestCase):
             self._completed_agent_response_with_voice_button()
         )
         button = response.params["reply_markup"]["inline_keyboard"][0][0]
-        self.assertEqual(button["text"], "🔊 Listen via Microsoft TTS")
+        self.assertEqual(button["text"], "🔊 Listen")
         action = self.store.connection.execute(
             """
             SELECT * FROM callback_actions
@@ -1848,8 +1980,8 @@ class DurableStoreTests(unittest.TestCase):
             "The durable voice response is ready.",
             f"agent-{mailbox_id}-request-{int(callback_job['job_id'])}",
             protected_paths=set(),
-            voice_name="en-GB-SoniaNeural",
-            rate="+10%",
+            voice_name="system",
+            rate="185",
         )
         voice = self.store.connection.execute(
             """
@@ -1865,7 +1997,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertEqual(params["message_thread_id"], 62)
         self.assertEqual(
             params["reply_markup"]["inline_keyboard"][0][0]["text"],
-            "🔊 Replay via Microsoft TTS",
+            "🔊 Replay",
         )
         self.assertEqual(
             json.loads(voice["route_json"]),
@@ -1928,7 +2060,7 @@ class DurableStoreTests(unittest.TestCase):
         self.assertIn("complete text response", params["text"])
         self.assertEqual(
             params["reply_markup"]["inline_keyboard"][0][0]["text"],
-            "Try Microsoft TTS again",
+            "Try voice again",
         )
 
     def test_sent_voice_note_installs_reply_route(self):
@@ -2270,8 +2402,8 @@ class DurableStoreTests(unittest.TestCase):
         }
         self.store.set_voice_configuration(
             voice_settings.VoiceConfiguration(
-                voice_name="en-US-AndrewNeural",
-                rate="-10%",
+                voice_name="Daniel",
+                rate="165",
             )
         )
         voice_path = Path(self.temporary_directory.name) / "update.ogg"
@@ -2300,9 +2432,9 @@ class DurableStoreTests(unittest.TestCase):
                             self.assertEqual(agent_telegram.main(), 0)
         self.assertEqual(
             synthesize.call_args.kwargs["voice_name"],
-            "en-US-AndrewNeural",
+            "Daniel",
         )
-        self.assertEqual(synthesize.call_args.kwargs["rate"], "-10%")
+        self.assertEqual(synthesize.call_args.kwargs["rate"], "165")
         voice_row = self.store.connection.execute(
             """
             SELECT method, params_json
@@ -3287,11 +3419,28 @@ class DurableStoreTests(unittest.TestCase):
             "voice",
             "projects",
             "newgroup",
+            "showcase",
             "bind",
             "removegroup",
             "teardown",
         ):
             self.assertIn(handled, [command["command"] for command in commands])
+        scopes = dict(
+            (scope["type"], scoped)
+            for scope, scoped in telegram_control.registered_bot_command_scopes()
+        )
+        self.assertNotIn(
+            "removegroup",
+            [command["command"] for command in scopes["all_private_chats"]],
+        )
+        self.assertNotIn(
+            "newgroup",
+            [command["command"] for command in scopes["all_group_chats"]],
+        )
+        self.assertIn(
+            "showcase",
+            [command["command"] for command in scopes["all_group_chats"]],
+        )
 
     def _leased_forum_subject(self, workspace):
         """A topic in a bound group, mid-turn — the surface that has an intro."""
@@ -4197,6 +4346,138 @@ class DurableStoreTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(reactivated["state"], "active")
         self.assertGreater(float(reactivated["expires_at"]), 122)
+        attempts_after_retry = self.store.connection.execute(
+            """
+            SELECT attempts
+            FROM agent_mailbox
+            WHERE mailbox_id = ?
+            """,
+            (mailbox_id,),
+        ).fetchone()["attempts"]
+        self.assertEqual(attempts_after_retry, 2)
+        third = self.store.claim_agent_mailbox(
+            "manual-retry-worker",
+            now=123,
+        )
+        self.assertEqual(third.mailbox_id, mailbox_id)
+        self.assertEqual(third.attempts, 3)
+        self.store.enqueue_agent_voice_status(
+            source_job_id,
+            "working",
+            third.input_text,
+            now=124,
+        )
+        self.store.attach_agent_mailbox_turn(
+            mailbox_id,
+            "manual-retry-worker",
+            "claude-third-turn",
+            now=125,
+        )
+        self.assertEqual(
+            self.store.fail_agent_mailbox(
+                mailbox_id,
+                "manual-retry-worker",
+                "manual retry failed",
+                now=126,
+                max_attempts=3,
+            ),
+            "dead",
+        )
+        manual_retry_operations = {
+            str(row["operation_id"])
+            for row in self.store.connection.execute(
+                """
+                SELECT operation_id
+                FROM outbox_messages
+                WHERE operation_id LIKE ?
+                """,
+                (f"agent-mailbox:{mailbox_id}:%attempt-3",),
+            ).fetchall()
+        }
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:voice-working-attempt-3",
+            manual_retry_operations,
+        )
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:turn-started-attempt-3",
+            manual_retry_operations,
+        )
+        self.assertIn(
+            f"agent-mailbox:{mailbox_id}:failed-attempt-3",
+            manual_retry_operations,
+        )
+
+    def test_heartbeat_keeps_stop_available_for_a_long_turn(self):
+        agent, _, _ = self._setup_routed_agent_turn()
+        mailbox = self.store.claim_agent_mailbox(
+            "agent-worker",
+            now=109,
+            lease_seconds=10,
+        )
+        operation_id = f"agent-mailbox:{mailbox.mailbox_id}:stop"
+        self.store.connection.execute(
+            """
+            UPDATE callback_actions
+            SET expires_at = 110
+            WHERE operation_id = ?
+            """,
+            (operation_id,),
+        )
+
+        self.store.heartbeat_agent_mailbox(
+            mailbox.mailbox_id,
+            "agent-worker",
+            lease_seconds=120,
+            now=111,
+        )
+
+        refreshed = self.store.connection.execute(
+            """
+            SELECT expires_at
+            FROM callback_actions
+            WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        self.assertGreaterEqual(float(refreshed["expires_at"]), 531)
+        self.assertEqual(agent.agent_id, mailbox.agent_id)
+
+    def test_expired_stop_reactivates_while_turn_is_still_active(self):
+        _agent, _, _ = self._setup_routed_agent_turn()
+        mailbox = self.store.claim_agent_mailbox("agent-worker", now=109)
+        action = self.store.resolve_callback_action_operation(
+            f"agent-mailbox:{mailbox.mailbox_id}:stop"
+        )
+        self.store.connection.execute(
+            """
+            UPDATE callback_actions
+            SET expires_at = 110
+            WHERE action_id = ?
+            """,
+            (action.action_id,),
+        )
+
+        consumed = self.store.consume_callback_action(
+            f"a:{action.token}",
+            chat_id=action.chat_id,
+            message_thread_id=action.message_thread_id,
+            authorized_user_id=action.authorized_user_id,
+            update_id=999,
+            now=111,
+        )
+
+        self.assertEqual(consumed.action_id, action.action_id)
+        self.assertEqual(
+            self.store.connection.execute(
+                """
+                SELECT state
+                FROM callback_actions
+                WHERE action_id = ?
+                """,
+                (action.action_id,),
+            ).fetchone()["state"],
+            "consumed",
+        )
 
     def test_stop_queued_during_start_attaches_to_exact_turn_and_cancels(self):
         agent, source_job_id, _ = self._setup_routed_agent_turn()
@@ -4435,6 +4716,73 @@ class DurableStoreTests(unittest.TestCase):
             now=114,
         )
         self.assertEqual(replacement.mailbox_id, next_mailbox_id)
+
+    def test_supervisor_recovery_requeues_only_the_exited_workers_turn(self):
+        agent, _, _ = self._setup_routed_agent_turn()
+        # macOS can change its hostname after a network transition. The
+        # single-Mac controller must still recover a lease created under the
+        # previous hostname.
+        dead_owner = "previous-host.local:999999:agent:deadbeef"
+        mailbox = self.store.claim_agent_mailbox(dead_owner, now=109)
+        self.store.attach_agent_mailbox_process(
+            mailbox.mailbox_id,
+            dead_owner,
+            888888,
+            now=110,
+        )
+        self.store.attach_agent_mailbox_turn(
+            mailbox.mailbox_id,
+            dead_owner,
+            "turn-orphaned",
+            now=111,
+        )
+
+        self.assertEqual(
+            self.store.provider_process_pids_for_agent_worker(999999),
+            [888888],
+        )
+        recovered = self.store.recover_agent_worker_leases(
+            999999,
+            now=112,
+        )
+
+        self.assertEqual(recovered, [mailbox.mailbox_id])
+        row = self.store.connection.execute(
+            """
+            SELECT state, lease_owner, lease_expires_at, provider_turn_id,
+                last_error
+            FROM agent_mailbox
+            WHERE mailbox_id = ?
+            """,
+            (mailbox.mailbox_id,),
+        ).fetchone()
+        self.assertEqual(row["state"], "queued")
+        self.assertIsNone(row["lease_owner"])
+        self.assertIsNone(row["lease_expires_at"])
+        self.assertIsNone(row["provider_turn_id"])
+        self.assertIn("queued for recovery", row["last_error"])
+        self.assertEqual(
+            self.store.connection.execute(
+                """
+                SELECT lifecycle_state
+                FROM agents
+                WHERE agent_id = ?
+                """,
+                (agent.agent_id,),
+            ).fetchone()["lifecycle_state"],
+            "registered",
+        )
+        event = self.store.connection.execute(
+            """
+            SELECT details_json
+            FROM events
+            WHERE kind = 'agent_worker_lease_recovered'
+            """
+        ).fetchone()
+        self.assertEqual(
+            json.loads(event["details_json"])["worker_pid"],
+            999999,
+        )
 
     def test_stop_does_not_clear_live_local_worker(self):
         agent, _, _ = self._setup_routed_agent_turn()
@@ -6995,6 +7343,28 @@ class SchemaCompatibilityTests(unittest.TestCase):
 
 
 class DurableIntegrationTests(unittest.TestCase):
+    def test_supervisor_children_are_process_group_leaders(self):
+        command = ["/usr/bin/python3", "telegram_control.py", "work-agents"]
+        fake_process = mock.Mock()
+        with mock.patch.object(
+            telegram_control.subprocess,
+            "Popen",
+            return_value=fake_process,
+        ) as popen:
+            result = telegram_control._spawn_supervisor_child(command)
+
+        self.assertIs(result, fake_process)
+        popen.assert_called_once_with(command, start_new_session=True)
+
+    def test_agent_retry_cli_requires_an_explicit_scope(self):
+        args = argparse.Namespace(
+            queue="agent",
+            item_id=None,
+            retry_all=False,
+        )
+        with self.assertRaisesRegex(StoreError, "--id MAILBOX_ID"):
+            telegram_control.retry_command(args)
+
     def test_durable_launch_agent_uses_supervisor_and_existing_label(self):
         plist = telegram_control.launch_agent_plist()
 
@@ -7035,7 +7405,6 @@ class DurableIntegrationTests(unittest.TestCase):
                 "work-agents",
                 "work-agents",
                 "maintain-workers",
-                "maintain-topics",
                 "send-outbox",
             ],
         )
@@ -10259,6 +10628,10 @@ class DurableIntegrationTests(unittest.TestCase):
                 receipt = store.claim_outbox("sender", now=10**12)
                 self.assertEqual(receipt.params["message_thread_id"], 62)
                 self.assertIn("📨 <b>Queued</b>", receipt.params["text"])
+                self.assertIsNone(
+                    store.claim_outbox("sender-2", now=10**12),
+                    "accepted agent messages must not queue a reaction",
+                )
 
                 followup = forum_update(
                     11,
@@ -10431,7 +10804,13 @@ class DurableIntegrationTests(unittest.TestCase):
                         json.loads(row["payload_json"])["model"]
                         for row in model_rows
                     ],
-                    [None, "opus", "sonnet", "fable"],
+                    [
+                        None,
+                        "opus",
+                        "claude-opus-4-8",
+                        "sonnet",
+                        "fable",
+                    ],
                 )
                 sonnet = next(
                     row
@@ -11035,6 +11414,196 @@ class DurableIntegrationTests(unittest.TestCase):
             self.assertIn("1 active topic · 1 session", text)
             self.assertNotIn(str(workspace), text)
 
+    def test_general_binding_creates_a_normal_starter_topic(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "telegram-control"
+            workspace.mkdir()
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            with DurableStore(database_path) as store:
+                forum = store.ensure_surface_binding(
+                    chat_id=-100777,
+                    surface_type="control",
+                    display_name="Telegram Control",
+                    target_type="controller",
+                    target_id="control",
+                    now=100,
+                )
+                bound, _ = store.bind_forum_workspace(
+                    chat_id=-100777,
+                    forum_binding_id=forum.binding_id,
+                    project_path=str(workspace.resolve()),
+                    provider="codex",
+                    now=101,
+                )
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CHAT_ID": "-100777",
+                "TELEGRAM_CHAT_TYPE": "supergroup",
+                "TELEGRAM_MESSAGE_THREAD_ID": "1",
+                "TELEGRAM_TOPIC_NAME": "General",
+                "TELEGRAM_CONTROL_SETTINGS_JSON": "{}",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    on_message.bridge,
+                    "read_token",
+                    return_value="token",
+                ), mock.patch.object(
+                    on_message.bridge,
+                    "api_call",
+                    return_value={"message_thread_id": 77},
+                ) as api_call:
+                    result = on_message.provision_bound_forum_starter(
+                        workspace=bound,
+                        operation_id="inbox:1:bind",
+                    )
+
+            self.assertTrue(result["created"])
+            self.assertEqual(result["message_thread_id"], 77)
+            api_call.assert_called_once_with(
+                "token",
+                "createForumTopic",
+                chat_id=-100777,
+                name="Start Here",
+            )
+            with DurableStore(database_path) as store:
+                subject = store.resolve_forum_subject(-100777, 77)
+                self.assertIsNotNone(subject)
+                self.assertEqual(subject.display_name, "Start Here")
+                intro = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(intro.method, "sendMessage")
+                self.assertEqual(intro.params["message_thread_id"], 77)
+                self.assertEqual(intro.card["kind"], "topic_intro")
+                self.assertIsNone(
+                    store.resolve_surface_binding(-100777, 1)
+                )
+
+    def test_seeded_checkout_is_offered_to_matching_new_group(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            workspace = Path(temporary_directory) / "telegram-control"
+            workspace.mkdir()
+            icon_path = workspace / "group-icon.png"
+            icon_path.write_bytes(b"\x89PNG\r\n\x1a\nicon")
+            database_path = Path(temporary_directory) / "controller.sqlite3"
+            with DurableStore(database_path) as store:
+                store.seed_install_workspace(
+                    display_name="Telegram Control",
+                    project_path=str(workspace.resolve()),
+                    working_directory=str(workspace.resolve()),
+                    group_icon_path=str(icon_path),
+                    now=90,
+                )
+            environment = {
+                "TELEGRAM_CONTROL_DB": str(database_path),
+                "TELEGRAM_CONTROL_JOB_ID": "1",
+                "TELEGRAM_CHAT_ID": "-100777",
+                "TELEGRAM_CHAT_TYPE": "supergroup",
+                "TELEGRAM_CHAT_TITLE": "Telegram Control",
+                "TELEGRAM_MESSAGE_THREAD_ID": "1",
+                "TELEGRAM_FROM_ID": "123",
+                "TELEGRAM_CONTROL_SETTINGS_JSON": "{}",
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                with mock.patch.object(
+                    on_message.provider_adapters,
+                    "provider_availability",
+                    return_value={"claude": None, "codex": "/bin/codex"},
+                ):
+                    self.assertFalse(
+                        on_message.forum_is_authorized_or_prompt()
+                    )
+
+            with DurableStore(database_path) as store:
+                prompt = store.claim_outbox("sender", now=10**12)
+                self.assertEqual(prompt.params["message_thread_id"], 1)
+                self.assertIn(
+                    str(workspace.resolve()),
+                    prompt.params["text"],
+                )
+                self.assertIn(
+                    "seeded by the Telegram Control installer",
+                    prompt.params["text"],
+                )
+                self.assertIn(
+                    "Welcome to Telegram Control",
+                    prompt.params["text"],
+                )
+                self.assertIn(
+                    "General is this group’s setup and administration topic",
+                    prompt.params["text"],
+                )
+                self.assertIn(
+                    "I’ll create Start Here automatically",
+                    prompt.params["text"],
+                )
+                action = store.connection.execute(
+                    """
+                    SELECT token, payload_json
+                    FROM callback_actions
+                    WHERE action_type = 'authorize_bind_forum'
+                    """
+                ).fetchone()
+                action_payload = json.loads(action["payload_json"])
+                self.assertTrue(action_payload["install_seed"])
+                self.assertEqual(
+                    action_payload["group_icon_path"],
+                    str(icon_path.resolve()),
+                )
+
+            confirmation = callback_update(
+                11,
+                data=f"a:{str(action['token'])}",
+                message_id=700,
+                message_thread_id=1,
+            )
+            confirmation["callback_query"]["message"]["chat"] = {
+                "id": -100777,
+                "type": "supergroup",
+                "title": "Telegram Control",
+                "is_forum": True,
+            }
+            callback_environment = dict(environment)
+            callback_environment.update(
+                {
+                    "TELEGRAM_CONTROL_JOB_ID": "2",
+                    "TELEGRAM_MESSAGE_ID": "700",
+                }
+            )
+            with mock.patch.dict(
+                os.environ,
+                callback_environment,
+                clear=False,
+            ):
+                with mock.patch.object(
+                    on_message,
+                    "provision_bound_forum_starter",
+                    return_value={
+                        "created": True,
+                        "display_name": "Start Here",
+                    },
+                ):
+                    on_message.handle_callback(
+                        confirmation,
+                        confirmation["callback_query"],
+                    )
+
+            with DurableStore(database_path) as store:
+                icon_call = store.connection.execute(
+                    """
+                    SELECT params_json
+                    FROM outbox_messages
+                    WHERE method = 'setChatPhoto'
+                    """
+                ).fetchone()
+                self.assertIsNotNone(icon_call)
+                self.assertEqual(
+                    json.loads(icon_call["params_json"]),
+                    {
+                        "chat_id": -100777,
+                        "__photo_file_path": str(icon_path.resolve()),
+                    },
+                )
+
     def test_newgroup_offers_the_one_tap_link_and_start_only_authorizes(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             database_path = Path(temporary_directory) / "controller.sqlite3"
@@ -11055,6 +11624,12 @@ class DurableIntegrationTests(unittest.TestCase):
                 process(message_update(10, "/newgroup"), "worker-1", 100)
                 card = store.claim_outbox("sender", now=10**12)
                 self.assertIn("Add me to a new project group", card.params["text"])
+                self.assertIn("View as Topics", card.params["text"])
+                self.assertIn("/bind", card.params["text"])
+                self.assertIn(
+                    "welcome card in General",
+                    card.params["text"],
+                )
                 self.assertEqual(
                     card.params["reply_markup"]["inline_keyboard"][0][0],
                     {
@@ -11063,6 +11638,7 @@ class DurableIntegrationTests(unittest.TestCase):
                             "https://t.me/example_bot?startgroup=true"
                             "&admin=change_info+delete_messages+manage_topics"
                         ),
+                        "style": "primary",
                     },
                 )
                 # /newgroup is deterministic controller work, not a router turn.
@@ -11072,7 +11648,8 @@ class DurableIntegrationTests(unittest.TestCase):
                 )
 
                 # Telegram delivers /start with a payload once the link adds the
-                # bot. That is an arrival, so it authorizes and nothing more.
+                # bot. General may omit message_thread_id, so the bridge
+                # normalizes it to 1 and posts deterministic onboarding there.
                 arrival = message_update(11, "/start true")
                 arrival["message"]["chat"] = {
                     "id": -100777,
@@ -11080,14 +11657,13 @@ class DurableIntegrationTests(unittest.TestCase):
                     "title": "Meet Without Fear",
                     "is_forum": True,
                 }
-                arrival["message"]["message_thread_id"] = 2
                 process(arrival, "worker-2", 101)
                 self.assertEqual(
                     store.status_counts().get("router_mailbox", {}),
                     {},
                 )
                 prompts = [
-                    json.loads(row["params_json"])["text"]
+                    json.loads(row["params_json"])
                     for row in store.connection.execute(
                         """
                         SELECT params_json FROM outbox_messages
@@ -11097,10 +11673,31 @@ class DurableIntegrationTests(unittest.TestCase):
                     ).fetchall()
                 ]
                 self.assertTrue(
-                    any("Authorize this private forum" in text for text in prompts)
+                    any(
+                        "Authorize this private forum" in params["text"]
+                        for params in prompts
+                    )
                 )
                 self.assertTrue(
-                    any("Which folder should this group work in" in text for text in prompts)
+                    any(
+                        "Which folder should this group work in"
+                        in params["text"]
+                        for params in prompts
+                    )
+                )
+                welcome = next(
+                    params
+                    for params in prompts
+                    if "Welcome to Telegram Control" in params["text"]
+                )
+                self.assertEqual(welcome["message_thread_id"], 1)
+                self.assertIn(
+                    "General is this group’s setup and administration topic",
+                    welcome["text"],
+                )
+                self.assertIn(
+                    "I’ll create Start Here automatically",
+                    welcome["text"],
                 )
 
     def test_bound_forum_status_is_read_only_and_does_not_create_subject(self):
@@ -12060,8 +12657,8 @@ class DurableIntegrationTests(unittest.TestCase):
             (
                 "claude",
                 {"model": "sonnet", "effort": "high"},
-                "Opus",
-                "opus",
+                "Opus 4.8",
+                "claude-opus-4-8",
                 "Max",
                 "max",
             ),
@@ -12181,12 +12778,56 @@ class DurableIntegrationTests(unittest.TestCase):
                                 json.loads(row["params_json"]) for row in rows
                             ]
 
-                        model_messages = invoke_callback(11, configure_data)
+                        next_update_id = 11
+                        if provider == "codex":
+                            backend_messages = invoke_callback(
+                                next_update_id,
+                                configure_data,
+                            )
+                            next_update_id += 1
+                            backend_prompt = next(
+                                params
+                                for params in backend_messages
+                                if "Change Codex backend"
+                                in str(params.get("text", ""))
+                            )
+                            cloud_data = next(
+                                button["callback_data"]
+                                for row in backend_prompt["reply_markup"][
+                                    "inline_keyboard"
+                                ]
+                                for button in row
+                                if "OpenAI cloud" in button["text"]
+                            )
+                            local_data = next(
+                                button["callback_data"]
+                                for row in backend_prompt["reply_markup"][
+                                    "inline_keyboard"
+                                ]
+                                for button in row
+                                if "Ollama local" in button["text"]
+                            )
+                            model_messages = invoke_callback(
+                                next_update_id,
+                                cloud_data,
+                            )
+                            next_update_id += 1
+                        else:
+                            model_messages = invoke_callback(
+                                next_update_id,
+                                configure_data,
+                            )
+                            next_update_id += 1
                         model_prompt = next(
                             params
                             for params in model_messages
-                            if "Change " in str(params.get("text", ""))
-                            and " model" in str(params.get("text", ""))
+                            if "reply_markup" in params
+                            if "model" in str(params.get("text", "")).lower()
+                            and (
+                                "Change " in str(params.get("text", ""))
+                                or "Choose a model"
+                                in str(params.get("text", ""))
+                            )
                         )
                         model_data = next(
                             button["callback_data"]
@@ -12197,7 +12838,11 @@ class DurableIntegrationTests(unittest.TestCase):
                             if button["text"] == model_label
                         )
 
-                        effort_messages = invoke_callback(12, model_data)
+                        effort_messages = invoke_callback(
+                            next_update_id,
+                            model_data,
+                        )
+                        next_update_id += 1
                         effort_prompt = next(
                             params
                             for params in effort_messages
@@ -12212,7 +12857,11 @@ class DurableIntegrationTests(unittest.TestCase):
                             if button["text"] == effort_label
                         )
 
-                        result_messages = invoke_callback(13, effort_data)
+                        result_messages = invoke_callback(
+                            next_update_id,
+                            effort_data,
+                        )
+                        next_update_id += 1
                         configured = store.resolve_agent(agent.agent_id)
                         self.assertEqual(
                             configured.provider_config["model"],
@@ -12245,6 +12894,68 @@ class DurableIntegrationTests(unittest.TestCase):
                             ).fetchone()[0],
                             0,
                         )
+                        if provider == "codex":
+                            with mock.patch.object(
+                                provider_adapters,
+                                "ollama_models",
+                                return_value=(("Tiny local", "tiny:1b"),),
+                            ):
+                                local_model_messages = invoke_callback(
+                                    next_update_id,
+                                    local_data,
+                                )
+                                next_update_id += 1
+                                local_model_prompt = next(
+                                    params
+                                    for params in local_model_messages
+                                    if "reply_markup" in params
+                                    and "Choose a model"
+                                    in str(params.get("text", ""))
+                                )
+                                self.assertTrue(
+                                    all(
+                                        len(row) == 1
+                                        for row in local_model_prompt[
+                                            "reply_markup"
+                                        ]["inline_keyboard"]
+                                    )
+                                )
+                                local_model_data = next(
+                                    button["callback_data"]
+                                    for row in local_model_prompt[
+                                        "reply_markup"
+                                    ]["inline_keyboard"]
+                                    for button in row
+                                    if button["text"] == "Tiny local"
+                                )
+                                local_result_messages = invoke_callback(
+                                    next_update_id,
+                                    local_model_data,
+                                )
+                                self.assertFalse(
+                                    any(
+                                        "Choose effort"
+                                        in str(params.get("text", ""))
+                                        for params in local_result_messages
+                                    )
+                                )
+
+                            local = store.resolve_agent(agent.agent_id)
+                            self.assertEqual(
+                                local.provider_config,
+                                {
+                                    "model": "tiny:1b",
+                                    "model_provider": "ollama",
+                                },
+                            )
+                            self.assertIsNone(local.provider_session_id)
+                            self.assertTrue(
+                                any(
+                                    "Codex (Ollama)"
+                                    in str(params.get("text", ""))
+                                    for params in local_result_messages
+                                )
+                            )
 
     def test_agent_can_confirm_switching_from_codex_to_claude(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

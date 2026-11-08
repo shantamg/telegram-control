@@ -15,6 +15,7 @@ from pathlib import Path
 import detached_worker
 import provider_defaults
 import telegram_bridge
+import telegram_native_ui
 import voice_responses
 from durable_store import DurableStore, StoreError, validate_provider_config
 
@@ -85,6 +86,10 @@ def parse_args() -> argparse.Namespace:
     subparsers.add_parser(
         "topic-teardown",
         help="Post a confirmation card for tearing down the current topic.",
+    )
+    subparsers.add_parser(
+        "ui-showcase",
+        help="Send the native Telegram interface showcase to this topic.",
     )
     topic_parser = subparsers.add_parser(
         "topic-create",
@@ -447,6 +452,26 @@ def main() -> int:
                 worker_id=worker_id,
             )
         print("Telegram topic teardown confirmation queued.")
+        return 0
+    if args.mode == "ui-showcase":
+        with DurableStore(database_path) as store:
+            target = store.agent_notification_target(
+                agent_id=agent_id,
+                mailbox_id=mailbox_id,
+                worker_id=worker_id,
+            )
+            context = store.agent_topic_creation_context(
+                agent_id=agent_id,
+                mailbox_id=mailbox_id,
+                worker_id=worker_id,
+            )
+        result = telegram_native_ui.send_showcase(
+            telegram_bridge.read_token(),
+            chat_id=target.chat_id,
+            message_thread_id=target.message_thread_id,
+            receiver_user_id=context.authorized_user_id,
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
         return 0
     if args.mode == "topic-create":
         first_prompt = sys.stdin.read(MAX_TOPIC_PROMPT_CHARACTERS + 1)
