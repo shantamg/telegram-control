@@ -13,15 +13,15 @@ class VoiceResponseTests(unittest.TestCase):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
         self.speech_dir = self.root / "speech"
-        self.edge = self.root / "edge-tts"
+        self.say = self.root / "say"
         self.ffmpeg = self.root / "ffmpeg"
-        self.edge.write_text("#!/bin/sh\n")
+        self.say.write_text("#!/bin/sh\n")
         self.ffmpeg.write_text("#!/bin/sh\n")
-        self.edge.chmod(0o700)
+        self.say.chmod(0o700)
         self.ffmpeg.chmod(0o700)
         self.patches = [
             mock.patch.object(voice_responses, "SPEECH_DIR", self.speech_dir),
-            mock.patch.object(voice_responses, "EDGE_TTS_BINARY", self.edge),
+            mock.patch.object(voice_responses, "SAY_BINARY", self.say),
             mock.patch.object(voice_responses, "FFMPEG_BINARY", self.ffmpeg),
         ]
         for patch in self.patches:
@@ -53,8 +53,8 @@ class VoiceResponseTests(unittest.TestCase):
 
     def test_synthesis_is_private_deterministic_and_cleans_intermediates(self):
         def fake_run(arguments, **_kwargs):
-            if "--write-media" in arguments:
-                output = Path(arguments[arguments.index("--write-media") + 1])
+            if "-o" in arguments:
+                output = Path(arguments[arguments.index("-o") + 1])
             else:
                 output = Path(arguments[-1])
             output.write_bytes(b"voice-bytes")
@@ -68,20 +68,20 @@ class VoiceResponseTests(unittest.TestCase):
             result = voice_responses.synthesize_voice(
                 "A concise response.",
                 "agent-12-request-44",
-                voice_name="en-US-AndrewNeural",
-                rate="-10%",
+                voice_name="Daniel",
+                rate="165",
             )
             repeated = voice_responses.synthesize_voice(
                 "This different text is not regenerated on retry.",
                 "agent-12-request-44",
-                voice_name="en-US-AndrewNeural",
-                rate="-10%",
+                voice_name="Daniel",
+                rate="165",
             )
 
         self.assertEqual(result, repeated)
         self.assertEqual(run.call_count, 2)
-        self.assertIn("en-US-AndrewNeural", run.call_args_list[0].args[0])
-        self.assertIn("-10%", run.call_args_list[0].args[0])
+        self.assertIn("Daniel", run.call_args_list[0].args[0])
+        self.assertIn("165", run.call_args_list[0].args[0])
         self.assertEqual(result.read_bytes(), b"voice-bytes")
         self.assertEqual(result.stat().st_mode & 0o777, 0o600)
         self.assertFalse(result.with_suffix(".txt").exists())
@@ -137,8 +137,8 @@ class VoiceResponseTests(unittest.TestCase):
 
     def test_failed_encode_never_publishes_partial_cache(self):
         def failed_run(arguments, **_kwargs):
-            if "--write-media" in arguments:
-                output = Path(arguments[arguments.index("--write-media") + 1])
+            if "-o" in arguments:
+                output = Path(arguments[arguments.index("-o") + 1])
                 output.write_bytes(b"media")
                 return subprocess.CompletedProcess(arguments, 0)
             Path(arguments[-1]).write_bytes(b"partial-voice")
@@ -164,8 +164,8 @@ class VoiceResponseTests(unittest.TestCase):
         self.assertEqual(list(self.speech_dir.glob(".atomic-retry-*")), [])
 
         def successful_run(arguments, **_kwargs):
-            if "--write-media" in arguments:
-                output = Path(arguments[arguments.index("--write-media") + 1])
+            if "-o" in arguments:
+                output = Path(arguments[arguments.index("-o") + 1])
             else:
                 output = Path(arguments[-1])
             output.write_bytes(b"complete-voice")
@@ -185,8 +185,8 @@ class VoiceResponseTests(unittest.TestCase):
 
     def test_encode_timeout_cleans_every_partial_file(self):
         def timed_out_run(arguments, **_kwargs):
-            if "--write-media" in arguments:
-                output = Path(arguments[arguments.index("--write-media") + 1])
+            if "-o" in arguments:
+                output = Path(arguments[arguments.index("-o") + 1])
                 output.write_bytes(b"media")
                 return subprocess.CompletedProcess(arguments, 0)
             Path(arguments[-1]).write_bytes(b"partial-voice")

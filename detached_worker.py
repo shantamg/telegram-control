@@ -42,6 +42,7 @@ import telegram_bridge
 import tmux_console
 import voice_responses
 from durable_store import DetachedWorker, DurableStore, StoreError, SurfaceBinding
+from telegram_formatting import escape_html
 
 NAME_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 MAX_REPORT_CHARACTERS = 3_500
@@ -49,6 +50,13 @@ MAX_REPORT_CHARACTERS = 3_500
 # A worker that dies immediately should not be respawned forever. Restarting
 # is a recovery mechanism, not a supervisor loop.
 MAX_RESTARTS = 3
+
+# Every intended-running worker holds a full provider CLI in memory whether or
+# not it is doing anything, and recovery faithfully resurrects all of them on
+# every reboot. Unbounded accumulation of finished-but-never-stopped workers
+# once swapped a 16 GB machine to a standstill, so creation refuses past this
+# point and names the workers to stop instead.
+MAX_RUNNING_WORKERS = 16
 RESTART_BACKOFF_SECONDS = 30
 RECOVERY_CONFIRM_TIMEOUT_SECONDS = 30 * 60
 SESSION_DISCOVERY_TIMEOUT_SECONDS = 15
@@ -112,6 +120,14 @@ def _validate_name(name: str) -> str:
 
 def tmux_session_name(name: str) -> str:
     return f"detached--{name}"
+
+
+def attach_command(worker: DetachedWorker) -> str:
+    target = shlex.quote(f"={worker.tmux_session_name}")
+    if target.startswith("="):
+        # zsh treats an unquoted leading = as executable-path expansion.
+        target = f"'{target}'"
+    return f"tmux attach-session -t {target}"
 
 
 def topic_name(name: str) -> str:
@@ -205,6 +221,19 @@ def create_worker(
     leaves an orphan tmux session nothing knows about.
     """
     _validate_name(name)
+    running = [
+        existing
+        for existing in store.list_detached_workers()
+        if existing.intended_state == "running" and existing.name != name
+    ]
+    if len(running) >= MAX_RUNNING_WORKERS:
+        roster = ", ".join(sorted(existing.name for existing in running))
+        raise StoreError(
+            f"{len(running)} detached workers are already intended running "
+            f"({roster}). Each one keeps a full provider process resident and "
+            "is resurrected on every reboot, so stop the finished ones with "
+            "worker-stop before starting another."
+        )
     directory = working_directory or project_path
     if not Path(directory).is_dir():
         raise StoreError("Detached worker working directory is unavailable.")
@@ -214,8 +243,10 @@ def create_worker(
         raise StoreError(f"A tmux session already uses the name {session_name}.")
 
     config = dict(provider_config or {})
+    account = provider_adapters.project_account(directory)
+    session_options = account.session_options(provider) if account else {}
     recovery_file = ensure_recovery_file(store, name)
-    baseline_sessions = _session_ids_for(provider, directory)
+    baseline_sessions = _session_ids_for(provider, directory, **session_options)
     provider_session_id = (
         str(uuid.uuid4()) if provider == "claude" else None
     )
@@ -226,6 +257,8 @@ def create_worker(
         provider_session_id=provider_session_id,
     )
     command.append(launch_preamble(name))
+    if account is not None:
+        command = account.tmux_command(provider, command)
 
     worker = store.create_detached_worker(
         name=name,
@@ -255,6 +288,7 @@ def create_worker(
                 provider,
                 directory,
                 baseline_sessions,
+                **session_options,
             )
             worker = store.configure_detached_worker_recovery(
                 name,
@@ -357,16 +391,20 @@ def _kill_session(session_name: str) -> None:
     )
 
 
-def _session_ids_for(provider: str, working_directory: str) -> set[str]:
+def _session_ids_for(
+    provider: str, working_directory: str, **session_options: Path
+) -> set[str]:
     if provider == "claude":
         sessions = claude_sessions.discover_sessions(
             working_directory,
             limit=100,
+            **session_options,
         )
     elif provider == "codex":
         sessions = codex_sessions.discover_sessions(
             working_directory,
             limit=100,
+            **session_options,
         )
     else:
         return set()
@@ -377,10 +415,14 @@ def _wait_for_new_session(
     provider: str,
     working_directory: str,
     baseline_session_ids: set[str],
+    **session_options: Path,
 ) -> str:
     deadline = time.monotonic() + SESSION_DISCOVERY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
-        candidates = _session_ids_for(provider, working_directory) - baseline_session_ids
+        candidates = (
+            _session_ids_for(provider, working_directory, **session_options)
+            - baseline_session_ids
+        )
         if len(candidates) == 1:
             return next(iter(candidates))
         if len(candidates) > 1:
@@ -397,11 +439,15 @@ def _wait_for_new_session(
 def validate_provider_session(worker: DetachedWorker) -> bool:
     if not worker.provider_session_id:
         return False
+    session_options = provider_adapters.project_session_options(
+        worker.provider, worker.working_directory
+    )
     if worker.provider == "claude":
         return (
             claude_sessions.resolve_session(
                 worker.provider_session_id,
                 worker.working_directory,
+                **session_options,
             )
             is not None
         )
@@ -410,13 +456,22 @@ def validate_provider_session(worker: DetachedWorker) -> bool:
             codex_sessions.resolve_session(
                 worker.provider_session_id,
                 worker.working_directory,
+                **session_options,
             )
             is not None
         )
     return False
 
 
-def resume_command_for(worker: DetachedWorker, prompt: str) -> list[str]:
+def resume_command_for(
+    worker: DetachedWorker,
+    prompt: Optional[str] = None,
+) -> list[str]:
+    """Argv that reopens the worker's exact conversation.
+
+    The prompt is optional because recovery no longer needs one: resuming the
+    session ID is itself what restores the worker's scheduled work.
+    """
     if not worker.provider_session_id:
         raise StoreError("Detached worker has no persisted provider session.")
     adapter = provider_adapters.adapter_for(_detached_agent_stub(worker))
@@ -424,8 +479,69 @@ def resume_command_for(worker: DetachedWorker, prompt: str) -> list[str]:
         command = adapter.console_command(_detached_agent_stub(worker))
     except provider_adapters.ProviderAdapterError as error:
         raise StoreError(str(error)) from error
-    command.append(prompt)
-    return command
+    if prompt:
+        command.append(prompt)
+    account = provider_adapters.project_account(worker.working_directory)
+    return account.tmux_command(worker.provider, command) if account else command
+
+
+def pane_text(session: str) -> str:
+    """What the session's pane is currently showing."""
+    result = subprocess.run(
+        [tmux_console.tmux_binary(), "capture-pane", "-p", "-t", session],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.stdout or ""
+
+
+# A resumed provider CLI can stall on an interactive startup dialog instead of
+# reaching its composer: Claude offers to condense a large session before
+# resuming it, and Codex offers to update itself. The tmux session then looks
+# recovered while the agent does nothing — after the August 14, 2026 reboot,
+# nine workers sat at these dialogs for two weeks, each pinning a full
+# provider process. Each entry: identifier, pane substrings that identify the
+# dialog, and the tmux keys that dismiss it without side effects.
+_STARTUP_DIALOGS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        "claude-resume-summary",
+        ("Resume from summary (recommended)", "Enter to confirm"),
+        ("Enter",),
+    ),
+    (
+        "codex-update-offer",
+        ("Update available!", "Press enter to continue"),
+        # The highlighted default is "Update now"; move down onto "Skip"
+        # rather than running an npm install inside a worker.
+        ("Down", "Enter"),
+    ),
+)
+
+
+def answer_startup_dialog(session_name: str) -> Optional[str]:
+    """Dismiss a known startup dialog so a resumed worker reaches its composer.
+
+    Returns the dialog's identifier when one was answered, None when the pane
+    shows anything else. Called from every maintenance pass over a live
+    session, so a dialog that takes a moment to render is still caught.
+    """
+    pane = pane_text(session_name)
+    for dialog_id, markers, keys in _STARTUP_DIALOGS:
+        if all(marker in pane for marker in markers):
+            subprocess.run(
+                [
+                    tmux_console.tmux_binary(),
+                    "send-keys",
+                    "-t",
+                    f"={session_name}",
+                    *keys,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            return dialog_id
+    return None
 
 
 def _brief_tmux(binary: str, *args: str) -> str:
@@ -555,6 +671,7 @@ def send_brief(name: str, worker_dir: Path, brief: bytes) -> Path:
     finally:
         os.close(directory_fd)
 
+
 def reconcile_worker(store: DurableStore, name: str) -> Optional[DetachedWorker]:
     """Bring observed state back in line with reality.
 
@@ -574,32 +691,6 @@ def reconcile_worker(store: DurableStore, name: str) -> Optional[DetachedWorker]
     if not alive and worker.observed_state != "stopped":
         return store.set_detached_worker_states(name, observed_state="stopped")
     return worker
-
-
-def _recovery_prompt(store: DurableStore, worker: DetachedWorker) -> str:
-    generation = worker.recovery_generation
-    controller = Path(__file__).resolve().with_name("telegram_control.py")
-    prefix = (
-        f"/usr/bin/python3 {shlex.quote(str(controller))} "
-        f"--db {shlex.quote(str(store.path))}"
-    )
-    confirm = (
-        f"{prefix} worker-recovery-confirm {worker.name} "
-        f"--generation {generation}"
-    )
-    fail = (
-        f"{prefix} worker-recovery-fail {worker.name} "
-        f"--generation {generation}"
-    )
-    base = worker.recovery_prompt.strip() or DEFAULT_RECOVERY_PROMPT
-    return (
-        f"{base}\n\n"
-        f"Recovery generation: {generation}\n\n"
-        "Success command (summary on standard input):\n"
-        f"{confirm}\n\n"
-        "Failure command (reason on standard input):\n"
-        f"{fail}"
-    )
 
 
 def enqueue_recovery_report(
@@ -689,6 +780,18 @@ def recover_worker(
         return "failed", worker
 
     if alive:
+        dialog = answer_startup_dialog(worker.tmux_session_name)
+        if dialog is not None:
+            enqueue_recovery_report(
+                store,
+                worker,
+                phase=f"dialog-{dialog}",
+                text=(
+                    f"⏯️ Detached worker '{worker.name}' was stalled at a "
+                    f"provider startup dialog ({dialog}). It was dismissed so "
+                    "the session can reach its composer and continue."
+                ),
+            )
         if worker.observed_state != "running":
             worker = store.set_detached_worker_states(
                 worker.name,
@@ -775,7 +878,11 @@ def recover_worker(
 
     worker = store.begin_detached_worker_recovery(worker.name, now=timestamp)
     try:
-        command = resume_command_for(worker, _recovery_prompt(store, worker))
+        # No prompt. Resuming the session ID is what restores the worker's
+        # scheduled work, and a prompt would only make the session busy —
+        # scheduled jobs fire while it is idle, so asking it to describe its
+        # own recovery briefly delays the thing being recovered.
+        command = resume_command_for(worker)
         _start_session(
             worker.tmux_session_name,
             worker.working_directory,
@@ -799,18 +906,40 @@ def recover_worker(
         )
         return "failed", worker
 
+    if not tmux_console.has_tmux_session(worker.tmux_session_name):
+        worker = store.fail_detached_worker_recovery(
+            worker.name,
+            worker.recovery_generation,
+            "The resumed provider process exited immediately.",
+            now=timestamp,
+        )
+        enqueue_recovery_report(
+            store,
+            worker,
+            phase="process-exited",
+            text=(
+                f"⚠️ Recovery attempt {worker.restart_count} for "
+                f"'{worker.name}' failed because the resumed provider process "
+                "exited immediately."
+            ),
+        )
+        return "failed", worker
+
+    worker = store.complete_detached_worker_recovery(
+        worker.name,
+        worker.recovery_generation,
+    )
     enqueue_recovery_report(
         store,
         worker,
-        phase="started",
+        phase="succeeded",
         text=(
-            f"♻️ Recovering detached worker '{worker.name}' after its tmux "
-            f"session stopped. The exact {worker.provider} conversation was "
-            "resumed and is restoring its own native background work. Telegram "
-            "Control is waiting for the agent to verify success."
+            f"♻️ Detached worker '{worker.name}' stopped and was recovered. Its "
+            f"exact {worker.provider} conversation is running again, with the "
+            "scheduled work it had before."
         ),
     )
-    return "started", worker
+    return "recovered", worker
 
 
 def confirm_recovery(
@@ -997,20 +1126,17 @@ def report_only_notice(
     main_topic_name: Optional[str],
     main_topic_url: Optional[str] = None,
 ) -> str:
-    """The reply an inbound message to a worker topic gets.
-
-    Worker topics are one-way by design. Steering a tmux session through chat
-    would mean reasoning about what it is doing and whether it is even at a
-    prompt; relaying through the main agent is both simpler and the thing an
-    operator actually wants.
-    """
-    destination = f" in {main_topic_name}" if main_topic_name else ""
+    """Render the Telegram HTML reply for inbound worker-topic messages."""
+    destination = f" in {escape_html(main_topic_name)}" if main_topic_name else ""
+    command = escape_html(attach_command(worker))
     notice = (
         f"This topic is report-only — it carries updates from the detached "
-        f"worker '{worker.name}' and nothing here is read by it.\n\n"
-        f"To steer or stop this worker, message the project's main agent"
+        f"worker '{escape_html(worker.name)}' and nothing here is read by it.\n\n"
+        "To interact directly, run this in a terminal on the machine running "
+        f"Telegram Control.\n<code>{command}</code>\n\n"
+        "To steer or stop this worker, message the project's main agent"
         f"{destination}."
     )
     if main_topic_url:
-        notice += f"\n\nOpen the main agent topic: {main_topic_url}"
+        notice += f"\n\nOpen the main agent topic: {escape_html(main_topic_url)}"
     return notice

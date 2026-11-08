@@ -35,7 +35,10 @@ def console_command_for(agent: ManagedAgent) -> list[str]:
             f"Interactive console is not implemented for provider: {agent.provider}"
         )
     try:
-        return adapter.console_command(agent)
+        command = adapter.console_command(agent)
+        directory = agent.working_directory or agent.project_path
+        account = provider_adapters.project_account(directory) if directory else None
+        return account.tmux_command(agent.provider, command) if account else command
     except provider_adapters.ProviderAdapterError as error:
         raise StoreError(str(error)) from error
 

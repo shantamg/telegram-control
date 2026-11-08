@@ -70,7 +70,7 @@ class FakeProcess:
         self.stdout = FakeStdout()
         self.stdin = FakeStdin(self)
         self.returncode = None
-        self.pid = None
+        self.pid = 98765
         self.terminated = False
         self.killed = False
 
@@ -135,6 +135,68 @@ def claude_agent(**overrides):
 
 
 class CodexEventTests(unittest.TestCase):
+    def test_ollama_models_are_discovered_and_sorted_by_installed_size(self):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _size=-1):
+                return json.dumps(
+                    {
+                        "models": [
+                            {"name": "larger:latest", "size": 4 * 1024**3},
+                            {"name": "small:1b", "size": 1 * 1024**3},
+                        ]
+                    }
+                ).encode("utf-8")
+
+        requests = []
+
+        def urlopen(request, timeout):
+            requests.append((request.full_url, timeout))
+            return Response()
+
+        models = provider_adapters.ollama_models(
+            base_url="http://localhost:11434",
+            urlopen=urlopen,
+        )
+
+        self.assertEqual(
+            models,
+            (
+                ("small:1b · 1.0 GB", "small:1b"),
+                ("larger:latest · 4.0 GB", "larger:latest"),
+            ),
+        )
+        self.assertEqual(
+            requests,
+            [("http://localhost:11434/api/tags", 3.0)],
+        )
+
+    def test_ollama_is_a_configurable_codex_backend_not_a_hardcoded_model(self):
+        self.assertIn(
+            ("Ollama local", "ollama"),
+            provider_adapters.model_provider_options("codex"),
+        )
+        with mock.patch.object(
+            provider_adapters,
+            "ollama_models",
+            return_value=(("Tiny", "tiny:1b"), ("Coder", "coder:7b")),
+        ):
+            options = provider_adapters.configuration_options(
+                "codex",
+                "ollama",
+            )
+
+        self.assertEqual(
+            options.models,
+            (("Tiny", "tiny:1b"), ("Coder", "coder:7b")),
+        )
+        self.assertEqual(options.efforts, (("Default", None),))
+
     def test_provider_availability_reports_each_cli_independently(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             claude = Path(temporary_directory) / "claude"
@@ -175,6 +237,28 @@ class CodexEventTests(unittest.TestCase):
                 "developerInstructions": turn_guidance.TURN_GUIDANCE,
             },
         )
+
+    def test_local_codex_threads_select_ollama_and_default_to_read_only(self):
+        agent = codex_agent(
+            provider_config={
+                "model_provider": "ollama",
+                "model": "tiny:1b",
+            }
+        )
+        self.assertEqual(
+            provider_adapters.CodexExecAdapter._sandbox_mode(agent),
+            "read-only",
+        )
+        method, params = provider_adapters.CodexExecAdapter._thread_request(
+            None,
+            "/tmp/project",
+            "tiny:1b",
+            "read-only",
+            model_provider="ollama",
+        )
+        self.assertEqual(method, "thread/start")
+        self.assertEqual(params["model"], "tiny:1b")
+        self.assertEqual(params["modelProvider"], "ollama")
 
     def test_consumes_persistent_session_final_message_and_usage(self):
         sessions = []
@@ -312,6 +396,24 @@ class ClaudeEventTests(unittest.TestCase):
                 [{"type": "system", "session_id": "session-one"}]
             )
 
+    def test_accepts_empty_success_for_native_compact_command(self):
+        result = provider_adapters.consume_claude_events(
+            [
+                {"type": "system", "session_id": "session-one"},
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "session_id": "session-one",
+                    "result": "",
+                },
+            ],
+            empty_success_text="Context compacted successfully.",
+        )
+
+        self.assertEqual(result.provider_session_id, "session-one")
+        self.assertEqual(result.final_text, "Context compacted successfully.")
+
     def test_command_uses_structured_resume_and_validated_permissions(self):
         adapter = provider_adapters.ClaudePrintAdapter(binary="/bin/claude")
         fresh = adapter.command(self.agent, None)
@@ -325,7 +427,7 @@ class ClaudeEventTests(unittest.TestCase):
             **{
                 **self.agent.__dict__,
                 "provider_config": {
-                    "model": "sonnet",
+                    "model": "claude-opus-4-8",
                     "effort": "high",
                     "permission_mode": "acceptEdits",
                 },
@@ -333,7 +435,8 @@ class ClaudeEventTests(unittest.TestCase):
         )
         resumed = adapter.command(configured, "session-123")
         self.assertIn("--model", resumed)
-        self.assertIn("sonnet", resumed)
+        model_index = resumed.index("--model")
+        self.assertEqual(resumed[model_index + 1], "claude-opus-4-8")
         self.assertIn("--effort", resumed)
         self.assertIn("high", resumed)
         self.assertEqual(resumed[-2:], ["--resume", "session-123"])
@@ -411,6 +514,7 @@ class TurnGuidanceCapabilityTests(unittest.TestCase):
         self.assertIn(("GPT-5.6 Terra", "gpt-5.6-terra"), codex.models)
         self.assertIn(("Ultra", "ultra"), codex.efforts)
         self.assertIn(("Opus", "opus"), claude.models)
+        self.assertIn(("Opus 4.8", "claude-opus-4-8"), claude.models)
         self.assertIn(("Max", "max"), claude.efforts)
         self.assertEqual(codex.models[0], ("Default", None))
         self.assertEqual(claude.models[0], ("Default", None))
@@ -456,6 +560,28 @@ class ConsoleCommandTests(unittest.TestCase):
         # divergence is exactly what belongs behind the adapter.
         self.assertIn('model_reasoning_effort="high"', command)
         self.assertEqual(command[-1], self.SESSION)
+
+    def test_codex_console_resumes_a_configured_ollama_session(self):
+        adapter = provider_adapters.CodexExecAdapter(binary="/bin/codex")
+        command = adapter.console_command(
+            codex_agent(
+                provider_session_id=self.SESSION,
+                provider_config={
+                    "model_provider": "ollama",
+                    "model": "small:1b",
+                },
+            )
+        )
+
+        self.assertIn("--oss", command)
+        self.assertEqual(
+            command[command.index("--local-provider") + 1],
+            "ollama",
+        )
+        self.assertEqual(
+            command[command.index("--sandbox") + 1],
+            "read-only",
+        )
 
     def test_claude_console_resumes_the_persisted_session(self):
         adapter = provider_adapters.ClaudePrintAdapter(binary="/bin/claude")
@@ -584,6 +710,155 @@ class LiveControlContractTests(unittest.TestCase):
                 }
             )
 
+    def test_codex_compact_resumes_session_and_waits_for_native_completion(self):
+        for recovery in (None, "thread-1"):
+            for ack_first in (True, False):
+                with self.subTest(recovery=recovery, ack_first=ack_first):
+                    process = FakeProcess(lambda payload: None)
+                    sessions, progress = [], []
+
+                    def handle(payload):
+                        self.codex_handshake(process, payload)
+                        if payload.get("method") != "thread/compact/start":
+                            return
+                        ack = {"id": payload["id"], "result": {}}
+                        if ack_first:
+                            process.stdout.emit(ack)
+                        # Ignore events from a different thread.
+                        process.stdout.emit({"method": "turn/started", "params": {
+                            "threadId": "other", "turn": {"id": "other-turn"},
+                        }})
+                        process.stdout.emit({"method": "turn/started", "params": {
+                            "threadId": "thread-1", "turn": {"id": "compact-1"},
+                        }})
+                        for method in ("item/started", "item/completed"):
+                            process.stdout.emit({"method": method, "params": {
+                                "threadId": "thread-1", "turnId": "compact-1",
+                                "item": {"id": "compact-item", "type": "contextCompaction"},
+                            }})
+                        process.stdout.emit({"method": "turn/completed", "params": {
+                            "threadId": "thread-1",
+                            "turn": {"id": "compact-1", "status": "completed"},
+                        }})
+                        if not ack_first:
+                            process.stdout.emit(ack)
+
+                    process.on_payload = handle
+                    result = provider_adapters.CodexExecAdapter(
+                        binary="/bin/codex", poll_interval_seconds=0.01,
+                        _popen_factory=FakePopenFactory(process),
+                    ).run_turn(
+                        codex_agent(provider_session_id="thread-1"),
+                        " /compact ", recovery, sessions.append, lambda: None,
+                        lambda stage, detail: progress.append((stage, detail)),
+                    )
+                    methods = [payload.get("method") for payload in process.payloads]
+                    self.assertIn("thread/resume", methods)
+                    self.assertNotIn("turn/start", methods)
+                    self.assertEqual(process.payloads[-1]["params"], {"threadId": "thread-1"})
+                    self.assertEqual(sessions, ["thread-1"])
+                    self.assertEqual(result.provider_session_id, "thread-1")
+                    self.assertEqual(result.final_text, "Context compacted successfully. "
+                                     "This topic will continue in the same Codex session.")
+                    self.assertIn(("turn_started", "compact-1"), progress)
+
+    def test_codex_compact_does_not_report_success_for_errors_or_missing_completion(self):
+        for failure in ("rpc", "turn", "interrupted", "eof", "timeout"):
+            with self.subTest(failure=failure):
+                process = FakeProcess(lambda payload: None)
+
+                def handle(payload):
+                    self.codex_handshake(process, payload)
+                    if payload.get("method") != "thread/compact/start":
+                        return
+                    if failure == "rpc":
+                        process.stdout.emit({"id": payload["id"], "error": {
+                            "message": "Compaction unavailable",
+                        }})
+                        return
+                    process.stdout.emit({"id": payload["id"], "result": {}})
+                    if failure == "timeout":
+                        return
+                    if failure == "eof":
+                        process.stdout.close()
+                        return
+                    process.stdout.emit({"method": "turn/started", "params": {
+                        "threadId": "thread-1", "turn": {"id": "compact-1"},
+                    }})
+                    process.stdout.emit({"method": "turn/completed", "params": {
+                        "threadId": "thread-1", "turn": {
+                            "id": "compact-1",
+                            "status": "interrupted" if failure == "interrupted" else "failed",
+                            "error": {"message": "Compaction failed"},
+                        },
+                    }})
+
+                process.on_payload = handle
+                adapter = provider_adapters.CodexExecAdapter(
+                    binary="/bin/codex", poll_interval_seconds=0.01,
+                    _popen_factory=FakePopenFactory(process),
+                )
+                adapter.timeout_seconds = 0.1
+                progress = []
+                with self.assertRaises(provider_adapters.ProviderAdapterError):
+                    adapter.run_turn(
+                        codex_agent(provider_session_id="thread-1"), "/compact", None,
+                        lambda _: None, lambda: None,
+                        lambda stage, detail: progress.append((stage, detail)),
+                    )
+                self.assertFalse(any(stage == "completed" for stage, _ in progress))
+
+    def test_codex_compact_supports_stop_and_rejects_steering(self):
+        process = FakeProcess(lambda payload: None)
+        controls = [
+            provider_adapters.ProviderControl(1, "steer", "new guidance", "compact-1"),
+            provider_adapters.ProviderControl(2, "cancel", "", "compact-1"),
+        ]
+        outcomes = []
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "thread/compact/start":
+                process.stdout.emit({"id": payload["id"], "result": {}})
+                process.stdout.emit({"method": "turn/started", "params": {
+                    "threadId": "thread-1", "turn": {"id": "compact-1"},
+                }})
+            elif payload.get("method") == "turn/interrupt":
+                process.stdout.emit({"id": payload["id"], "result": {}})
+
+        process.on_payload = handle
+        adapter = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex", poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        )
+        with self.assertRaises(provider_adapters.ProviderTurnCancelled):
+            adapter.run_turn(
+                codex_agent(provider_session_id="thread-1"), "/compact", None,
+                lambda _: None, lambda: None,
+                poll_control=lambda: controls.pop(0) if controls else None,
+                on_control=lambda control, outcome, _: outcomes.append((control.control_id, outcome)),
+            )
+        self.assertEqual(outcomes, [(1, "rejected"), (2, "applied")])
+        self.assertEqual(process.payloads[-1]["params"], {
+            "threadId": "thread-1", "turnId": "compact-1",
+        })
+
+    def test_codex_compact_mentioned_in_prose_is_an_ordinary_turn(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "turn/start":
+                self.emit_codex_completion(process)
+
+        process.on_payload = handle
+        result = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex", poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        ).run_turn(codex_agent(), "Explain /compact", None, lambda _: None, lambda: None)
+        self.assertEqual(result.final_text, "Codex final")
+        self.assertNotIn("thread/compact/start", [p.get("method") for p in process.payloads])
+
     def test_controller_codex_home_isolates_state_and_links_shared_inputs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -689,6 +964,42 @@ class LiveControlContractTests(unittest.TestCase):
                 ).is_file()
             )
             self.assertTrue((runtime_home / "auth.json").is_symlink())
+
+    def test_bound_codex_app_server_uses_profile_auth_and_separate_sqlite(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "turn/start":
+                self.emit_codex_completion(process)
+
+        process.on_payload = handle
+        factory = FakePopenFactory(process)
+        adapter = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex", poll_interval_seconds=0.01, _popen_factory=factory,
+        )
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            profile_home = root / "profile"
+            profile_home.mkdir()
+            profile = provider_adapters.ai_accounts.Profile("Lovely", None, profile_home)
+            runtime_home = root / "codex-home"
+            with mock.patch.object(provider_adapters, "project_account", return_value=profile):
+                adapter.run_turn(
+                    codex_agent(runtime_environment={
+                        "TELEGRAM_CONTROL_CODEX_HOME": str(runtime_home),
+                        "OPENAI_API_KEY": "inherited",
+                    }),
+                    "Inspect the worker.", None, lambda _session: None, lambda: None,
+                )
+            self.assertEqual(factory.kwargs["env"]["CODEX_HOME"], str(profile_home))
+            self.assertNotIn("OPENAI_API_KEY", factory.kwargs["env"])
+            self.assertIn('cli_auth_credentials_store="file"', factory.command)
+            sqlite_override = next(arg for arg in factory.command if arg.startswith("sqlite_home="))
+            sqlite_home = Path(json.loads(sqlite_override.split("=", 1)[1]))
+            self.assertEqual(sqlite_home.parent, runtime_home)
+            self.assertTrue((sqlite_home / ".telegram-control-app-server-start.lock").is_file())
+            self.assertFalse((sqlite_home / "auth.json").exists())
 
     def test_provider_control_validation_and_capabilities(self):
         control = provider_adapters.ProviderControl(
@@ -827,6 +1138,99 @@ class LiveControlContractTests(unittest.TestCase):
         rendered_progress = repr(progress)
         self.assertNotIn("SECRET", rendered_progress)
         self.assertNotIn("/private/project", rendered_progress)
+
+    def test_codex_ollama_uses_the_same_incremental_progress_path(self):
+        process = FakeProcess(lambda payload: None)
+
+        def handle(payload):
+            self.codex_handshake(process, payload)
+            if payload.get("method") == "turn/start":
+                process.stdout.emit(
+                    {
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "local-message",
+                                "type": "agentMessage",
+                                "text": "",
+                                "phase": "final_answer",
+                            },
+                        },
+                    }
+                )
+                process.stdout.emit(
+                    {
+                        "method": "item/agentMessage/delta",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "itemId": "local-message",
+                            "delta": "LOCAL",
+                        },
+                    }
+                )
+                process.stdout.emit(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "local-message",
+                                "type": "agentMessage",
+                                "text": "LOCAL STREAM",
+                                "phase": "final_answer",
+                            },
+                        },
+                    }
+                )
+                process.stdout.emit(
+                    {
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turn": {
+                                "id": "turn-1",
+                                "items": [],
+                                "status": "completed",
+                            },
+                        },
+                    }
+                )
+
+        process.on_payload = handle
+        progress = []
+        result = provider_adapters.CodexExecAdapter(
+            binary="/bin/codex",
+            poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        ).run_turn(
+            codex_agent(
+                provider_config={
+                    "model_provider": "ollama",
+                    "model": "small:1b",
+                }
+            ),
+            "Use the local model.",
+            None,
+            lambda _session_id: None,
+            lambda: None,
+            lambda stage, detail: progress.append((stage, detail)),
+        )
+
+        self.assertEqual(
+            process.payloads[2]["params"]["modelProvider"],
+            "ollama",
+        )
+        self.assertEqual(
+            process.payloads[2]["params"]["sandbox"],
+            "read-only",
+        )
+        self.assertIn(("response", "LOCAL"), progress)
+        self.assertIn(("response", "LOCAL STREAM"), progress)
+        self.assertEqual(result.final_text, "LOCAL STREAM")
 
     def test_codex_streams_commentary_and_final_answer_as_visible_progress(self):
         process = FakeProcess(lambda payload: None)
@@ -1180,6 +1584,152 @@ class LiveControlContractTests(unittest.TestCase):
         self.assertNotIn("SECRET", repr(progress))
         self.assertNotIn("/private/project", repr(progress))
 
+    def test_claude_keeps_steer_in_flight_during_a_long_tool_call(self):
+        process = FakeProcess(lambda payload: None)
+        user_messages = []
+        heartbeats_after_steer = 0
+        emitted_result = False
+
+        def handle(payload):
+            self.claude_initialize(process, payload)
+            if payload.get("type") != "user":
+                return
+            user_messages.append(payload)
+            if len(user_messages) == 1:
+                process.stdout.emit(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": payload["session_id"],
+                    }
+                )
+
+        def heartbeat():
+            nonlocal heartbeats_after_steer, emitted_result
+            if len(user_messages) < 2 or emitted_result:
+                return
+            heartbeats_after_steer += 1
+            if heartbeats_after_steer < 5:
+                return
+            emitted_result = True
+            process.stdout.emit(dict(user_messages[1]))
+            self.emit_claude_result(
+                process,
+                user_messages[1]["session_id"],
+            )
+
+        process.on_payload = handle
+        controls = [
+            provider_adapters.ProviderControl(
+                42,
+                "steer",
+                "Apply this after the current tool call.",
+            )
+        ]
+        outcomes = []
+        adapter = provider_adapters.ClaudePrintAdapter(
+            binary="/bin/claude",
+            poll_interval_seconds=0.01,
+            control_timeout_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        )
+
+        result = adapter.run_turn(
+            claude_agent(),
+            "Start a long tool call.",
+            None,
+            lambda _session: None,
+            heartbeat,
+            poll_control=lambda: controls.pop(0) if controls else None,
+            on_control=lambda control, outcome, detail: outcomes.append(
+                (control.control_id, outcome, detail)
+            ),
+        )
+
+        self.assertGreaterEqual(heartbeats_after_steer, 5)
+        self.assertEqual(len(user_messages), 2)
+        self.assertEqual(
+            outcomes,
+            [
+                (
+                    42,
+                    "applied",
+                    "Guidance was accepted by the active Claude turn.",
+                )
+            ],
+        )
+        self.assertEqual(result.final_text, "Claude final")
+
+    def test_claude_unacknowledged_steer_does_not_block_stop(self):
+        process = FakeProcess(lambda payload: None)
+        user_messages = []
+
+        def handle(payload):
+            self.claude_initialize(process, payload)
+            if payload.get("type") == "user":
+                user_messages.append(payload)
+                if len(user_messages) == 1:
+                    process.stdout.emit(
+                        {
+                            "type": "system",
+                            "subtype": "init",
+                            "session_id": payload["session_id"],
+                        }
+                    )
+                return
+            request = payload.get("request")
+            if (
+                payload.get("type") == "control_request"
+                and isinstance(request, dict)
+                and request.get("subtype") == "interrupt"
+            ):
+                process.stdout.emit(
+                    {
+                        "type": "control_response",
+                        "response": {
+                            "subtype": "success",
+                            "request_id": payload["request_id"],
+                            "response": {},
+                        },
+                    }
+                )
+
+        process.on_payload = handle
+        controls = [
+            provider_adapters.ProviderControl(
+                43,
+                "steer",
+                "Apply this after the current tool call.",
+            ),
+            provider_adapters.ProviderControl(44, "cancel"),
+        ]
+        outcomes = []
+        adapter = provider_adapters.ClaudePrintAdapter(
+            binary="/bin/claude",
+            poll_interval_seconds=0.01,
+            control_timeout_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        )
+
+        with self.assertRaises(provider_adapters.ProviderTurnCancelled):
+            adapter.run_turn(
+                claude_agent(),
+                "Start a long tool call.",
+                None,
+                lambda _session: None,
+                lambda: None,
+                poll_control=lambda: controls.pop(0) if controls else None,
+                on_control=lambda control, outcome, detail: outcomes.append(
+                    (control.control_id, outcome, detail)
+                ),
+            )
+
+        self.assertEqual(len(user_messages), 2)
+        self.assertEqual(
+            outcomes,
+            [(44, "applied", "Claude acknowledged the interrupt.")],
+        )
+
     def test_claude_streams_visible_text_blocks_as_incremental_progress(self):
         process = FakeProcess(lambda payload: None)
 
@@ -1445,6 +1995,49 @@ class LiveControlContractTests(unittest.TestCase):
             lambda: None,
         )
         self.assertEqual(result.final_text, "Claude final")
+
+    def test_claude_compact_stays_native_during_recovery_and_accepts_empty_result(self):
+        process = FakeProcess(lambda payload: None)
+        user_messages = []
+
+        def handle(payload):
+            self.claude_initialize(process, payload)
+            if payload.get("type") == "user":
+                user_messages.append(payload)
+                process.stdout.emit(
+                    {
+                        "type": "system",
+                        "subtype": "init",
+                        "session_id": payload["session_id"],
+                    }
+                )
+                process.stdout.emit(
+                    {
+                        "type": "result",
+                        "subtype": "success",
+                        "is_error": False,
+                        "session_id": payload["session_id"],
+                        "result": "",
+                        "usage": {},
+                    }
+                )
+
+        process.on_payload = handle
+        result = provider_adapters.ClaudePrintAdapter(
+            binary="/bin/claude",
+            poll_interval_seconds=0.01,
+            _popen_factory=FakePopenFactory(process),
+        ).run_turn(
+            claude_agent(provider_session_id="session-existing"),
+            "/compact",
+            "session-existing",
+            lambda _session: None,
+            lambda: None,
+        )
+
+        self.assertEqual(user_messages[0]["message"]["content"], "/compact")
+        self.assertEqual(result.provider_session_id, "session-existing")
+        self.assertIn("Context compacted successfully", result.final_text)
 
 
 if __name__ == "__main__":

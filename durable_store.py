@@ -34,10 +34,16 @@ _LOCAL_AGENT_LEASE_OWNER = re.compile(
 
 
 def _local_agent_lease_owner_is_gone(lease_owner: Optional[str]) -> bool:
-    """Prove that a standard local agent lease no longer has a worker process."""
+    """Prove that a standard single-Mac lease no longer has a worker process.
+
+    The hostname embedded in a lease is diagnostic, not stable identity: macOS
+    can change it when the network changes while the controller is running.
+    Telegram Control currently supports one local Mac, so the PID remains the
+    authoritative liveness check even when that hostname has changed.
+    """
 
     match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(str(lease_owner or ""))
-    if match is None or match.group(1) != socket.gethostname():
+    if match is None:
         return False
     try:
         os.kill(int(match.group(2)), 0)
@@ -145,14 +151,6 @@ class SurfaceBinding:
     target_type: str
     target_id: str
     state: str
-
-
-@dataclass(frozen=True)
-class TopicProbe:
-    binding_id: int
-    chat_id: int
-    message_thread_id: int
-    display_name: str
 
 
 @dataclass(frozen=True)
@@ -272,6 +270,7 @@ class DetachedWorker:
     recovery_started_at: Optional[float]
     last_recovered_at: Optional[float]
     last_recovery_error: Optional[str]
+    created_at: float = 0.0
 
     @property
     def needs_restart(self) -> bool:
@@ -1010,11 +1009,10 @@ MIGRATION_19 = (
 )
 
 MIGRATION_20 = (
-    # The Bot API does not emit ordinary topic-deletion updates. A supervised
-    # maintenance loop therefore sends and immediately deletes a silent,
-    # invisible probe periodically and records its schedule here. Only a
-    # definitive "thread not found" result retires local routing metadata;
-    # all other Telegram failures fail closed.
+    # These columns originally scheduled proactive topic-existence probes.
+    # Probing was retired because even rejected Bot API calls can create
+    # unread topic activity in Telegram clients. Keep the additive schema for
+    # compatibility and use the fields only for explicit retirement details.
     """
     ALTER TABLE surface_bindings
     ADD COLUMN last_probe_at REAL
@@ -1368,7 +1366,7 @@ def validate_provider_config(
         raise StoreError("Agent provider is invalid.")
     value = dict(config or {})
     allowed = (
-        {"model", "effort", "sandbox"}
+        {"model", "effort", "sandbox", "model_provider"}
         if provider == "codex"
         else {"model", "effort", "permission_mode"}
     )
@@ -1391,6 +1389,9 @@ def validate_provider_config(
     ):
         raise StoreError(f"Agent effort is invalid for {provider}.")
     if provider == "codex":
+        model_provider = value.get("model_provider")
+        if model_provider is not None and model_provider != "ollama":
+            raise StoreError("Codex model provider is invalid.")
         sandbox = value.get("sandbox")
         if sandbox is not None and (
             not isinstance(sandbox, str)
@@ -1451,6 +1452,22 @@ class DurableStore:
         self.close()
 
     def _migrate(self) -> None:
+        current = int(
+            self.connection.execute("PRAGMA user_version").fetchone()[0]
+        )
+        if current > SCHEMA_VERSION:
+            raise IncompatibleSchemaError(
+                f"Database schema {current} is newer than supported schema "
+                f"{SCHEMA_VERSION}."
+            )
+        # Every collector, queue worker, sender, and short-lived handler opens
+        # its own connection. Taking SQLite's single writer lock just to prove
+        # that an already-current schema is still current turns simultaneous
+        # process startup into a lock convoy. Only migration contenders need
+        # the write transaction below; _run_migrations() rechecks the version
+        # after acquiring it so concurrent first-open races remain safe.
+        if current == SCHEMA_VERSION:
+            return
         # Table rebuilds (schema v14) must run without foreign-key
         # enforcement; the pragma only takes effect outside a transaction,
         # and referential integrity is verified explicitly afterwards.
@@ -1469,6 +1486,7 @@ class DurableStore:
                     f"Database schema {current} is newer than supported schema "
                     f"{SCHEMA_VERSION}."
                 )
+            migration_needed = current < SCHEMA_VERSION
             if current < 1:
                 for statement in MIGRATION_1:
                     self.connection.execute(statement)
@@ -1603,16 +1621,19 @@ class DurableStore:
                     self.connection.execute(statement)
                 current = 23
                 self.connection.execute("PRAGMA user_version = 23")
-            # Referential integrity is audited before the commit so a failed
-            # check rolls the whole migration back instead of stranding an
-            # upgraded-but-broken database.
-            violations = self.connection.execute(
-                "PRAGMA foreign_key_check"
-            ).fetchall()
-            if violations:
-                raise IncompatibleSchemaError(
-                    "Migration left foreign-key violations behind."
-                )
+            if migration_needed:
+                # Referential integrity is audited before the commit so a
+                # failed migration rolls back instead of stranding an
+                # upgraded-but-broken database. A concurrent process may have
+                # completed the migration while this connection waited for the
+                # writer lock; in that case there is nothing here to audit.
+                violations = self.connection.execute(
+                    "PRAGMA foreign_key_check"
+                ).fetchall()
+                if violations:
+                    raise IncompatibleSchemaError(
+                        "Migration left foreign-key violations behind."
+                    )
             self.connection.execute("COMMIT")
         except BaseException:
             self.connection.execute("ROLLBACK")
@@ -1690,7 +1711,9 @@ class DurableStore:
             return voice_settings.DEFAULT_CONFIGURATION
         try:
             value = json.loads(str(row["value"]))
-            return voice_settings.validate_configuration(value)
+            return voice_settings.validate_configuration(
+                voice_settings.upgrade_legacy(value)
+            )
         except (json.JSONDecodeError, ValueError):
             raise StoreError(
                 "Stored voice configuration is invalid."
@@ -2716,20 +2739,60 @@ class DurableStore:
                     "This button was already used.",
                 )
             if float(row["expires_at"]) <= timestamp:
-                if row["state"] == "active":
-                    self.connection.execute(
+                if str(row["action_type"]) == "agent_turn_stop":
+                    try:
+                        mailbox_id = int(
+                            json.loads(str(row["payload_json"]))["mailbox_id"]
+                        )
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        mailbox_id = 0
+                    mailbox = self.connection.execute(
                         """
-                        UPDATE callback_actions
-                        SET state = 'expired', updated_at = ?
-                        WHERE action_id = ? AND state = 'active'
+                        SELECT state
+                        FROM agent_mailbox
+                        WHERE mailbox_id = ?
                         """,
-                        (timestamp, int(row["action_id"])),
-                    )
-                self.connection.execute("COMMIT")
-                raise CallbackActionError(
-                    "expired",
-                    "This button has expired.",
-                )
+                        (mailbox_id,),
+                    ).fetchone()
+                    if (
+                        mailbox is not None
+                        and str(mailbox["state"]) in {"queued", "leased"}
+                    ):
+                        self.connection.execute(
+                            """
+                            UPDATE callback_actions
+                            SET expires_at = ?, updated_at = ?
+                            WHERE action_id = ? AND state = 'active'
+                            """,
+                            (
+                                timestamp + 2 * 60 * 60,
+                                timestamp,
+                                int(row["action_id"]),
+                            ),
+                        )
+                        row = self.connection.execute(
+                            """
+                            SELECT *
+                            FROM callback_actions
+                            WHERE action_id = ?
+                            """,
+                            (int(row["action_id"]),),
+                        ).fetchone()
+                if row["state"] == "active":
+                    if float(row["expires_at"]) <= timestamp:
+                        self.connection.execute(
+                            """
+                            UPDATE callback_actions
+                            SET state = 'expired', updated_at = ?
+                            WHERE action_id = ? AND state = 'active'
+                            """,
+                            (timestamp, int(row["action_id"])),
+                        )
+                        self.connection.execute("COMMIT")
+                        raise CallbackActionError(
+                            "expired",
+                            "This button has expired.",
+                        )
             if row["state"] != "active":
                 raise CallbackActionError(
                     str(row["state"]),
@@ -3727,64 +3790,6 @@ class DurableStore:
             (int(chat_id),),
         ).fetchall()
         return [self._surface_binding_from_row(row) for row in rows]
-
-    def list_due_topic_probes(
-        self,
-        *,
-        now: Optional[float] = None,
-        interval_seconds: float = 24 * 60 * 60,
-        limit: int = 100,
-    ) -> list[TopicProbe]:
-        """Return active Telegram topics whose quiet existence check is due."""
-        timestamp = time.time() if now is None else float(now)
-        interval = float(interval_seconds)
-        if interval <= 0:
-            raise StoreError("Topic probe interval must be positive.")
-        count = int(limit)
-        if count < 1 or count > 1000:
-            raise StoreError("Topic probe batch size must be between 1 and 1000.")
-        cutoff = timestamp - interval
-        rows = self.connection.execute(
-            """
-            SELECT binding_id, chat_id, message_thread_id, display_name
-            FROM surface_bindings
-            WHERE state = 'active' AND message_thread_id != 0
-                AND COALESCE(last_probe_at, updated_at) <= ?
-            ORDER BY COALESCE(last_probe_at, updated_at), binding_id
-            LIMIT ?
-            """,
-            (cutoff, count),
-        ).fetchall()
-        return [
-            TopicProbe(
-                binding_id=int(row["binding_id"]),
-                chat_id=int(row["chat_id"]),
-                message_thread_id=int(row["message_thread_id"]),
-                display_name=str(row["display_name"]),
-            )
-            for row in rows
-        ]
-
-    def record_topic_probe(
-        self,
-        binding_id: int,
-        *,
-        error: Optional[str] = None,
-        now: Optional[float] = None,
-    ) -> bool:
-        """Record one conclusive-live or inconclusive topic probe."""
-        timestamp = time.time() if now is None else float(now)
-        message = str(error)[:1000] if error else None
-        cursor = self.connection.execute(
-            """
-            UPDATE surface_bindings
-            SET last_probe_at = ?, last_probe_error = ?
-            WHERE binding_id = ? AND state = 'active'
-                AND message_thread_id != 0
-            """,
-            (timestamp, message, int(binding_id)),
-        )
-        return cursor.rowcount == 1
 
     def retire_missing_topic(
         self,
@@ -6563,7 +6568,7 @@ class DurableStore:
             "inline_keyboard": [
                 [
                     {
-                        "text": "🔊 Listen via Microsoft TTS",
+                        "text": "🔊 Listen",
                         "callback_data": f"a:{action.token}",
                     }
                 ]
@@ -7702,7 +7707,10 @@ class DurableStore:
         agent = self.resolve_agent(agent_id)
         if agent is None:
             raise StoreError("Managed agent was not found.")
-        provider_name = "Claude" if agent.provider == "claude" else "Codex"
+        provider_name = provider_defaults.provider_display_name(
+            agent.provider,
+            agent.provider_config,
+        )
         model_name, effort_name = provider_defaults.describe_provider_config(
             agent.provider,
             agent.provider_config,
@@ -8222,6 +8230,7 @@ class DurableStore:
                 else None
             ),
             last_recovery_error=row["last_recovery_error"],
+            created_at=float(row["created_at"]),
         )
 
     def create_detached_worker(
@@ -8944,7 +8953,9 @@ class DurableStore:
         updates: dict[str, Optional[str]],
         now: Optional[float] = None,
     ) -> ManagedAgent:
-        if not updates or not set(updates).issubset({"model", "effort"}):
+        if not updates or not set(updates).issubset(
+            {"model", "effort", "model_provider"}
+        ):
             raise StoreError("Agent model configuration update is invalid.")
         timestamp = time.time() if now is None else float(now)
         self.connection.execute("BEGIN IMMEDIATE")
@@ -8972,20 +8983,30 @@ class DurableStore:
                     "Wait for the active agent turn or console before reconfiguring it."
                 )
             config = dict(agent.provider_config)
+            previous_model_provider = config.get("model_provider")
             for key, value in updates.items():
                 if value is None:
                     config.pop(key, None)
                 else:
                     config[key] = value
             config = validate_provider_config(agent.provider, config)
+            model_provider_changed = (
+                config.get("model_provider") != previous_model_provider
+            )
             self.connection.execute(
                 """
                 UPDATE agents
-                SET provider_config_json = ?, updated_at = ?
+                SET provider_config_json = ?,
+                    provider_session_id = CASE
+                        WHEN ? THEN NULL
+                        ELSE provider_session_id
+                    END,
+                    updated_at = ?
                 WHERE agent_id = ?
                 """,
                 (
                     json.dumps(config, separators=(",", ":"), sort_keys=True),
+                    int(model_provider_changed),
                     timestamp,
                     agent_id,
                 ),
@@ -9456,6 +9477,7 @@ class DurableStore:
                                 {
                                     "text": "Remove group & all topics",
                                     "callback_data": f"a:{confirm.token}",
+                                    "style": "danger",
                                 }
                             ],
                             [
@@ -9552,6 +9574,7 @@ class DurableStore:
                             {
                                 "text": "Delete topic & session",
                                 "callback_data": f"a:{confirm.token}",
+                                "style": "danger",
                             }
                         ],
                         [
@@ -12248,24 +12271,362 @@ class DurableStore:
         now: Optional[float] = None,
     ) -> None:
         timestamp = time.time() if now is None else float(now)
-        cursor = self.connection.execute(
+        lease_expires_at = timestamp + float(lease_seconds)
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self.connection.execute(
+                """
+                UPDATE agent_mailbox
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE mailbox_id = ? AND state = 'leased'
+                    AND lease_owner = ?
+                """,
+                (
+                    lease_expires_at,
+                    timestamp,
+                    int(mailbox_id),
+                    worker_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LeaseLostError(
+                    f"Agent mailbox lease for {mailbox_id} is no longer owned."
+                )
+            self.connection.execute(
+                """
+                UPDATE callback_actions
+                SET expires_at = MAX(expires_at, ?), updated_at = ?
+                WHERE operation_id = ?
+                    AND action_type = 'agent_turn_stop'
+                    AND state = 'active'
+                """,
+                (
+                    lease_expires_at + 5 * 60,
+                    timestamp,
+                    f"agent-mailbox:{int(mailbox_id)}:stop",
+                ),
+            )
+            self.connection.execute("COMMIT")
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
+
+    def attach_agent_mailbox_process(
+        self,
+        mailbox_id: int,
+        worker_id: str,
+        provider_process_pid: int,
+        now: Optional[float] = None,
+    ) -> None:
+        """Record the provider process group that belongs to this lease."""
+
+        pid = int(provider_process_pid)
+        if pid <= 0:
+            raise StoreError("Provider process PID must be positive.")
+        timestamp = time.time() if now is None else float(now)
+        row = self.connection.execute(
             """
-            UPDATE agent_mailbox
-            SET lease_expires_at = ?, updated_at = ?
+            SELECT 1
+            FROM agent_mailbox
             WHERE mailbox_id = ? AND state = 'leased'
                 AND lease_owner = ?
             """,
-            (
-                timestamp + float(lease_seconds),
-                timestamp,
-                int(mailbox_id),
-                worker_id,
-            ),
-        )
-        if cursor.rowcount != 1:
+            (int(mailbox_id), worker_id),
+        ).fetchone()
+        if row is None:
             raise LeaseLostError(
                 f"Agent mailbox lease for {mailbox_id} is no longer owned."
             )
+        self.connection.execute(
+            """
+            INSERT INTO events(
+                kind, subject_type, subject_id, details_json, created_at
+            )
+            VALUES (
+                'agent_provider_process_started',
+                'agent_mailbox', ?, ?, ?
+            )
+            """,
+            (
+                str(int(mailbox_id)),
+                json.dumps(
+                    {
+                        "lease_owner": worker_id,
+                        "provider_process_pid": pid,
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                timestamp,
+            ),
+        )
+
+    def provider_process_pids_for_agent_worker(
+        self,
+        worker_pid: int,
+    ) -> list[int]:
+        """Return provider process groups recorded for a leased local worker."""
+
+        rows = self.connection.execute(
+            """
+            SELECT m.mailbox_id, m.lease_owner
+            FROM agent_mailbox AS m
+            WHERE m.state = 'leased'
+            """
+        ).fetchall()
+        result: list[int] = []
+        for row in rows:
+            owner = str(row["lease_owner"] or "")
+            match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(owner)
+            if (
+                match is None
+                or int(match.group(2)) != int(worker_pid)
+            ):
+                continue
+            events = self.connection.execute(
+                """
+                SELECT details_json
+                FROM events
+                WHERE kind = 'agent_provider_process_started'
+                    AND subject_type = 'agent_mailbox'
+                    AND subject_id = ?
+                ORDER BY event_id DESC
+                """,
+                (str(int(row["mailbox_id"])),),
+            ).fetchall()
+            for event in events:
+                try:
+                    details = json.loads(str(event["details_json"]))
+                    if str(details.get("lease_owner", "")) != owner:
+                        continue
+                    pid = int(details["provider_process_pid"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                if pid > 0:
+                    result.append(pid)
+                break
+        return sorted(set(result))
+
+    def gone_local_agent_worker_pids(self) -> list[int]:
+        """Return leased local agent workers proven to have exited."""
+
+        result: set[int] = set()
+        rows = self.connection.execute(
+            """
+            SELECT DISTINCT lease_owner
+            FROM agent_mailbox
+            WHERE state = 'leased'
+            """
+        ).fetchall()
+        for row in rows:
+            owner = str(row["lease_owner"] or "")
+            match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(owner)
+            if match is None:
+                continue
+            pid = int(match.group(2))
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                result.add(pid)
+            except OSError:
+                continue
+        return sorted(result)
+
+    def recover_agent_worker_leases(
+        self,
+        worker_pid: int,
+        now: Optional[float] = None,
+    ) -> list[int]:
+        """Immediately recover turns owned by a local worker that exited.
+
+        The supervisor calls this only after terminating the exited worker's
+        process group, so any provider child from that attempt is gone before
+        the turn becomes claimable again.
+        """
+
+        timestamp = time.time() if now is None else float(now)
+        recovered: list[int] = []
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = self.connection.execute(
+                """
+                SELECT mailbox_id, agent_id, lease_owner, attempts
+                FROM agent_mailbox
+                WHERE state = 'leased'
+                """
+            ).fetchall()
+            for row in rows:
+                owner = str(row["lease_owner"] or "")
+                match = _LOCAL_AGENT_LEASE_OWNER.fullmatch(owner)
+                if (
+                    match is None
+                    or int(match.group(2)) != int(worker_pid)
+                ):
+                    continue
+                mailbox_id = int(row["mailbox_id"])
+                agent_id = str(row["agent_id"])
+                attempts = int(row["attempts"])
+                durable_stop = self.connection.execute(
+                    """
+                    SELECT 1
+                    FROM agent_turn_controls
+                    WHERE mailbox_id = ? AND control_type = 'cancel'
+                        AND state IN (
+                            'queued', 'delivery_in_flight', 'applied'
+                        )
+                    LIMIT 1
+                    """,
+                    (mailbox_id,),
+                ).fetchone()
+                if durable_stop is not None:
+                    self.connection.execute(
+                        """
+                        UPDATE agent_turn_controls
+                        SET state = 'applied',
+                            result_text =
+                                'Stop completed while recovering an exited worker.',
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND control_type = 'cancel'
+                            AND state IN ('queued', 'delivery_in_flight')
+                        """,
+                        (timestamp, mailbox_id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE agent_turn_controls
+                        SET state = 'rejected',
+                            result_text =
+                                'The provider turn stopped before this guidance was applied.',
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND control_type = 'steer'
+                            AND state IN ('queued', 'delivery_in_flight')
+                        """,
+                        (timestamp, mailbox_id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE agent_mailbox
+                        SET state = 'cancelled', lease_owner = NULL,
+                            lease_expires_at = NULL, provider_turn_id = NULL,
+                            last_error =
+                                'Recovered Stop after agent worker exit.',
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND state = 'leased'
+                            AND lease_owner = ?
+                        """,
+                        (timestamp, mailbox_id, owner),
+                    )
+                    self._expire_agent_stop_action(mailbox_id, timestamp)
+                    self._enqueue_finished_agent_control_edits(
+                        mailbox_id,
+                        timestamp,
+                    )
+                    self._enqueue_agent_status_edit(
+                        mailbox_id,
+                        f"worker-exit-cancelled-{int(worker_pid)}",
+                        self.label_text(
+                            self.agent_card_header(mailbox_id, agent_id),
+                            "⏹ Cancelled after the worker exited.",
+                        ),
+                        timestamp,
+                        terminal=True,
+                    )
+                else:
+                    self.connection.execute(
+                        """
+                        UPDATE agent_turn_controls
+                        SET state = 'rejected',
+                            result_text =
+                                'The provider turn ended when its worker exited.',
+                            updated_at = ?
+                        WHERE mailbox_id = ?
+                            AND state IN ('queued', 'delivery_in_flight')
+                        """,
+                        (timestamp, mailbox_id),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE agent_mailbox
+                        SET state = 'queued', available_at = ?,
+                            lease_owner = NULL, lease_expires_at = NULL,
+                            provider_turn_id = NULL,
+                            last_error =
+                                'Agent worker exited; turn queued for recovery.',
+                            updated_at = ?
+                        WHERE mailbox_id = ? AND state = 'leased'
+                            AND lease_owner = ?
+                        """,
+                        (timestamp, timestamp, mailbox_id, owner),
+                    )
+                    self.connection.execute(
+                        """
+                        UPDATE callback_actions
+                        SET state = 'active', consumed_at = NULL,
+                            consumed_by_update_id = NULL,
+                            expires_at = MAX(expires_at, ?), updated_at = ?
+                        WHERE operation_id = ?
+                            AND action_type = 'agent_turn_stop'
+                        """,
+                        (
+                            timestamp + 2 * 60 * 60,
+                            timestamp,
+                            f"agent-mailbox:{mailbox_id}:stop",
+                        ),
+                    )
+                    self._enqueue_finished_agent_control_edits(
+                        mailbox_id,
+                        timestamp,
+                    )
+                    self._enqueue_agent_status_edit(
+                        mailbox_id,
+                        f"worker-exit-retry-{int(worker_pid)}",
+                        self.label_text(
+                            self.agent_card_header(mailbox_id, agent_id),
+                            "🔄 Worker exited; retrying this turn.",
+                        ),
+                        timestamp,
+                    )
+                self.connection.execute(
+                    """
+                    UPDATE agents
+                    SET lifecycle_state = 'registered', updated_at = ?
+                    WHERE agent_id = ? AND lifecycle_state = 'running'
+                    """,
+                    (timestamp, agent_id),
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO events(
+                        kind, subject_type, subject_id, details_json, created_at
+                    )
+                    VALUES (
+                        'agent_worker_lease_recovered',
+                        'agent_mailbox', ?, ?, ?
+                    )
+                    """,
+                    (
+                        str(mailbox_id),
+                        json.dumps(
+                            {
+                                "agent_id": agent_id,
+                                "attempts": attempts,
+                                "lease_owner": owner,
+                                "worker_pid": int(worker_pid),
+                            },
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        ),
+                        timestamp,
+                    ),
+                )
+                recovered.append(mailbox_id)
+            self.connection.execute("COMMIT")
+            return recovered
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+            raise
 
     def complete_agent_mailbox(
         self,
@@ -12576,7 +12937,10 @@ class DurableStore:
                 else:
                     self._enqueue_agent_status_edit(
                         mailbox_id,
-                        "failed",
+                        self._agent_attempt_operation_suffix(
+                            "failed",
+                            attempts,
+                        ),
                         (
                             self.label_text(
                                 self.agent_card_header(
@@ -12769,7 +13133,7 @@ class DurableStore:
                     "inline_keyboard": [
                         [
                             {
-                        "text": "🔊 Replay via Microsoft TTS",
+                        "text": "🔊 Replay",
                                 "callback_data": f"a:{replay.token}",
                             }
                         ]
@@ -12830,7 +13194,7 @@ class DurableStore:
                     "inline_keyboard": [
                         [
                             {
-                                "text": "Try Microsoft TTS again",
+                                "text": "Try voice again",
                                 "callback_data": f"a:{retry.token}",
                             }
                         ]
@@ -13070,7 +13434,12 @@ class DurableStore:
                 self.connection.execute("ROLLBACK")
             raise
 
-    def retry_dead(self, queue: str, now: Optional[float] = None) -> int:
+    def retry_dead(
+        self,
+        queue: str,
+        now: Optional[float] = None,
+        item_id: Optional[int] = None,
+    ) -> int:
         timestamp = time.time() if now is None else float(now)
         if queue == "inbox":
             cursor = self.connection.execute(
@@ -13095,19 +13464,37 @@ class DurableStore:
         elif queue == "agent":
             dead_mailboxes = self.connection.execute(
                 """
-                SELECT mailbox_id
-                FROM agent_mailbox
-                WHERE state = 'dead'
-                """
+                SELECT m.mailbox_id
+                FROM agent_mailbox AS m
+                JOIN agents AS a ON a.agent_id = m.agent_id
+                WHERE m.state = 'dead' AND a.lifecycle_state != 'stopped'
+                    AND (? IS NULL OR m.mailbox_id = ?)
+                """,
+                (
+                    int(item_id) if item_id is not None else None,
+                    int(item_id) if item_id is not None else None,
+                ),
             ).fetchall()
             cursor = self.connection.execute(
                 """
                 UPDATE agent_mailbox
-                SET state = 'queued', attempts = 0, available_at = ?,
+                SET state = 'queued', available_at = ?,
                     last_error = NULL, updated_at = ?
-                WHERE state = 'dead'
+                WHERE mailbox_id IN (
+                    SELECT m.mailbox_id
+                    FROM agent_mailbox AS m
+                    JOIN agents AS a ON a.agent_id = m.agent_id
+                    WHERE m.state = 'dead'
+                        AND a.lifecycle_state != 'stopped'
+                        AND (? IS NULL OR m.mailbox_id = ?)
+                )
                 """,
-                (timestamp, timestamp),
+                (
+                    timestamp,
+                    timestamp,
+                    int(item_id) if item_id is not None else None,
+                    int(item_id) if item_id is not None else None,
+                ),
             )
             for row in dead_mailboxes:
                 self.connection.execute(
@@ -13142,7 +13529,169 @@ class DurableStore:
             )
         return int(cursor.rowcount)
 
+    INSTALL_WORKSPACE_KEY = "install_workspace"
     RESTART_REQUEST_KEY = "restart_requested"
+
+    def seed_install_workspace(
+        self,
+        *,
+        display_name: str,
+        project_path: str,
+        working_directory: Optional[str] = None,
+        git_repository_root: Optional[str] = None,
+        group_icon_path: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> dict[str, Any]:
+        """Remember the checkout that should back the first matching group.
+
+        A Telegram chat ID does not exist until the owner creates a group and
+        adds the bot. Installation can still durably seed the local half of
+        that future binding. When a private forum with the matching product
+        name arrives, the handler can offer the exact checkout as a one-tap,
+        confirmation-gated workspace instead of asking the owner to type it.
+        """
+        name = " ".join(str(display_name).strip().split())
+        workspace = str(project_path)
+        workdir = str(working_directory or project_path)
+        git_root = (
+            str(git_repository_root)
+            if git_repository_root is not None
+            else None
+        )
+        try:
+            icon_path = (
+                str(Path(group_icon_path).resolve(strict=True))
+                if group_icon_path is not None
+                else None
+            )
+        except OSError:
+            raise StoreError("Install workspace seed icon is unavailable.") from None
+        if (
+            not name
+            or len(name) > 128
+            or not Path(workspace).is_absolute()
+            or not Path(workdir).is_absolute()
+            or (git_root is not None and not Path(git_root).is_absolute())
+            or (
+                icon_path is not None
+                and Path(icon_path).suffix.casefold() not in {".png", ".jpg", ".jpeg"}
+            )
+        ):
+            raise StoreError("Install workspace seed is invalid.")
+        timestamp = time.time() if now is None else float(now)
+        existing_binding = self.connection.execute(
+            """
+            SELECT chat_id
+            FROM forum_workspaces
+            WHERE project_path = ? AND working_directory = ?
+                AND state = 'active'
+            ORDER BY created_at
+            LIMIT 1
+            """,
+            (workspace, workdir),
+        ).fetchone()
+        seed = {
+            "display_name": name,
+            "project_path": workspace,
+            "working_directory": workdir,
+            "git_repository_root": git_root,
+            "group_icon_path": icon_path,
+            "chat_id": (
+                int(existing_binding["chat_id"])
+                if existing_binding is not None
+                else None
+            ),
+        }
+        self.connection.execute(
+            """
+            INSERT INTO controller_state(key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (
+                self.INSTALL_WORKSPACE_KEY,
+                json.dumps(seed, separators=(",", ":"), sort_keys=True),
+                timestamp,
+            ),
+        )
+        return seed
+
+    def install_workspace_for_forum(
+        self,
+        *,
+        chat_id: int,
+        display_name: str,
+    ) -> Optional[dict[str, Any]]:
+        """Return the seeded checkout when this forum is allowed to claim it."""
+        row = self.connection.execute(
+            "SELECT value FROM controller_state WHERE key = ?",
+            (self.INSTALL_WORKSPACE_KEY,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            seed = json.loads(str(row["value"]))
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(seed, dict):
+            return None
+        seeded_name = " ".join(str(seed.get("display_name", "")).split())
+        requested_name = " ".join(str(display_name).split())
+        claimed_chat_id = seed.get("chat_id")
+        if (
+            not seeded_name
+            or seeded_name.casefold() != requested_name.casefold()
+            or (
+                claimed_chat_id is not None
+                and int(claimed_chat_id) != int(chat_id)
+            )
+        ):
+            return None
+        return seed
+
+    def mark_install_workspace_bound(
+        self,
+        *,
+        chat_id: int,
+        project_path: str,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Attach the install seed to its confirmed Telegram forum once."""
+        row = self.connection.execute(
+            "SELECT value FROM controller_state WHERE key = ?",
+            (self.INSTALL_WORKSPACE_KEY,),
+        ).fetchone()
+        if row is None:
+            return False
+        try:
+            seed = json.loads(str(row["value"]))
+        except (TypeError, ValueError):
+            return False
+        if (
+            not isinstance(seed, dict)
+            or str(seed.get("project_path", "")) != str(project_path)
+            or (
+                seed.get("chat_id") is not None
+                and int(seed["chat_id"]) != int(chat_id)
+            )
+        ):
+            return False
+        seed["chat_id"] = int(chat_id)
+        timestamp = time.time() if now is None else float(now)
+        self.connection.execute(
+            """
+            UPDATE controller_state
+            SET value = ?, updated_at = ?
+            WHERE key = ?
+            """,
+            (
+                json.dumps(seed, separators=(",", ":"), sort_keys=True),
+                timestamp,
+                self.INSTALL_WORKSPACE_KEY,
+            ),
+        )
+        return True
 
     def request_controller_restart(
         self,

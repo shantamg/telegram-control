@@ -695,6 +695,32 @@ def explicit_reply_message_id(message: dict[str, Any]) -> str:
     return str(message_id) if message_id is not None else ""
 
 
+def forum_message_thread_id(message: dict[str, Any]) -> Optional[int]:
+    """Return a routable forum topic ID, including Telegram's General topic.
+
+    Telegram represents the special General topic as topic ID 1, but some
+    updates delivered from General omit ``message_thread_id``. Treating that
+    omission as a non-forum message made the controller silently reject the
+    only topic a newly-created group has. A missing ID is normalized only for
+    an actual forum supergroup; ordinary supergroup messages remain unchanged.
+    """
+    raw_thread_id = message.get("message_thread_id")
+    if raw_thread_id is not None:
+        try:
+            thread_id = int(raw_thread_id)
+        except (TypeError, ValueError):
+            return None
+        return thread_id if thread_id > 0 else None
+    chat = message.get("chat") or {}
+    if (
+        chat.get("type") == "supergroup"
+        and chat.get("is_forum") is True
+        and not chat.get("username")
+    ):
+        return 1
+    return None
+
+
 def update_authorization_failure(
     config: dict[str, Any],
     update: dict[str, Any],
@@ -723,7 +749,7 @@ def update_authorization_failure(
         chat_type == "supergroup"
         and chat.get("is_forum") is True
         and not chat.get("username")
-        and message.get("message_thread_id") is not None
+        and forum_message_thread_id(message) is not None
     )
     if not (authorized_private_chat or authorized_private_forum):
         return "chat"
@@ -787,6 +813,9 @@ def process_update(
         if isinstance(topic_created, dict)
         else ""
     )
+    message_thread_id = forum_message_thread_id(message)
+    if message_thread_id == 1 and not topic_name:
+        topic_name = "General"
     environment.update(
         {
             "TELEGRAM_CHAT_ID": str(chat["id"]),
@@ -794,7 +823,9 @@ def process_update(
             "TELEGRAM_CHAT_TITLE": str(chat.get("title", "")),
             "TELEGRAM_TOPIC_NAME": topic_name,
             "TELEGRAM_MESSAGE_ID": str(message.get("message_id", "")),
-            "TELEGRAM_MESSAGE_THREAD_ID": str(message.get("message_thread_id", "")),
+            "TELEGRAM_MESSAGE_THREAD_ID": (
+                str(message_thread_id) if message_thread_id is not None else ""
+            ),
             "TELEGRAM_REPLY_TO_MESSAGE_ID": explicit_reply_message_id(message),
             "TELEGRAM_TEXT": str(message.get("text", "")),
             "TELEGRAM_FROM_ID": str(sender.get("id", "")),

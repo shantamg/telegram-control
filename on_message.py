@@ -19,12 +19,14 @@ import codex_sessions
 import detached_worker
 import discovery
 import helper_paths
+import local_actions
 import provider_adapters
 import provider_defaults
 import router_contract
 import telegram_bridge as bridge
 import telegram_formatting
 import telegram_help
+import telegram_native_ui
 import tmux_console
 import voice_responses
 import voice_settings
@@ -69,6 +71,8 @@ CONTROL_WORKSPACE_QUESTION = (
     "~/Software/my-project, or describe the project and Control will find it "
     "and confirm before binding anything."
 )
+GENERAL_FORUM_TOPIC_ID = 1
+STARTER_TOPIC_NAME = "Start Here"
 
 
 def effective_app_settings(workspace_path: Optional[str] = None) -> dict:
@@ -105,6 +109,12 @@ def workspace_question() -> str:
         if control_agent_enabled()
         else WORKSPACE_QUESTION
     )
+
+
+def should_send_local_action_output(payload: dict) -> bool:
+    return payload.get("suppress_output") is not True
+
+
 def deliver_api_call(
     method: str,
     params: dict,
@@ -218,7 +228,7 @@ def handle_report_only_topic() -> bool:
             origin.display_name if origin is not None else None,
             detached_worker.telegram_topic_url(origin),
         )
-    send_message(notice)
+    send_message(notice, parse_mode="HTML")
     return True
 
 
@@ -270,16 +280,24 @@ def send_status_card(update: dict) -> None:
         send_message("Durable status requires the Stage 2 controller.")
         return
     chat_id, thread_id = surface_coordinates()
+    binding_thread_id = (
+        None
+        if (
+            os.environ.get("TELEGRAM_CHAT_TYPE") == "supergroup"
+            and thread_id == GENERAL_FORUM_TOPIC_ID
+        )
+        else thread_id
+    )
     user_id = int(os.environ["TELEGRAM_FROM_ID"])
     with DurableStore(Path(database_path)) as store:
         binding = store.resolve_surface_binding(
             chat_id=chat_id,
-            message_thread_id=thread_id,
+            message_thread_id=binding_thread_id,
         )
         if binding is None:
             binding = store.ensure_surface_binding(
                 chat_id=chat_id,
-                message_thread_id=thread_id,
+                message_thread_id=binding_thread_id,
                 surface_type="control",
                 display_name=surface_display_name(),
                 target_type="controller",
@@ -676,8 +694,6 @@ def enqueue_agent_reply_input(
             receipt_parse_mode="HTML",
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
         )
-
-
 def try_enqueue_agent_steer(route, text: str) -> bool:
     """Treat a reply to the exact active turn card as live guidance."""
     database_path = os.environ.get("TELEGRAM_CONTROL_DB")
@@ -752,7 +768,10 @@ def send_agent_status() -> None:
                 ttl_seconds=15 * 60,
             )
             resume_session_action = None
-            if agent.provider in {"codex", "claude"}:
+            if agent.provider in {"codex", "claude"} and not (
+                agent.provider == "codex"
+                and agent.provider_config.get("model_provider") == "ollama"
+            ):
                 resume_session_action = store.create_callback_action(
                     operation_id=f"inbox:{job_id}:agent-resume-session-picker",
                     action_type="agent_resume_session_picker",
@@ -899,7 +918,10 @@ def send_agent_status() -> None:
         if context_summary is not None:
             usage_fields.insert(0, ("Context", context_summary))
     escape = telegram_formatting.escape_html
-    provider_name = "Claude" if agent.provider == "claude" else "Codex"
+    provider_name = provider_defaults.provider_display_name(
+        agent.provider,
+        agent.provider_config,
+    )
     lines = [
         "<b>Managed agent</b>",
         (
@@ -958,19 +980,63 @@ def send_group_setup_card() -> None:
         "Add me to a new project group:\n\n"
         "1. Create a private Telegram group — any name.\n"
         "2. Turn on Topics in the group's settings.\n"
-        "3. Tap the button below and pick that group. Telegram adds me and "
+        "3. Choose Telegram’s separate View as Topics display mode.\n"
+        "4. Tap the button below and pick that group. Telegram adds me and "
         "asks you to grant Change group info, Delete messages, and Manage "
         "topics in the same step — no separate promotion.\n\n"
-        "Then send anything in the group and I will ask which folder it works "
-        "in. A bot cannot create the group or enable Topics itself; those two "
-        "steps are yours.\n\n"
+        "Once I’m added, I’ll post a welcome card in General with the exact "
+        "next steps. A group named Telegram Control is offered this installed "
+        "checkout automatically; other groups use /bind followed by an exact "
+        "existing folder path.\n\n"
+        "A bot cannot create the group, enable Topics, or choose your display "
+        "mode; those steps are yours.\n\n"
         f"{telegram_help.HELP_HINT}",
         reply_markup={
             "inline_keyboard": [
-                [{"text": "Add me to a group", "url": link}]
+                [
+                    {
+                        "text": "Add me to a group",
+                        "url": link,
+                        "style": "primary",
+                    }
+                ]
             ]
         },
     )
+
+
+def send_native_ui_showcase() -> None:
+    """Send a side-effect-free preview of Telegram's native bot surfaces."""
+    chat_id, thread_id = surface_coordinates()
+    user_id_text = os.environ.get("TELEGRAM_FROM_ID")
+    message_id_text = os.environ.get("TELEGRAM_MESSAGE_ID")
+    if not user_id_text:
+        raise StoreError("The native UI showcase requires a Telegram user.")
+    token = bridge.read_token()
+    result = telegram_native_ui.send_showcase(
+        token,
+        chat_id=chat_id,
+        message_thread_id=thread_id,
+        receiver_user_id=int(user_id_text),
+        source_message_id=(
+            int(message_id_text) if message_id_text is not None else None
+        ),
+    )
+    unavailable = [
+        label.replace("_", " ")
+        for label, available in result.items()
+        if not available
+        and not (
+            (label == "chat_picker" and chat_id < 0)
+            or (label == "ephemeral_hint" and chat_id > 0)
+        )
+    ]
+    if unavailable:
+        send_message(
+            "Some preview surfaces were unavailable here: "
+            + ", ".join(unavailable)
+            + ". The ordinary-message fallbacks remain usable."
+        )
 
 
 def create_agent_from_catalog(project_slug: str) -> None:
@@ -1045,8 +1111,6 @@ def enqueue_agent_input(
             receipt_parse_mode="HTML",
             authorized_user_id=int(os.environ["TELEGRAM_FROM_ID"]),
         )
-
-
 def enqueue_router_input(
     text: str,
     replied_message_id: Optional[int] = None,
@@ -1084,8 +1148,6 @@ def enqueue_router_input(
             receipt_parse_mode="HTML",
             replied_message_id=replied_message_id,
         )
-
-
 def proposed_forum_setup(
     text: str,
     *,
@@ -1213,7 +1275,10 @@ def send_forum_binding_prompt(
                 "provider": provider,
                 "provider_config": {},
                 "already_authorized": already_authorized,
+                "install_seed": bool(setup.get("install_seed")),
             }
+            if setup.get("group_icon_path") is not None:
+                payload["group_icon_path"] = str(setup["group_icon_path"])
             action = store.create_callback_action(
                 operation_id=(
                     f"inbox:{job_id}:direct-bind-forum:{provider}"
@@ -1236,6 +1301,7 @@ def send_forum_binding_prompt(
                             else f"Use {provider_name}"
                         ),
                         "callback_data": f"a:{action.token}",
+                        "style": "primary",
                     }
                 ]
             )
@@ -1269,20 +1335,82 @@ def send_forum_binding_prompt(
         question = (
             f"Choose {display_name}’s default agent and bind this workspace."
         )
+    welcome = (
+        "Welcome to Telegram Control.\n\n"
+        "General is this group’s setup and administration topic. Agent "
+        "conversations run in normal topics, so they can be managed and "
+        "removed independently.\n\n"
+        if not already_authorized
+        else ""
+    )
+    starter_guidance = (
+        "After confirmation, I’ll create Start Here automatically. Open it "
+        "and send your first request."
+        if thread_id == GENERAL_FORUM_TOPIC_ID
+        else "After confirmation, this topic becomes the first agent "
+        "conversation. Send your first request here."
+    )
     send_message(
-        f"{question}\n\n"
+        welcome
+        + f"{question}\n\n"
         f"Workspace: {setup['project_path']}\n"
         f"{provider_line}\n\n"
+        + (
+            "This checkout was seeded by the Telegram Control installer.\n\n"
+            if setup.get("install_seed")
+            else ""
+        )
         + (
             "The forum is already authorized. Nothing is bound until you confirm."
             if already_authorized
             else "This authorizes the private forum and binds its topics to "
             "that workspace. Nothing changes until you confirm."
         )
+        + f"\n\n{starter_guidance}"
         + f"\n\n{telegram_help.HELP_HINT}",
         reply_markup={"inline_keyboard": buttons},
     )
     return True
+
+
+def install_seeded_forum_setup(
+    *,
+    chat_id: int,
+    display_name: str,
+) -> Optional[dict]:
+    """Resolve the install-time checkout for its first matching project group."""
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    if not database_path:
+        return None
+    with DurableStore(Path(database_path)) as store:
+        seed = store.install_workspace_for_forum(
+            chat_id=chat_id,
+            display_name=display_name,
+        )
+    if seed is None:
+        return None
+    try:
+        workspace_root, working_directory, git_repository_root = (
+            discovery.validate_agent_workspace(
+                str(seed["project_path"]),
+                str(seed["working_directory"]),
+                (
+                    str(seed["git_repository_root"])
+                    if seed.get("git_repository_root") is not None
+                    else None
+                ),
+            )
+        )
+    except (KeyError, StoreError):
+        return None
+    return {
+        "project_path": workspace_root,
+        "working_directory": working_directory,
+        "git_repository_root": git_repository_root,
+        "requested_provider": None,
+        "install_seed": True,
+        "group_icon_path": seed.get("group_icon_path"),
+    }
 
 
 def prompt_direct_forum_binding(text: str) -> bool:
@@ -1302,7 +1430,10 @@ def prompt_direct_forum_binding(text: str) -> bool:
             "Send /bind followed by a path, for example:\n"
             "/bind ~/Software/my-project\n\n"
             "Folder descriptions are available only when the optional Control "
-            "agent is enabled."
+            "agent is enabled.",
+            reply_markup=telegram_native_ui.force_reply_markup(
+                "Paste an exact local folder path"
+            ),
         )
         return True
     return send_forum_binding_prompt(
@@ -1348,6 +1479,11 @@ def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
                 raise StoreError("Private forum authorization is invalid.")
             return True
         setup = proposed_forum_setup(text) if text else None
+        if setup is None:
+            setup = install_seeded_forum_setup(
+                chat_id=chat_id,
+                display_name=display_name,
+            )
         if setup is not None:
             return not send_forum_binding_prompt(
                 setup,
@@ -1368,6 +1504,14 @@ def forum_is_authorized_or_prompt(text: Optional[str] = None) -> bool:
             ttl_seconds=60 * 60,
         )
     send_message(
+        "Welcome to Telegram Control.\n\n"
+        "General is this group’s setup and administration topic. Agent "
+        "conversations will run in normal topics so they can be managed and "
+        "removed independently.\n\n"
+        "To get started:\n"
+        "1. Authorize this private group below.\n"
+        "2. Send /bind followed by its exact local folder path.\n"
+        "3. Confirm the provider. I’ll create Start Here automatically.\n\n"
         f"Authorize this private forum for {bot_label()}?\n\n"
         f"Forum: {display_name}\n\n"
         f"Only your paired Telegram account will be accepted. Add {bot_label()} "
@@ -1402,6 +1546,11 @@ def ensure_bound_forum_subject():
         )
     chat_id = int(chat_id_text)
     thread_id = int(thread_id_text)
+    if thread_id == GENERAL_FORUM_TOPIC_ID:
+        # General is the group's durable setup/admin surface. Telegram does
+        # not allow deleting it with deleteForumTopic, so it must never become
+        # an ordinary disposable agent conversation.
+        return None
     with DurableStore(Path(database_path)) as store:
         if store.resolve_forum_workspace(chat_id) is None:
             # Until the forum is bound, its topics remain Control surfaces so
@@ -1490,6 +1639,8 @@ def forum_subject_setup_pending() -> bool:
         return False
     chat_id = int(chat_id_text)
     thread_id = int(thread_id_text)
+    if thread_id == GENERAL_FORUM_TOPIC_ID:
+        return False
     with DurableStore(Path(database_path)) as store:
         if store.resolve_forum_workspace(chat_id) is None:
             return False
@@ -1529,6 +1680,125 @@ def provision_direct_forum_subject(*, first_turn_queued: bool = False):
     return subject
 
 
+def provision_bound_forum_starter(
+    *,
+    workspace,
+    operation_id: str,
+) -> dict:
+    """Make the binding topic usable, or create a normal first topic.
+
+    General stays an administrative surface because Telegram gives it special
+    lifecycle rules. If binding happened there, create one ordinary topic that
+    can safely use the normal agent and teardown machinery. If the owner bound
+    the group from an ordinary topic, reuse that topic instead.
+    """
+    database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+    chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+    thread_id_text = os.environ.get("TELEGRAM_MESSAGE_THREAD_ID", "")
+    if not database_path or not chat_id_text or not thread_id_text:
+        raise StoreError("Starter topic provisioning requires a forum topic.")
+    chat_id = int(chat_id_text)
+    current_thread_id = int(thread_id_text)
+    topic_name = " ".join(
+        os.environ.get("TELEGRAM_TOPIC_NAME", "").strip().split()
+    )
+    created_in_telegram = False
+
+    with DurableStore(Path(database_path)) as store:
+        existing_topics = store.list_topic_surfaces(chat_id)
+        if current_thread_id == GENERAL_FORUM_TOPIC_ID and existing_topics:
+            return {
+                "created": False,
+                "message_thread_id": existing_topics[0].message_thread_id,
+                "display_name": existing_topics[0].display_name,
+            }
+
+    target_thread_id = current_thread_id
+    display_name = topic_name or STARTER_TOPIC_NAME
+    if current_thread_id == GENERAL_FORUM_TOPIC_ID:
+        try:
+            topic = bridge.api_call(
+                bridge.read_token(),
+                "createForumTopic",
+                chat_id=chat_id,
+                name=STARTER_TOPIC_NAME,
+            )
+            target_thread_id = int(topic["message_thread_id"])
+        except bridge.BridgeError as exc:
+            return {
+                "created": False,
+                "error": (
+                    "The group is bound, but Telegram could not create its "
+                    f"first topic: {exc}"
+                ),
+            }
+        except (KeyError, TypeError, ValueError):
+            return {
+                "created": False,
+                "error": (
+                    "The group is bound, but Telegram returned no usable ID "
+                    "for its first topic."
+                ),
+            }
+        if target_thread_id <= GENERAL_FORUM_TOPIC_ID:
+            return {
+                "created": False,
+                "error": (
+                    "The group is bound, but Telegram returned an invalid "
+                    "first-topic ID."
+                ),
+            }
+        display_name = STARTER_TOPIC_NAME
+        created_in_telegram = True
+
+    confirm_agent = bool(
+        effective_app_settings(workspace.project_path)["topics"][
+            "confirm_agent"
+        ]
+    )
+    with DurableStore(Path(database_path)) as store:
+        if confirm_agent:
+            store.ensure_surface_binding(
+                chat_id=chat_id,
+                message_thread_id=target_thread_id,
+                surface_type="task",
+                display_name=display_name,
+                target_type="controller",
+                target_id="control",
+            )
+            store.enqueue_api_call(
+                operation_id=f"{operation_id}:starter-prompt",
+                method="sendMessage",
+                params={
+                    "chat_id": chat_id,
+                    "message_thread_id": target_thread_id,
+                    "text": (
+                        "🎛 Control\n\n"
+                        "Send your first request here. Telegram Control will "
+                        "confirm this topic’s agent before it starts."
+                    ),
+                },
+                serialize_key=f"topic-intro:{chat_id}:{target_thread_id}",
+            )
+        else:
+            subject, subject_created = store.ensure_forum_subject(
+                chat_id=chat_id,
+                message_thread_id=target_thread_id,
+                display_name=display_name,
+            )
+            if subject_created:
+                store.enqueue_forum_subject_intro(
+                    subject.agent_id,
+                    f"{operation_id}:starter",
+                    started=False,
+                )
+    return {
+        "created": created_in_telegram,
+        "message_thread_id": target_thread_id,
+        "display_name": display_name,
+    }
+
+
 def prompt_forum_subject_provider_selection(
     request_was_already_sent: bool = False,
     pending_request: Optional[str] = None,
@@ -1563,6 +1833,8 @@ def prompt_forum_subject_provider_selection(
         )
     chat_id = int(chat_id_text)
     thread_id = int(thread_id_text)
+    if thread_id == GENERAL_FORUM_TOPIC_ID:
+        return False
     display_name = " ".join(surface_display_name().strip().split())
     if not display_name or len(display_name) > 128:
         raise StoreError("Forum topic display name is invalid.")
@@ -1610,7 +1882,10 @@ def prompt_forum_subject_provider_selection(
             ttl_seconds=24 * 60 * 60,
         )
 
-    provider_name = "Claude" if workspace.provider == "claude" else "Codex"
+    provider_name = provider_defaults.provider_display_name(
+        workspace.provider,
+        workspace.provider_config,
+    )
     model_name, effort_name = provider_defaults.describe_provider_config(
         workspace.provider,
         workspace.provider_config,
@@ -1795,7 +2070,7 @@ def voice_configuration_review(
         "Review spoken reply settings\n\n"
         f"Current: {current_voice} · {current_rate}\n"
         f"Selected: {staged_voice} · {staged_rate}\n\n"
-        "Preview generates a real Microsoft TTS voice note. Confirm is the "
+        "Preview generates a real Mac voice note. Confirm is the "
         "only action that changes the global setting.",
         {
             "inline_keyboard": [
@@ -1958,7 +2233,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 "answerCallbackQuery",
                 {
                     "callback_query_id": callback_query_id,
-                    "text": "Generating preview via Microsoft TTS…",
+                    "text": "Generating preview with the Mac voice…",
                 },
                 "callback-answer",
             )
@@ -2806,6 +3081,26 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             raise StoreError(
                 "The forum workspace changed before confirmation."
             )
+        install_group_icon_path = None
+        if bool(action.payload.get("install_seed")):
+            raw_icon_path = action.payload.get("group_icon_path")
+            if raw_icon_path is not None:
+                try:
+                    install_group_icon_path = Path(
+                        str(raw_icon_path)
+                    ).resolve(strict=True)
+                except OSError:
+                    raise StoreError(
+                        "The install-seeded Telegram group icon is unavailable."
+                    ) from None
+                if (
+                    not install_group_icon_path.is_file()
+                    or install_group_icon_path.suffix.casefold()
+                    not in {".png", ".jpg", ".jpeg"}
+                ):
+                    raise StoreError(
+                        "The install-seeded Telegram group icon is invalid."
+                    )
         with DurableStore(Path(database_path)) as store:
             workspace, _created = store.authorize_and_bind_forum_workspace(
                 chat_id=target_chat_id,
@@ -2816,6 +3111,24 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 provider=str(action.payload["provider"]),
                 provider_config=provider_config,
             )
+            if bool(action.payload.get("install_seed")):
+                store.mark_install_workspace_bound(
+                    chat_id=target_chat_id,
+                    project_path=workspace.project_path,
+                )
+        if install_group_icon_path is not None:
+            deliver_api_call(
+                "setChatPhoto",
+                {
+                    "chat_id": target_chat_id,
+                    "__photo_file_path": str(install_group_icon_path),
+                },
+                "install-seed-group-icon",
+            )
+        starter = provision_bound_forum_starter(
+            workspace=workspace,
+            operation_id=action.operation_id,
+        )
         if callback_query_id:
             deliver_api_call(
                 "answerCallbackQuery",
@@ -2834,6 +3147,22 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             },
             "forum-setup-clear",
         )
+        starter_detail = (
+            "\n\n"
+            + str(starter["error"])
+            + " Create a normal topic manually and send a message there."
+            if starter.get("error")
+            else (
+                "\n\n"
+                + (
+                    f"Created {starter['display_name']}. Open it and start "
+                    "talking."
+                    if starter.get("created")
+                    else f"{starter['display_name']} is ready for your first "
+                    "request."
+                )
+            )
+        )
         send_message(
             f"✅ {workspace.display_name} is "
             + (
@@ -2841,10 +3170,11 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 if bool(action.payload.get("already_authorized"))
                 else "authorized and bound"
             )
-            + ".\n\n"
-            "Create or open any topic and send your request. Its agent starts "
-            "automatically with this group’s defaults; use /agent inside a "
-            "topic whenever you want different settings.\n\n"
+            + "."
+            + starter_detail
+            + "\n\n"
+            "New topics also start automatically with this group’s defaults; "
+            "use /agent inside a topic whenever you want different settings.\n\n"
             f"{telegram_help.HELP_HINT}"
         )
         return
@@ -2926,7 +3256,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 "answerCallbackQuery",
                 {
                     "callback_query_id": callback_query_id,
-                    "text": "Generating via Microsoft TTS…",
+                    "text": "Generating with the Mac voice…",
                 },
                 "callback-answer",
             )
@@ -3403,6 +3733,10 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 provider=str(action.payload["provider"]),
                 provider_config=provider_config,
             )
+        starter = provision_bound_forum_starter(
+            workspace=workspace,
+            operation_id=action.operation_id,
+        )
         if callback_query_id:
             deliver_api_call(
                 "answerCallbackQuery",
@@ -3429,7 +3763,18 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             "🎛 Control\n\n"
             f"✅ {workspace.display_name} is now bound to "
             f"{workspace.workspace_root}.\n\n"
-            "New topics can now become workspace-scoped subjects."
+            + (
+                str(starter["error"])
+                if starter.get("error")
+                else (
+                    f"Created {starter['display_name']}; it is ready for the "
+                    "first request."
+                    if starter.get("created")
+                    else f"{starter['display_name']} is ready for the first "
+                    "request."
+                )
+            )
+            + "\n\nNew topics can also become workspace-scoped subjects."
         )
         return
     if action.action_type in {
@@ -3767,37 +4112,12 @@ def handle_callback(update: dict, callback_query: dict) -> None:
         if provider not in {"codex", "claude"}:
             raise StoreError("Agent configuration provider is invalid.")
         try:
-            options = provider_adapters.configuration_options(provider)
             with DurableStore(Path(database_path)) as store:
                 bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
                 if bound_agent is None or bound_agent.agent_id != agent_id:
                     raise StoreError("Managed agent surface changed.")
                 if bound_agent.provider != provider:
                     raise StoreError("Managed agent provider changed.")
-                selected_model = bound_agent.provider_config.get("model")
-                model_actions = []
-                for label, model in options.models:
-                    select = store.create_callback_action(
-                        operation_id=(
-                            f"callback:{update['update_id']}:"
-                            f"agent-configure-model:{model or 'default'}"
-                        ),
-                        action_type="agent_configure_model_select",
-                        payload={
-                            "agent_id": agent_id,
-                            "provider": provider,
-                            "model": model,
-                        },
-                        chat_id=chat_id,
-                        message_thread_id=thread_id,
-                        authorized_user_id=user_id,
-                        one_time=True,
-                        ttl_seconds=15 * 60,
-                    )
-                    display_label = (
-                        f"✓ {label}" if model == selected_model else label
-                    )
-                    model_actions.append((display_label, select))
                 current_model, current_effort = (
                     provider_defaults.describe_provider_config(
                         provider,
@@ -3805,6 +4125,65 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                         bound_agent.project_path,
                     )
                 )
+                if provider == "codex":
+                    selected_backend = bound_agent.provider_config.get(
+                        "model_provider"
+                    )
+                    backend_actions = []
+                    for label, model_provider in (
+                        provider_adapters.model_provider_options(provider)
+                    ):
+                        select = store.create_callback_action(
+                            operation_id=(
+                                f"callback:{update['update_id']}:"
+                                "agent-configure-backend:"
+                                f"{model_provider or 'cloud'}"
+                            ),
+                            action_type="agent_configure_model_provider_select",
+                            payload={
+                                "agent_id": agent_id,
+                                "provider": provider,
+                                "model_provider": model_provider,
+                            },
+                            chat_id=chat_id,
+                            message_thread_id=thread_id,
+                            authorized_user_id=user_id,
+                            one_time=True,
+                            ttl_seconds=15 * 60,
+                        )
+                        display_label = (
+                            f"✓ {label}"
+                            if model_provider == selected_backend
+                            else label
+                        )
+                        backend_actions.append((display_label, select))
+                else:
+                    options = provider_adapters.configuration_options(provider)
+                    selected_model = bound_agent.provider_config.get("model")
+                    model_actions = []
+                    for label, model in options.models:
+                        select = store.create_callback_action(
+                            operation_id=(
+                                f"callback:{update['update_id']}:"
+                                f"agent-configure-model:{model or 'default'}"
+                            ),
+                            action_type="agent_configure_model_select",
+                            payload={
+                                "agent_id": agent_id,
+                                "provider": provider,
+                                "model_provider": None,
+                                "model": model,
+                            },
+                            chat_id=chat_id,
+                            message_thread_id=thread_id,
+                            authorized_user_id=user_id,
+                            one_time=True,
+                            ttl_seconds=15 * 60,
+                        )
+                        display_label = (
+                            f"✓ {label}" if model == selected_model else label
+                        )
+                        model_actions.append((display_label, select))
         except StoreError as exc:
             if callback_query_id:
                 deliver_api_call(
@@ -3818,6 +4197,35 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 )
             return
         provider_name = "Claude" if provider == "claude" else "Codex"
+        if provider == "codex":
+            current_backend = (
+                "Ollama local"
+                if bound_agent.provider_config.get("model_provider") == "ollama"
+                else "OpenAI cloud"
+            )
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": "Choose where Codex runs.",
+                    },
+                    "callback-answer",
+                )
+            send_message(
+                "Change Codex backend\n\n"
+                f"Current backend: {current_backend}\n"
+                f"Current model: {current_model}\n"
+                f"Current effort: {current_effort}\n\n"
+                "Changing backend starts a fresh conversation.",
+                reply_markup={
+                    "inline_keyboard": option_button_rows(
+                        backend_actions,
+                        width=1,
+                    ),
+                },
+            )
+            return
         if callback_query_id:
             deliver_api_call(
                 "answerCallbackQuery",
@@ -3837,16 +4245,171 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             },
         )
         return
+    if action.action_type == "agent_configure_model_provider_select":
+        agent_id = str(action.payload.get("agent_id", ""))
+        provider = str(action.payload.get("provider", ""))
+        model_provider = action.payload.get("model_provider")
+        if provider != "codex" or model_provider not in {
+            value
+            for _label, value in provider_adapters.model_provider_options(
+                provider
+            )
+        }:
+            raise StoreError("Stored Codex backend selection is invalid.")
+        try:
+            options = provider_adapters.configuration_options(
+                provider,
+                model_provider,
+            )
+            with DurableStore(Path(database_path)) as store:
+                bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
+                if bound_agent is None or bound_agent.agent_id != agent_id:
+                    raise StoreError("Managed agent surface changed.")
+                if bound_agent.provider != provider:
+                    raise StoreError("Managed agent provider changed.")
+                selected_model = (
+                    bound_agent.provider_config.get("model")
+                    if bound_agent.provider_config.get("model_provider")
+                    == model_provider
+                    else None
+                )
+                model_actions = []
+                for label, model in options.models:
+                    select = store.create_callback_action(
+                        operation_id=(
+                            f"callback:{update['update_id']}:"
+                            f"agent-configure-model:{model or 'default'}"
+                        ),
+                        action_type="agent_configure_model_select",
+                        payload={
+                            "agent_id": agent_id,
+                            "provider": provider,
+                            "model_provider": model_provider,
+                            "model": model,
+                        },
+                        chat_id=chat_id,
+                        message_thread_id=thread_id,
+                        authorized_user_id=user_id,
+                        one_time=True,
+                        ttl_seconds=15 * 60,
+                    )
+                    display_label = (
+                        f"✓ {label}" if model == selected_model else label
+                    )
+                    model_actions.append((display_label, select))
+        except StoreError as exc:
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": str(exc),
+                        "show_alert": True,
+                    },
+                    "callback-answer",
+                )
+            return
+        backend_name = (
+            "Ollama local" if model_provider == "ollama" else "OpenAI cloud"
+        )
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Choose a model.",
+                },
+                "callback-answer",
+            )
+        send_message(
+            f"Backend: {backend_name}\n\nChoose a model.\n\n"
+            "Installed Ollama models are discovered at runtime.",
+            reply_markup={
+                "inline_keyboard": option_button_rows(
+                    model_actions,
+                    width=1 if model_provider == "ollama" else 3,
+                ),
+            },
+        )
+        return
     if action.action_type == "agent_configure_model_select":
         agent_id = str(action.payload.get("agent_id", ""))
         provider = str(action.payload.get("provider", ""))
+        model_provider = action.payload.get("model_provider")
         model = action.payload.get("model")
         if provider not in {"codex", "claude"}:
             raise StoreError("Agent configuration provider is invalid.")
-        options = provider_adapters.configuration_options(provider)
+        if provider == "claude":
+            model_provider = None
+        elif model_provider not in {
+            value
+            for _label, value in provider_adapters.model_provider_options(
+                provider
+            )
+        }:
+            raise StoreError("Stored Codex backend selection is invalid.")
+        options = provider_adapters.configuration_options(
+            provider,
+            model_provider,
+        )
         model_labels = {value: label for label, value in options.models}
         if model not in model_labels:
             raise StoreError("Stored agent model selection is invalid.")
+        if model_provider == "ollama":
+            try:
+                with DurableStore(Path(database_path)) as store:
+                    bound_agent = store.resolve_agent_for_surface(
+                        chat_id,
+                        thread_id,
+                    )
+                    if bound_agent is None or bound_agent.agent_id != agent_id:
+                        raise StoreError("Managed agent surface changed.")
+                    if bound_agent.provider != provider:
+                        raise StoreError("Managed agent provider changed.")
+                    configured = store.configure_agent_provider(
+                        agent_id,
+                        {
+                            "model": str(model),
+                            "effort": None,
+                            "model_provider": "ollama",
+                        },
+                    )
+                    store.enqueue_topic_intro_refresh(agent_id)
+            except StoreError as exc:
+                if callback_query_id:
+                    deliver_api_call(
+                        "answerCallbackQuery",
+                        {
+                            "callback_query_id": callback_query_id,
+                            "text": str(exc),
+                            "show_alert": True,
+                        },
+                        "callback-answer",
+                    )
+                return
+            model_name, effort_name = (
+                provider_defaults.describe_provider_config(
+                    configured.provider,
+                    configured.provider_config,
+                    configured.project_path,
+                )
+            )
+            if callback_query_id:
+                deliver_api_call(
+                    "answerCallbackQuery",
+                    {
+                        "callback_query_id": callback_query_id,
+                        "text": f"Using {model_name} locally.",
+                    },
+                    "callback-answer",
+                )
+            send_message(
+                "✅ Updated Codex (Ollama) settings.\n"
+                f"Model: {model_name}\n"
+                f"Effort: {effort_name}\n\n"
+                "The next message will start a fresh local conversation."
+            )
+            return
         try:
             with DurableStore(Path(database_path)) as store:
                 bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
@@ -3866,6 +4429,7 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                         payload={
                             "agent_id": agent_id,
                             "provider": provider,
+                            "model_provider": model_provider,
                             "model": model,
                             "effort": effort,
                         },
@@ -3891,7 +4455,10 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     "callback-answer",
                 )
             return
-        model_config = {"model": str(model)} if model is not None else {}
+        model_config = {
+            "model_provider": model_provider,
+            **({"model": str(model)} if model is not None else {}),
+        }
         model_name, _ = provider_defaults.describe_provider_config(
             provider,
             model_config,
@@ -3906,9 +4473,14 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 },
                 "callback-answer",
             )
+        conversation_note = (
+            "Changing backend starts a fresh conversation."
+            if bound_agent.provider_config.get("model_provider")
+            != model_provider
+            else "The current conversation will be preserved."
+        )
         send_message(
-            f"Model: {model_name}\n\nChoose effort.\n\n"
-            "The current conversation will be preserved.",
+            f"Model: {model_name}\n\nChoose effort.\n\n{conversation_note}",
             reply_markup={
                 "inline_keyboard": option_button_rows(effort_actions),
             },
@@ -3917,11 +4489,24 @@ def handle_callback(update: dict, callback_query: dict) -> None:
     if action.action_type == "agent_configure_effort_select":
         agent_id = str(action.payload.get("agent_id", ""))
         provider = str(action.payload.get("provider", ""))
+        model_provider = action.payload.get("model_provider")
         model = action.payload.get("model")
         effort = action.payload.get("effort")
         if provider not in {"codex", "claude"}:
             raise StoreError("Agent configuration provider is invalid.")
-        options = provider_adapters.configuration_options(provider)
+        if provider == "claude":
+            model_provider = None
+        elif model_provider not in {
+            value
+            for _label, value in provider_adapters.model_provider_options(
+                provider
+            )
+        }:
+            raise StoreError("Stored Codex backend selection is invalid.")
+        options = provider_adapters.configuration_options(
+            provider,
+            model_provider,
+        )
         if model not in {value for _, value in options.models}:
             raise StoreError("Stored agent model selection is invalid.")
         if effort not in {value for _, value in options.efforts}:
@@ -3939,6 +4524,11 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     {
                         "model": str(model) if model is not None else None,
                         "effort": str(effort) if effort is not None else None,
+                        "model_provider": (
+                            str(model_provider)
+                            if model_provider is not None
+                            else None
+                        ),
                     },
                 )
                 session_preserved = (
@@ -3964,7 +4554,10 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             configured.provider_config,
             configured.project_path,
         )
-        provider_name = "Claude" if provider == "claude" else "Codex"
+        provider_name = provider_defaults.provider_display_name(
+            configured.provider,
+            configured.provider_config,
+        )
         if callback_query_id:
             deliver_api_call(
                 "answerCallbackQuery",
@@ -4107,8 +4700,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
             if bound_agent is None or bound_agent.agent_id != agent_id:
                 raise StoreError("Managed agent surface changed.")
-            provider_name = (
-                "Claude" if bound_agent.provider == "claude" else "Codex"
+            provider_name = provider_defaults.provider_display_name(
+                bound_agent.provider,
+                bound_agent.provider_config,
             )
             confirm = store.create_callback_action(
                 operation_id=f"callback:{update['update_id']}:agent-new-session-confirm",
@@ -4152,8 +4746,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 bound_agent = store.resolve_agent_for_surface(chat_id, thread_id)
                 if bound_agent is None or bound_agent.agent_id != agent_id:
                     raise StoreError("Managed agent surface changed.")
-                provider_name = (
-                    "Claude" if bound_agent.provider == "claude" else "Codex"
+                provider_name = provider_defaults.provider_display_name(
+                    bound_agent.provider,
+                    bound_agent.provider_config,
                 )
                 store.reset_agent_session(agent_id)
                 # A fresh session has no context yet; the header should say so
@@ -4219,6 +4814,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                 discovered = session_source.discover_sessions(
                     working_directory,
                     excluded_session_ids=used_session_ids,
+                    **provider_adapters.project_session_options(
+                        provider, working_directory
+                    ),
                 )
                 snapshot = store.create_callback_action(
                     operation_id=snapshot_operation_id,
@@ -4367,6 +4965,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                         session_source.resolve_session(
                             provider_session_id,
                             working_directory,
+                            **provider_adapters.project_session_options(
+                                provider, working_directory
+                            ),
                         )
                         if working_directory
                         else None
@@ -4476,6 +5077,9 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     session_source.resolve_session(
                         provider_session_id,
                         working_directory,
+                        **provider_adapters.project_session_options(
+                            provider, working_directory
+                        ),
                     )
                     if working_directory
                     else None
@@ -4515,6 +5119,26 @@ def handle_callback(update: dict, callback_query: dict) -> None:
             f"✅ This topic will continue the selected {provider_name} session on its "
             "next message."
         )
+        return
+    if action.action_type == "local_action_run":
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery",
+                {
+                    "callback_query_id": callback_query_id,
+                    "text": "Running check now…",
+                },
+                "callback-answer",
+            )
+        try:
+            output = local_actions.run_local_action(
+                str(action.payload.get("key", ""))
+            )
+        except local_actions.LocalActionError as exc:
+            send_message(f"❌ {exc}")
+            return
+        if should_send_local_action_output(action.payload):
+            send_message(output)
         return
     if action.action_type == "refresh_status":
         chat_id, thread_id = surface_coordinates()
@@ -5151,10 +5775,33 @@ def route_user_input(
 def send_direct_mode_home() -> None:
     """Explain the deterministic surface instead of silently invoking Control."""
     if os.environ.get("TELEGRAM_CHAT_TYPE") == "supergroup":
+        database_path = os.environ.get("TELEGRAM_CONTROL_DB")
+        chat_id_text = os.environ.get("TELEGRAM_CHAT_ID")
+        if database_path and chat_id_text:
+            with DurableStore(Path(database_path)) as store:
+                workspace = store.resolve_forum_workspace(int(chat_id_text))
+                topics = store.list_topic_surfaces(int(chat_id_text))
+            if workspace is not None:
+                destination = (
+                    topics[0].display_name
+                    if topics
+                    else "any regular topic"
+                )
+                send_message(
+                    "General is this project group’s setup and administration "
+                    "topic.\n\n"
+                    f"Open {destination} or another regular topic for an agent "
+                    "conversation. New topics start automatically with this "
+                    "group’s defaults."
+                )
+                return
         send_message(
             "This group does not have a workspace yet.\n\n"
             "Send /bind followed by an exact folder path, for example:\n"
-            "/bind ~/Software/my-project"
+            "/bind ~/Software/my-project",
+            reply_markup=telegram_native_ui.force_reply_markup(
+                "Paste an exact local folder path"
+            ),
         )
         return
     send_message(
@@ -5261,6 +5908,14 @@ def main() -> int:
                     send_agent_status()
                 else:
                     send_status_card(update)
+            elif command.lower() == "/compact":
+                binding = current_surface_binding()
+                if binding is None or binding.target_type != "agent":
+                    send_message("/compact only works inside a managed agent topic.")
+                else:
+                    # Always queue a native operation, even when this command
+                    # replies to the active progress card. Never steer it as text.
+                    enqueue_agent_input(binding.target_id, "/compact")
             elif command.lower() == "/voice":
                 send_voice_configuration()
             elif command.lower() == "/help":
@@ -5273,6 +5928,8 @@ def main() -> int:
                 send_project_catalog()
             elif command.lower() == "/newgroup":
                 send_group_setup_card()
+            elif command.lower() == "/showcase":
+                send_native_ui_showcase()
             elif command.lower().startswith("/bind"):
                 if not prompt_direct_forum_binding(text):
                     send_message(
@@ -5289,7 +5946,8 @@ def main() -> int:
                     send_message(
                         "I am already paired with this chat.\n\n"
                         "Send /newgroup to add me to a project group, or "
-                        f"just tell me what you need.\n\n{telegram_help.HELP_HINT}"
+                        "send /projects to inspect existing workspaces.\n\n"
+                        f"{telegram_help.HELP_HINT}"
                     )
             elif agent_create is not None:
                 create_agent_from_catalog(agent_create.group(1))

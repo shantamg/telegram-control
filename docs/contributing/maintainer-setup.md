@@ -2,22 +2,24 @@
 
 Files in the repository can guide collaboration, but only a repository owner
 can change visibility, rules, security features, and collaborator permissions.
-Use this checklist after reviewing and merging the readiness pull request.
+Use this checklist to keep the public repository's GitHub controls aligned with
+the source policy.
 
-## 1. Confirm the license
+## 1. Preserve the license
 
-This repository proposes the Apache License 2.0: permissive reuse with an
-explicit patent grant and preservation requirements. Confirm that this is the
-license you want before making the repository public. Changing a license after
-accepting outside contributions is much harder.
+This repository is licensed under the Apache License 2.0: permissive reuse with
+an explicit patent grant and preservation requirements. Keep `LICENSE` and the
+contributor notice intact. Changing a license after accepting outside
+contributions requires careful legal and contributor review.
 
 GitHub explains why an explicit license is necessary in
 [Licensing a repository](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository).
 
-## 2. Audit before changing visibility
+## 2. Audit public history and incoming changes
 
-Review the entire Git history for secrets and personal information, including
-deleted files. At minimum, look for:
+Review incoming commits and periodically audit the entire Git history for
+secrets and personal information, including deleted files. At minimum, look
+for:
 
 - Telegram bot tokens and invitation links;
 - provider credentials and session exports;
@@ -29,13 +31,12 @@ Also review GitHub Actions, deploy keys, webhooks, collaborators, branch names,
 releases, issue content, and repository description. Rotate a secret if it was
 ever committed; deleting the current file is not enough.
 
-Then change **Settings → General → Danger Zone → Change repository
-visibility**. Public visibility is not needed for the software to run. It only
-allows anyone to read and fork the source.
+The repository is already public. Visibility is not needed for the software to
+run and does not grant access to any installation's bot, database, or Mac.
 
 ## 3. Protect `main` with a ruleset
 
-Create a branch ruleset targeting the default branch and make it active. GitHub
+Verify that an active branch ruleset targets the default branch. GitHub
 documents the available controls in
 [Available rules for rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets).
 

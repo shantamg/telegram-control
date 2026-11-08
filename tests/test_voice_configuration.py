@@ -118,8 +118,8 @@ class VoiceConfigurationTests(unittest.TestCase):
                 voice_settings.DEFAULT_CONFIGURATION,
             )
             selected = voice_settings.VoiceConfiguration(
-                voice_name="en-US-AndrewNeural",
-                rate="-10%",
+                voice_name="Daniel",
+                rate="165",
             )
             self.assertEqual(store.set_voice_configuration(selected), selected)
             self.assertEqual(store.voice_configuration(), selected)
@@ -127,7 +127,7 @@ class VoiceConfigurationTests(unittest.TestCase):
                 store.set_voice_configuration(
                     voice_settings.VoiceConfiguration(
                         voice_name="not-a-real-voice",
-                        rate="+10%",
+                        rate="205",
                     )
                 )
 
@@ -135,19 +135,19 @@ class VoiceConfigurationTests(unittest.TestCase):
         with DurableStore(self.database_path) as store:
             picker = self._invoke_command(store)
             self.assertIn("Spoken reply settings", picker["text"])
-            self.assertIn("🇬🇧 Sonia", picker["text"])
+            self.assertIn("💻 Mac default", picker["text"])
             labels = [
                 button["text"]
                 for row in picker["reply_markup"]["inline_keyboard"]
                 for button in row
             ]
-            self.assertIn("🇺🇸 Andrew", labels)
-            self.assertIn("✓ Quick · +10%", labels)
+            self.assertIn("🇬🇧 Daniel", labels)
+            self.assertIn("✓ Natural · 185 wpm", labels)
             andrew_data = next(
                 button["callback_data"]
                 for row in picker["reply_markup"]["inline_keyboard"]
                 for button in row
-                if button["text"] == "🇺🇸 Andrew"
+                if button["text"] == "🇬🇧 Daniel"
             )
 
             _job_id, selection_calls = self._invoke_callback(
@@ -161,7 +161,7 @@ class VoiceConfigurationTests(unittest.TestCase):
                 if method == "editMessageText"
             )
             self.assertIn("Review spoken reply settings", review["text"])
-            self.assertIn("Selected: 🇺🇸 Andrew", review["text"])
+            self.assertIn("Selected: 🇬🇧 Daniel", review["text"])
             review_buttons = {
                 button["text"]: button["callback_data"]
                 for row in review["reply_markup"]["inline_keyboard"]
@@ -199,13 +199,13 @@ class VoiceConfigurationTests(unittest.TestCase):
                 )
             synthesize.assert_called_once_with(
                 (
-                    "Hello. This is Andrew, your Telegram Control voice. "
+                    "Hello. This is Daniel, your Telegram Control voice. "
                     "Spoken replies will sound like this."
                 ),
                 f"voice-preview-{preview_job_id}",
                 protected_paths=set(),
-                voice_name="en-US-AndrewNeural",
-                rate="+10%",
+                voice_name="Daniel",
+                rate="185",
             )
             preview_voice = store.connection.execute(
                 """
@@ -245,7 +245,7 @@ class VoiceConfigurationTests(unittest.TestCase):
                 button["callback_data"]
                 for row in back["reply_markup"]["inline_keyboard"]
                 for button in row
-                if button["text"] == "🇺🇸 Andrew"
+                if button["text"] == "🇬🇧 Daniel"
             )
             _job_id, second_selection_calls = self._invoke_callback(
                 store,
@@ -281,8 +281,8 @@ class VoiceConfigurationTests(unittest.TestCase):
             self.assertEqual(
                 store.voice_configuration(),
                 voice_settings.VoiceConfiguration(
-                    voice_name="en-US-AndrewNeural",
-                    rate="+10%",
+                    voice_name="Daniel",
+                    rate="185",
                 ),
             )
 

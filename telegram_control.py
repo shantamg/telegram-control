@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -53,6 +54,9 @@ from durable_store import (
 DATABASE_PATH = bridge.CONFIG_DIR / "controller.sqlite3"
 SCRIPT_PATH = Path(__file__).resolve()
 SKILLS_SOURCE_DIR = SCRIPT_PATH.parent / "skills"
+INSTALL_GROUP_ICON_PATH = (
+    SCRIPT_PATH.parent / "assets" / "telegram-control-group-icon.png"
+)
 # Skill sources are checkout-relative: they refer to this repository through a
 # placeholder that installation resolves to wherever the checkout actually is.
 SKILL_ROOT_PLACEHOLDER = "{{TELEGRAM_CONTROL_ROOT}}"
@@ -69,9 +73,6 @@ MANAGED_SHARED_SKILLS = (
 )
 DEFAULT_AGENT_WORKERS = 8
 MAX_AGENT_WORKERS = 16
-TOPIC_PROBE_INTERVAL_SECONDS = 24 * 60 * 60
-TOPIC_PROBE_BATCH_SIZE = 100
-TOPIC_ROOT_PROBE_TEXT = "Telegram Control topic existence probe"
 ROUTER_MAX_COMPLETED_TURNS = 12
 ROUTER_MAX_INPUT_TOKENS = 180_000
 ROUTER_MAX_DISCOVERY_STEPS = 6
@@ -82,14 +83,6 @@ MISSING_TOPIC_ERROR_MARKERS = (
     "message thread not found",
     "topic_id_invalid",
     "topic id invalid",
-)
-EXISTING_TOPIC_ROOT_ERROR_MARKERS = (
-    "message can't be edited",
-    "message cannot be edited",
-)
-MISSING_TOPIC_ROOT_ERROR_MARKERS = (
-    "message to edit not found",
-    *MISSING_TOPIC_ERROR_MARKERS,
 )
 RELOAD_JOB_PREFIX = "local.telegram-control.reload"
 DEFAULT_RESTART_DELAY_SECONDS = 20.0
@@ -128,9 +121,6 @@ def open_store(path: Path) -> DurableStore:
     store = DurableStore(path)
     try:
         store.initialize_poll_offset(bridge.read_offset())
-        check = store.quick_check()
-        if check != "ok":
-            raise StoreError(f"SQLite quick_check returned: {check}")
         return store
     except BaseException:
         store.close()
@@ -325,7 +315,13 @@ def process_agent_mailbox_job(
         adapter = provider_adapters.adapter_for(agent)
 
         def on_progress(stage: str, detail: str) -> None:
-            if stage == "turn_started":
+            if stage == "process_started":
+                store.attach_agent_mailbox_process(
+                    job.mailbox_id,
+                    worker_id,
+                    int(detail),
+                )
+            elif stage == "turn_started":
                 store.attach_agent_mailbox_turn(
                     job.mailbox_id,
                     worker_id,
@@ -2133,145 +2129,6 @@ def telegram_reports_missing_topic(error: str) -> bool:
     return any(marker in normalized for marker in MISSING_TOPIC_ERROR_MARKERS)
 
 
-def telegram_topic_root_probe_result(error: str) -> str:
-    """Classify an attempted edit of a topic-creation service message."""
-    normalized = " ".join(str(error).casefold().split())
-    if any(marker in normalized for marker in EXISTING_TOPIC_ROOT_ERROR_MARKERS):
-        return "alive"
-    if any(marker in normalized for marker in MISSING_TOPIC_ROOT_ERROR_MARKERS):
-        return "missing"
-    return "inconclusive"
-
-
-def probe_due_topics_once(
-    store: DurableStore,
-    token: str,
-    *,
-    interval_seconds: float = TOPIC_PROBE_INTERVAL_SECONDS,
-    batch_size: int = TOPIC_PROBE_BATCH_SIZE,
-    now: Optional[float] = None,
-) -> dict[str, int]:
-    """Reconcile active local routes against Telegram topic existence.
-
-    Telegram's Bot API has no read-only topic lookup. For every non-General
-    forum topic, however, the topic ID is also the ID of its non-editable
-    topic-creation service message. Attempting to edit that root message is a
-    non-mutating existence check: an existing open or closed topic reports
-    that the message cannot be edited, while a deleted topic reports that the
-    message was not found. Only a definitive missing-root response retires
-    local state. General cannot be deleted, and permission, network, and all
-    other failures remain inconclusive.
-    """
-    timestamp = time.time() if now is None else float(now)
-    counts = {"probed": 0, "alive": 0, "retired": 0, "deferred": 0}
-    candidates = store.list_due_topic_probes(
-        now=timestamp,
-        interval_seconds=interval_seconds,
-        limit=batch_size,
-    )
-    for candidate in candidates:
-        counts["probed"] += 1
-        if candidate.message_thread_id == 1:
-            store.record_topic_probe(candidate.binding_id, now=timestamp)
-            counts["alive"] += 1
-            log_event(
-                "topic_probe_result",
-                binding_id=candidate.binding_id,
-                chat_id=candidate.chat_id,
-                message_thread_id=candidate.message_thread_id,
-                result="alive",
-                probe="non_deletable_general",
-            )
-            continue
-        try:
-            bridge.api_call(
-                token,
-                "editMessageText",
-                chat_id=candidate.chat_id,
-                message_id=candidate.message_thread_id,
-                text=TOPIC_ROOT_PROBE_TEXT,
-            )
-        except bridge.BridgeError as exc:
-            error = str(exc)
-            probe_result = telegram_topic_root_probe_result(error)
-            if probe_result == "missing":
-                retired = store.retire_missing_topic(
-                    candidate.binding_id,
-                    reason=error,
-                    now=timestamp,
-                )
-                counts["retired" if retired else "deferred"] += 1
-                log_event(
-                    "topic_probe_missing",
-                    binding_id=candidate.binding_id,
-                    chat_id=candidate.chat_id,
-                    message_thread_id=candidate.message_thread_id,
-                    retired=retired,
-                )
-            elif probe_result == "alive":
-                store.record_topic_probe(candidate.binding_id, now=timestamp)
-                counts["alive"] += 1
-                log_event(
-                    "topic_probe_result",
-                    binding_id=candidate.binding_id,
-                    chat_id=candidate.chat_id,
-                    message_thread_id=candidate.message_thread_id,
-                    result="alive",
-                    probe="topic_root_service_message",
-                )
-            else:
-                store.record_topic_probe(
-                    candidate.binding_id,
-                    error=error,
-                    now=timestamp,
-                )
-                counts["deferred"] += 1
-                log_event(
-                    "topic_probe_result",
-                    binding_id=candidate.binding_id,
-                    chat_id=candidate.chat_id,
-                    message_thread_id=candidate.message_thread_id,
-                    result="inconclusive",
-                )
-        else:
-            error = (
-                "Telegram unexpectedly allowed editing a topic-creation "
-                "service message; topic existence is inconclusive."
-            )
-            store.record_topic_probe(
-                candidate.binding_id,
-                error=error,
-                now=timestamp,
-            )
-            counts["deferred"] += 1
-            log_event(
-                "topic_probe_result",
-                binding_id=candidate.binding_id,
-                chat_id=candidate.chat_id,
-                message_thread_id=candidate.message_thread_id,
-                result="inconclusive",
-            )
-    return counts
-
-
-def maintain_topics_command(args: argparse.Namespace) -> None:
-    """Periodically retire routes for topics deleted directly in Telegram."""
-    token = bridge.read_token()
-    with open_store(args.db) as store:
-        while True:
-            counts = probe_due_topics_once(
-                store,
-                token,
-                interval_seconds=args.interval_seconds,
-                batch_size=args.batch_size,
-            )
-            if counts["probed"]:
-                log_event("topic_maintenance_cycle", **counts)
-            if args.once:
-                return
-            time.sleep(args.idle_sleep)
-
-
 def supervisor_commands(
     database_path: Path,
     agent_workers: int = DEFAULT_AGENT_WORKERS,
@@ -2291,9 +2148,41 @@ def supervisor_commands(
         commands.append([*base, "work-router"])
     commands.extend([*base, "work-agents"] for _ in range(count))
     commands.append([*base, "maintain-workers"])
-    commands.append([*base, "maintain-topics"])
     commands.append([*base, "send-outbox"])
     return commands
+
+
+def _spawn_supervisor_child(command: list[str]) -> subprocess.Popen[Any]:
+    """Start one worker as a process-group leader for bounded cleanup."""
+
+    return subprocess.Popen(command, start_new_session=True)
+
+
+def _terminate_process_group(process_group_id: int, timeout: float = 3.0) -> None:
+    """Terminate one owned process group without affecting sibling workers."""
+
+    pgid = int(process_group_id)
+    if pgid <= 0 or pgid == os.getpgrp():
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        return
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def cleanup_reload_jobs() -> list[str]:
@@ -2347,8 +2236,25 @@ def run_command(args: argparse.Namespace) -> None:
     )
     processes: list[subprocess.Popen[Any]] = []
     try:
+        with open_store(args.db) as store:
+            gone_worker_pids = store.gone_local_agent_worker_pids()
+        for worker_pid in gone_worker_pids:
+            with open_store(args.db) as store:
+                provider_pids = (
+                    store.provider_process_pids_for_agent_worker(worker_pid)
+                )
+            for provider_pid in provider_pids:
+                _terminate_process_group(provider_pid)
+            with open_store(args.db) as store:
+                recovered = store.recover_agent_worker_leases(worker_pid)
+            log_event(
+                "startup_agent_worker_lease_recovered",
+                worker_pid=worker_pid,
+                provider_process_pids=provider_pids,
+                recovered_mailbox_ids=recovered,
+            )
         for command in commands:
-            processes.append(subprocess.Popen(command))
+            processes.append(_spawn_supervisor_child(command))
         log_event(
             "supervisor_started",
             child_pids=[process.pid for process in processes],
@@ -2357,11 +2263,54 @@ def run_command(args: argparse.Namespace) -> None:
         )
         next_restart_check = time.time()
         while True:
-            for process in processes:
+            for index, process in enumerate(processes):
                 return_code = process.poll()
                 if return_code is not None:
-                    raise StoreError(
-                        f"Controller child {process.pid} exited with status {return_code}."
+                    command = commands[index]
+                    role = str(command[-1])
+                    recovered_mailbox_ids: list[int] = []
+                    provider_process_pids: list[int] = []
+                    if role == "work-agents":
+                        try:
+                            with open_store(args.db) as store:
+                                provider_process_pids = (
+                                    store.provider_process_pids_for_agent_worker(
+                                        process.pid
+                                    )
+                                )
+                        except (OSError, StoreError) as exc:
+                            log_event(
+                                "agent_provider_process_lookup_failed",
+                                worker_pid=process.pid,
+                                error=str(exc),
+                            )
+                    for provider_pid in provider_process_pids:
+                        _terminate_process_group(provider_pid)
+                    _terminate_process_group(process.pid)
+                    if role == "work-agents":
+                        try:
+                            with open_store(args.db) as store:
+                                recovered_mailbox_ids = (
+                                    store.recover_agent_worker_leases(
+                                        process.pid
+                                    )
+                                )
+                        except (OSError, StoreError) as exc:
+                            log_event(
+                                "agent_worker_lease_recovery_failed",
+                                worker_pid=process.pid,
+                                error=str(exc),
+                            )
+                    replacement = _spawn_supervisor_child(command)
+                    processes[index] = replacement
+                    log_event(
+                        "controller_child_restarted",
+                        old_pid=process.pid,
+                        new_pid=replacement.pid,
+                        role=role,
+                        return_code=return_code,
+                        provider_process_pids=provider_process_pids,
+                        recovered_mailbox_ids=recovered_mailbox_ids,
                     )
             if time.time() >= next_restart_check:
                 next_restart_check = time.time() + 5
@@ -2380,14 +2329,25 @@ def run_command(args: argparse.Namespace) -> None:
                     raise SystemExit(0)
             time.sleep(1)
     finally:
-        for process in processes:
-            if process.poll() is None:
-                process.terminate()
+        for index, process in enumerate(processes):
+            if index < len(commands) and commands[index][-1] == "work-agents":
+                try:
+                    with open_store(args.db) as store:
+                        provider_pids = (
+                            store.provider_process_pids_for_agent_worker(
+                                process.pid
+                            )
+                        )
+                except (OSError, StoreError):
+                    provider_pids = []
+                for provider_pid in provider_pids:
+                    _terminate_process_group(provider_pid)
+            _terminate_process_group(process.pid)
         for process in processes:
             try:
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                process.kill()
+                _terminate_process_group(process.pid, timeout=0)
         signal.signal(signal.SIGTERM, previous_sigterm)
 
 
@@ -2577,7 +2537,7 @@ def worker_start_command(args: argparse.Namespace) -> None:
                     worker.provider_session_id is not None
                 ),
                 "recovery_file": worker.recovery_file_path,
-                "attach": f"tmux attach-session -t '={worker.tmux_session_name}'",
+                "attach": detached_worker.attach_command(worker),
             },
             indent=2,
             sort_keys=True,
@@ -2646,6 +2606,12 @@ def worker_status_command(args: argparse.Namespace) -> None:
                     "last_recovery_error": current.last_recovery_error,
                     "tmux_session": current.tmux_session_name,
                     "project_path": current.project_path,
+                    "created_at": datetime.fromtimestamp(
+                        current.created_at
+                    ).isoformat(timespec="seconds"),
+                    "age_days": round(
+                        (time.time() - current.created_at) / 86400, 1
+                    ),
                 }
             )
     print(json.dumps(rows, indent=2, sort_keys=True))
@@ -2831,14 +2797,65 @@ def registered_bot_commands() -> list[dict[str, str]]:
     return commands
 
 
+def registered_bot_command_scopes(
+) -> list[tuple[dict[str, str], list[dict[str, str]]]]:
+    """Render Telegram's private/group composer menus from the command catalog."""
+    commands = registered_bot_commands()
+    by_name = {command["command"]: command for command in commands}
+    scopes = []
+    for scope_type, names in (
+        ("all_private_chats", telegram_help.PRIVATE_COMMAND_NAMES),
+        ("all_group_chats", telegram_help.GROUP_COMMAND_NAMES),
+    ):
+        unknown = [name for name in names if name not in by_name]
+        if unknown:
+            raise StoreError(
+                f"Telegram {scope_type} command scope is invalid: "
+                + ", ".join(unknown)
+            )
+        scopes.append(
+            (
+                {"type": scope_type},
+                [by_name[name] for name in names],
+            )
+        )
+    return scopes
+
+
 def sync_commands_command(_: argparse.Namespace) -> None:
-    """Publish the command menu so every command is tappable, pin or not."""
+    """Publish scoped command menus so the composer stays context-relevant."""
     token = bridge.read_token()
     commands = registered_bot_commands()
     bridge.api_call(token, "setMyCommands", commands=commands)
-    print(f"Registered {len(commands)} Telegram commands:")
+    for scope, scoped_commands in registered_bot_command_scopes():
+        bridge.api_call(
+            token,
+            "setMyCommands",
+            commands=scoped_commands,
+            scope=scope,
+        )
+    print(f"Registered {len(commands)} Telegram commands with private/group scopes:")
     for command in commands:
         print(f"- /{command['command']} — {command['description']}")
+
+
+def seed_install_workspace(store: DurableStore) -> dict[str, Any]:
+    """Seed this checkout as the default Telegram Control group workspace."""
+    checkout = SCRIPT_PATH.parent.resolve()
+    workspace, working_directory, git_repository_root = (
+        discovery.validate_agent_workspace(
+            str(checkout),
+            str(checkout),
+            discovery.exact_git_root(str(checkout)),
+        )
+    )
+    return store.seed_install_workspace(
+        display_name="Telegram Control",
+        project_path=workspace,
+        working_directory=working_directory,
+        git_repository_root=git_repository_root,
+        group_icon_path=str(INSTALL_GROUP_ICON_PATH.resolve(strict=True)),
+    )
 
 
 def install_command(args: argparse.Namespace) -> None:
@@ -2848,8 +2865,12 @@ def install_command(args: argparse.Namespace) -> None:
     if not handler_path.is_file():
         raise StoreError(f"Handler does not exist: {handler_path}")
     bridge.handler_command(handler_path)
-    with open_store(args.db):
-        pass
+    with open_store(args.db) as store:
+        install_workspace = seed_install_workspace(store)
+    print(
+        "Seeded the Telegram Control group workspace at "
+        f"{install_workspace['project_path']}."
+    )
     install_managed_skills()
     try:
         sync_commands_command(args)
@@ -3447,18 +3468,18 @@ def doctor_command(args: argparse.Namespace) -> None:
         Path("/usr/local/bin/ffmpeg"),
         command_name="ffmpeg",
     )
-    edge_tts = helper_paths.resolve_binary(
-        "edge_tts_binary",
-        Path.home() / ".local" / "bin" / "edge-tts",
-        command_name="edge-tts",
+    say = helper_paths.resolve_binary(
+        "say_binary",
+        Path("/usr/bin/say"),
+        command_name="say",
     )
     handy_ready = handy.is_file() and os.access(handy, os.X_OK)
     ffmpeg_ready = ffmpeg.is_file() and os.access(ffmpeg, os.X_OK)
     model_ready = HANDY_MODEL_DIR.is_dir()
     voice_input_ready = handy_ready and ffmpeg_ready and model_ready
     spoken_reply_ready = (
-        edge_tts.is_file()
-        and os.access(edge_tts, os.X_OK)
+        say.is_file()
+        and os.access(say, os.X_OK)
         and ffmpeg_ready
     )
     tmux = shutil.which("tmux")
@@ -3489,7 +3510,7 @@ def doctor_command(args: argparse.Namespace) -> None:
     )
     if not spoken_reply_ready:
         notices.append(
-            "Spoken replies need edge-tts and ffmpeg."
+            "Spoken replies need macOS say and ffmpeg."
         )
     print(
         "Interactive console and detached workers: "
@@ -3553,9 +3574,18 @@ def config_show_command(args: argparse.Namespace) -> None:
 
 
 def retry_command(args: argparse.Namespace) -> None:
+    item_id = getattr(args, "item_id", None)
+    retry_all = bool(getattr(args, "retry_all", False))
+    if args.queue == "agent" and item_id is None and not retry_all:
+        raise StoreError(
+            "Agent retry requires --id MAILBOX_ID or an explicit --all."
+        )
+    if args.queue != "agent" and item_id is not None:
+        raise StoreError("--id is currently supported only for the agent queue.")
     with open_store(args.db) as store:
-        count = store.retry_dead(args.queue)
-    print(f"Requeued {count} dead {args.queue} item(s).")
+        count = store.retry_dead(args.queue, item_id=item_id)
+    target = f" mailbox {int(item_id)}" if item_id is not None else ""
+    print(f"Requeued {count} dead {args.queue} item(s){target}.")
 
 
 def add_loop_arguments(parser: argparse.ArgumentParser, lease_seconds: float) -> None:
@@ -3613,36 +3643,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_loop_arguments(outbox_parser, lease_seconds=90)
     outbox_parser.set_defaults(function=send_outbox_command)
-
-    topic_maintenance_parser = subparsers.add_parser(
-        "maintain-topics",
-        help="Retire controller routes for topics deleted directly in Telegram.",
-    )
-    topic_maintenance_parser.add_argument(
-        "--once",
-        action="store_true",
-        help="Probe one due batch and exit.",
-    )
-    topic_maintenance_parser.add_argument(
-        "--interval-seconds",
-        type=float,
-        default=TOPIC_PROBE_INTERVAL_SECONDS,
-        help="Minimum seconds between existence checks for a topic.",
-    )
-    topic_maintenance_parser.add_argument(
-        "--batch-size",
-        type=int,
-        choices=range(1, 1001),
-        default=TOPIC_PROBE_BATCH_SIZE,
-        help="Maximum topics checked in one maintenance cycle.",
-    )
-    topic_maintenance_parser.add_argument(
-        "--idle-sleep",
-        type=float,
-        default=5 * 60,
-        help="Seconds between checks for newly due topics.",
-    )
-    topic_maintenance_parser.set_defaults(function=maintain_topics_command)
 
     worker_maintenance_parser = subparsers.add_parser(
         "maintain-workers",
@@ -3914,6 +3914,19 @@ def build_parser() -> argparse.ArgumentParser:
     retry_parser.add_argument(
         "queue",
         choices=("inbox", "outbox", "agent", "router"),
+    )
+    retry_scope = retry_parser.add_mutually_exclusive_group()
+    retry_scope.add_argument(
+        "--id",
+        dest="item_id",
+        type=int,
+        help="Retry one exact agent mailbox ID.",
+    )
+    retry_scope.add_argument(
+        "--all",
+        dest="retry_all",
+        action="store_true",
+        help="Explicitly retry every eligible dead item in this queue.",
     )
     retry_parser.set_defaults(function=retry_command)
     return parser
