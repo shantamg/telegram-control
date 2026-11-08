@@ -12386,6 +12386,9 @@ class DurableIntegrationTests(unittest.TestCase):
                 ).fetchone()
 
             environment = {
+                # Match the real handler's explicit settings environment;
+                # do not read the developer machine's Telegram pairing.
+                "TELEGRAM_CONTROL_SETTINGS_JSON": "{}",
                 "TELEGRAM_CONTROL_DB": str(database_path),
                 "TELEGRAM_CONTROL_JOB_ID": str(job["job_id"]),
                 "TELEGRAM_CHAT_ID": "-100777",

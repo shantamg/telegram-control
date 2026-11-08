@@ -2275,3 +2275,8 @@ Verification: all 447 tests passed, including both RPC/event orderings, session
 preservation, recovery, errors, Stop, command normalization, queueing, and scope.
 A real installed Codex app-server smoke test created a disposable thread,
 compacted it, and resumed that same thread with its earlier instruction intact.
+
+GitHub's clean-runner checks also exposed an older forum-binding fixture that
+read the developer's installed Telegram configuration during its callback.
+The fixture now supplies the same explicit settings environment as a real
+handler, so it passes without local pairing.
