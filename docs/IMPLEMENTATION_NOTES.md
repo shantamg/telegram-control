@@ -2214,14 +2214,16 @@ voices.
 
 ## Project account bindings
 
-The standalone `ai_accounts.py` wrapper resolves the nearest private
+The `ai-accounts` wrapper, maintained in its own repository and vendored as
+the `vendor/ai-accounts` submodule, resolves the nearest private
 `.ai-account.local` file from the working directory. A Git root ends the
 ancestor search. Linked worktrees can inherit the primary checkout's root
 binding. Only a company label is stored in the binding. Separate owner-only
 profile mappings under `~/.config/ai-accounts/profiles/` select the native
 Claude and Codex directories. The wrapper writes bindings atomically, adds a
 local Git exclusion, and requires a choice from the launched provider's
-signed-in profiles on the first interactive launch. Existing CLI defaults
+profiles on the first interactive launch; choosing one that is not signed in,
+or adding a new one, runs the provider's sign-in before launching. Existing CLI defaults
 can be selected explicitly per provider.
 
 Managed turns, the session picker, console takeover, and detached worker
@@ -2280,3 +2282,17 @@ GitHub's clean-runner checks also exposed an older forum-binding fixture that
 read the developer's installed Telegram configuration during its callback.
 The fixture now supplies the same explicit settings environment as a real
 handler, so it passes without local pairing.
+
+## ai-accounts as a submodule
+
+The account switcher moved to https://github.com/shantamg/ai-accounts and is
+pinned here as the `vendor/ai-accounts` submodule. The root `ai_accounts.py` is
+a shim that loads the submodule's module and registers it under the
+`ai_accounts` name, so existing imports and `mock.patch.object(ai_accounts, …)`
+calls reach the real module. A checkout without the submodule fails at import
+with an instruction to run `git submodule update --init`. `SETUP.command` runs
+that, and CI checks out submodules and runs both test suites. Tests for the
+module itself live upstream. `tests/test_ai_accounts.py` keeps only the
+Telegram-facing integration tests. Long-running workers load the shim after an
+idle-safe reload. Verified with the full suite under `/usr/bin/python3` and the
+submodule's suite.

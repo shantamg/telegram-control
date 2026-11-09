@@ -8,50 +8,29 @@ label, and the CLI adds the filename to the repository's local Git exclude.
 
 ## Set up the terminal wrapper
 
-Put a link to the script in a directory on your `PATH`. Run this from the checkout.
+The account switcher is its own project,
+[ai-accounts](https://github.com/shantamg/ai-accounts), and Telegram Control
+uses it through the `vendor/ai-accounts` submodule. Install the `ai-accounts`
+command and the `c` and `codex` aliases by following its README. In short:
 
 ```sh
-mkdir -p ~/bin
-ln -s "$PWD/ai_accounts.py" ~/bin/ai-accounts
+git clone https://github.com/shantamg/ai-accounts.git ~/ai-accounts
+~/ai-accounts/install.sh --aliases
 ```
 
-Add the aliases to your interactive shell configuration, such as `~/.zshrc`.
+That README also covers creating profiles, signing in (the `c` and `codex`
+picker can add an account and guide you through sign-in), and binding
+projects. Telegram Control reads the same profiles and `.ai-account.local`
+bindings, so set them up in Terminal first.
+
+To move Telegram Control to a newer ai-accounts, update the submodule:
 
 ```sh
-alias codex='ai-accounts run codex --'
-alias c='ai-accounts run claude --'
+git submodule update --remote vendor/ai-accounts
 ```
 
-The wrapper is also callable as `ai-accounts run claude --` or
-`ai-accounts run codex --` without aliases. It passes the rest of the command
-line to the provider.
-
-## Configure and sign in
-
-Choose company labels that fit your setup. In this example, Personal uses the
-two existing default CLI sign-ins and Work gets two new account directories.
-
-```sh
-ai-accounts profile Personal --claude-dir default --codex-dir default
-ai-accounts profile Work
-ai-accounts login Work claude
-ai-accounts login Work codex
-ai-accounts status
-```
-
-You can also specify existing private profile directories with
-`--claude-dir /absolute/path` or `--codex-dir /absolute/path`. Claude Code
-uses the directory to scope its macOS Keychain entry. For a custom Codex
-directory, the wrapper selects file-backed credentials in that home. Default
-profiles use the CLI's existing credential storage setting. Profile mappings
-are private files under `~/.config/ai-accounts/profiles/`.
-
-In a project directory, launch `codex` or `c` and select a company signed in to
-the requested provider. The wrapper saves the binding at the Git root or in the
-current directory for a non-Git project. For an explicit binding or a directory
-override within a repository, run `ai-accounts bind Work` in that directory.
-Run `ai-accounts show` to inspect the effective company. A shell without an
-interactive terminal requires an existing binding.
+Commit the new submodule pointer, then queue a restart with
+`./telegram_control.py request-restart`.
 
 ## Use the binding in Telegram
 

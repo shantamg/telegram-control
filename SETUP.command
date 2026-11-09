@@ -3,6 +3,9 @@
 set -e
 cd "${0:A:h}"
 
+# ai-accounts is a submodule; fetch it if the clone skipped submodules.
+git submodule update --init --recursive
+
 ./telegram_bridge.py setup
 ./telegram_bridge.py send "✅ Telegram bridge paired with this Mac."
 
