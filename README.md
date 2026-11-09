@@ -45,7 +45,7 @@ your terminal.
 ## Install on a local Mac
 
 ```sh
-git clone https://github.com/shantamg/telegram-control.git
+git clone --recurse-submodules https://github.com/shantamg/telegram-control.git
 cd telegram-control
 ./SETUP.command
 ```
@@ -235,7 +235,7 @@ policy. In particular:
 | Per-update commands and confirmations | `on_message.py` |
 | SQLite schema, queues, routes, and lifecycle | `durable_store.py` |
 | Claude and Codex execution/session state | `provider_adapters.py`, `claude_sessions.py`, `codex_sessions.py`, `provider_defaults.py` |
-| Shared terminal and Telegram account selection | `ai_accounts.py` |
+| Shared terminal and Telegram account selection | `ai_accounts.py` (shim for the [ai-accounts](https://github.com/shantamg/ai-accounts) submodule in `vendor/ai-accounts`) |
 | Help, formatting, inventory, and voice UI | `telegram_help.py`, `telegram_formatting.py`, `workspace_catalog.py`, `voice_settings.py`, `voice_responses.py` |
 | Optional Control router | `router_contract.py`, `router_eval.py`, `discovery.py` |
 | Agent-scoped Telegram capabilities | `agent_telegram.py`, `skills/` |

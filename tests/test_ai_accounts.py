@@ -1,4 +1,7 @@
-"""Project account selection shared by terminal and Telegram launches."""
+"""Telegram Control's use of the vendored ai-accounts module.
+
+The module's own behavior is tested in vendor/ai-accounts/tests.
+"""
 
 import json
 import os
@@ -53,25 +56,6 @@ class ProjectAccountTests(unittest.TestCase):
         with self.assertRaisesRegex(ai_accounts.AccountError, "already exists"):
             ai_accounts._save_binding(self.project, self.profile, replace=False)
 
-    def test_git_excludes_binding_and_linked_worktree_inherits_it(self):
-        def git(*args):
-            return subprocess.run(
-                ["/usr/bin/git", "-C", str(self.project), *args],
-                check=True, capture_output=True, text=True,
-            )
-
-        git("init")
-        git("-c", "user.name=Test", "-c", "user.email=test@example.com",
-            "commit", "--allow-empty", "-m", "Initial commit")
-        worktree = self.root / "worktree"
-        git("worktree", "add", "--detach", str(worktree))
-        ai_accounts._save_binding(self.project, self.profile, replace=False)
-        self.assertEqual(
-            git("check-ignore", ai_accounts.BINDING).stdout.strip(),
-            ai_accounts.BINDING,
-        )
-        self.assertEqual(ai_accounts.project_profile(worktree), self.profile)
-
     def test_invalid_binding_fails_closed(self):
         marker = self.project / ai_accounts.BINDING
         marker.write_text("Lovely\n")
@@ -82,22 +66,3 @@ class ProjectAccountTests(unittest.TestCase):
         marker.write_text("Missing\n")
         with self.assertRaisesRegex(provider_adapters.ProviderAdapterError, "is missing"):
             provider_adapters.project_account(str(self.project))
-
-    def test_tmux_applies_profile_inside_pane_and_removes_inherited_api_key(self):
-        command = self.profile.tmux_command(
-            "claude", ["/usr/bin/printenv", "CLAUDE_CONFIG_DIR"]
-        )
-        output = subprocess.check_output(
-            command, env={**os.environ, "CLAUDE_CONFIG_DIR": "/some/other/account"},
-            text=True,
-        )
-        self.assertEqual(output.strip(), str(self.profile.claude))
-        command = self.profile.tmux_command(
-            "claude", ["/usr/bin/printenv", "ANTHROPIC_API_KEY"]
-        )
-        result = subprocess.run(
-            command, env={**os.environ, "ANTHROPIC_API_KEY": "inherited"},
-            capture_output=True,
-        )
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(result.stdout, b"")

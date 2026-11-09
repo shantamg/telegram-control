@@ -1,0 +1,3 @@
+[submodule "vendor/ai-accounts"]
+	path = vendor/ai-accounts
+	url = https://github.com/shantamg/ai-accounts.git
