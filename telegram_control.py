@@ -128,6 +128,18 @@ def open_store(path: Path) -> DurableStore:
         raise
 
 
+def update_targets_herdr(store: DurableStore, update: dict[str, Any]) -> bool:
+    message = update.get("message") or (update.get("callback_query") or {}).get("message")
+    if not isinstance(message, dict):
+        return False
+    chat_id = (message.get("chat") or {}).get("id")
+    thread_id = bridge.forum_message_thread_id(message)
+    if not isinstance(chat_id, int) or thread_id is None:
+        return False
+    binding = store.resolve_surface_binding(chat_id, thread_id)
+    return binding is not None and binding.target_type == "herdr"
+
+
 def collect_once(
     store: DurableStore,
     token: str,
@@ -154,6 +166,13 @@ def collect_once(
                 "ignored_unauthorized": authorization_failure,
             }
         )
+        held_for_mac = (
+            authorization_failure is None
+            and config.get("herdr_only_receiver") is True
+            and not update_targets_herdr(store, update)
+        )
+        if held_for_mac:
+            stored_update = {"update_id": int(update["update_id"]), "held_for_mac": update}
         inserted = store.ingest_update(stored_update)
         committed_offset = store.poll_offset()
         if committed_offset is not None:
@@ -165,6 +184,8 @@ def collect_once(
             (
                 "update_ignored"
                 if inserted and authorization_failure is not None
+                else "update_held_for_mac"
+                if inserted and held_for_mac
                 else "update_ingested"
                 if inserted
                 else "update_duplicate"

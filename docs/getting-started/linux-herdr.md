@@ -19,6 +19,12 @@ From the checkout, run `python3 telegram_bridge.py setup` to pair over hidden
 input, then `python3 telegram_control.py install-skills`. If the bot was already
 in service, coordinate its receiver cutover and preserve the old workspace
 and session data before pairing. Pairing uses Telegram's update stream.
+For a cutover that pauses Mac topics, set `"herdr_only_receiver": true` in
+the receiver's private config. The receiver preserves authorized updates
+outside linked Herdr topics in `telegram_updates` under `held_for_mac`,
+without creating replacement sessions or running those updates. The old
+controller's saved polling cursor should seed the Linux database after the
+old receiver drains and stops.
 
 Copy `deploy/telegram-control.service` to `~/.config/systemd/user/`, then run
 `systemctl --user daemon-reload` and

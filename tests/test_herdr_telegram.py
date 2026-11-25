@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import herdr_telegram as handoff
 import on_message
+import telegram_control
 from durable_store import DurableStore, StoreError
 
 
@@ -108,6 +109,30 @@ class HerdrTelegramTests(unittest.TestCase):
             params = json.loads(row["params_json"])
             self.assertEqual(params["message_thread_id"], 7)
             self.assertEqual(params["reply_parameters"]["message_id"], 41)
+
+    def test_herdr_only_receiver_holds_old_topics_and_dispatches_linked_ones(self):
+        binding = self.create_topic()
+        updates = [
+            {"update_id": update_id, "message": {
+                "chat": {"id": binding.chat_id, "type": "supergroup", "is_forum": True},
+                "message_thread_id": thread_id,
+                "from": {"id": 12},
+                "text": "Test routing",
+            }}
+            for update_id, thread_id in [(71, 6), (72, 7)]
+        ]
+        config = {"chat_id": 12, "owner_user_id": 12, "herdr_only_receiver": True}
+        with patch.object(telegram_control.bridge, "api_call", return_value=updates), patch.object(
+            telegram_control.bridge, "save_offset"
+        ):
+            telegram_control.collect_once(self.store, "fake", config)
+        job = self.store.claim_job("inbox")
+        self.assertEqual(job.update_id, 72)
+        self.assertIsNone(self.store.claim_job("inbox"))
+        record = self.store.connection.execute(
+            "SELECT raw_json FROM telegram_updates WHERE update_id = 71"
+        ).fetchone()
+        self.assertEqual(json.loads(record["raw_json"])["held_for_mac"], updates[0])
 
     def test_remote_prompt_uses_peer_script_and_terminal_identity(self):
         remote = handoff.Terminal("peer/t1", "peer/t1:agent-one", self.root, "idle")
