@@ -39,6 +39,27 @@ class HerdrTelegramTests(unittest.TestCase):
             self.assertEqual(api.call_count, 2)
         return binding
 
+    def test_terminal_identity_is_independent_of_caller_timezone(self):
+        row = {
+            "address": "t1",
+            "state": "live",
+            "pid": os.getpid(),
+            "created_ms": 1,
+            "cwd": str(self.root),
+            "status": {"app": "claude-code", "state": "idle"},
+        }
+        with patch.object(
+            handoff, "hc", side_effect=[row, {"core": {"id": "core-one"}}] * 2
+        ), patch.object(handoff, "agent_process", return_value=os.getpid()), patch.object(
+            handoff, "provider_session_id", return_value="session-one"
+        ):
+            with patch.dict(os.environ, {"TZ": "America/Los_Angeles"}):
+                pacific = handoff.inspect_terminal("t1")
+            with patch.dict(os.environ, {"TZ": "UTC"}):
+                utc = handoff.inspect_terminal("t1")
+
+        self.assertEqual(pacific.target_id, utc.target_id)
+
     def test_repeated_handoff_reuses_topic_without_creating_managed_agent(self):
         binding = self.create_topic()
         with patch.object(handoff.bridge, "api_call") as api:

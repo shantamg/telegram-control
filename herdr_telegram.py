@@ -161,7 +161,10 @@ def inspect_terminal(address: str, *, from_agent: bool = False) -> Terminal:
         int(row["pid"]), status["app"], caller=os.getpid() if from_agent else None
     )
     started = subprocess.check_output(
-        ["/bin/ps", "-p", str(pid), "-o", "lstart="], text=True, timeout=5
+        ["/bin/ps", "-p", str(pid), "-o", "lstart="],
+        env={**os.environ, "TZ": "UTC", "LC_ALL": "C"},
+        text=True,
+        timeout=5,
     ).strip()
     core_id = (hc("server", "status").get("core") or {}).get("id")
     if not core_id or not started:

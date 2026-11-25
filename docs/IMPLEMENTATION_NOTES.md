@@ -2313,6 +2313,11 @@ go through `hc send` when the agent is ready. The route pins the Core,
 terminal creation, and agent process and includes the provider session ID
 when it can be read directly from that process or its metadata. Agents
 without that metadata are identified by their process lifetime.
+Process start times use UTC and the C locale so a terminal and the receiver
+derive the same identity even when their environments differ. The regression
+test inspects the same process under Pacific time and UTC. An existing link
+hashed with a different timezone or locale needs to be verified against the
+live process before updating its target, or linked again from Herdr.
 
 Each forwarded prompt includes a scoped reply command. The agent supplies
 its final text to that command, which validates the linked process and
