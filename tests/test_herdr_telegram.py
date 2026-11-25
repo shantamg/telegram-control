@@ -86,6 +86,69 @@ class HerdrTelegramTests(unittest.TestCase):
                 handoff.link_topic(self.store, self.terminal, "Example", None)
         self.assertEqual(api.call_count, 2)
 
+    def herdr_env(self, binding, job_id, attempt):
+        return {
+            "TELEGRAM_CONTROL_DB": str(self.store.path),
+            "TELEGRAM_CONTROL_JOB_ID": str(job_id),
+            "TELEGRAM_CONTROL_JOB_ATTEMPT": str(attempt),
+            "TELEGRAM_CHAT_ID": str(binding.chat_id),
+            "TELEGRAM_CHAT_TYPE": "supergroup",
+            "TELEGRAM_MESSAGE_THREAD_ID": "7",
+            "TELEGRAM_FROM_ID": "12",
+        }
+
+    def test_working_agent_receives_prompt_without_idle_guard(self):
+        binding = self.create_topic()
+        working = handoff.Terminal("t1", "t1:agent-one", self.root, "working")
+        update = {"message": {"message_id": 51, "text": "Also check the logs."}}
+        with patch.dict(os.environ, self.herdr_env(binding, 31, 1)), patch.object(
+            on_message, "send_message"
+        ), patch.object(handoff, "inspect_terminal", return_value=working), patch.object(
+            handoff, "hc"
+        ) as hc, patch("sys.stdin", io.StringIO(json.dumps(update))):
+            self.assertEqual(on_message.main(), 0)
+        hc.assert_called_once()
+        self.assertEqual(hc.call_args.args[:2], ("send", "t1"))
+
+    def test_blocked_agent_retries_quietly_and_delivers_later(self):
+        binding = self.create_topic()
+        blocked = handoff.Terminal("t1", "t1:agent-one", self.root, "blocked")
+        update = {"message": {"message_id": 52, "voice": {"duration": 3}}}
+        notices = []
+        for attempt in (1, 2):
+            with patch.dict(os.environ, self.herdr_env(binding, 32, attempt)), patch.object(
+                on_message, "send_message", side_effect=lambda text, **_: notices.append(text)
+            ), patch.object(
+                on_message, "transcribe_voice_note", return_value="Ship it."
+            ), patch.object(handoff, "inspect_terminal", return_value=blocked), patch.object(
+                handoff, "hc"
+            ) as hc, patch("sys.stdin", io.StringIO(json.dumps(update))):
+                self.assertEqual(on_message.main(), handoff.bridge.HERDR_BUSY_HANDLER_EXIT)
+            hc.assert_not_called()
+        self.assertEqual(len([n for n in notices if "Transcribing" in n]), 1)
+        self.assertEqual(len([n for n in notices if "can't take input" in n]), 1)
+        self.assertFalse(any(n.startswith("❌") for n in notices))
+        # Once the agent is free, the same job delivers instead of being skipped.
+        with patch.dict(os.environ, self.herdr_env(binding, 32, 3)), patch.object(
+            on_message, "send_message"
+        ), patch.object(
+            on_message, "transcribe_voice_note", return_value="Ship it."
+        ), patch.object(handoff, "inspect_terminal", return_value=self.terminal), patch.object(
+            handoff, "hc"
+        ) as hc, patch("sys.stdin", io.StringIO(json.dumps(update))):
+            self.assertEqual(on_message.main(), 0)
+        hc.assert_called_once()
+        self.assertIn("Ship it.", hc.call_args.args[-1])
+
+    def test_core_status_mismatch_releases_turn_for_retry(self):
+        binding = self.create_topic()
+        with patch.object(handoff, "inspect_terminal", return_value=self.terminal), patch.object(
+            handoff, "hc", side_effect=handoff.HerdrBusy("not ready for input")
+        ):
+            with self.assertRaises(handoff.HerdrBusy):
+                handoff.forward_input(self.store, binding, 33, 53, "Hi", voice=False)
+        self.assertIsNone(handoff.read_state(self.store, "herdr-turn:33"))
+
     def test_voice_routes_to_existing_terminal_and_replies_once(self):
         binding = self.create_topic()
         env = {

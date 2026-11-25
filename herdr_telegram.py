@@ -43,6 +43,16 @@ STALE_LINK = "The linked Herdr agent changed or closed. Ask the running agent to
 SESSION_ID = re.compile(r"[0-9a-fA-F-]{36}")
 
 
+# Agents accept typed input mid-turn (Claude Code and Codex queue it), so a
+# working agent can take a Telegram prompt now. Anything else (a permission
+# dialog, an error) must not receive keystrokes; the inbox retries later.
+DELIVERABLE_STATUSES = {"idle", "done", "working"}
+
+
+class HerdrBusy(StoreError):
+    """The agent cannot take input yet; the durable inbox should retry quietly."""
+
+
 @dataclass(frozen=True)
 class Terminal:
     address: str
@@ -72,7 +82,7 @@ def hc(*args: str, timeout: int = 8) -> dict:
         if kind in {"not_found", "finished", "needs_target"}:
             raise StoreError(STALE_LINK)
         if kind in {"blocked", "status_mismatch"}:
-            raise StoreError("Herdr is busy or waiting for input. Check the pane and send your prompt again when it is ready.")
+            raise HerdrBusy("The Herdr agent is not ready for input (waiting in its pane).")
         raise StoreError("Could not confirm the result from Herdr Core.")
     return payload
 
@@ -146,6 +156,41 @@ def provider_session_id(pid: int, app: str, labels: dict) -> str | None:
         if len(ids) == 1:
             return ids.pop()
     return None
+
+
+def current_terminal_address() -> str:
+    """This process's Herdr terminal, even when the agent scrubbed HC_* variables.
+
+    Codex runs tool commands with a filtered environment, so HC_TERMINAL_ID may
+    be absent. Fall back to the live terminal whose root process is one of our
+    ancestors; inspect_terminal still verifies the agent lineage afterwards.
+    """
+    address = os.environ.get("HC_TERMINAL_ID", "")
+    if ADDRESS.fullmatch(address):
+        return address
+    commands = subprocess.check_output(
+        ["/bin/ps", "-axo", "pid=,ppid="], text=True, timeout=5
+    )
+    parent = {}
+    for line in commands.splitlines():
+        fields = line.split()
+        if len(fields) == 2:
+            parent[int(fields[0])] = int(fields[1])
+    ancestors, pid = set(), os.getpid()
+    while pid > 1 and pid not in ancestors:
+        ancestors.add(pid)
+        pid = parent.get(pid, 0)
+    matches = []
+    for row in hc("ls").get("terminals", []):
+        candidate = row.get("address", "")
+        if row.get("state") != "live" or not ADDRESS.fullmatch(candidate):
+            continue
+        detail = hc("get", candidate)
+        if int(detail.get("pid") or 0) in ancestors:
+            matches.append(candidate)
+    if len(matches) != 1:
+        raise StoreError("Run this from an agent in a local Herdr terminal.")
+    return matches[0]
 
 
 def inspect_terminal(address: str, *, from_agent: bool = False) -> Terminal:
@@ -465,8 +510,8 @@ def forward_input(
     ):
         raise StoreError(STALE_LINK)
     terminal = linked_terminal(binding)
-    if terminal.status not in {"idle", "done"}:
-        raise StoreError("The Herdr agent is busy or needs input. Check its pane and send this again when it is ready.")
+    if terminal.status not in DELIVERABLE_STATUSES:
+        raise HerdrBusy(f"The Herdr agent is not ready for input ({terminal.status or 'unknown'}).")
     nonce = secrets.token_hex(16)
     state = {
         "binding_id": binding.binding_id,
@@ -489,20 +534,31 @@ def forward_input(
         "Then give the same reply normally here. Never include the reply command or ticket in your answer. "
         "The reply command is scoped to this particular message."
     )
-    if peer:
-        relay_call(peer["ssh"], {
-            "action": "deliver",
-            "address": address,
-            "target_id": terminal.target_id.split("/", 1)[1],
-            "prompt": prompt,
-        })
-    else:
-        deliver_prompt(terminal, prompt)
+    try:
+        if peer:
+            relay_call(peer["ssh"], {
+                "action": "deliver",
+                "address": address,
+                "target_id": terminal.target_id.split("/", 1)[1],
+                "prompt": prompt,
+            })
+        else:
+            deliver_prompt(terminal, prompt)
+    except HerdrBusy:
+        # Nothing reached the pane, so release the turn for the next attempt.
+        store.connection.execute("DELETE FROM controller_state WHERE key = ?", (key,))
+        raise
+    except StoreError as exc:
+        # The relay flattens errors to text; recognise the peer's busy refusal.
+        if peer and "not ready for input" in str(exc):
+            store.connection.execute("DELETE FROM controller_state WHERE key = ?", (key,))
+            raise HerdrBusy(str(exc)) from None
+        raise
 
 
 def deliver_prompt(terminal: Terminal, prompt: str) -> None:
-    if terminal.status not in {"idle", "done"}:
-        raise StoreError("The Herdr agent is busy or needs input. Wait until it is ready.")
+    if terminal.status not in DELIVERABLE_STATUSES:
+        raise HerdrBusy(f"The Herdr agent is not ready for input ({terminal.status or 'unknown'}).")
     args = ["send"]
     if terminal.status == "idle":
         args += ["--if", "idle"]
@@ -674,7 +730,7 @@ def main() -> int:
         if args.command == "relay":
             print(json.dumps(serve_relay(args.peer)))
             return 0
-        terminal = inspect_terminal(os.environ.get("HC_TERMINAL_ID", ""), from_agent=True)
+        terminal = inspect_terminal(current_terminal_address(), from_agent=True)
         request = {key: value for key, value in vars(args).items() if key != "command"}
         request["action"] = args.command
         if args.command in {"reply", "voice"}:

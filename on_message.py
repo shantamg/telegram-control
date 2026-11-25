@@ -5903,7 +5903,9 @@ def handle_herdr_topic(message: dict) -> bool:
             raise StoreError("Voice message exceeds Telegram's 20 MB bot download limit.")
         if int(voice.get("duration", 0)) > MAX_VOICE_SECONDS:
             raise StoreError("Voice message exceeds the 30-minute limit.")
-        send_message("🎙️ Transcribing your voice note…")
+        first_attempt = int(os.environ.get("TELEGRAM_CONTROL_JOB_ATTEMPT") or 1) <= 1
+        if first_attempt:
+            send_message("🎙️ Transcribing your voice note…")
         text = transcribe_voice_note(voice)
         if not text:
             send_message("I couldn't detect speech in that voice note. Try recording again.")
@@ -5914,9 +5916,18 @@ def handle_herdr_topic(message: dict) -> bool:
             send_message("Send text or a voice note to this Herdr topic.")
             return True
     with DurableStore(database) as store:
-        herdr_telegram.forward_input(
-            store, binding, job_id, int(message["message_id"]), text, voice=is_voice
-        )
+        try:
+            herdr_telegram.forward_input(
+                store, binding, job_id, int(message["message_id"]), text, voice=is_voice
+            )
+        except herdr_telegram.HerdrBusy:
+            # Tell the user once; the durable inbox keeps retrying quietly.
+            if herdr_telegram.reserve_state(store, f"herdr-busy-notice:{job_id}", {"at": time.time()}):
+                send_message(
+                    "⏳ Your Herdr agent can't take input right now (it may be waiting "
+                    "on a prompt in its pane). I'll deliver this as soon as it's ready."
+                )
+            raise
     return True
 
 
@@ -6100,6 +6111,9 @@ def main() -> int:
             return bridge.RETRYABLE_HANDLER_EXIT
         send_message(f"❌ {exc}")
         return 1
+    except herdr_telegram.HerdrBusy as exc:
+        print(f"Herdr agent not ready: {exc}", file=sys.stderr, flush=True)
+        return bridge.HERDR_BUSY_HANDLER_EXIT
     except StoreError as exc:
         print(f"Durable handler error: {exc}", file=sys.stderr, flush=True)
         send_message(f"❌ {exc}")
