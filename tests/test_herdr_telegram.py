@@ -147,3 +147,46 @@ class HerdrTelegramTests(unittest.TestCase):
         }):
             self.assertTrue(on_message.handle_herdr_topic({"text": "Late message"}))
         self.assertIsNone(self.store.resolve_forum_subject(binding.chat_id, 7))
+
+    def test_herdr_teardown_preview_does_not_delete(self):
+        binding = self.create_topic()
+        preview = handoff.preview_topic_teardown(self.store, self.terminal)
+        self.assertEqual(preview["topic"], binding.display_name)
+        self.assertEqual(preview["confirmation_id"], binding.binding_id)
+        self.assertEqual(self.store.resolve_surface_binding_by_id(binding.binding_id), binding)
+        self.assertIsNone(self.store.outbox_operation_state(f"herdr-topic:{binding.binding_id}:delete"))
+
+    def test_herdr_teardown_confirmation_requires_the_same_agent(self):
+        binding = self.create_topic()
+        other = handoff.Terminal("t1", "t1:different-agent", self.root, "idle")
+        with self.assertRaisesRegex(StoreError, "different or inactive"):
+            handoff.confirm_topic_teardown(self.store, other, binding.binding_id)
+        self.assertEqual(self.store.resolve_surface_binding_by_id(binding.binding_id), binding)
+
+    def test_repeated_herdr_confirmation_cannot_delete_a_new_topic(self):
+        binding = self.create_topic()
+        self.assertEqual(
+            handoff.confirm_topic_teardown(self.store, self.terminal, binding.binding_id),
+            "queued",
+        )
+        newer = self.store.ensure_surface_binding(
+            binding.chat_id, "task", "New handoff", "herdr", self.terminal.target_id, 8
+        )
+        self.assertEqual(
+            handoff.confirm_topic_teardown(self.store, self.terminal, binding.binding_id),
+            "queued",
+        )
+        self.assertEqual(self.store.resolve_surface_binding_by_id(newer.binding_id), newer)
+        deletions = self.store.connection.execute(
+            "SELECT count(*) FROM outbox_messages WHERE method = 'deleteForumTopic'"
+        ).fetchone()[0]
+        self.assertEqual(deletions, 1)
+        intro = self.store.claim_outbox("sender")
+        self.store.complete_outbox(intro.message_id, "sender", {})
+        deletion = self.store.claim_outbox("sender")
+        self.assertEqual(deletion.method, "deleteForumTopic")
+        self.store.complete_outbox(deletion.message_id, "sender", {})
+        self.assertEqual(
+            handoff.confirm_topic_teardown(self.store, self.terminal, binding.binding_id),
+            "sent",
+        )

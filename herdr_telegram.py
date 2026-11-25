@@ -253,22 +253,29 @@ def write_state(store: DurableStore, key: str, value: dict) -> None:
     )
 
 
+def find_linked_topic(store: DurableStore, terminal: Terminal) -> SurfaceBinding | None:
+    rows = store.connection.execute(
+        """
+        SELECT binding_id FROM surface_bindings
+        WHERE target_type = ? AND target_id = ? AND state = 'active'
+        LIMIT 2
+        """,
+        (TARGET_TYPE, terminal.target_id),
+    ).fetchall()
+    if len(rows) > 1:
+        raise StoreError("More than one Telegram topic is linked to this Herdr agent.")
+    return store.resolve_surface_binding_by_id(rows[0]["binding_id"]) if rows else None
+
+
 def link_topic(
     store: DurableStore, terminal: Terminal, title: str, group: str | None
 ) -> SurfaceBinding:
     name = " ".join(title.split())
     if not name or len(name) > 128:
         raise StoreError("Choose a Telegram topic name of 1 to 128 characters.")
-    for row in store.connection.execute(
-        """
-        SELECT chat_id, message_thread_id FROM surface_bindings
-        WHERE target_type = ? AND target_id = ? AND state = 'active'
-        """,
-        (TARGET_TYPE, terminal.target_id),
-    ):
-        binding = store.resolve_surface_binding(row["chat_id"], row["message_thread_id"])
-        if binding is not None:
-            return binding
+    existing = find_linked_topic(store, terminal)
+    if existing is not None:
+        return existing
 
     key = f"herdr-topic:{terminal.target_id}"
     state = read_state(store, key)
@@ -340,9 +347,9 @@ def tear_down_topic(store: DurableStore, binding: SurfaceBinding) -> None:
         updated = store.connection.execute(
             """
             UPDATE surface_bindings SET state = 'revoked', updated_at = ?
-            WHERE binding_id = ? AND target_type = ? AND state = 'active'
+            WHERE binding_id = ? AND target_type = ? AND target_id = ? AND state = 'active'
             """,
-            (time.time(), binding.binding_id, TARGET_TYPE),
+            (time.time(), binding.binding_id, TARGET_TYPE, binding.target_id),
         )
         if updated.rowcount:
             store.enqueue_api_call(
@@ -354,6 +361,44 @@ def tear_down_topic(store: DurableStore, binding: SurfaceBinding) -> None:
     except BaseException:
         store.connection.rollback()
         raise
+
+
+def preview_topic_teardown(store: DurableStore, terminal: Terminal) -> dict:
+    binding = find_linked_topic(store, terminal)
+    if binding is None:
+        raise StoreError("This Herdr agent has no active Telegram topic.")
+    return {
+        "topic": binding.display_name,
+        "url": detached_worker.telegram_topic_url(binding),
+        "confirmation_id": binding.binding_id,
+    }
+
+
+def confirm_topic_teardown(store: DurableStore, terminal: Terminal, binding_id: int) -> str:
+    binding = store.resolve_surface_binding_by_id(binding_id)
+    operation = f"herdr-topic:{binding_id}:delete"
+    if binding is None:
+        # A repeated confirmation can check the same operation after revocation.
+        previous = store.connection.execute(
+            """
+            SELECT 1 FROM surface_bindings
+            WHERE binding_id = ? AND target_type = ? AND target_id = ? AND state = 'revoked'
+            """,
+            (binding_id, TARGET_TYPE, terminal.target_id),
+        ).fetchone()
+        state = store.outbox_operation_state(operation) if previous is not None else None
+        if state is not None:
+            return state
+    if (
+        binding is None or binding.target_type != TARGET_TYPE
+        or binding.target_id != terminal.target_id
+    ):
+        raise StoreError("That confirmation is for a different or inactive topic.")
+    tear_down_topic(store, binding)
+    state = store.outbox_operation_state(operation)
+    if state is None:
+        raise StoreError("The Telegram topic changed before deletion was queued.")
+    return state
 
 
 def forward_input(
@@ -470,6 +515,8 @@ def main() -> int:
     link.add_argument("--group")
     reply = commands.add_parser("reply", help="Post the response for one linked Telegram turn.")
     reply.add_argument("ticket")
+    teardown = commands.add_parser("teardown", help="Preview or confirm removal of this agent's linked Telegram topic.")
+    teardown.add_argument("--confirm", type=int, metavar="CONFIRMATION_ID")
     args = parser.parse_args()
     try:
         terminal = inspect_terminal(os.environ.get("HC_TERMINAL_ID", ""), from_agent=True)
@@ -477,6 +524,17 @@ def main() -> int:
             if args.command == "link":
                 binding = link_topic(store, terminal, args.name, args.group)
                 print(json.dumps({"topic": binding.display_name, "url": detached_worker.telegram_topic_url(binding)}))
+            elif args.command == "teardown":
+                if args.confirm is None:
+                    print(json.dumps(preview_topic_teardown(store, terminal)))
+                else:
+                    state = confirm_topic_teardown(store, terminal, args.confirm)
+                    # Give the existing outbox a moment to acknowledge the deletion.
+                    deadline = time.monotonic() + 8
+                    while state in {"queued", "leased"} and time.monotonic() < deadline:
+                        time.sleep(0.25)
+                        state = store.outbox_operation_state(f"herdr-topic:{args.confirm}:delete")
+                    print(json.dumps({"deletion": state}))
             else:
                 answer = sys.stdin.read(40_001).strip()
                 if not answer or len(answer) > 40_000:

@@ -2323,6 +2323,13 @@ creation whose outcome is unknown is held for inspection rather than
 retried. Confirming /teardown revokes the route and queues deletion of the
 Telegram topic.
 
+From Herdr, the same skill can preview and confirm deletion in the current
+conversation. The preview returns only the linked topic and its confirmation ID.
+The confirmation checks the calling agent again, pins the chosen binding, and
+uses the same durable deletion operation as /teardown. Repeating a confirmation
+checks the existing operation. Focused tests covered preview without deletion,
+confirmation against a different agent, and repeated confirmation.
+
 The tests covered topic creation and reuse, replay of an inbox job, reply
 routing and deduplication, replacement of the running agent, and teardown.
 An isolated Herdr Core run verified Handy transcription of a sample
