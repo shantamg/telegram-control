@@ -1955,7 +1955,8 @@ def voice_configuration_picker(
     current = store.voice_configuration()
     current_voice, current_rate = voice_settings.describe(current)
     voice_actions = []
-    for index, option in enumerate(voice_settings.VOICE_OPTIONS):
+    voices = voice_settings.VOICE_OPTIONS[:1] if helper_paths.IS_LINUX else voice_settings.VOICE_OPTIONS
+    for index, option in enumerate(voices):
         configuration = voice_settings.VoiceConfiguration(
             voice_name=option.name,
             rate=current.rate,
@@ -5248,6 +5249,22 @@ def convert_to_wav(source: Path, destination: Path) -> None:
 
 
 def transcribe_wav(wav_path: Path) -> str:
+    if helper_paths.IS_LINUX:
+        speech_dir = helper_paths.SPEECH_RUNTIME_DIR
+        result = subprocess.run(
+            [
+                str(speech_dir / "venv/bin/python"),
+                str(Path(__file__).with_name("linux_transcribe.py")),
+                str(speech_dir),
+                str(wav_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=TRANSCRIPTION_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0:
+            raise bridge.BridgeError("Server-side Parakeet transcription failed.")
+        return result.stdout.strip()
     if not HANDY_BINARY.is_file():
         raise bridge.BridgeError(f"Handy transcription helper is missing: {HANDY_BINARY}")
     result = subprocess.run(
@@ -5886,7 +5903,7 @@ def handle_herdr_topic(message: dict) -> bool:
             raise StoreError("Voice message exceeds Telegram's 20 MB bot download limit.")
         if int(voice.get("duration", 0)) > MAX_VOICE_SECONDS:
             raise StoreError("Voice message exceeds the 30-minute limit.")
-        send_message("🎙️ Transcribing on the Mac…")
+        send_message("🎙️ Transcribing your voice note…")
         text = transcribe_voice_note(voice)
         if not text:
             send_message("I couldn't detect speech in that voice note. Try recording again.")

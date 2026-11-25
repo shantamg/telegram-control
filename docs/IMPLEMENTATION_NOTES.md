@@ -2335,3 +2335,13 @@ routing and deduplication, replacement of the running agent, and teardown.
 An isolated Herdr Core run verified Handy transcription of a sample
 recording, real terminal delivery, a reply from a simulated agent process,
 and generation of playable OGG audio. Telegram API calls were mocked.
+
+## Linux Herdr handoff
+
+The Linux receiver uses a private token file, the existing durable supervisor
+under a systemd user unit, sherpa-onnx Parakeet V3 for voice input, and Piper with
+FFmpeg for voice output. One receiver can relay via restricted SSH commands to
+another Herdr host. Peer-qualified terminal identities pin the remote Core,
+terminal and agent just as local identities do. A linked Herdr agent can queue
+an explicit voice note from the terminal, independently of Telegram-originated
+voice turns. See the Linux Herdr setup guide for service and relay configuration.

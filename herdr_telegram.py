@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Link a Telegram Control topic to a live, local Herdr agent."""
+"""Link a Telegram Control topic to a live Herdr agent."""
 
 from __future__ import annotations
 
@@ -25,6 +25,9 @@ from durable_store import DurableStore, StoreError, SurfaceBinding
 
 
 TARGET_TYPE = "herdr"
+RELAY_CONFIG = helper_paths.CONFIG_DIR / "herdr-relay.json"
+SSH_ALIAS = re.compile(r"[a-z][a-z0-9-]{0,60}")
+VOICE_KEY = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 SCRIPT = Path(__file__).resolve()
 HC = helper_paths.resolve_binary(
     "herdr_core_binary",
@@ -129,7 +132,7 @@ def provider_session_id(pid: int, app: str, labels: dict) -> str | None:
     if provider == "codex":
         try:
             result = subprocess.run(
-                ["/usr/sbin/lsof", "-a", "-p", str(pid), "-Fn"],
+                ["lsof", "-a", "-p", str(pid), "-Fn"],
                 capture_output=True, text=True, timeout=4,
             )
         except (OSError, subprocess.SubprocessError):
@@ -174,9 +177,49 @@ def inspect_terminal(address: str, *, from_agent: bool = False) -> Terminal:
     return Terminal(address, f"{address}:{digest}", Path(cwd), status["state"])
 
 
+def relay_configuration() -> dict:
+    try:
+        return json.loads(RELAY_CONFIG.read_text())
+    except FileNotFoundError:
+        return {}
+
+
+def relay_call(alias: str, request: dict, timeout: int = 120) -> dict:
+    if not SSH_ALIAS.fullmatch(alias):
+        raise StoreError("Invalid Herdr relay SSH alias.")
+    result = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", alias, "telegram-control"],
+        input=json.dumps(request),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError:
+        raise StoreError("The Herdr relay did not respond.") from None
+    if not isinstance(payload, dict):
+        raise StoreError("The Herdr relay returned an invalid response.")
+    if result.returncode != 0:
+        raise StoreError(payload.get("error", "The Herdr relay failed."))
+    return payload
+
+
+def peer_terminal(machine: str, address: str) -> Terminal:
+    peers = relay_configuration().get("peers", {})
+    if machine not in peers:
+        raise StoreError(STALE_LINK)
+    row = relay_call(peers[machine]["ssh"], {"action": "inspect", "address": address}, timeout=20)
+    if row["address"] != address or not row["target_id"].startswith(f"{address}:"):
+        raise StoreError(STALE_LINK)
+    return Terminal(f"{machine}/{address}", f"{machine}/{row['target_id']}", Path(row["cwd"]), row["status"])
+
+
 def linked_terminal(binding: SurfaceBinding) -> Terminal:
     try:
-        terminal = inspect_terminal(binding.target_id.split(":", 1)[0])
+        address = binding.target_id.split(":", 1)[0]
+        machine, separator, remote_address = address.partition("/")
+        terminal = peer_terminal(machine, remote_address) if separator else inspect_terminal(address)
     except (OSError, subprocess.SubprocessError):
         raise StoreError(STALE_LINK) from None
     if terminal.target_id != binding.target_id:
@@ -431,7 +474,10 @@ def forward_input(
     }
     if not reserve_state(store, key, state):
         return
-    command = shlex.join(["/usr/bin/python3", str(SCRIPT), "reply", f"{job_id}:{nonce}"])
+    machine, separator, address = terminal.address.partition("/")
+    peer = relay_configuration()["peers"][machine] if separator else None
+    script = peer["script"] if peer else str(SCRIPT)
+    command = shlex.join(["/usr/bin/python3", script, "reply", f"{job_id}:{nonce}"])
     prompt = (
         f"{text}\n\n[Telegram Control handoff]\n"
         "The user sent this from the Telegram topic linked to your Herdr session. "
@@ -440,6 +486,20 @@ def forward_input(
         "Then give the same reply normally here. Never include the reply command or ticket in your answer. "
         "The reply command is scoped to this particular message."
     )
+    if peer:
+        relay_call(peer["ssh"], {
+            "action": "deliver",
+            "address": address,
+            "target_id": terminal.target_id.split("/", 1)[1],
+            "prompt": prompt,
+        })
+    else:
+        deliver_prompt(terminal, prompt)
+
+
+def deliver_prompt(terminal: Terminal, prompt: str) -> None:
+    if terminal.status not in {"idle", "done"}:
+        raise StoreError("The Herdr agent is busy or needs input. Wait until it is ready.")
     args = ["send"]
     if terminal.status == "idle":
         args += ["--if", "idle"]
@@ -507,6 +567,91 @@ def queue_reply(store: DurableStore, ticket: str, text: str, terminal: Terminal)
         raise
 
 
+def queue_voice(store: DurableStore, terminal: Terminal, key: str, text: str) -> str:
+    if not VOICE_KEY.fullmatch(key):
+        raise StoreError("Use a lowercase voice key of up to 64 letters, digits or hyphens.")
+    if not text or len(text) > voice_responses.MAX_SPEECH_CHARACTERS:
+        raise StoreError("Pass 1 to 3,500 characters of voice text on stdin.")
+    binding = find_linked_topic(store, terminal)
+    if binding is None or store.resolve_forum_workspace(binding.chat_id) is None:
+        raise StoreError("Link this Herdr agent to a Telegram topic first.")
+    operation = f"herdr-voice:{binding.binding_id}:{key}"
+    state = store.outbox_operation_state(operation)
+    if state is not None:
+        return state
+    config = store.voice_configuration()
+    audio_key = hashlib.sha256(operation.encode()).hexdigest()[:32]
+    voice_path = voice_responses.synthesize_voice(
+        text,
+        audio_key,
+        protected_paths=store.pending_voice_file_paths(),
+        voice_name=config.voice_name,
+        rate=config.rate,
+    )
+    with store.connection:
+        if store.resolve_surface_binding_by_id(binding.binding_id) != binding:
+            raise StoreError(STALE_LINK)
+        store.enqueue_api_call(operation, "sendVoice", {
+            "chat_id": binding.chat_id,
+            "message_thread_id": binding.message_thread_id,
+            "__voice_file_path": str(voice_path),
+        })
+    return store.outbox_operation_state(operation) or "queued"
+
+
+def handle_action(store: DurableStore, terminal: Terminal, request: dict) -> dict:
+    action = request["action"]
+    if action == "link":
+        binding = link_topic(store, terminal, request["name"], request.get("group"))
+        return {"topic": binding.display_name, "url": detached_worker.telegram_topic_url(binding)}
+    if action == "reply":
+        answer = request["text"]
+        if not answer or len(answer) > 40_000:
+            raise StoreError("Pass 1 to 40,000 characters of reply text on stdin.")
+        queue_reply(store, request["ticket"], answer, terminal)
+        return {"reply": "queued"}
+    if action == "voice":
+        return {"voice": queue_voice(store, terminal, request["key"], request["text"])}
+    if action != "teardown":
+        raise StoreError("Unsupported Herdr action.")
+    confirmation = request.get("confirm")
+    if confirmation is None:
+        return preview_topic_teardown(store, terminal)
+    state = confirm_topic_teardown(store, terminal, confirmation)
+    deadline = time.monotonic() + 8
+    while state in {"queued", "leased"} and time.monotonic() < deadline:
+        time.sleep(0.25)
+        state = store.outbox_operation_state(f"herdr-topic:{confirmation}:delete")
+    return {"deletion": state}
+
+
+def serve_relay(peer: str | None) -> dict:
+    if os.environ.get("SSH_ORIGINAL_COMMAND") != "telegram-control":
+        raise StoreError("The Herdr relay requires its dedicated SSH command.")
+    request = json.loads(sys.stdin.read(150_000))
+    action, address = request["action"], request["address"]
+    if peer is None:
+        terminal = inspect_terminal(address)
+        if action == "inspect":
+            return {
+                "address": terminal.address,
+                "target_id": terminal.target_id,
+                "cwd": str(terminal.cwd),
+                "status": terminal.status,
+            }
+        if action != "deliver" or terminal.target_id != request.get("target_id"):
+            raise StoreError(STALE_LINK)
+        deliver_prompt(terminal, request["prompt"])
+        return {"delivery": "sent"}
+    terminal = peer_terminal(peer, address)
+    if terminal.target_id != f"{peer}/{request['target_id']}":
+        raise StoreError(STALE_LINK)
+    if action == "link" and not request.get("group"):
+        request["group"] = relay_configuration()["peers"][peer].get("group")
+    with DurableStore(bridge.CONFIG_DIR / "controller.sqlite3") as store:
+        return handle_action(store, terminal, request)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -515,35 +660,36 @@ def main() -> int:
     link.add_argument("--group")
     reply = commands.add_parser("reply", help="Post the response for one linked Telegram turn.")
     reply.add_argument("ticket")
+    voice = commands.add_parser("voice", help="Send a voice note to this Herdr agent's linked topic.")
+    voice.add_argument("--key", required=True)
     teardown = commands.add_parser("teardown", help="Preview or confirm removal of this agent's linked Telegram topic.")
     teardown.add_argument("--confirm", type=int, metavar="CONFIRMATION_ID")
+    relay = commands.add_parser("relay", help="Process a request via a dedicated SSH relay key.")
+    relay.add_argument("--peer")
     args = parser.parse_args()
     try:
+        if args.command == "relay":
+            print(json.dumps(serve_relay(args.peer)))
+            return 0
         terminal = inspect_terminal(os.environ.get("HC_TERMINAL_ID", ""), from_agent=True)
-        with DurableStore(bridge.CONFIG_DIR / "controller.sqlite3") as store:
-            if args.command == "link":
-                binding = link_topic(store, terminal, args.name, args.group)
-                print(json.dumps({"topic": binding.display_name, "url": detached_worker.telegram_topic_url(binding)}))
-            elif args.command == "teardown":
-                if args.confirm is None:
-                    print(json.dumps(preview_topic_teardown(store, terminal)))
-                else:
-                    state = confirm_topic_teardown(store, terminal, args.confirm)
-                    # Give the existing outbox a moment to acknowledge the deletion.
-                    deadline = time.monotonic() + 8
-                    while state in {"queued", "leased"} and time.monotonic() < deadline:
-                        time.sleep(0.25)
-                        state = store.outbox_operation_state(f"herdr-topic:{args.confirm}:delete")
-                    print(json.dumps({"deletion": state}))
-            else:
-                answer = sys.stdin.read(40_001).strip()
-                if not answer or len(answer) > 40_000:
-                    raise StoreError("Pass 1 to 40,000 characters of reply text on stdin.")
-                queue_reply(store, args.ticket, answer, terminal)
-                print("Telegram reply queued.")
+        request = {key: value for key, value in vars(args).items() if key != "command"}
+        request["action"] = args.command
+        if args.command in {"reply", "voice"}:
+            request["text"] = sys.stdin.read(40_001).strip()
+        hub = relay_configuration().get("hub")
+        if hub:
+            request.update(address=terminal.address, target_id=terminal.target_id)
+            result = relay_call(hub, request, timeout=220)
+        else:
+            with DurableStore(bridge.CONFIG_DIR / "controller.sqlite3") as store:
+                result = handle_action(store, terminal, request)
+        print(json.dumps(result))
         return 0
-    except (OSError, KeyError, ValueError, subprocess.SubprocessError, StoreError, bridge.BridgeError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+    except (OSError, KeyError, ValueError, subprocess.SubprocessError, StoreError, bridge.BridgeError, voice_responses.VoiceResponseError) as exc:
+        if args.command == "relay":
+            print(json.dumps({"error": str(exc)}))
+        else:
+            print(f"Error: {exc}", file=sys.stderr)
         return 1
 
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Control
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.local/share/telegram-control/app
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStartPre=/usr/bin/test -s %h/.config/telegram-bridge/config.json
+ExecStartPre=/usr/bin/test -s %h/.config/telegram-bridge/bot-token
+ExecStart=/usr/bin/python3 %h/.local/share/telegram-control/app/telegram_control.py run --agent-workers 1
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

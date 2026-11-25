@@ -2219,7 +2219,7 @@ def run_command(args: argparse.Namespace) -> None:
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop_on_sigterm)
-    removed_reload_jobs = cleanup_reload_jobs()
+    removed_reload_jobs = [] if helper_paths.IS_LINUX else cleanup_reload_jobs()
     if removed_reload_jobs:
         log_event(
             "stale_reload_jobs_removed",

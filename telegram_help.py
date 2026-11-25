@@ -153,7 +153,7 @@ In a managed conversational topic, send a Telegram photo or any document normall
 
 Send a Telegram voice note there normally; it is transcribed locally and routed like text. If Telegram briefly fails to provide the audio file, Control retries behind the same transcribing receipt and shows an error only after every durable attempt fails. Report-only worker topics do not accept messages or commands.
 
-Use /voice to choose the global macOS voice and speaking speed used by Listen buttons, agent voice updates, and detached worker voice reports. Selecting an option only stages it. Preview generates a real sample voice note; Confirm applies it, and Back returns to the choices without changing anything.
+Use /voice to choose the available voice and speaking speed used by Listen buttons, agent voice updates, and detached worker voice reports. Selecting an option only stages it. Preview generates a real sample voice note; Confirm applies it, and Back returns to the choices without changing anything.
 
 Reply to an exact agent-routed message to continue that agent. A Control-routed reply continues the optional conversational Control agent only when it is enabled. During an active turn, a reply to its progress card can steer the work, and its Stop button interrupts the provider. Stop remains valid while the turn is active. If an owning worker exits, Control terminates that attempt’s provider process, restarts only the failed worker, and immediately retries or completes a queued Stop without disturbing other topics. Agents can also send requested voice or text progress updates through scoped Telegram skills.""",
     ),
@@ -196,7 +196,7 @@ By default, each new topic in a bound group starts immediately with the group’
 
 An active topic agent can create another regular conversational topic in the same group and queue a self-contained first prompt there. Ask it to create a topic by name and describe the separate task; the new independent session begins immediately and is conversational, unlike a detached worker's report-only topic.
 
-To continue a running Herdr conversation here, ask the agent in Herdr to “Continue this in Telegram,” then open the link it returns. Send text or a voice note. The Mac transcribes the whole recording and a voice turn receives a playable reply. Use /status to see the linked terminal. To delete the topic, ask the agent in Herdr to “Remove this Telegram topic” or use /teardown here. Both ask for confirmation and leave the Herdr agent running.
+To continue a running Herdr conversation here, ask the agent in Herdr to “Continue this in Telegram,” then open the link it returns. Send text or a voice note. The Telegram Control server transcribes the whole recording and a voice turn receives a playable reply. You can also ask from Herdr for a voice note in its linked topic. Use /status to see the linked terminal. To delete the topic, ask the agent in Herdr to “Remove this Telegram topic” or use /teardown here. Both ask for confirmation and leave the Herdr agent running.
 
 The central conversational Control agent is optional and disabled by default. Direct mode does not need it: work happens in group topics, and a Claude-only installation does not need Codex.
 

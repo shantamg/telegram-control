@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import helper_paths
+
 
 @dataclass(frozen=True)
 class VoiceOption:
@@ -31,7 +33,9 @@ class VoiceConfiguration:
 SYSTEM_VOICE_NAME = "system"
 
 VOICE_OPTIONS = (
-    VoiceOption(SYSTEM_VOICE_NAME, "💻 Mac default", "This Mac's system voice"),
+    VoiceOption(SYSTEM_VOICE_NAME, "Server voice", "Local Piper voice")
+    if helper_paths.IS_LINUX
+    else VoiceOption(SYSTEM_VOICE_NAME, "💻 Mac default", "This Mac's system voice"),
     VoiceOption("Samantha", "🇺🇸 Samantha", "American English · female"),
     VoiceOption("Reed (English (US))", "🇺🇸 Reed", "American English · male"),
     VoiceOption("Daniel", "🇬🇧 Daniel", "British English · male"),

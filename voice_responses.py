@@ -14,13 +14,7 @@ import helper_paths
 import voice_settings
 
 
-SPEECH_DIR = (
-    Path.home()
-    / "Library"
-    / "Application Support"
-    / "telegram-bridge"
-    / "speech-outbox"
-)
+SPEECH_DIR = helper_paths.CONFIG_DIR / "speech-outbox"
 SAY_BINARY = helper_paths.resolve_binary(
     "say_binary",
     Path("/usr/bin/say"),
@@ -131,7 +125,9 @@ def synthesize_voice(
     except ValueError as exc:
         raise VoiceResponseError(str(exc)) from None
     cleanup_stale_files(protected_paths=protected_paths)
-    if not SAY_BINARY.is_file() or not os.access(SAY_BINARY, os.X_OK):
+    piper = helper_paths.SPEECH_RUNTIME_DIR / "venv/bin/piper" if helper_paths.IS_LINUX else None
+    synthesizer = piper or SAY_BINARY
+    if not synthesizer.is_file() or not os.access(synthesizer, os.X_OK):
         raise VoiceResponseError("The speech synthesizer is unavailable.")
     if not FFMPEG_BINARY.is_file() or not os.access(FFMPEG_BINARY, os.X_OK):
         raise VoiceResponseError("The audio encoder is unavailable.")
@@ -145,7 +141,8 @@ def synthesize_voice(
         final_path.unlink(missing_ok=True)
     nonce = secrets.token_hex(6)
     text_path = SPEECH_DIR / f".{key}-{nonce}.txt"
-    media_path = SPEECH_DIR / f".{key}-{nonce}.aiff"
+    media_format = "wav" if piper else "aiff"
+    media_path = SPEECH_DIR / f".{key}-{nonce}.{media_format}"
     encoded_path = SPEECH_DIR / f".{key}-{nonce}.ogg"
     try:
         text_path.write_text(speech_text(value), encoding="utf-8")
@@ -155,8 +152,20 @@ def synthesize_voice(
             if configuration.voice_name == voice_settings.SYSTEM_VOICE_NAME
             else ["-v", configuration.voice_name]
         )
-        say = subprocess.run(
-            [
+        if piper:
+            speech_command = [
+                str(piper),
+                "-m",
+                str(helper_paths.SPEECH_RUNTIME_DIR / "voice.onnx"),
+                "--input-file",
+                str(text_path),
+                "--length-scale",
+                str(185 / int(configuration.rate)),
+                "-f",
+                str(media_path),
+            ]
+        else:
+            speech_command = [
                 str(SAY_BINARY),
                 *voice_arguments,
                 "-r",
@@ -165,7 +174,9 @@ def synthesize_voice(
                 str(text_path),
                 "-o",
                 str(media_path),
-            ],
+            ]
+        synthesis = subprocess.run(
+            speech_command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -173,7 +184,7 @@ def synthesize_voice(
             timeout=SYNTHESIS_TIMEOUT_SECONDS,
             check=False,
         )
-        if say.returncode != 0 or not media_path.is_file():
+        if synthesis.returncode != 0 or not media_path.is_file():
             raise VoiceResponseError("Speech synthesis failed.")
         media_path.chmod(0o600)
         ffmpeg = subprocess.run(

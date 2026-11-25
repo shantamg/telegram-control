@@ -109,6 +109,36 @@ class HerdrTelegramTests(unittest.TestCase):
             self.assertEqual(params["message_thread_id"], 7)
             self.assertEqual(params["reply_parameters"]["message_id"], 41)
 
+    def test_remote_prompt_uses_peer_script_and_terminal_identity(self):
+        remote = handoff.Terminal("peer/t1", "peer/t1:agent-one", self.root, "idle")
+        binding = self.store.ensure_surface_binding(
+            -10012345, "task", "Remote", "herdr", remote.target_id, 8
+        )
+        relay_config = {"peers": {"peer": {"ssh": "peer-alias", "script": "/srv/peer/herdr_telegram.py"}}}
+        with patch.object(handoff, "linked_terminal", return_value=remote), patch.object(
+            handoff, "relay_configuration", return_value=relay_config
+        ), patch.object(handoff, "relay_call") as relay:
+            handoff.forward_input(self.store, binding, 42, 17, "Check this.", voice=True)
+
+        alias, request = relay.call_args.args
+        self.assertEqual(alias, "peer-alias")
+        self.assertEqual(request["target_id"], "t1:agent-one")
+        self.assertIn("/srv/peer/herdr_telegram.py reply 42:", request["prompt"])
+        self.assertIn("Check this.", request["prompt"])
+
+    def test_explicit_herdr_voice_uses_the_linked_topic_once(self):
+        binding = self.create_topic()
+        with patch.object(
+            handoff.voice_responses, "synthesize_voice", return_value=self.root / "speech.ogg"
+        ) as speech:
+            self.assertEqual(handoff.queue_voice(self.store, self.terminal, "voice-test", "Hello"), "queued")
+            self.assertEqual(handoff.queue_voice(self.store, self.terminal, "voice-test", "Hello"), "queued")
+        speech.assert_called_once()
+        voice = self.store.connection.execute(
+            "SELECT params_json FROM outbox_messages WHERE method = 'sendVoice'"
+        ).fetchone()
+        self.assertEqual(json.loads(voice["params_json"])["message_thread_id"], binding.message_thread_id)
+
     def test_changed_terminal_never_receives_a_prompt(self):
         binding = self.create_topic()
         replacement = handoff.Terminal("t1", "t1:agent-two", self.root, "idle")

@@ -20,9 +20,8 @@ create a topic and start talking. An older conversational Control layer remains
 available as an opt-in feature for people who want natural-language workspace
 discovery and delegation.
 
-> **Current support:** a single, local Mac. Linux servers, hosted deployment,
-> containers, and multi-host operation are future work, not supported setup
-> paths.
+The guided installer is for a local Mac. For a server-hosted
+Herdr handoff, see [Linux Herdr setup](docs/getting-started/linux-herdr.md).
 
 ## What you need
 
