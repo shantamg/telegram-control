@@ -44,6 +44,8 @@ DEFAULT_HANDLER_PATH = SCRIPT_PATH.with_name("on_message.py")
 # managed/worker topics require manage_topics.
 GROUP_ADMIN_RIGHTS = ("change_info", "delete_messages", "manage_topics")
 RETRYABLE_HANDLER_EXIT = 75
+# A linked Herdr agent cannot take input yet. Retried patiently and quietly.
+HERDR_BUSY_HANDLER_EXIT = 76
 
 
 class BridgeError(RuntimeError):
@@ -52,6 +54,10 @@ class BridgeError(RuntimeError):
 
 class RetryableHandlerError(BridgeError):
     """A handler failure that the durable inbox should retry silently."""
+
+
+class HerdrBusyHandlerError(BridgeError):
+    """The linked Herdr agent is not ready; wait for it instead of failing."""
 
 
 _RETRYABLE_TELEGRAM_ERRORS = (
@@ -877,6 +883,8 @@ def process_update(
         env=environment,
     )
     if result.returncode != 0:
+        if result.returncode == HERDR_BUSY_HANDLER_EXIT:
+            raise HerdrBusyHandlerError("The linked Herdr agent is not ready yet.")
         if result.returncode == RETRYABLE_HANDLER_EXIT:
             raise RetryableHandlerError(
                 "Handler reported a retryable Telegram transport failure."

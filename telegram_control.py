@@ -243,6 +243,27 @@ def process_inbox_job(
             update_id=job.update_id,
             attempts=job.attempts,
         )
+    except bridge.HerdrBusyHandlerError as exc:
+        # Roughly two hours of patient retries every 5-15 seconds.
+        state = store.fail_job(
+            job.job_id,
+            worker_id,
+            str(exc),
+            max_attempts=600,
+            base_delay=5.0,
+            max_delay=15.0,
+            terminal_failure_text=control_message(
+                "❌ Your Herdr agent stayed unavailable for about two hours, "
+                "so this message was not delivered. Check its pane and send it again."
+            ),
+        )
+        log_event(
+            "inbox_herdr_busy",
+            job_id=job.job_id,
+            update_id=job.update_id,
+            attempts=job.attempts,
+            state=state,
+        )
     except bridge.RetryableHandlerError as exc:
         state = store.fail_job(
             job.job_id,
