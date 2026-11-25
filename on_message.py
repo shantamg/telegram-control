@@ -19,6 +19,7 @@ import codex_sessions
 import detached_worker
 import discovery
 import helper_paths
+import herdr_telegram
 import local_actions
 import provider_adapters
 import provider_defaults
@@ -2149,6 +2150,22 @@ def handle_callback(update: dict, callback_query: dict) -> None:
                     "text": exc.user_message,
                     "show_alert": exc.code in {"unauthorized", "invalid"},
                 },
+                "callback-answer",
+            )
+        return
+
+    if action.action_type == "herdr_topic_teardown":
+        with DurableStore(Path(database_path)) as store:
+            binding = store.resolve_surface_binding(chat_id, thread_id)
+            if (
+                binding is not None
+                and binding.binding_id == action.payload["binding_id"]
+                and binding.target_type == herdr_telegram.TARGET_TYPE
+            ):
+                herdr_telegram.tear_down_topic(store, binding)
+        if callback_query_id:
+            deliver_api_call(
+                "answerCallbackQuery", {"callback_query_id": callback_query_id},
                 "callback-answer",
             )
         return
@@ -5812,6 +5829,80 @@ def send_direct_mode_home() -> None:
     )
 
 
+def handle_herdr_topic(message: dict) -> bool:
+    """Handle a linked topic before normal topic provisioning or agent routing."""
+    database = Path(os.environ["TELEGRAM_CONTROL_DB"])
+    chat_id, thread_id = surface_coordinates()
+    with DurableStore(database) as store:
+        binding = store.resolve_surface_binding(chat_id, thread_id)
+        if binding is None and store.connection.execute(
+            """
+            SELECT 1 FROM surface_bindings
+            WHERE chat_id = ? AND message_thread_id = ? AND target_type = ?
+            """,
+            (chat_id, thread_id, herdr_telegram.TARGET_TYPE),
+        ).fetchone() is not None:
+            # The route is retired. The outbox may still be deleting the topic.
+            return True
+    if binding is None or binding.target_type != herdr_telegram.TARGET_TYPE:
+        return False
+    if "forum_topic_created" in message:
+        return True
+    command = addressed_command(str(message.get("text", ""))).lower()
+    if command in {"/help", "/voice", "/projects", "/removegroup"}:
+        return False
+    if not forum_is_authorized_or_prompt():
+        return True
+    job_id = int(os.environ["TELEGRAM_CONTROL_JOB_ID"])
+    if command == "/teardown":
+        with DurableStore(database) as store:
+            action = store.create_callback_action(
+                f"inbox:{job_id}:herdr-teardown",
+                "herdr_topic_teardown",
+                {"binding_id": binding.binding_id},
+                chat_id,
+                int(os.environ["TELEGRAM_FROM_ID"]),
+                message_thread_id=thread_id,
+                ttl_seconds=30 * 60,
+            )
+        send_message(
+            "Permanently delete this Telegram topic and its history? Your Herdr agent will keep running.",
+            reply_markup={"inline_keyboard": [[
+                {"text": "Delete Telegram topic", "callback_data": f"a:{action.token}", "style": "danger"}
+            ]]},
+        )
+        return True
+    if command in {"/status", "/agent"}:
+        terminal = herdr_telegram.linked_terminal(binding)
+        send_message(f"Linked to Herdr terminal {terminal.address}. Agent status: {terminal.status}.")
+        return True
+    if command.startswith("/"):
+        send_message("Open the agent in Herdr to run that command.")
+        return True
+    is_voice = "voice" in message
+    if is_voice:
+        voice = message["voice"]
+        if int(voice.get("file_size", 0)) > MAX_VOICE_BYTES:
+            raise StoreError("Voice message exceeds Telegram's 20 MB bot download limit.")
+        if int(voice.get("duration", 0)) > MAX_VOICE_SECONDS:
+            raise StoreError("Voice message exceeds the 30-minute limit.")
+        send_message("🎙️ Transcribing on the Mac…")
+        text = transcribe_voice_note(voice)
+        if not text:
+            send_message("I couldn't detect speech in that voice note. Try recording again.")
+            return True
+    else:
+        text = str(message.get("text") or "").strip()
+        if not text:
+            send_message("Send text or a voice note to this Herdr topic.")
+            return True
+    with DurableStore(database) as store:
+        herdr_telegram.forward_input(
+            store, binding, job_id, int(message["message_id"]), text, voice=is_voice
+        )
+    return True
+
+
 def main() -> int:
     update = json.load(sys.stdin)
     username = os.environ.get("TELEGRAM_FROM_USERNAME") or "unknown"
@@ -5821,6 +5912,13 @@ def main() -> int:
         message = update.get("message")
         if callback_query:
             handle_callback(update, callback_query)
+        elif (
+            message
+            and os.environ.get("TELEGRAM_CHAT_TYPE") == "supergroup"
+            and os.environ.get("TELEGRAM_CONTROL_DB")
+            and handle_herdr_topic(message)
+        ):
+            return 0
         elif (
             message
             and not isinstance(message.get("forum_topic_created"), dict)
