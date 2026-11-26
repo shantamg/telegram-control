@@ -1,0 +1,49 @@
+#!/bin/sh
+# Start a coding agent in Herdr so it (1) shows in the Herdr app, (2) survives
+# its parent, (3) reports back to the caller, and (4) optionally opens its own
+# Telegram topic. Prints the terminal address.
+#
+# herdr-spawn --name NAME [--agent codex|claude] [--cwd DIR] [--on MACHINE]
+#             [--telegram "Topic name"] [--no-report] [--tab NAME] -- "task text"
+set -eu
+agent=codex name="" cwd="$PWD" on="" topic="" report=1 tab=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name) name=$2; shift 2;;
+    --agent) agent=$2; shift 2;;
+    --cwd) cwd=$2; shift 2;;
+    --on) on=$2; shift 2;;
+    --telegram) topic=$2; shift 2;;
+    --no-report) report=0; shift;;
+    --tab) tab=$2; shift 2;;
+    --) shift; break;;
+    *) echo "herdr-spawn: unknown option $1" >&2; exit 2;;
+  esac
+done
+[ -n "$name" ] && [ $# -ge 1 ] || { echo "usage: herdr-spawn --name NAME [opts] -- \"task\"" >&2; exit 2; }
+task=$1
+if [ -n "$topic" ]; then
+  task="$task
+
+Before starting, open a Telegram topic named $topic using the installed herdr-telegram-handoff skill. Use its voice and reply commands when appropriate."
+fi
+if [ "$report" = 1 ] && [ -n "${HC_TERMINAL_ID:-}" ]; then
+  task="$task
+
+When done or stuck, report the result in a few lines with: hc send $HC_TERMINAL_ID \"<result>\""
+  parent_args="--outlive-parent"
+else
+  parent_args="--no-parent"
+fi
+set -- run --bg --json --name "$name" --cwd "$cwd" $parent_args --label "spawned-by=${HC_TERMINAL_ID:-cli}"
+[ -n "$on" ] && set -- "$@" --on "$on"
+out=$(hc "$@" "$agent" "$task")
+addr=$(printf '%s' "$out" | /usr/bin/python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["address"])')
+sent=$(printf '%s' "$out" | /usr/bin/python3 -c 'import json,sys;d=json.load(sys.stdin);print(str(d.get("first_message",{}).get("sent")).lower())')
+if [ -n "$tab" ]; then
+    "$(dirname "$0")/herdr-show" "$addr" --tab "$tab" >/dev/null
+else
+    "$(dirname "$0")/herdr-show" "$addr" >/dev/null
+fi
+printf '{"terminal":"%s","task_sent":%s,"shown_in_app":true}\n' "$addr" "$sent"
+[ "$sent" = true ] || { echo "herdr-spawn: task not delivered; inspect with: hc read $addr" >&2; exit 1; }
