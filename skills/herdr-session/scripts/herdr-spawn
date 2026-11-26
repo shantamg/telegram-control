@@ -40,10 +40,11 @@ set -- run --bg --json --name "$name" --cwd "$cwd" $parent_args --label "spawned
 out=$(hc "$@" "$agent" "$task")
 addr=$(printf '%s' "$out" | /usr/bin/python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["address"])')
 sent=$(printf '%s' "$out" | /usr/bin/python3 -c 'import json,sys;d=json.load(sys.stdin);print(str(d.get("first_message",{}).get("sent")).lower())')
-if [ -n "$tab" ]; then
-    "$(dirname "$0")/herdr-show" "$addr" --tab "$tab" >/dev/null
-else
-    "$(dirname "$0")/herdr-show" "$addr" >/dev/null
-fi
-printf '{"terminal":"%s","task_sent":%s,"shown_in_app":true}\n' "$addr" "$sent"
+show="$(dirname "$0")/herdr-show"
+set -- "$addr"
+[ -z "$tab" ] || set -- "$@" --tab "$tab"
+shown=true
+"$show" "$@" >/dev/null || shown=false
+printf '{"terminal":"%s","task_sent":%s,"shown_in_app":%s}\n' "$addr" "$sent" "$shown"
 [ "$sent" = true ] || { echo "herdr-spawn: task not delivered; inspect with: hc read $addr" >&2; exit 1; }
+[ "$shown" = true ] || { echo "herdr-spawn: retry showing $addr with herdr-show" >&2; exit 1; }
