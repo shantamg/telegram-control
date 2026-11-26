@@ -78,8 +78,18 @@ def main():
         if "error" in doc:
             sys.exit(f"herdr-show: {doc['error'].get('message')}")
         value, version = doc["result"].get("value"), doc["result"]["version"]
-        if not value or not value.get("spaces"):
-            sys.exit("herdr-show: the Herdr app has no layout yet; open the app once first")
+        if value is None:
+            value = {}
+        if not value.get("spaces"):
+            folder = term.get("cwd")
+            if not folder:
+                sys.exit("herdr-show: the terminal has no working directory for its first space")
+            value["spaces"] = [{
+                "id": "sp" + secrets.token_hex(16),
+                "name": a.space or "",
+                "folder": folder,
+                "tabs": [],
+            }]
         if contains(value, address):
             print(json.dumps({"terminal": address, "shown": True, "changed": False}))
             return
