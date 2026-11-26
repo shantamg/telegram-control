@@ -64,3 +64,39 @@ The group is a default for links from that peer. Use an exact group name when
 the peer serves multiple projects. Start a session on the peer in Herdr and ask
 it to continue in Telegram. The receiver checks the peer's live terminal and
 agent identity before linking, forwarding a turn, or accepting a reply.
+
+## Roll out the same commands across the fleet
+
+Install Herdr Core and a Codex CLI that supports `--no-daemon` on each host.
+Clone this repository with its submodule, check out the same reviewed commit on
+each host, and keep each release in its own directory. For example:
+
+```sh
+revision=REVIEWED_COMMIT_SHA
+release="$HOME/.local/share/telegram-control/app-$revision"
+mkdir -p "$(dirname "$release")"
+git clone --recurse-submodules https://github.com/shantamg/telegram-control.git "$release"
+git -C "$release" checkout --detach "$revision"
+git -C "$release" submodule update --init
+python3 "$release/deploy/herdr-host.py" install
+python3 "$release/deploy/herdr-host.py" check
+```
+
+Use the same Python for both invocations. On a Mac, choose a Python 3.9+ that can
+import `plistlib`. The installer uses its absolute path for the handoff
+launcher. The current release can be checked from
+`~/.local/share/telegram-control/app/deploy/herdr-host.py`.
+
+The installer points the stable `app` link at the selected checkout. It installs
+the shared **herdr-session** and **herdr-telegram-handoff** skills, their
+relative Claude skill links, the Herdr Codex template, and the
+`herdr-spawn`, `herdr-show`, and `herdr-telegram` commands. The Codex wrapper
+uses `--no-daemon` only in a Herdr terminal. The launcher uses the existing
+desktop bridge on a Mac that has one configured.
+
+Keep the receiver's bot token, controller database, SSH relay identities, and
+peer settings in place across releases. Peers need the restricted SSH relay
+described above. Keep a single active receiver for the token. On that receiver,
+verify the outbox and worker leases are clear before restarting the service
+against the new `app` link. Verify the service is active, then test one existing
+route. Re-running the installer from the previous checkout rolls the tools back.

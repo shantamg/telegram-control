@@ -1,0 +1,15 @@
+#!/bin/sh
+# Keep Herdr's terminal environment and process ancestry in Codex tool calls.
+set -eu
+for codex_binary in "$HOME/.local/share/herdr-tools/bin/codex" /opt/homebrew/bin/codex /usr/local/bin/codex /usr/bin/codex; do
+    [ -x "$codex_binary" ] && break
+done
+[ -x "$codex_binary" ] || { echo 'Codex CLI is missing.' >&2; exit 127; }
+if [ -n "${HC_TERMINAL_ID:-}" ]; then
+    case "${1:-}" in
+        ""|-*|resume|fork|exec|review)
+            exec "$codex_binary" --no-daemon --sandbox danger-full-access --ask-for-approval never "$@"
+            ;;
+    esac
+fi
+exec "$codex_binary" "$@"

@@ -1,0 +1,107 @@
+#!/usr/bin/python3 -I
+"""Make a herdr-core terminal visible in the Herdr app.
+
+The Herdr app only shows terminals placed in its layout document
+("herdr-app" in herdr-core). Terminals started with `hc run` are not
+added there, so they stay invisible. This adds the terminal as a new tab
+in a space (default: the first space), using doc.set's version check.
+
+Usage: herdr-show <terminal|machine/tN> [--tab NAME] [--space NAME]
+
+A machine/tN address edits that machine's layout (doc.get/doc.set "on").
+"""
+import argparse
+import json
+import secrets
+import shutil
+import subprocess
+import sys
+
+DOC = "herdr-app"
+
+
+def rpc(calls):
+    lines = "".join(
+        json.dumps({"jsonrpc": "2.0", "id": i, "method": m, "params": p}) + "\n"
+        for i, (m, p) in enumerate(calls, 1)
+    )
+    out = subprocess.run(["hc", "connect"], input=lines, capture_output=True,
+                         text=True, timeout=20).stdout
+    replies = {}
+    for line in out.splitlines():
+        msg = json.loads(line)
+        if "id" in msg:
+            replies[msg["id"]] = msg
+    return [replies.get(i, {"error": {"message": "no reply"}}) for i in range(1, len(calls) + 1)]
+
+
+def contains(node, address):
+    if isinstance(node, dict):
+        content = node.get("content")
+        if isinstance(content, dict) and content.get("terminal") == address:
+            return True
+        return any(contains(v, address) for v in node.values())
+    if isinstance(node, list):
+        return any(contains(v, address) for v in node)
+    return False
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("terminal")
+    ap.add_argument("--tab")
+    ap.add_argument("--space")
+    a = ap.parse_args()
+
+    machine, _, local = a.terminal.rpartition("/")
+    on = {"on": machine} if machine else {}
+    (got,) = rpc([("terminal.get", {"terminal": a.terminal})])
+    if "error" in got:
+        sys.exit(f"herdr-show: {got['error'].get('message')}")
+    term = got["result"]
+    address = (term.get("address") or "").rpartition("/")[2] or local
+    if not address:
+        sys.exit("herdr-show: could not resolve the terminal address")
+
+    app = shutil.which("herdr-app")
+    if app and not machine and not a.tab and not a.space:
+        shown = subprocess.run(
+            [app, "do", "terminal.keep", "--terminal", address, "--place", "tab"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if shown.returncode == 0:
+            print(json.dumps({"terminal": address, "shown": True}))
+            return
+
+    for _ in range(5):
+        (doc,) = rpc([("doc.get", {"name": DOC, **on})])
+        if "error" in doc:
+            sys.exit(f"herdr-show: {doc['error'].get('message')}")
+        value, version = doc["result"].get("value"), doc["result"]["version"]
+        if not value or not value.get("spaces"):
+            sys.exit("herdr-show: the Herdr app has no layout yet; open the app once first")
+        if contains(value, address):
+            print(json.dumps({"terminal": address, "shown": True, "changed": False}))
+            return
+        spaces = value["spaces"]
+        space = next((s for s in spaces if s.get("name") == a.space), None) if a.space else spaces[0]
+        if space is None:
+            sys.exit(f"herdr-show: no space named {a.space!r}; have: {[s.get('name') for s in spaces]}")
+        tab_id = "tb" + secrets.token_hex(16)
+        space.setdefault("tabs", []).append({
+            "id": tab_id,
+            "name": a.tab or term.get("name") or address,
+            "root": {"id": tab_id, "type": "row", "children": [
+                {"id": "pb" + secrets.token_hex(16), "type": "block",
+                 "content": {"terminal": address}}]},
+        })
+        (res,) = rpc([("doc.set", {"name": DOC, "value": value, "version": version, **on})])
+        if "error" not in res:
+            print(json.dumps({"terminal": address, "shown": True, "changed": True,
+                              "space": space.get("name")}))
+            return
+    sys.exit("herdr-show: the layout kept changing; try again")
+
+
+if __name__ == "__main__":
+    main()
