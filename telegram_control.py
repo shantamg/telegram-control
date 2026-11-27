@@ -65,6 +65,7 @@ CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
 MANAGED_SHARED_SKILLS = (
     "telegram-group-icon",
     "telegram-create-topic",
+    "herdr-telegram-handoff",
     "telegram-detached-worker",
     "telegram-topic-teardown",
     "telegram-text-update",

@@ -2296,3 +2296,57 @@ module itself live upstream. `tests/test_ai_accounts.py` keeps only the
 Telegram-facing integration tests. Long-running workers load the shim after an
 idle-safe reload. Verified with the full suite under `/usr/bin/python3` and the
 submodule's suite.
+
+## Continue a Herdr conversation in Telegram
+
+The shared `herdr-telegram-handoff` skill starts in a running local Herdr
+agent. The helper checks `HC_TERMINAL_ID` against the terminal and the
+caller's process ancestry. It selects the workspace's bound private
+Telegram forum or accepts an explicitly chosen bound group. Git worktrees
+can match the group's main checkout. Repeating the handoff for the same
+live agent returns its existing topic link.
+
+The topic uses the existing `surface_bindings` table with a Herdr destination
+and no managed agent or provider mailbox. The handler processes it before
+regular topic provisioning. Text and Handy's whole-file voice transcript
+go through `hc send` when the agent is ready. The route pins the Core,
+terminal creation, and agent process and includes the provider session ID
+when it can be read directly from that process or its metadata. Agents
+without that metadata are identified by their process lifetime.
+
+Each forwarded prompt includes a scoped reply command. The agent supplies
+its final text to that command, which validates the linked process and
+queues the reply in the existing outbox. Voice turns also queue on-device
+speech using the configured /voice settings. An inbox retry reuses its
+record and does not send a second terminal prompt. A Telegram topic
+creation whose outcome is unknown is held for inspection rather than
+retried. Confirming /teardown revokes the route and queues deletion of the
+Telegram topic.
+
+From Herdr, the same skill can preview and confirm deletion in the current
+conversation. The preview returns only the linked topic and its confirmation ID.
+The confirmation checks the calling agent again, pins the chosen binding, and
+uses the same durable deletion operation as /teardown. Repeating a confirmation
+checks the existing operation. Focused tests covered preview without deletion,
+confirmation against a different agent, and repeated confirmation.
+
+The tests covered topic creation and reuse, replay of an inbox job, reply
+routing and deduplication, replacement of the running agent, and teardown.
+An isolated Herdr Core run verified Handy transcription of a sample
+recording, real terminal delivery, a reply from a simulated agent process,
+and generation of playable OGG audio. Telegram API calls were mocked.
+
+Herdr voice notes now have a durable receipt for each inbox job. The sender
+edits that message with the transcript preview during handoff, the working
+status, and the first chunk of the final reply. The whole transcript goes to
+Herdr. Longer replies continue in separate messages and audio uses the existing
+voice reply path. Empty recordings and terminal transcription or handoff
+errors update the receipt. Pending edits survive a controller reload using
+the existing controller state table. The sender waits for the receipt ID
+and for preceding edits, including edits waiting for retry.
+
+The Herdr regression test exercises a transcription that finishes before
+Telegram acknowledges the receipt, inbox replay, concurrent sender claims,
+a final reply while the working edit is leased, and a late status after
+completion. It checks the same Telegram message ID throughout and one audio
+reply. Telegram and the Herdr terminal are mocked in this test.

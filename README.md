@@ -137,6 +137,13 @@ the bot or delete the group in Telegram after cleanup finishes.
   can inspect.
 - `/help` is the in-Telegram source of truth for commands and workflows.
 - Agents can create more conversational topics when asked.
+- In a local Herdr agent, say **Continue this in Telegram**. The installed
+  `herdr-telegram-handoff` skill opens a topic in your bound private project
+  group and returns its link. Text and whole voice notes continue the running
+  conversation. Voice turns receive the answer as text and a playable reply.
+  Say **Remove this Telegram topic** in that Herdr conversation, or use
+  `/teardown` in Telegram. Confirm the permanent deletion of the topic and
+  its history. The agent keeps running in Herdr.
 - Optional detached workers use tmux for work that must outlive one turn. The
   parent starts and briefs a worker, then finishes instead of polling its tmux
   pane. After a reboot, Telegram Control resumes the exact provider session and

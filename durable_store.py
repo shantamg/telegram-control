@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import time
 from dataclasses import dataclass, field
+from enum import IntEnum
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
@@ -22,6 +23,13 @@ import provider_defaults
 import telegram_formatting
 import telegram_help
 import voice_settings
+
+
+class HerdrVoiceStage(IntEnum):
+    SENDING = 1
+    WORKING = 2
+    FAILED = 3
+    ANSWERED = 4
 
 
 SCHEMA_VERSION = 23
@@ -1973,6 +1981,14 @@ class DurableStore:
         if message_thread_id is not None:
             message_thread_id = int(message_thread_id)
 
+        herdr_receipt = self.connection.execute(
+            "SELECT message_id FROM outbox_messages WHERE operation_id = ?",
+            (f"herdr-turn:{source_inbox_job_id}:receipt",),
+        ).fetchone()
+        if herdr_receipt is not None:
+            self.stage_herdr_voice_edit(source_inbox_job_id, HerdrVoiceStage.FAILED, {"text": text})
+            return int(herdr_receipt["message_id"])
+
         receipt = self.connection.execute(
             """
             SELECT params_json, telegram_result_json
@@ -2866,6 +2882,50 @@ class DurableStore:
         )
         return int(updated.rowcount)
 
+    def stage_herdr_voice_edit(self, job_id: int, stage: HerdrVoiceStage, params: dict) -> None:
+        """Hold each stage until Telegram has assigned an ID to the receipt."""
+        key = f"herdr-voice-pending:{int(job_id)}:{stage.value}"
+        self.connection.execute(
+            """
+            INSERT INTO controller_state(key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO NOTHING
+            """,
+            (key, json.dumps({"stage": stage, "params": params}), time.time()),
+        )
+
+    def _queue_ready_herdr_voice_edits(self, timestamp: float) -> None:
+        pending = self.connection.execute(
+            "SELECT key, value FROM controller_state WHERE key GLOB 'herdr-voice-pending:*' ORDER BY key"
+        ).fetchall()
+        for row in pending:
+            prefix = "herdr-turn:" + row["key"].split(":")[1]
+            receipt = self.connection.execute(
+                "SELECT state, params_json, telegram_result_json FROM outbox_messages WHERE operation_id = ?",
+                (prefix + ":receipt",),
+            ).fetchone()
+            if receipt is None or receipt["state"] in {"queued", "leased"}:
+                continue
+            update = json.loads(row["value"])
+            stage = int(update["stage"])
+            # Wait for an older edit even during backoff. A retry or fast reply
+            # can also stage an older status after a newer one has been sent.
+            latest = self.connection.execute(
+                "SELECT operation_id, state FROM outbox_messages WHERE operation_id GLOB ? "
+                "ORDER BY message_id DESC LIMIT 1",
+                (prefix + ":edit:*",),
+            ).fetchone()
+            if latest is None or int(latest["operation_id"].rsplit(":", 1)[1]) < stage:
+                if latest is not None and latest["state"] in {"leased", "queued"}:
+                    continue
+                params = json.loads(receipt["params_json"])
+                method = "sendMessage"
+                if receipt["state"] == "sent":
+                    method = "editMessageText"
+                    params = {"chat_id": params["chat_id"],
+                              "message_id": json.loads(receipt["telegram_result_json"])["message_id"]}
+                self.enqueue_api_call(f"{prefix}:edit:{stage}", method, {**params, **update["params"]}, now=timestamp)
+            self.connection.execute("DELETE FROM controller_state WHERE key = ?", (row["key"],))
+
     def claim_outbox(
         self,
         worker_id: str,
@@ -2884,6 +2944,7 @@ class DurableStore:
                 """,
                 (timestamp, timestamp),
             )
+            self._queue_ready_herdr_voice_edits(timestamp)
             # Edits of the same routing receipt share a durable serialize_key
             # and are delivered strictly one at a time, so an agent-outcome
             # edit can never be claimed while its own dispatch-preview edit is
