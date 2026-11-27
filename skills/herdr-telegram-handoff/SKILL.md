@@ -17,15 +17,15 @@ Choose a short topic name that describes the work and run:
 
 The command identifies the agent from the terminal environment, checks its process, and chooses the private Telegram Control group bound to the workspace. If it asks for a group, use `--group "Exact group name"` once the user has chosen the destination. Reusing the skill for the same running agent returns the existing topic. Report the URL from the command so the user can open the topic on their phone.
 
-Keep working in the current conversation. The Telegram topic routes text and transcribed voice notes back to this pane. A prompt delivered from the topic contains a reply command for that message. When finishing that prompt, run its reply command with the final reply text on stdin, then give the same reply in Herdr. Report any delivery error in Herdr.
+Keep working in the current conversation. The Telegram topic routes text and transcribed voice notes back to this pane. A prompt delivered from the topic contains a reply command for that message. For a Telegram prompt, use its reply command once with the actual answer on stdin. An incoming voice note already receives a spoken answer. For typed input requesting audio, append `:voice` to the reply ticket. This completes the turn. Then give the same answer in Herdr. Report any delivery error in Herdr.
 
 ## Send a voice note from Herdr
 
-If there is no linked topic, open one first. Then pick a stable, lowercase key
+Use this standalone command for messages requested directly in Herdr. If there is no linked topic, open one first. Then pick a stable, lowercase key
 for the requested message and pass the spoken text on stdin:
 
 ```sh
-/usr/bin/python3 "{{TELEGRAM_CONTROL_ROOT}}/herdr_telegram.py" voice --key session-test <<'EOF'
+/usr/bin/python3 "{{TELEGRAM_CONTROL_ROOT}}/herdr_telegram.py" voice --key standalone-session-test <<'EOF'
 This is a voice note from my Herdr session.
 EOF
 ```
