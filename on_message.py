@@ -5928,7 +5928,7 @@ def handle_herdr_topic(message: dict) -> bool:
             transcript = preview[0].text + ("…" if len(preview) > 1 else "")
 
             def update_receipt(stage: HerdrVoiceStage, status: str) -> None:
-                store.stage_herdr_voice_edit(job_id, stage, {"text": f"{status}\n\n{transcript}"})
+                store.stage_herdr_voice_edit(job_id, stage, {"text": f"{status}\n\nYou said: “{transcript}”"})
 
             update_receipt(HerdrVoiceStage.SENDING, "📤 Sending to Herdr…")
             try:
