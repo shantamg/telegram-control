@@ -121,3 +121,9 @@ python3 ~/.local/share/telegram-control/app/deploy/herdr-host.py check --compare
 
 Exit code 0 means the revision matches and all tools are present. Exit code 2
 means the installed and published revisions differ.
+
+The installer also moves a receiver’s packaged `on_message.py` configuration
+to the stable `app/on_message.py` path. The host check verifies this incoming
+handler path as well as the installed revision. The inbox worker reads the
+configuration at startup, so a receiver whose handler path changed needs
+the queued supervisor reload.

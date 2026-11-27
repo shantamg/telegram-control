@@ -69,6 +69,20 @@ def base_paths(home: Path) -> tuple[Path, Path, Path]:
     return config, data / "telegram-control", bridge
 
 
+def managed_handler_config(bridge: Path, deploy: Path) -> dict | None:
+    """Recognize only the standard message handler inside a packaged release."""
+    config_path = bridge / "config.json"
+    if not config_path.is_file():
+        return None
+    config = json.loads(config_path.read_text())
+    handler = Path(config.get("handler_path") or "").expanduser()
+    if handler.name != "on_message.py" or handler.parent.parent != deploy:
+        return None
+    if handler.parent.name == "app" or re.fullmatch(r"app-[0-9a-f]{7,40}", handler.parent.name):
+        return config
+    return None
+
+
 def verify_checkout() -> str:
     for required in ("herdr_telegram.py", "telegram_control.py", "vendor/ai-accounts"):
         if not (ROOT / required).exists():
@@ -83,7 +97,7 @@ def verify_checkout() -> str:
 
 
 def install(home: Path) -> dict:
-    config, deploy, _ = base_paths(home)
+    config, deploy, bridge = base_paths(home)
     revision = verify_checkout()
     binary = home / ".local/bin"
     codex = codex_path(home)
@@ -153,6 +167,11 @@ def install(home: Path) -> dict:
             staged_link.symlink_to(ROOT, target_is_directory=True)
             os.replace(staged_link, app)
 
+    settings = managed_handler_config(bridge, deploy)
+    stable_handler = app / "on_message.py"
+    if settings is not None and settings["handler_path"] != str(stable_handler):
+        settings["handler_path"] = str(stable_handler)
+        write_file(bridge / "config.json", (json.dumps(settings, indent=2) + "\n").encode(), 0o600)
     return {**check(host=home), "revision": revision}
 
 
@@ -177,6 +196,11 @@ def check(host: Path) -> dict:
         info["revision"] = revision.stdout.strip()
     else:
         tools["checkout"] = False
+    settings = managed_handler_config(bridge, deploy)
+    if settings is not None:
+        handler = Path(settings["handler_path"])
+        info["incoming_handler"] = str(handler)
+        tools["incoming_handler"] = handler == app / "on_message.py" and handler.is_file()
     if relay.get("hub"):
         info["hub"] = relay["hub"]
     if relay.get("peers"):
