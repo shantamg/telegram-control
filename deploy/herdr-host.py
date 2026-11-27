@@ -190,13 +190,31 @@ def main() -> int:
     parser.add_argument("command", choices=["install", "check"])
     parser.add_argument("--home", type=Path, default=Path.home(),
                         help="Account directory used for installation and test environments.")
+    parser.add_argument("--compare-branch", metavar="BRANCH",
+                        help="With check, compare the installed revision to this branch on origin.")
     args = parser.parse_args()
+    if args.compare_branch and args.command != "check":
+        parser.error("--compare-branch requires check")
     try:
         result = install(args.home) if args.command == "install" else check(args.home)
+        if args.compare_branch:
+            branch = "refs/heads/" + args.compare_branch
+            output = subprocess.check_output(
+                ["git", "-C", result["checkout"], "ls-remote", "--exit-code", "origin", branch],
+                text=True, timeout=30,
+            )
+            matches = [line.split()[0] for line in output.splitlines()
+                       if line.split()[1] == branch]
+            if len(matches) != 1:
+                raise ValueError(f"Could not resolve branch {args.compare_branch}.")
+            result["remote_revision"] = matches[0]
+            result["matches_remote"] = result.get("revision") == matches[0]
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         parser.exit(1, f"{exc}\n")
     print(json.dumps(result, indent=2))
-    return int(not all(result["tools"].values()))
+    if not all(result["tools"].values()):
+        return 1
+    return 2 if result.get("matches_remote") is False else 0
 
 
 if __name__ == "__main__":
