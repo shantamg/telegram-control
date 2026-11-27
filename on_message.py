@@ -34,6 +34,7 @@ import voice_settings
 import workspace_catalog
 from durable_store import (
     CallbackActionError,
+    HerdrVoiceStage,
     DurableStore,
     StoreError,
     compose_forum_setup_input,
@@ -5879,26 +5880,56 @@ def handle_herdr_topic(message: dict) -> bool:
     if command.startswith("/"):
         send_message("Open the agent in Herdr to run that command.")
         return True
-    is_voice = "voice" in message
-    if is_voice:
+    if "voice" in message:
         voice = message["voice"]
         if int(voice.get("file_size", 0)) > MAX_VOICE_BYTES:
             raise StoreError("Voice message exceeds Telegram's 20 MB bot download limit.")
         if int(voice.get("duration", 0)) > MAX_VOICE_SECONDS:
             raise StoreError("Voice message exceeds the 30-minute limit.")
-        send_message("🎙️ Transcribing on the Mac…")
-        text = transcribe_voice_note(voice)
-        if not text:
-            send_message("I couldn't detect speech in that voice note. Try recording again.")
-            return True
-    else:
-        text = str(message.get("text") or "").strip()
-        if not text:
-            send_message("Send text or a voice note to this Herdr topic.")
-            return True
+        with DurableStore(database) as store:
+            if herdr_telegram.read_state(store, f"herdr-turn:{job_id}") is not None:
+                return True
+            store.enqueue_api_call(
+                f"herdr-turn:{job_id}:receipt", "sendMessage",
+                {"chat_id": chat_id, "message_thread_id": thread_id,
+                 "text": "🎙️ Transcribing on the Mac…"},
+            )
+            try:
+                text = transcribe_voice_note(voice)
+            except bridge.BridgeError as exc:
+                if bridge.is_retryable_telegram_error(exc):
+                    raise
+                store.stage_herdr_voice_edit(job_id, HerdrVoiceStage.FAILED, {"text": f"❌ {exc}"})
+                return True
+            except subprocess.TimeoutExpired:
+                store.stage_herdr_voice_edit(job_id, HerdrVoiceStage.FAILED, {"text": "❌ Local transcription timed out."})
+                return True
+            if not text:
+                store.stage_herdr_voice_edit(job_id, HerdrVoiceStage.FAILED, {"text": "I couldn't detect speech. Try recording again."})
+                return True
+            preview = telegram_formatting.render_plain_chunks(text, limit=3400)
+            transcript = preview[0].text + ("…" if len(preview) > 1 else "")
+
+            def update_receipt(stage: HerdrVoiceStage, status: str) -> None:
+                store.stage_herdr_voice_edit(job_id, stage, {"text": f"{status}\n\n{transcript}"})
+
+            update_receipt(HerdrVoiceStage.SENDING, "📤 Sending to Herdr…")
+            try:
+                herdr_telegram.forward_input(
+                    store, binding, job_id, int(message["message_id"]), text, voice=True
+                )
+            except StoreError as exc:
+                update_receipt(HerdrVoiceStage.FAILED, f"❌ {exc}")
+                return True
+            update_receipt(HerdrVoiceStage.WORKING, "🧠 Herdr is working…")
+        return True
+    text = str(message.get("text") or "").strip()
+    if not text:
+        send_message("Send text or a voice note to this Herdr topic.")
+        return True
     with DurableStore(database) as store:
         herdr_telegram.forward_input(
-            store, binding, job_id, int(message["message_id"]), text, voice=is_voice
+            store, binding, job_id, int(message["message_id"]), text, voice=False
         )
     return True
 

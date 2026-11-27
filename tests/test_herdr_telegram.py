@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import herdr_telegram as handoff
 import on_message
-from durable_store import DurableStore, StoreError
+from durable_store import DurableStore, HerdrVoiceStage, StoreError
 
 
 class HerdrTelegramTests(unittest.TestCase):
@@ -91,6 +91,22 @@ class HerdrTelegramTests(unittest.TestCase):
         self.assertEqual(args[:4], ("send", "--if", "idle", "t1"))
         self.assertIn("Run the checks.", args[-1])
         ticket = re.search(r"reply (23:[a-f0-9]{32})", args[-1])[1]
+        intro = self.store.claim_outbox("test")
+        self.store.complete_outbox(intro.message_id, "test", {"message_id": 90})
+        receipt = self.store.claim_outbox("test")
+        self.assertIn("Transcribing", receipt.params["text"])
+        self.store.complete_outbox(receipt.message_id, "test", {"message_id": 91})
+        sending = self.store.claim_outbox("test")
+        self.assertEqual(sending.method, "editMessageText")
+        self.assertEqual(sending.params["message_id"], 91)
+        self.assertIn("Run the checks.", sending.params["text"])
+        self.assertIsNone(self.store.claim_outbox("other-sender"))
+        self.store.complete_outbox(sending.message_id, "test", True)
+        working = self.store.claim_outbox("test")
+        self.assertEqual(working.method, "editMessageText")
+        self.assertEqual(working.params["message_id"], 91)
+        self.assertIn("Herdr is working", working.params["text"])
+        self.assertIn("Run the checks.", working.params["text"])
         with patch.object(
             handoff.voice_responses, "synthesize_voice", return_value=self.root / "speech.ogg"
         ) as speech:
@@ -100,14 +116,20 @@ class HerdrTelegramTests(unittest.TestCase):
             handoff.queue_reply(self.store, ticket, "The checks passed.", self.terminal)
             handoff.queue_reply(self.store, ticket, "Repeated answer", self.terminal)
         speech.assert_called_once()
-        rows = self.store.connection.execute(
-            "SELECT method, params_json FROM outbox_messages ORDER BY message_id"
-        ).fetchall()[1:]
-        self.assertEqual([row["method"] for row in rows], ["sendMessage", "sendVoice"])
-        for row in rows:
-            params = json.loads(row["params_json"])
-            self.assertEqual(params["message_thread_id"], 7)
-            self.assertEqual(params["reply_parameters"]["message_id"], 41)
+        self.store.complete_outbox(working.message_id, "test", True)
+        deliveries = []
+        while (item := self.store.claim_outbox("test")) is not None:
+            deliveries.append(item)
+            self.store.complete_outbox(item.message_id, "test", {"message_id": 92})
+        self.assertCountEqual([item.method for item in deliveries], ["editMessageText", "sendVoice"])
+        answer = next(item for item in deliveries if item.method == "editMessageText")
+        self.assertEqual(answer.params, {"chat_id": binding.chat_id, "message_id": 91,
+                                         "text": "The checks passed."})
+        audio = next(item for item in deliveries if item.method == "sendVoice")
+        self.assertEqual(audio.params["message_thread_id"], 7)
+        self.assertEqual(audio.params["reply_parameters"]["message_id"], 41)
+        self.store.stage_herdr_voice_edit(23, HerdrVoiceStage.WORKING, {"text": "late working status"})
+        self.assertIsNone(self.store.claim_outbox("test"))
 
     def test_changed_terminal_never_receives_a_prompt(self):
         binding = self.create_topic()

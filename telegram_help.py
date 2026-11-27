@@ -196,7 +196,7 @@ By default, each new topic in a bound group starts immediately with the group’
 
 An active topic agent can create another regular conversational topic in the same group and queue a self-contained first prompt there. Ask it to create a topic by name and describe the separate task; the new independent session begins immediately and is conversational, unlike a detached worker's report-only topic.
 
-To continue a running Herdr conversation here, ask the agent in Herdr to “Continue this in Telegram,” then open the link it returns. Send text or a voice note. The Mac transcribes the whole recording and a voice turn receives a playable reply. Use /status to see the linked terminal. To delete the topic, ask the agent in Herdr to “Remove this Telegram topic” or use /teardown here. Both ask for confirmation and leave the Herdr agent running.
+To continue a running Herdr conversation here, ask the agent in Herdr to “Continue this in Telegram,” then open the link it returns. Send text or a voice note. The Mac transcribes the whole recording. The transcribing message updates with your transcript, shows when Herdr is working, and becomes the final answer. You also receive a playable voice reply. Use /status to see the linked terminal. To delete the topic, ask the agent in Herdr to “Remove this Telegram topic” or use /teardown here. Both ask for confirmation and leave the Herdr agent running.
 
 The central conversational Control agent is optional and disabled by default. Direct mode does not need it: work happens in group topics, and a Claude-only installation does not need Codex.
 

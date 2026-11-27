@@ -2335,3 +2335,18 @@ routing and deduplication, replacement of the running agent, and teardown.
 An isolated Herdr Core run verified Handy transcription of a sample
 recording, real terminal delivery, a reply from a simulated agent process,
 and generation of playable OGG audio. Telegram API calls were mocked.
+
+Herdr voice notes now have a durable receipt for each inbox job. The sender
+edits that message with the transcript preview during handoff, the working
+status, and the first chunk of the final reply. The whole transcript goes to
+Herdr. Longer replies continue in separate messages and audio uses the existing
+voice reply path. Empty recordings and terminal transcription or handoff
+errors update the receipt. Pending edits survive a controller reload using
+the existing controller state table. The sender waits for the receipt ID
+and for preceding edits, including edits waiting for retry.
+
+The Herdr regression test exercises a transcription that finishes before
+Telegram acknowledges the receipt, inbox replay, concurrent sender claims,
+a final reply while the working edit is leased, and a late status after
+completion. It checks the same Telegram message ID throughout and one audio
+reply. Telegram and the Herdr terminal are mocked in this test.

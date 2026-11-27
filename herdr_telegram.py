@@ -21,7 +21,7 @@ import helper_paths
 import telegram_bridge as bridge
 import telegram_formatting
 import voice_responses
-from durable_store import DurableStore, StoreError, SurfaceBinding
+from durable_store import DurableStore, HerdrVoiceStage, StoreError, SurfaceBinding
 
 
 TARGET_TYPE = "herdr"
@@ -464,7 +464,7 @@ def queue_reply(store: DurableStore, ticket: str, text: str, terminal: Terminal)
     if time.time() > state["created_at"] + 24 * 60 * 60:
         raise StoreError("This Telegram reply ticket expired.")
     prefix = f"herdr-turn:{job_id}:reply"
-    if store.outbox_operation_state(f"{prefix}:text:0") is not None:
+    if state.get("reply_queued") or store.outbox_operation_state(f"{prefix}:text:0") is not None:
         return
     scope = {
         "chat_id": binding.chat_id,
@@ -488,9 +488,16 @@ def queue_reply(store: DurableStore, ticket: str, text: str, terminal: Terminal)
     try:
         if store.resolve_surface_binding_by_id(binding.binding_id) != binding:
             raise StoreError(STALE_LINK)
-        if store.outbox_operation_state(f"{prefix}:text:0") is None:
+        state = read_state(store, f"herdr-turn:{job_id}")
+        if not state.get("reply_queued") and store.outbox_operation_state(f"{prefix}:text:0") is None:
+            edit_receipt = state["voice"] and store.outbox_operation_state(f"herdr-turn:{job_id}:receipt")
+            state["reply_queued"] = True
+            write_state(store, f"herdr-turn:{job_id}", state)
             chunks = telegram_formatting.render_plain_chunks(text, speaker="", limit=3800)
             for index, chunk in enumerate(chunks):
+                if index == 0 and edit_receipt:
+                    store.stage_herdr_voice_edit(int(job_id), HerdrVoiceStage.ANSWERED, {"text": chunk.text})
+                    continue
                 params = dict(scope)
                 chunk.add_to_params(params)
                 store.enqueue_api_call(f"{prefix}:text:{index}", "sendMessage", params, serialize_key=prefix)
