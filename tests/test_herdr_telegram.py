@@ -179,7 +179,7 @@ class HerdrTelegramTests(unittest.TestCase):
         hc.assert_called_once()
         args = hc.call_args.args
         self.assertEqual(args[:4], ("send", "--if", "idle", "t1"))
-        self.assertIn("Run the checks.", args[-1])
+        self.assertTrue(args[-1].startswith("Run the checks.\n\n"))
         ticket = re.search(r"reply (23:[a-f0-9]{32})", args[-1])[1]
         intro = self.store.claim_outbox("test")
         self.store.complete_outbox(intro.message_id, "test", {"message_id": 90})
@@ -189,14 +189,14 @@ class HerdrTelegramTests(unittest.TestCase):
         sending = self.store.claim_outbox("test")
         self.assertEqual(sending.method, "editMessageText")
         self.assertEqual(sending.params["message_id"], 91)
-        self.assertIn("Run the checks.", sending.params["text"])
+        self.assertTrue(sending.params["text"].endswith("You said: “Run the checks.”"))
         self.assertIsNone(self.store.claim_outbox("other-sender"))
         self.store.complete_outbox(sending.message_id, "test", True)
         working = self.store.claim_outbox("test")
         self.assertEqual(working.method, "editMessageText")
         self.assertEqual(working.params["message_id"], 91)
         self.assertIn("Herdr is working", working.params["text"])
-        self.assertIn("Run the checks.", working.params["text"])
+        self.assertTrue(working.params["text"].endswith("You said: “Run the checks.”"))
         with patch.object(
             handoff.voice_responses, "synthesize_voice", return_value=self.root / "speech.ogg"
         ) as speech:

@@ -2387,3 +2387,7 @@ enqueue another reply. During an open turn the standalone voice command
 directs the agent to its reply ticket. Independent posts initiated in Herdr
 can use an explicit `standalone-` key. Tests cover both input types, an
 attempted standalone post, and a repeated final confirmation.
+
+Herdr voice status edits display the transcript preview as `You said: “…”`.
+The routing test verifies the quoted preview in the sending and working edits
+and the original words at the start of the agent prompt.
