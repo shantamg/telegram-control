@@ -20,9 +20,8 @@ create a topic and start talking. An older conversational Control layer remains
 available as an opt-in feature for people who want natural-language workspace
 discovery and delegation.
 
-> **Current support:** a single, local Mac. Linux servers, hosted deployment,
-> containers, and multi-host operation are future work, not supported setup
-> paths.
+The guided installer is for a local Mac. For a server-hosted
+Herdr handoff, see [Linux Herdr setup](docs/getting-started/linux-herdr.md).
 
 ## What you need
 
@@ -73,6 +72,10 @@ result with:
 
 For the human checkpoints, troubleshooting, and uninstall details, follow the
 [complete local-Mac setup guide](docs/getting-started/local-mac.md).
+
+Installed Herdr fleet commands check this repository’s `main` branch on use
+and install new revisions before dispatch. See the
+[host installation and update guide](docs/getting-started/linux-herdr.md#updates-on-use).
 
 ## Connect the first project
 
@@ -137,6 +140,13 @@ the bot or delete the group in Telegram after cleanup finishes.
   can inspect.
 - `/help` is the in-Telegram source of truth for commands and workflows.
 - Agents can create more conversational topics when asked.
+- In a local Herdr agent, say **Continue this in Telegram**. The installed
+  `herdr-telegram-handoff` skill opens a topic in your bound private project
+  group and returns its link. Text and whole voice notes continue the running
+  conversation. Voice turns receive the answer as text and a playable reply.
+  Say **Remove this Telegram topic** in that Herdr conversation, or use
+  `/teardown` in Telegram. Confirm the permanent deletion of the topic and
+  its history. The agent keeps running in Herdr.
 - Optional detached workers use tmux for work that must outlive one turn. The
   parent starts and briefs a worker, then finishes instead of polling its tmux
   pane. After a reboot, Telegram Control resumes the exact provider session and

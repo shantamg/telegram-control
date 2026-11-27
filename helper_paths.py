@@ -20,17 +20,18 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Optional
 
 
-CONFIG_PATH = (
-    Path.home()
-    / "Library"
-    / "Application Support"
-    / "telegram-bridge"
-    / "config.json"
-)
+IS_LINUX = sys.platform.startswith("linux")
+if IS_LINUX:
+    CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "telegram-bridge"
+    SPEECH_RUNTIME_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / "telegram-control" / "speech"
+else:
+    CONFIG_DIR = Path.home() / "Library" / "Application Support" / "telegram-bridge"
+CONFIG_PATH = CONFIG_DIR / "config.json"
 
 
 def configured_binary(config_key: str) -> Optional[Path]:

@@ -11,6 +11,7 @@ import os
 import plistlib
 import re
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -21,14 +22,16 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+import helper_paths
 import voice_responses
 
 
 APP_NAME = "telegram-bridge"
 KEYCHAIN_TOKEN_SERVICE = "telegram-bridge-bot-token"
 LAUNCH_AGENT_LABEL = "local.telegram-bridge"
-CONFIG_DIR = Path.home() / "Library" / "Application Support" / APP_NAME
-CONFIG_PATH = CONFIG_DIR / "config.json"
+CONFIG_DIR = helper_paths.CONFIG_DIR
+CONFIG_PATH = helper_paths.CONFIG_PATH
+TOKEN_PATH = CONFIG_DIR / "bot-token"
 STATE_PATH = CONFIG_DIR / "offset"
 LOG_DIR = Path.home() / "Library" / "Logs"
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
@@ -41,6 +44,8 @@ DEFAULT_HANDLER_PATH = SCRIPT_PATH.with_name("on_message.py")
 # managed/worker topics require manage_topics.
 GROUP_ADMIN_RIGHTS = ("change_info", "delete_messages", "manage_topics")
 RETRYABLE_HANDLER_EXIT = 75
+# A linked Herdr agent cannot take input yet. Retried patiently and quietly.
+HERDR_BUSY_HANDLER_EXIT = 76
 
 
 class BridgeError(RuntimeError):
@@ -49,6 +54,10 @@ class BridgeError(RuntimeError):
 
 class RetryableHandlerError(BridgeError):
     """A handler failure that the durable inbox should retry silently."""
+
+
+class HerdrBusyHandlerError(BridgeError):
+    """The linked Herdr agent is not ready; wait for it instead of failing."""
 
 
 _RETRYABLE_TELEGRAM_ERRORS = (
@@ -84,6 +93,15 @@ def keychain_account() -> str:
 
 
 def read_token() -> str:
+    if helper_paths.IS_LINUX:
+        try:
+            with os.fdopen(os.open(TOKEN_PATH, os.O_RDONLY | os.O_NOFOLLOW)) as stream:
+                status = os.fstat(stream.fileno())
+                if status.st_uid != os.getuid() or status.st_mode & 0o077:
+                    raise BridgeError("The bot token file must be private to the service user.")
+                return clean_and_validate_token(stream.read(256))
+        except OSError:
+            raise BridgeError("The Linux bot token is unavailable. Run the setup command.") from None
     result = subprocess.run(
         [
             "/usr/bin/security",
@@ -106,6 +124,16 @@ def read_token() -> str:
 
 
 def store_token(token: str) -> None:
+    if helper_paths.IS_LINUX:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor, temporary = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".bot-token-")
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(clean_and_validate_token(token) + "\n")
+            os.replace(temporary, TOKEN_PATH)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
+        return
     # The token is never written to disk or printed. macOS's security tool requires
     # the secret as an argument when updating a generic-password item.
     result = subprocess.run(
@@ -855,6 +883,8 @@ def process_update(
         env=environment,
     )
     if result.returncode != 0:
+        if result.returncode == HERDR_BUSY_HANDLER_EXIT:
+            raise HerdrBusyHandlerError("The linked Herdr agent is not ready yet.")
         if result.returncode == RETRYABLE_HANDLER_EXIT:
             raise RetryableHandlerError(
                 "Handler reported a retryable Telegram transport failure."

@@ -65,6 +65,7 @@ CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
 MANAGED_SHARED_SKILLS = (
     "telegram-group-icon",
     "telegram-create-topic",
+    "herdr-telegram-handoff",
     "telegram-detached-worker",
     "telegram-topic-teardown",
     "telegram-text-update",
@@ -127,6 +128,18 @@ def open_store(path: Path) -> DurableStore:
         raise
 
 
+def update_targets_herdr(store: DurableStore, update: dict[str, Any]) -> bool:
+    message = update.get("message") or (update.get("callback_query") or {}).get("message")
+    if not isinstance(message, dict):
+        return False
+    chat_id = (message.get("chat") or {}).get("id")
+    thread_id = bridge.forum_message_thread_id(message)
+    if not isinstance(chat_id, int) or thread_id is None:
+        return False
+    binding = store.resolve_surface_binding(chat_id, thread_id)
+    return binding is not None and binding.target_type == "herdr"
+
+
 def collect_once(
     store: DurableStore,
     token: str,
@@ -153,6 +166,13 @@ def collect_once(
                 "ignored_unauthorized": authorization_failure,
             }
         )
+        held_for_mac = (
+            authorization_failure is None
+            and config.get("herdr_only_receiver") is True
+            and not update_targets_herdr(store, update)
+        )
+        if held_for_mac:
+            stored_update = {"update_id": int(update["update_id"]), "held_for_mac": update}
         inserted = store.ingest_update(stored_update)
         committed_offset = store.poll_offset()
         if committed_offset is not None:
@@ -164,6 +184,8 @@ def collect_once(
             (
                 "update_ignored"
                 if inserted and authorization_failure is not None
+                else "update_held_for_mac"
+                if inserted and held_for_mac
                 else "update_ingested"
                 if inserted
                 else "update_duplicate"
@@ -220,6 +242,27 @@ def process_inbox_job(
             job_id=job.job_id,
             update_id=job.update_id,
             attempts=job.attempts,
+        )
+    except bridge.HerdrBusyHandlerError as exc:
+        # Roughly two hours of patient retries every 5-15 seconds.
+        state = store.fail_job(
+            job.job_id,
+            worker_id,
+            str(exc),
+            max_attempts=600,
+            base_delay=5.0,
+            max_delay=15.0,
+            terminal_failure_text=control_message(
+                "❌ Your Herdr agent stayed unavailable for about two hours, "
+                "so this message was not delivered. Check its pane and send it again."
+            ),
+        )
+        log_event(
+            "inbox_herdr_busy",
+            job_id=job.job_id,
+            update_id=job.update_id,
+            attempts=job.attempts,
+            state=state,
         )
     except bridge.RetryableHandlerError as exc:
         state = store.fail_job(
@@ -2218,7 +2261,7 @@ def run_command(args: argparse.Namespace) -> None:
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop_on_sigterm)
-    removed_reload_jobs = cleanup_reload_jobs()
+    removed_reload_jobs = [] if helper_paths.IS_LINUX else cleanup_reload_jobs()
     if removed_reload_jobs:
         log_event(
             "stale_reload_jobs_removed",
