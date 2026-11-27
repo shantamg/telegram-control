@@ -113,14 +113,14 @@ def install(home: Path) -> dict:
             raise ValueError(f"Conflicting Claude skill link at {link}")
     deploy.mkdir(parents=True, exist_ok=True)
 
-    # Keep the app link stable because peers store an absolute callback path.
-    if app.resolve() != ROOT:
-        with tempfile.TemporaryDirectory(prefix=".app-", dir=deploy) as temporary:
-            staged_link = Path(temporary) / "app"
-            staged_link.symlink_to(ROOT, target_is_directory=True)
-            os.replace(staged_link, app)
+    def launcher(name: str) -> str:
+        command = shlex.join([sys.executable, str(app / "deploy/herdr-run.py"), name])
+        return f'#!/bin/sh\nexec {command} "$@"\n'
 
-    write_file(wrapper, (ROOT / "deploy/codex-herdr").read_bytes(), 0o755)
+    codex_wrapper = (ROOT / "deploy/codex-herdr").read_text()
+    guard = 'if [ -n "${HC_TERMINAL_ID:-}" ]; then'
+    dispatch = launcher("codex").splitlines()[1]
+    write_file(wrapper, codex_wrapper.replace(guard, guard + "\n    " + dispatch).encode(), 0o755)
     template = (ROOT / "deploy/herdr-codex-template.md").read_text()
     write_file(
         config / "herdr-core/templates/codex.md",
@@ -142,18 +142,17 @@ def install(home: Path) -> dict:
         install_link(home / ".claude/skills" / name, destination)
     for name in ("herdr-show", "herdr-spawn"):
         relative = Path("herdr-session/scripts") / name
-        write_file(guides / relative, (ROOT / "skills" / relative).read_bytes(), 0o755)
+        write_file(guides / relative, launcher(name).encode(), 0o755)
         install_link(binary / name, guides / relative)
 
-    entry = deploy / "mac-relay-entry.py"
-    canonical = app / "herdr_telegram.py"
-    launcher = (
-        "#!/bin/sh\nset -eu\n"
-        f"entry={shlex.quote(str(canonical))}\n"
-        f"[ ! -f {shlex.quote(str(entry))} ] || entry={shlex.quote(str(entry))}\n"
-        f'exec {shlex.quote(sys.executable)} "$entry" "$@"\n'
-    )
-    write_file(binary / "herdr-telegram", launcher.encode(), 0o755)
+    write_file(binary / "herdr-telegram", launcher("herdr-telegram").encode(), 0o755)
+    # Keep the app link stable because peers store an absolute callback path.
+    if app.resolve() != ROOT:
+        with tempfile.TemporaryDirectory(prefix=".app-", dir=deploy) as temporary:
+            staged_link = Path(temporary) / "app"
+            staged_link.symlink_to(ROOT, target_is_directory=True)
+            os.replace(staged_link, app)
+
     return {**check(host=home), "revision": revision}
 
 

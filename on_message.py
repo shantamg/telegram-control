@@ -6154,4 +6154,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    herdr_telegram.dispatch_installed_script(Path(__file__), "handler")
     raise SystemExit(main())

@@ -718,6 +718,19 @@ def serve_relay(peer: str | None) -> dict:
         return handle_action(store, terminal, request)
 
 
+def dispatch_installed_script(script: Path, command: str) -> None:
+    """Direct receiver and SSH entry points also follow the stable release link."""
+    if os.environ.pop("HERDR_DISPATCHED_SCRIPT", None) == str(script.resolve()):
+        return
+    data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
+    deploy = data / "telegram-control"
+    runner = deploy / "app/deploy/herdr-run.py"
+    root = script.resolve().parent
+    if runner.is_file() and (root == (deploy / "app").resolve() or
+                             (root.parent == deploy and root.name.startswith("app-"))):
+        os.execv(sys.executable, [sys.executable, str(runner), command, *sys.argv[1:]])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -760,4 +773,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    dispatch_installed_script(Path(__file__), "relay-helper")
     raise SystemExit(main())

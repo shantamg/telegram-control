@@ -101,22 +101,23 @@ verify the outbox and worker leases are clear before restarting the service
 against the new `app` link. Verify the service is active, then test one existing
 route. Re-running the installer from the previous checkout rolls the tools back.
 
-### Check for a published update
+### Updates on use
 
-Each host installs the controller, relay helper, and shared skills from one
-commit in this repository. Make changes in a development checkout on any host
-and push them to the shared branch through Git. The Herdr fleet currently
-tracks `feature/linux-herdr-telegram`. From any installed host, run:
+Push shared changes through the Telegram Control repository and merge them into
+`main`. On each use, the installed Herdr session and Telegram launchers check
+their checkout’s Git origin for the latest commit on `main`. Direct receiver
+and relay invocations also check. If an update is available, the host downloads
+a separate checkout with its pinned submodules, installs its skills and tools,
+and runs the requested command from the new release. Simultaneous checks share
+a host lock. A failed check prints a warning and continues with the active
+installation. The Linux receiver requests a drained supervisor reload.
+
+Install the fleet package once on each new host. Older installations need one
+manual upgrade to a release with the updater. To inspect the active revision:
 
 ```sh
-python3 ~/.local/share/telegram-control/app/deploy/herdr-host.py check --compare-branch feature/linux-herdr-telegram
+python3 ~/.local/share/telegram-control/app/deploy/herdr-host.py check --compare-branch main
 ```
 
-This reads the installed checkout and queries its Git remote. Exit code 0
-means the revision matches and the tools are present. Exit code 2 means the
-installed and published revisions differ. Review the commits, then use the
-versioned installation above with the same full SHA on the receiver and peers.
-On a supervised receiver with automatic restart enabled, request a drained
-reload with `python3 ~/.local/share/telegram-control/app/telegram_control.py
-request-restart --reason "Apply Herdr release"`. The supervisor takes it
-when the queues are idle. The comparison is on demand.
+Exit code 0 means the revision matches and all tools are present. Exit code 2
+means the installed and published revisions differ.

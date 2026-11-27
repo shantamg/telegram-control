@@ -73,6 +73,10 @@ result with:
 For the human checkpoints, troubleshooting, and uninstall details, follow the
 [complete local-Mac setup guide](docs/getting-started/local-mac.md).
 
+Installed Herdr fleet commands check this repository’s `main` branch on use
+and install new revisions before dispatch. See the
+[host installation and update guide](docs/getting-started/linux-herdr.md#updates-on-use).
+
 ## Connect the first project
 
 1. Send `/newgroup` to the bot's private chat.

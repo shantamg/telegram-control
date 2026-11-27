@@ -2365,3 +2365,9 @@ Telegram acknowledges the receipt, inbox replay, concurrent sender claims,
 a final reply while the working edit is leased, and a late status after
 completion. It checks the same Telegram message ID throughout and one audio
 reply. Telegram and the Herdr terminal are mocked in this test.
+
+Herdr host installations track origin/main on use. The installed launchers
+and direct relay and receiver entries run through the stable app symlink,
+which preserves pinned relay routes. The updater serializes installations
+and checks out the fetched revision and its pinned submodules in a separate
+release directory. Receiver activation queues the supervisor’s idle reload.
