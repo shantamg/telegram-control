@@ -2371,3 +2371,11 @@ and direct relay and receiver entries run through the stable app symlink,
 which preserves pinned relay routes. The updater serializes installations
 and checks out the fetched revision and its pinned submodules in a separate
 release directory. Receiver activation queues the supervisor’s idle reload.
+
+A live Mac-linked voice turn reached the Linux receiver after the fleet update
+but used an older inbox handler pinned in its pairing configuration. The receipt
+was sent as an ordinary controller message and the reply arrived separately.
+The fleet installer now moves packaged handler paths to the stable app link,
+and host checks detect a pinned handler even when the installed SHA matches.
+The installer regression test starts with a stale release path, verifies that
+the check flags it, installs twice, and checks that other settings survive.

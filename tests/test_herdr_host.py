@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -35,7 +36,15 @@ class HerdrHostInstallTest(unittest.TestCase):
                 bridge.mkdir(parents=True)
                 relay = bridge / "herdr-relay.json"
                 relay.write_text('{"hub":"trusted-hub"}')
+                config_path = bridge / "config.json"
+                config_path.write_text(json.dumps({
+                    "handler_path": str(deploy / "app-abcdef0/on_message.py"), "other": "preserve",
+                }))
+                self.assertFalse(herdr_host.check(home)["tools"]["incoming_handler"])
                 first = herdr_host.install(home)
+                self.assertEqual(json.loads(config_path.read_text()), {
+                    "handler_path": str(deploy / "app/on_message.py"), "other": "preserve",
+                })
                 self.assertTrue(all(first["tools"].values()))
                 self.assertEqual(first, herdr_host.install(home))
                 self.assertEqual(first["hub"], "trusted-hub")
