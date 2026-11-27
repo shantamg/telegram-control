@@ -526,11 +526,18 @@ def forward_input(
     peer = relay_configuration()["peers"][machine] if separator else None
     script = peer["script"] if peer else str(SCRIPT)
     command = shlex.join(["/usr/bin/python3", script, "reply", f"{job_id}:{nonce}"])
+    audio_instruction = (
+        "This voice turn already includes one spoken reply."
+        if voice else
+        f"For a requested spoken answer, use {command}:voice instead."
+    )
     prompt = (
         f"{text}\n\n[Telegram Control handoff]\n"
         "The user sent this from the Telegram topic linked to your Herdr session. "
         "When you finish this request (or need the user's answer), use your terminal tool to "
         f"run {command} and pass your final user-facing reply on stdin. "
+        f"{audio_instruction} Pass the actual answer to the reply command once. "
+        "A separate voice post or a delivery announcement would duplicate the response. "
         "Then give the same reply normally here. Never include the reply command or ticket in your answer. "
         "The reply command is scoped to this particular message."
     )
@@ -566,7 +573,8 @@ def deliver_prompt(terminal: Terminal, prompt: str) -> None:
 
 
 def queue_reply(store: DurableStore, ticket: str, text: str, terminal: Terminal) -> None:
-    match = TICKET.fullmatch(ticket)
+    spoken = ticket.endswith(":voice")
+    match = TICKET.fullmatch(ticket.removesuffix(":voice"))
     if match is None:
         raise StoreError("This Telegram reply ticket is invalid.")
     job_id, nonce = match.groups()
@@ -591,7 +599,7 @@ def queue_reply(store: DurableStore, ticket: str, text: str, terminal: Terminal)
         "reply_parameters": {"message_id": state["message_id"], "allow_sending_without_reply": True},
     }
     voice_path = None
-    if state["voice"]:
+    if state["voice"] or spoken:
         config = store.voice_configuration()
         try:
             voice_path = voice_responses.synthesize_voice(
@@ -645,6 +653,27 @@ def queue_voice(store: DurableStore, terminal: Terminal, key: str, text: str) ->
     state = store.outbox_operation_state(operation)
     if state is not None:
         return state
+    # Standalone audio has no turn identity. Never guess which concurrent
+    # prompt it belongs to or let it bypass the turn's reply deduplication.
+    if not key.startswith("standalone-") and store.connection.execute(
+        """
+        SELECT 1 FROM controller_state AS turn
+        WHERE turn.key GLOB 'herdr-turn:[0-9]*'
+            AND json_extract(turn.value, '$.binding_id') = ?
+            AND json_extract(turn.value, '$.created_at') >= ?
+            AND coalesce(json_extract(turn.value, '$.reply_queued'), 0) = 0
+            AND NOT EXISTS (
+                SELECT 1 FROM outbox_messages WHERE operation_id = turn.key || ':reply:text:0'
+            )
+        LIMIT 1
+        """,
+        (binding.binding_id, time.time() - 24 * 60 * 60),
+    ).fetchone():
+        raise StoreError(
+            "This topic has an open Telegram turn. Use its reply command with the actual "
+            "answer on stdin (append :voice to its ticket for audio). For an independent "
+            "message requested directly in Herdr, use a key starting with standalone-."
+        )
     config = store.voice_configuration()
     audio_key = hashlib.sha256(operation.encode()).hexdigest()[:32]
     voice_path = voice_responses.synthesize_voice(

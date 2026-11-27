@@ -2379,3 +2379,11 @@ The fleet installer now moves packaged handler paths to the stable app link,
 and host checks detect a pinned handler even when the installed SHA matches.
 The installer regression test starts with a stale release path, verifies that
 the check flags it, installs twice, and checks that other settings survive.
+
+Herdr replies to incoming voice notes synthesize the substantive answer once.
+For typed requests the same reply ticket accepts a `:voice` suffix to request
+audio. Both forms consume the same turn, so a later completion message cannot
+enqueue another reply. During an open turn the standalone voice command
+directs the agent to its reply ticket. Independent posts initiated in Herdr
+can use an explicit `standalone-` key. Tests cover both input types, an
+attempted standalone post, and a repeated final confirmation.

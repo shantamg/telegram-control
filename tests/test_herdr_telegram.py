@@ -275,6 +275,29 @@ class HerdrTelegramTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(json.loads(voice["params_json"])["message_thread_id"], binding.message_thread_id)
 
+    def test_requested_audio_completes_turn_once(self):
+        binding = self.create_topic()
+        for job, voice in ((25, True), (26, False)):
+            with patch.object(handoff, "linked_terminal", return_value=self.terminal), patch.object(
+                handoff, "hc"
+            ) as hc:
+                handoff.forward_input(self.store, binding, job, 49, "Send the report as audio.", voice=voice)
+            ticket = re.search(r"reply (\d+:[a-f0-9]{32})", hc.call_args.args[-1])[1]
+            with patch.object(handoff.voice_responses, "synthesize_voice",
+                              return_value=self.root / "answer.ogg") as speech:
+                with self.assertRaisesRegex(StoreError, "open Telegram turn"):
+                    handoff.queue_voice(self.store, self.terminal, "report", "The report")
+                handoff.queue_reply(self.store, ticket if voice else ticket + ":voice", "The report", self.terminal)
+                handoff.queue_reply(self.store, ticket, "Sent a voice note.", self.terminal)
+                speech.assert_called_once()
+                self.assertEqual(speech.call_args.args[0], "The report")
+            rows = self.store.connection.execute(
+                "SELECT method, params_json FROM outbox_messages WHERE operation_id GLOB ? ORDER BY message_id",
+                (f"herdr-turn:{job}:reply:*",),
+            ).fetchall()
+            self.assertEqual([row["method"] for row in rows], ["sendMessage", "sendVoice"])
+            self.assertEqual(json.loads(rows[0]["params_json"])["text"], "The report")
+
     def test_changed_terminal_never_receives_a_prompt(self):
         binding = self.create_topic()
         replacement = handoff.Terminal("t1", "t1:agent-two", self.root, "idle")
